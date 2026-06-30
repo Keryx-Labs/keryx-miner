@@ -2,15 +2,13 @@ use std::collections::HashMap;
 use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
-use std::time::Duration;
+use std::thread::{self, JoinHandle as ThreadJoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::{pow, watch, Error};
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use tokio::sync::mpsc::Sender;
-use tokio::task::{self, JoinHandle};
-use tokio::time::MissedTickBehavior;
 
 use crate::pow::BlockSeed;
 use keryx_miner::{PluginManager, WorkerSpec};
@@ -35,7 +33,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
     use std::os::unix::thread::JoinHandleExt;
     let pthread_handle = handle.as_pthread_t();
     std::thread::spawn(move || {
-        sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_millis(1000));
         if kill_switch.load(Ordering::SeqCst) {
             match nix::sys::pthread::pthread_kill(pthread_handle, nix::sys::signal::Signal::SIGUSR1) {
                 Ok(()) => {
@@ -65,7 +63,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
 
     std::thread::spawn(move || unsafe {
         let ensure_full_move = raw_handle;
-        sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_millis(1000));
         if kill_switch.load(Ordering::SeqCst) {
             kernel32::TerminateThread(ensure_full_move.0, 0);
         }
@@ -93,7 +91,8 @@ pub struct MinerManager {
     handles: Vec<MinerHandler>,
     block_channel: watch::Sender<Option<WorkerCommand>>,
     send_channel: Sender<BlockSeed>,
-    logger_handle: JoinHandle<()>,
+    logger_handle: ThreadJoinHandle<()>,
+    logger_stop: Arc<AtomicBool>,
     is_synced: bool,
     hashes_tried: Arc<AtomicU64>,
     hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
@@ -104,7 +103,10 @@ pub struct MinerManager {
 impl Drop for MinerManager {
     fn drop(&mut self) {
         info!("Closing miner");
-        self.logger_handle.abort();
+        self.logger_stop.store(true, Ordering::Release);
+        if let Err(e) = self.logger_handle.join() {
+            error!("Hashrate logger failed to join: {:?}", e);
+        }
         match self.block_channel.send(Some(WorkerCommand::Close)) {
             Ok(_) => {}
             Err(_) => warn!("All workers are already dead"),
@@ -157,15 +159,21 @@ impl MinerManager {
                 hashes_by_worker.clone(),
             ));
         }
+        let logger_stop = Arc::new(AtomicBool::new(false));
+        let logger_stop_spawn = Arc::clone(&logger_stop);
         Self {
             handles,
             block_channel: send,
             send_channel,
-            logger_handle: task::spawn(Self::log_hashrate(
-                Arc::clone(&hashes_tried),
-                hashes_by_worker.clone(),
-                Arc::clone(&opoi_challenge_active),
-            )),
+            logger_handle: thread::spawn(move || {
+                Self::log_hashrate(
+                    Arc::clone(&hashes_tried),
+                    hashes_by_worker.clone(),
+                    Arc::clone(&opoi_challenge_active),
+                    logger_stop_spawn,
+                )
+            }),
+            logger_stop,
             is_synced: true,
             hashes_tried,
             current_state_id: AtomicUsize::new(0),
@@ -498,27 +506,26 @@ impl MinerManager {
         })
     }
 
-    async fn log_hashrate(
+    fn log_hashrate(
         hashes_tried: Arc<AtomicU64>,
         hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
         opoi_challenge_active: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
     ) {
-        let mut ticker = tokio::time::interval(LOG_RATE);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut last_instant = ticker.tick().await;
-        // Consecutive all-zero ticks while NOT in an OPoI inference pause.
+        let mut last_instant = Instant::now();
         let mut zero_streak: u32 = 0;
-        loop {
-            let now = ticker.tick().await;
-            let duration = (now - last_instant).as_secs_f64();
-            last_instant = now;
-            // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
+        while !stop.load(Ordering::Acquire) {
+            thread::sleep(LOG_RATE);
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            let duration = last_instant.elapsed().as_secs_f64();
+            last_instant = Instant::now();
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
                 || keryx_miner::pom_gpu::is_loading();
             let total = hashes_tried.swap(0, Ordering::AcqRel);
 
             if total > 0 {
-                // Mining normally: report aggregate + per-device rates.
                 zero_streak = 0;
                 let (rate, suffix) = Self::hash_suffix(total as f64 / duration);
                 info!("Current hashrate is {:.2} {}", rate, suffix);
@@ -530,25 +537,21 @@ impl MinerManager {
                 continue;
             }
 
-            // No hashes this tick — keep the per-device counters drained for the next window.
             for (_device, counter) in &*hashes_by_worker.lock().unwrap() {
                 counter.store(0, Ordering::Release);
             }
 
             if challenge_active {
-                // PoW is intentionally paused while the GPU runs inference / loads a model.
                 zero_streak = 0;
                 info!("OPoI inference in progress — PoW paused, stand by");
             } else {
                 zero_streak = zero_streak.saturating_add(1);
                 if zero_streak >= STALL_GRACE_TICKS {
-                    // Sustained zeros outside an inference pause — this is a real problem.
                     warn!("Workers stalled or crashed. Consider reducing workload and check that your node is synced");
                     for (device, _) in &*hashes_by_worker.lock().unwrap() {
                         warn!("Device {}: 0 hash/s", device);
                     }
                 } else {
-                    // Transient pause (model load/eviction or template gap) — not a crash yet.
                     info!("PoW paused (OPoI inference / model load) — stand by");
                 }
             }

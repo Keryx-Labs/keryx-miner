@@ -12,7 +12,6 @@ use rand::{thread_rng, RngCore};
 use std::fs;
 use std::sync::atomic::AtomicU16;
 use std::sync::Arc;
-use std::thread::sleep;
 use std::time::Duration;
 
 use crate::cli::Opt;
@@ -300,8 +299,35 @@ async fn client_main(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+/// Tokio async worker count. Async workload is minimal (gRPC/stratum + a few tasks);
+/// default 2 avoids spawning one worker per logical CPU on large rigs.
+fn tokio_worker_threads() -> usize {
+    std::env::var("KERYX_ASYNC_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .clamp(1, 4)
+}
+
+/// Cap for `spawn_blocking` (inference, IPFS, model prefetch). Override with KERYX_BLOCKING_THREADS.
+fn tokio_blocking_threads() -> usize {
+    std::env::var("KERYX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+        .clamp(2, 16)
+}
+
+fn main() -> Result<(), Error> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tokio_worker_threads())
+        .max_blocking_threads(tokio_blocking_threads())
+        .enable_all()
+        .build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> Result<(), Error> {
     #[cfg(target_os = "windows")]
     adjust_console().unwrap_or_else(|e| {
         eprintln!("WARNING: Failed to protect console ({}). Any selection in console will freeze the miner.", e)
@@ -558,6 +584,6 @@ async fn main() -> Result<(), Error> {
             Err(e) => error!("Client closed with error {:?}", e),
         }
         info!("Client closed, reconnecting");
-        sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

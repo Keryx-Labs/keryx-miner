@@ -15,6 +15,7 @@ use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -90,32 +91,50 @@ impl Client for KeryxdHandler {
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         self.opoi_challenge_active = Some(miner.opoi_challenge_flag());
-        // Harvest in-flight inference on a timer, independently of node notifications.
-        // On a sole-producer node, pausing mining for inference stops block production,
-        // so the node stops sending NewBlockTemplate notifications — without this timer
-        // the finished inference would never be collected and mining would deadlock.
-        let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(200));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        const CHALLENGE_KEEPALIVE: Duration = Duration::from_secs(2);
         loop {
-            let maybe_msg = tokio::select! {
-                msg = self.stream.message() => Some(msg?),
-                _ = tick.tick() => None,
-            };
-            match maybe_msg {
-                Some(Some(m)) => match m.payload {
-                    Some(payload) => self.handle_message(payload, miner).await?,
-                    None => warn!("keryxd message payload is empty"),
-                },
-                Some(None) => break, // stream closed by node
-                None => {
-                    // Timer tick: if a regular inference just finished, get a fresh template.
-                    if self.inference_rx.is_some() && self.poll_inference().await {
-                        self.client_get_block_template().await?;
-                    // If a challenge is in flight, keep pinging the node so the result is
-                    // delivered as soon as the inference task completes. This is critical on
-                    // sole-producer nodes where mining suspension stops NewBlockTemplate
-                    // notifications and the response would otherwise never be sent.
-                    } else if self.challenge_inference_rx.is_some() {
+            if self.inference_rx.is_none() && self.challenge_inference_rx.is_none() {
+                match self.stream.message().await? {
+                    Some(m) => match m.payload {
+                        Some(payload) => self.handle_message(payload, miner).await?,
+                        None => warn!("keryxd message payload is empty"),
+                    },
+                    None => break,
+                }
+                continue;
+            }
+
+            if self.inference_rx.is_some() {
+                tokio::select! {
+                    msg = self.stream.message() => {
+                        match msg? {
+                            Some(m) => match m.payload {
+                                Some(payload) => self.handle_message(payload, miner).await?,
+                                None => warn!("keryxd message payload is empty"),
+                            },
+                            None => break,
+                        }
+                    }
+                    finished = self.await_regular_inference() => {
+                        if finished {
+                            self.client_get_block_template().await?;
+                        }
+                    }
+                }
+            } else {
+                // Challenge in flight: slow keepalive for sole-producer nodes where mining
+                // suspension stops NewBlockTemplate notifications.
+                tokio::select! {
+                    msg = self.stream.message() => {
+                        match msg? {
+                            Some(m) => match m.payload {
+                                Some(payload) => self.handle_message(payload, miner).await?,
+                                None => warn!("keryxd message payload is empty"),
+                            },
+                            None => break,
+                        }
+                    }
+                    _ = tokio::time::sleep(CHALLENGE_KEEPALIVE) => {
                         self.client_get_block_template().await?;
                     }
                 }
@@ -453,6 +472,22 @@ impl KeryxdHandler {
         }
     }
 
+    /// Awaits in-flight regular inference, then uploads to IPFS and submits AiResponse.
+    /// Returns `true` when inference finished (regardless of tx success).
+    async fn await_regular_inference(&mut self) -> bool {
+        let Some((raw, rx)) = self.inference_rx.take() else {
+            return false;
+        };
+        let result_opt = match rx.await {
+            Ok(v) => v,
+            Err(_) => {
+                info!("OPoI: inference task dropped — AiResponse skipped");
+                return true;
+            }
+        };
+        self.complete_inference(raw, result_opt).await
+    }
+
     /// Polls the in-flight inference task. When complete, uploads the result to
     /// IPFS and submits a zero-input/zero-output AiResponse transaction.
     /// Returns `true` if inference just finished (regardless of tx success).
@@ -464,6 +499,10 @@ impl KeryxdHandler {
             self.inference_rx = Some((raw, rx));
             return false;
         };
+        self.complete_inference(raw, result_opt).await
+    }
+
+    async fn complete_inference(&mut self, raw: Vec<u8>, result_opt: Option<String>) -> bool {
         let Some(result) = result_opt else {
             // Inference returned None: model not ready or think block exhausted max_tokens.
             // Do NOT upload anything to IPFS — skip this AiResponse entirely.
