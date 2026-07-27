@@ -99,11 +99,36 @@ ldconfig -p | grep -q libcublas.so.12 || { echo "libcublas still not in loader c
 ldconfig -p | grep -q libcurand.so   || { echo "libcurand still not in loader cache"; exit 1; }
 ldconfig -p | grep -q libcudart.so.12 || { echo "libcudart still not in loader cache"; exit 1; }
 rm -f cuda-keyring.deb"#;
-    Command::new("bash")
+    let output = match Command::new("bash")
         .args(["-c", script])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            error!("CUDA lib auto-install failed to launch: {e}");
+            return false;
+        }
+    };
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !line.trim().is_empty() {
+            info!("CUDA install: {line}");
+        }
+    }
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            warn!("CUDA install: {line}");
+        }
+    }
+
+    if output.status.success() {
+        true
+    } else {
+        error!("CUDA lib auto-install failed with status {}", output.status);
+        false
+    }
 }
 
 #[cfg(target_os = "windows")]
