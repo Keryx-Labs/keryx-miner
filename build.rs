@@ -31,7 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     {
         let out_dir = env::var("OUT_DIR").unwrap();
-        let sm_list = env::var("POM_SM_LIST").unwrap_or_else(|_| "90,89,86,80,75,70,61".to_string());
+        // Default covers RTX 50 (120), Hopper (90), RTX 40 (89), RTX 30 (86), plus older fallbacks.
+        // sm_120 needs CUDA toolkit ≥ 12.8; older toolkits get a placeholder and runtime skips it.
+        let sm_list = env::var("POM_SM_LIST").unwrap_or_else(|_| "120,90,89,86,80,75,70,61".to_string());
         let sms: Vec<String> = sm_list
             .split(',')
             .map(str::trim)
@@ -40,14 +42,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         assert!(!sms.is_empty(), "POM_SM_LIST resolved to an empty set");
 
-        for sm in sms {
+        // Always materialize every PTX slot `pom_gpu.rs` include_str!'s, even if not in POM_SM_LIST.
+        let required_sms = ["120", "90", "89", "86", "80", "75", "70", "61"];
+        let mut build_sms: Vec<String> = sms;
+        for sm in required_sms {
+            if !build_sms.iter().any(|s| s == sm) {
+                build_sms.push(sm.to_string());
+            }
+        }
+
+        // Optional: reuse prebuilt PTX (e.g. compiled under WSL) when local nvcc cannot host-compile
+        // (MSVC missing on Windows, or mismatched gcc). Expected files: pom_mine_sm{SM}.ptx
+        let prebuilt_ptx_dir = env::var("POM_PTX_DIR").ok();
+        println!("cargo:rerun-if-env-changed=POM_PTX_DIR");
+        println!("cargo:rerun-if-env-changed=NVCC_FLAGS");
+
+        for sm in build_sms {
             let ptx = format!("{out_dir}/pom_mine_sm{sm}.ptx");
-            let output = std::process::Command::new(&nvcc)
-                .args(["-ptx", "-O3", &format!("-arch=sm_{sm}"), "cuda/pom_mine.cu", "-o", &ptx])
+            if let Some(ref dir) = prebuilt_ptx_dir {
+                let src = format!("{dir}/pom_mine_sm{sm}.ptx");
+                if std::path::Path::new(&src).exists() {
+                    fs::copy(&src, &ptx).unwrap_or_else(|e| {
+                        panic!("failed copying prebuilt PTX {src} -> {ptx}: {e}")
+                    });
+                    continue;
+                }
+            }
+
+            let mut cmd = std::process::Command::new(&nvcc);
+            cmd.args(["-ptx", "-O3", &format!("-arch=sm_{sm}")]);
+            // Host gcc 15+ (Ubuntu 25+/WSL) is rejected by CUDA 12.8; allow override.
+            // Extra flags via NVCC_FLAGS (space-separated).
+            cmd.arg("-allow-unsupported-compiler");
+            if let Ok(extra) = env::var("NVCC_FLAGS") {
+                for flag in extra.split_whitespace() {
+                    cmd.arg(flag);
+                }
+            }
+            cmd.args(["cuda/pom_mine.cu", "-o", &ptx]);
+            let output = cmd
                 .output()
                 .unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run for sm_{sm}: {e}"));
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                // sm_120 is optional on older toolkits (needs CUDA ≥ 12.8). Leave a stub so
+                // include_str! still resolves; runtime selection skips non-PTX stubs.
+                if sm == "120" {
+                    println!(
+                        "cargo:warning=nvcc could not emit pom_mine sm_120 PTX (need CUDA ≥ 12.8); RTX 50 will fall back to sm_89/sm_86. stderr:\n{stderr}"
+                    );
+                    fs::write(
+                        &ptx,
+                        "// pom_mine sm_120 unavailable — rebuild with CUDA toolkit ≥ 12.8\n",
+                    )
+                    .unwrap_or_else(|e| panic!("failed writing sm_120 placeholder {ptx}: {e}"));
+                    continue;
+                }
                 panic!(
                     "nvcc failed to compile cuda/pom_mine.cu for sm_{sm}:\n{}",
                     stderr
@@ -157,6 +207,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
                 "-DGGML_CUDA_NCCL=OFF",
                 "-DCMAKE_BUILD_TYPE=Release",
                 &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
+                // CUDA 12.8 host-check rejects gcc 15+; keep builds working on current Ubuntu/WSL.
+                "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler",
             ]),
     )?;
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "8".to_string());

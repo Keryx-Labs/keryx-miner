@@ -104,8 +104,45 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 }
                 return Ok(());
             } else {
-                // 200, or the server ignored Range ⇒ (re)start from scratch.
+                // 200, or the server ignored Range. Never wipe a local file that already matches
+                // the remote size — IPFS gateways often ignore Range and answer 200 + full
+                // Content-Length, which previously truncated multi-GB GGUFs back to zero.
                 let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
+                if resume_from > 0 {
+                    if let Some(t) = total {
+                        if resume_from >= t {
+                            if ui_progress_to_stderr() {
+                                eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                            } else {
+                                ui_download_info(&format!(
+                                    "[keryx-miner] already complete ({} MB).",
+                                    resume_from / 1_000_000
+                                ));
+                            }
+                            return Ok(());
+                        }
+                    }
+                    // Partial local file + no Range support: keep the bytes and resume via a
+                    // fresh request without Range only when we have nothing useful; otherwise
+                    // refuse to truncate and retry later (gateway may regain Range support).
+                    if resume_from > 1_000_000 {
+                        drop(response);
+                        attempt += 1;
+                        if attempt >= MAX_ATTEMPTS {
+                            return Err(anyhow!(
+                                "download {} cannot resume: server ignored Range and local partial is {} MB",
+                                url,
+                                resume_from / 1_000_000
+                            ));
+                        }
+                        ui_download_warn(&format!(
+                            "[keryx-miner] server ignored Range (HTTP {status}); keeping local {} MB, retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s…",
+                            resume_from / 1_000_000
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
+                        continue;
+                    }
+                }
                 let f = std::fs::File::create(dest)
                     .with_context(|| format!("create {}", dest.display()))?;
                 (f, 0u64, total)
@@ -208,18 +245,51 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     let gguf = dir.join("model.gguf");
     let ok_flag = dir.join(".ok");
 
-    // H4 models pin no separate tokenizer.json (llama uses the one embedded in the GGUF).
+    // Separate tokenizer.json is optional for the lineup — llama uses the GGUF-embedded one.
     let tok_needed = !spec.tokenizer_cid.is_empty();
-    // .ok sentinel written only after a complete download — guards against truncated files
-    if (!tok_needed || tok.exists()) && gguf.exists() && ok_flag.exists() {
-        log::debug!("SlmEngine: found local model '{}' at {}", spec.name, dir.display());
+    let gguf_ready = crate::gguf::is_complete_file(&gguf);
+    let tok_ready = !tok_needed || tok.exists();
+
+    // Reuse a complete on-disk GGUF even when `.ok` was lost (HiveOS upgrades, manual copies,
+    // interrupted flag write). Never re-download a model that already parses as complete.
+    if gguf_ready && tok_ready {
+        if !ok_flag.exists() {
+            let _ = std::fs::write(&ok_flag, b"");
+        }
+        log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
+
     std::fs::create_dir_all(&dir)?;
-    let _ = std::fs::remove_file(&ok_flag); // clear stale flag before re-downloading
-    ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
-    if tok_needed && !tok.exists() { download_file(&ipfs_url(spec.tokenizer_cid), &tok)?; }
-    download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
+    if ok_flag.exists() && !gguf_ready {
+        let _ = std::fs::remove_file(&ok_flag); // clear stale flag before repairing
+    }
+
+    if !gguf_ready {
+        ui_download_info(&format!(
+            "[keryx-miner] Downloading model '{}' via IPFS. This happens once.",
+            spec.name
+        ));
+        download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
+        if !crate::gguf::is_complete_file(&gguf) {
+            return Err(anyhow!(
+                "model '{}' download finished but GGUF is incomplete at {}",
+                spec.name,
+                gguf.display()
+            ));
+        }
+    } else {
+        ui_download_info(&format!(
+            "[keryx-miner] Reusing existing GGUF for '{}' at {}",
+            spec.name,
+            gguf.display()
+        ));
+    }
+
+    if tok_needed && !tok.exists() {
+        download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
+    }
+
     std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
     ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
     Ok((tok, gguf))
@@ -296,7 +366,18 @@ pub fn probe_gpu_inference() -> GpuProbe {
     // Windows nvcc links cudart statically into keryx-llama.dll, so only cuBLAS is probed.
     // Each probe Library is dropped immediately — we only care that it CAN load; the
     // engine (re-)loads it for real later, and the OS loader refcounts it.
-    let loads = |candidates: &[&str]| candidates.iter().any(|so| unsafe { libloading::Library::new(so) }.is_ok());
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let loads = |candidates: &[&str]| {
+        candidates.iter().any(|name| {
+            let bundled = exe_dir.join(name);
+            unsafe {
+                libloading::Library::new(&bundled).is_ok() || libloading::Library::new(name).is_ok()
+            }
+        })
+    };
     #[cfg(windows)]
     let ok = loads(&["cublas64_12.dll"]);
     #[cfg(not(windows))]

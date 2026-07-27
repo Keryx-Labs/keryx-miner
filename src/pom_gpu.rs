@@ -20,6 +20,7 @@ use log::{info, warn};
 
 use cudarc::driver::{result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, LaunchConfig};
 
+const PTX_SM120: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm120.ptx"));
 const PTX_SM90: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm90.ptx"));
 const PTX_SM89: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm89.ptx"));
 const PTX_SM86: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm86.ptx"));
@@ -32,15 +33,77 @@ const FATBIN_NEXTGEN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine
 const CHUNK_BYTES: usize = 32;
 const POM_KERNEL_NAME: &str = "pom_mine";
 
-const POM_PTX_CANDIDATES: [(&str, &str, &str); 7] = [
-    ("pom_mine_mod_sm90", "sm_90", PTX_SM90),
-    ("pom_mine_mod_sm89", "sm_89", PTX_SM89),
-    ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
-    ("pom_mine_mod_sm80", "sm_80", PTX_SM80),
-    ("pom_mine_mod_sm75", "sm_75", PTX_SM75),
-    ("pom_mine_mod_sm70", "sm_70", PTX_SM70),
-    ("pom_mine_mod_sm61", "sm_61", PTX_SM61),
-];
+/// Ordered PTX images to try for a GPU's compute capability.
+///
+/// Primary targets (by GeForce generation):
+/// - RTX 50 / consumer Blackwell (`sm_120`) → native `sm_120`, then Ada/Ampere fallbacks
+/// - RTX 40 / Ada (`sm_89`) → `sm_89`, then `sm_86`
+/// - RTX 30 / Ampere (`sm_86`) → `sm_86`, then `sm_80`
+fn ptx_candidates_for_cc(major: i32, minor: i32) -> Vec<(&'static str, &'static str, &'static str)> {
+    if major >= 12 {
+        // Consumer Blackwell (RTX 5090/5080/5070…): must prefer sm_120. sm_100 is a different
+        // datacenter arch and fails on GeForce; without sm_120 the card used to land on JIT'd
+        // sm_86 at roughly half throughput.
+        vec![
+            ("pom_mine_mod_sm120", "sm_120", PTX_SM120),
+            ("pom_mine_mod_sm89", "sm_89", PTX_SM89),
+            ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+        ]
+    } else if major >= 10 {
+        // Datacenter Blackwell — no dedicated sm_100 PoM image yet; Ada PTX JITs forward.
+        vec![
+            ("pom_mine_mod_sm89", "sm_89", PTX_SM89),
+            ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+        ]
+    } else if major == 9 {
+        vec![
+            ("pom_mine_mod_sm90", "sm_90", PTX_SM90),
+            ("pom_mine_mod_sm89", "sm_89", PTX_SM89),
+            ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+        ]
+    } else if major == 8 && minor >= 9 {
+        // RTX 40 (Ada Lovelace)
+        vec![
+            ("pom_mine_mod_sm89", "sm_89", PTX_SM89),
+            ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+        ]
+    } else if major == 8 && minor >= 6 {
+        // RTX 30 (Ampere GA102/GA104…)
+        vec![
+            ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+            ("pom_mine_mod_sm80", "sm_80", PTX_SM80),
+        ]
+    } else if major == 8 {
+        // GA100 / early Ampere
+        vec![
+            ("pom_mine_mod_sm80", "sm_80", PTX_SM80),
+            ("pom_mine_mod_sm75", "sm_75", PTX_SM75),
+        ]
+    } else if major == 7 && minor >= 5 {
+        vec![
+            ("pom_mine_mod_sm75", "sm_75", PTX_SM75),
+            ("pom_mine_mod_sm70", "sm_70", PTX_SM70),
+        ]
+    } else if major == 7 {
+        vec![
+            ("pom_mine_mod_sm70", "sm_70", PTX_SM70),
+            ("pom_mine_mod_sm61", "sm_61", PTX_SM61),
+        ]
+    } else {
+        vec![
+            ("pom_mine_mod_sm61", "sm_61", PTX_SM61),
+            ("pom_mine_mod_sm70", "sm_70", PTX_SM70),
+            ("pom_mine_mod_sm75", "sm_75", PTX_SM75),
+            ("pom_mine_mod_sm80", "sm_80", PTX_SM80),
+            ("pom_mine_mod_sm86", "sm_86", PTX_SM86),
+        ]
+    }
+}
+
+fn ptx_image_usable(ptx: &str) -> bool {
+    let trimmed = ptx.trim_start();
+    !trimmed.is_empty() && !trimmed.starts_with("//") && trimmed.contains(".version")
+}
 
 #[derive(Clone, Debug)]
 pub struct GpuKernelInfo {
@@ -279,26 +342,28 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
         }
     }
 
-    for (module_name, label, ptx) in POM_PTX_CANDIDATES {
+    let cc = gpu_compute_capability(device_id);
+    let (major, minor) = cc.unwrap_or((0, 0));
+    let candidates = ptx_candidates_for_cc(major, minor);
+
+    for (module_name, label, ptx) in candidates {
+        if !ptx_image_usable(ptx) {
+            warn!(
+                "PoM[gpu{}]: {} PTX unavailable in this build (rebuild with CUDA ≥ 12.8 for sm_120)",
+                device_id, label
+            );
+            continue;
+        }
         match LoadedPomKernel::from_ptx(label, ptx) {
             Ok(kernel) => {
-                let cc = gpu_compute_capability(device_id);
-                if let Some((major, minor)) = cc {
-                    info!(
-                        "PoM[gpu{} cc{}.{}]: startup loaded {} PTX fallback via {}",
-                        device_id,
-                        major,
-                        minor,
-                        label,
-                        module_name,
-                    );
-                } else {
-                    info!("PoM[gpu{}]: startup loaded {} PTX fallback via {}", device_id, label, module_name);
-                }
+                info!(
+                    "PoM[gpu{} cc{}.{}]: startup loaded {} PTX via {} (RTX30=sm_86, RTX40=sm_89, RTX50=sm_120)",
+                    device_id, major, minor, label, module_name,
+                );
                 set_gpu_kernel_info(
                     device_id,
                     cc,
-                    &format!("{} PTX fallback", label),
+                    &format!("{} PTX", label),
                     module_name,
                 );
                 return Ok(kernel);
@@ -309,7 +374,11 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
         }
     }
 
-    Err(anyhow!("PoM GPU: no compatible PTX image for this device/driver"))
+    Err(anyhow!(
+        "PoM GPU: no compatible PTX image for device cc{}.{} (want sm_120/sm_89/sm_86 by generation)",
+        major,
+        minor
+    ))
 }
 
 fn words4(b: &[u8; 32]) -> [u64; 4] {

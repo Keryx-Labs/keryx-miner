@@ -462,11 +462,48 @@ fn main() -> Result<(), Error> {
     rt.block_on(run())
 }
 
+/// Prefer CUDA / bundled runtime libs that ship next to the miner binary so packages are
+/// self-contained (HiveOS/Windows zips include cuBLAS + friends + IPFS).
+fn prepend_exe_dir_to_library_path() {
+    let mut exe_dir = current_exe().unwrap_or_default();
+    if !exe_dir.pop() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let exe = exe_dir.to_string_lossy().into_owned();
+        match std::env::var("LD_LIBRARY_PATH") {
+            Ok(cur) if !cur.is_empty() => {
+                if !cur.split(':').any(|p| p == exe) {
+                    std::env::set_var("LD_LIBRARY_PATH", format!("{exe}:{cur}"));
+                }
+            }
+            _ => std::env::set_var("LD_LIBRARY_PATH", &exe),
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows already searches the executable directory for DLL loads; also prepend PATH
+        // so child processes (and some CRT loaders) see bundled CUDA/IPFS deps.
+        let exe = exe_dir.to_string_lossy().into_owned();
+        match std::env::var("PATH") {
+            Ok(cur) if !cur.is_empty() => {
+                let sep = ';';
+                if !cur.split(sep).any(|p| p.eq_ignore_ascii_case(&exe)) {
+                    std::env::set_var("PATH", format!("{exe}{sep}{cur}"));
+                }
+            }
+            _ => std::env::set_var("PATH", &exe),
+        }
+    }
+}
+
 async fn run() -> Result<(), Error> {
     #[cfg(target_os = "windows")]
     adjust_console().unwrap_or_else(|e| {
         eprintln!("WARNING: Failed to protect console ({}). Any selection in console will freeze the miner.", e)
     });
+    prepend_exe_dir_to_library_path();
     let mut path = current_exe().unwrap_or_default();
     path.pop(); // Getting the parent directory
     let plugins = filter_plugins(path.to_str().unwrap_or("."));

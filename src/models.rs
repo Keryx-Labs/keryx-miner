@@ -127,7 +127,9 @@ pub const KIMI_LINEAR_48B: ModelSpec = ModelSpec {
 /// `crate::pom::h5_activation_daa()`, it raises the tier-0 VRAM floor to ~6 GB (closes the "any 2 GB
 /// card mines tier 0" gap). `model_id` = CIDv0[2..34] of the pinned GGUF; `weight_cids` points at the
 /// same GGUF the node's `POM_TIERS_H5[0]` R_T was built over, so the miner's runtime R_T matches.
-/// tokenizer.json is the shared Qwen3 tokenizer (same CID as Qwen3-32B tier 3).
+/// `tokenizer_cid` is empty: llama uses the tokenizer embedded in the GGUF (same as the rest of the
+/// lineup). A non-empty CID previously forced a separate tokenizer.json download and, when that
+/// file was missing, re-entered the GGUF download path and could wipe an already-complete model.
 pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
     name: "qwen3-8b-abliterated",
     model_id: [
@@ -137,7 +139,7 @@ pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
         0x57, 0x4a, 0x72, 0x87, 0x4c, 0x35, 0x0d, 0x24,
     ],
     format: ModelFormat::GgufQwen35,
-    tokenizer_cid: "QmcuGkJvR343ry3b4jy7u5L9ior3ujas3yGAFMSyZdACb5",
+    tokenizer_cid: "",
     weight_cids: &["QmccwHVeZYVzEq6A5ofk76MxrnwzMnSjAVt9PaUQ7zfLXm"],
     dir_name: "Qwen3-8B-abliterated",
     // ~4.6 GB Q4_K_S weights + ~1.2 GB KV/workspace → fits a 6 GB card (measured 5,409 MiB @ ctx 4096).

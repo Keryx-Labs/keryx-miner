@@ -1,7 +1,43 @@
 /// IPFS integration — upload inference results and auto-manage kubo daemon.
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const KUBO_VERSION_FALLBACK: &str = "0.41.0";
+
+fn home_dir() -> PathBuf {
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        if !h.is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    PathBuf::from(".")
+}
+
+fn miner_exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn bundled_ipfs_bin(exe_dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let names: [&str; 2] = ["ipfs.exe", "ipfs"];
+    #[cfg(not(windows))]
+    let names: [&str; 1] = ["ipfs"];
+    for name in names {
+        let p = exe_dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
 
 /// Upload `text` to the IPFS node at `api_url` and return the raw 34-byte multihash.
 /// The multihash format is: [0x12, 0x20, <32-byte sha2-256 digest>].
@@ -102,8 +138,8 @@ pub fn ensure_daemon(api_url: &str) {
     };
 
     // Init repo if first run.
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let ipfs_repo = std::path::PathBuf::from(&home).join(".ipfs");
+    let home = home_dir();
+    let ipfs_repo = home.join(".ipfs");
     if !ipfs_repo.exists() {
         log::info!("Initialising IPFS repo...");
         let _ = std::process::Command::new(&ipfs_bin)
@@ -117,7 +153,7 @@ pub fn ensure_daemon(api_url: &str) {
     // mDNS/discovery noise does not pollute the miner terminal while
     // keeping Kubo logs accessible for inference debugging.
     log::info!("Starting IPFS daemon...");
-    let log_dir = std::path::PathBuf::from(&home).join(".keryx");
+    let log_dir = home.join(".keryx");
     let _ = std::fs::create_dir_all(&log_dir);
     let kubo_log = log_dir.join("kubo.log");
     let (stdout, stderr) = match std::fs::OpenOptions::new().create(true).append(true).open(&kubo_log) {
@@ -151,25 +187,23 @@ pub fn ensure_daemon(api_url: &str) {
     }
 }
 
-fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
-    // 1. Check PATH.
+fn find_or_download_kubo() -> anyhow::Result<PathBuf> {
+    let exe_dir = miner_exe_dir();
+
+    // 1. Prefer the Kubo binary shipped next to the miner (release packages).
+    if let Some(local) = bundled_ipfs_bin(&exe_dir) {
+        log::info!("Using bundled IPFS at {}", local.display());
+        return Ok(local);
+    }
+
+    // 2. Check PATH.
     if let Ok(out) = std::process::Command::new("ipfs").arg("version").output() {
         if out.status.success() {
-            return Ok(std::path::PathBuf::from("ipfs"));
+            return Ok(PathBuf::from("ipfs"));
         }
     }
 
-    // 2. Check next to the miner executable.
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let local_bin = exe_dir.join("ipfs");
-    if local_bin.exists() {
-        return Ok(local_bin);
-    }
-
-    // 3. Download kubo for the current platform.
+    // 3. Download kubo for the current platform into the miner directory.
     let version = fetch_latest_kubo_version();
     let (os, arch) = detect_platform()?;
     let archive_ext = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
@@ -183,7 +217,9 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     extract_ipfs_binary(&archive_path, &exe_dir)?;
     std::fs::remove_file(&archive_path).ok();
 
-    let bin = exe_dir.join(if cfg!(target_os = "windows") { "ipfs.exe" } else { "ipfs" });
+    let bin = bundled_ipfs_bin(&exe_dir).ok_or_else(|| {
+        anyhow::anyhow!("ipfs binary missing after extracting {}", archive_name)
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

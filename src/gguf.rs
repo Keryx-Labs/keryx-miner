@@ -198,6 +198,33 @@ impl GgufMeta {
         names.sort();
         names
     }
+
+    /// Minimum on-disk byte length required for every tensor's data to be present.
+    pub fn required_file_len(&self) -> u64 {
+        self.tensors
+            .values()
+            .map(|t| self.tensor_data_offset.saturating_add(t.offset).saturating_add(t.nbytes))
+            .max()
+            .unwrap_or(self.tensor_data_offset)
+    }
+}
+
+/// True when `path` is a parseable GGUF whose on-disk size covers every tensor.
+/// Used to reuse already-downloaded models without hitting the network again.
+pub fn is_complete_file(path: &std::path::Path) -> bool {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let meta = match GgufMeta::read(&mut f) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let file_len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    file_len >= meta.required_file_len()
 }
 
 #[cfg(test)]
