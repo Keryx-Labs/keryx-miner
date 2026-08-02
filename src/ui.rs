@@ -10,7 +10,7 @@ use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{macros::format_description, OffsetDateTime};
 
 use crate::stats::MinerStats;
@@ -18,6 +18,54 @@ use crate::stats::MinerStats;
 const MAX_LOG_LINES: usize = 2000;
 const REDRAW_RATE: Duration = Duration::from_millis(300);
 const MIN_LOG_ROWS: u16 = 5;
+const BLOCK_CELEBRATION_DURATION: Duration = Duration::from_secs(4);
+const BLOCK_COIN_FRAMES: [[&str; 7]; 5] = [
+    [
+        "       .-=======-.       ",
+        "     .'    ||     '.     ",
+        "    /      K/       \\    ",
+        "   |       K<        |   ",
+        "    \\      K\\       /    ",
+        "     '.    ||     .'     ",
+        "       '-=======-'       ",
+    ],
+    [
+        "          .---.          ",
+        "         / ||  \\         ",
+        "        |  K/   |        ",
+        "        |  K<   |        ",
+        "        |  K\\   |        ",
+        "         \\ ||  /         ",
+        "          '---'          ",
+    ],
+    [
+        "           ||            ",
+        "          /||\\           ",
+        "          ||K|           ",
+        "          ||R|           ",
+        "          ||X|           ",
+        "          \\||/           ",
+        "           ||            ",
+    ],
+    [
+        "          .---.          ",
+        "         /  || \\         ",
+        "        |   \\K |        ",
+        "        |   >K |        ",
+        "        |   /K |        ",
+        "         \\  || /         ",
+        "          '---'          ",
+    ],
+    [
+        "   *   .-=======-.   *   ",
+        "     .'     ||    '.     ",
+        "    /       \\K      \\    ",
+        "   |        >K       |   ",
+        "    \\       /K      /    ",
+        "     '.     ||    .'     ",
+        "   *   '-=======-'   *   ",
+    ],
+];
 
 #[derive(Copy, Clone)]
 struct Palette {
@@ -293,8 +341,11 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
         let mut last_size: Option<(u16, u16)> = None;
         let mut pending_resize: Option<(u16, u16)> = None;
         let mut first_frame = true;
-        let mut last_draw_key: Option<(u16, u16, bool, bool, u64, usize, u64, u64, u64)> = None;
-        let mut last_drawn_at = std::time::Instant::now();
+        let mut last_draw_key: Option<(u16, u16, bool, bool, u64, usize, u64, u64, u64, Option<usize>)> =
+            None;
+        let mut last_drawn_at = Instant::now();
+        let mut last_accepted_blocks = stats.snapshot().accepted_blocks;
+        let mut block_celebration_started: Option<Instant> = None;
 
         while !stop_clone.load(Ordering::Acquire) {
             if handle_input(&ui_state, &shutdown_requested) {
@@ -329,6 +380,15 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
             };
 
             let snapshot = stats.snapshot();
+            if snapshot.accepted_blocks > last_accepted_blocks {
+                block_celebration_started = Some(Instant::now());
+            }
+            last_accepted_blocks = snapshot.accepted_blocks;
+            let block_coin_frame = block_celebration_started
+                .and_then(|started| block_animation_frame(started.elapsed()));
+            if block_celebration_started.is_some() && block_coin_frame.is_none() {
+                block_celebration_started = None;
+            }
             let draw_key = (
                 current_size.0,
                 current_size.1,
@@ -339,10 +399,18 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
                 snapshot.last_update_epoch_s,
                 snapshot.accepted_blocks,
                 snapshot.rejected_blocks,
+                block_coin_frame,
             );
             let periodic_refresh_due = last_drawn_at.elapsed() >= Duration::from_secs(1);
             if should_clear || periodic_refresh_due || last_draw_key != Some(draw_key) {
-                draw_frame(&mut out, current_size, &snapshot, &ui_state, should_clear);
+                draw_frame(
+                    &mut out,
+                    current_size,
+                    &snapshot,
+                    &ui_state,
+                    should_clear,
+                    block_coin_frame,
+                );
                 last_draw_key = Some(draw_key);
                 last_drawn_at = std::time::Instant::now();
             }
@@ -392,6 +460,7 @@ fn draw_frame(
     snapshot: &crate::stats::MinerStatsSnapshot,
     ui_state: &UiState,
     _clear_screen: bool,
+    block_coin_frame: Option<usize>,
 ) {
     let (w, h) = size;
     let total_width = w as usize;
@@ -887,8 +956,68 @@ fn draw_frame(
         draw_colored_cell(out, 0, y, total_width, "", palette().text, palette().bg, false);
     }
 
+    if let Some(frame) = block_coin_frame {
+        draw_block_celebration(out, w, h, frame, snapshot.accepted_blocks);
+    }
+
     let _ = queue!(out, ResetColor, SetAttribute(Attribute::Reset));
     let _ = out.flush();
+}
+
+fn block_animation_frame(elapsed: Duration) -> Option<usize> {
+    if elapsed >= BLOCK_CELEBRATION_DURATION {
+        return None;
+    }
+    Some((elapsed.as_millis() / REDRAW_RATE.as_millis()) as usize % BLOCK_COIN_FRAMES.len())
+}
+
+fn draw_block_celebration(out: &mut std::io::Stdout, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
+    let title = format!("KRX BLOCK ACCEPTED  #{}", accepted_blocks);
+    let art = &BLOCK_COIN_FRAMES[frame % BLOCK_COIN_FRAMES.len()];
+    let panel_width = art
+        .iter()
+        .map(|line| line.len())
+        .chain(std::iter::once(title.len()))
+        .max()
+        .unwrap_or(0)
+        + 4;
+    let panel_height = art.len() + 4;
+
+    if (w as usize) < panel_width || (h as usize) < panel_height {
+        if h > 0 {
+            draw_colored_cell(out, 0, 0, w as usize, &title, palette().bright, palette().panel, true);
+        }
+        return;
+    }
+
+    let x = (w as usize - panel_width) as u16 / 2;
+    let y = (h as usize - panel_height) as u16 / 2;
+    for row in 0..panel_height {
+        draw_colored_cell(out, x, y + row as u16, panel_width, "", palette().text, palette().panel, false);
+    }
+
+    draw_colored_cell(
+        out,
+        x,
+        y + 1,
+        panel_width,
+        &format!("{:^panel_width$}", title),
+        palette().bright,
+        palette().panel,
+        true,
+    );
+    for (row, line) in art.iter().enumerate() {
+        draw_colored_cell(
+            out,
+            x,
+            y + row as u16 + 2,
+            panel_width,
+            &format!("{:^panel_width$}", line),
+            palette().warn,
+            palette().panel,
+            true,
+        );
+    }
 }
 
 fn draw_colored_line(
@@ -1215,6 +1344,27 @@ fn uppercase_first_char(s: &str) -> String {
     match chars.next() {
         Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_animation_advances_and_expires() {
+        assert_eq!(block_animation_frame(Duration::ZERO), Some(0));
+        assert_eq!(block_animation_frame(REDRAW_RATE), Some(1));
+        assert_eq!(block_animation_frame(REDRAW_RATE * 5), Some(0));
+        assert_eq!(block_animation_frame(BLOCK_CELEBRATION_DURATION), None);
+    }
+
+    #[test]
+    fn block_animation_keeps_krx_identity() {
+        assert!(BLOCK_COIN_FRAMES.iter().all(|frame| {
+            let art = frame.join("\n");
+            art.contains('K') || art.contains("KRX")
+        }));
     }
 }
 
