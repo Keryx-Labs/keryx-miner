@@ -4,6 +4,9 @@ models/
 escrow.key
 escrow_state.json
 .env
+.ledger/
+.ledger-project
+.ledger-handoff.setup.lock
 
 target-hive/
 Cargo.lock
