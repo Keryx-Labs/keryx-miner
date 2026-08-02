@@ -6,8 +6,9 @@
 /// served-lineup state (`ai:cap`), the model downloads, and the per-model chat templates.
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashSet;
 use std::io::{IsTerminal, Read, Write};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use crate::models::ModelSpec;
 
@@ -24,6 +25,35 @@ const SYSTEM_PROMPT_NEXT: &str =
 
 /// Models the miner currently serves (drives `ai:cap`), set once at startup.
 static SUPPORTED_SPECS: RwLock<&'static [&'static ModelSpec]> = RwLock::new(&[]);
+
+fn unavailable_models() -> &'static RwLock<HashSet<[u8; 32]>> {
+    static MODELS: OnceLock<RwLock<HashSet<[u8; 32]>>> = OnceLock::new();
+    MODELS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
+    if unavailable_models().write().unwrap().insert(*model_id) {
+        log::warn!(
+            "event=ai_capability_withdrawn model={} reason=\"{}\"",
+            hex::encode(&model_id[..4]),
+            reason
+        );
+    }
+}
+
+pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
+    if unavailable_models().write().unwrap().remove(model_id) {
+        log::info!(
+            "event=ai_capability_restored model={} reason=\"{}\"",
+            hex::encode(&model_id[..4]),
+            reason
+        );
+    }
+}
+
+fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
+    unavailable_models().read().unwrap().contains(model_id)
+}
 
 // ── File management ──────────────────────────────────────────────────────────
 
@@ -397,11 +427,14 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     Ok(())
 }
 
-/// Return the model_ids of supported models that have fully-downloaded files (.ok flag present).
+/// Models advertised to the node must have complete files and a compatible inference engine.
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
+    if !crate::llama_engine::library_available() {
+        return Vec::new();
+    }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     specs.iter()
-        .filter(|s| model_dir(s).join(".ok").exists())
+        .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
         .collect()
 }
@@ -420,6 +453,9 @@ pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
 
 /// True only when the model is supported and its files are completely downloaded.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
+    if !crate::llama_engine::library_available() || model_is_unavailable(model_id) {
+        return false;
+    }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
     model_dir(spec).join(".ok").exists()
@@ -431,9 +467,17 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
 /// The generated text is user-facing only — consensus checks the fixed-point `model_fixed`
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
 /// submitted): a miner must not be rewarded for garbage.
-pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+pub fn load_and_run_inference(
+    model_id: &[u8; 32],
+    prompt: &str,
+    max_tokens: usize,
+    correlation: &str,
+) -> Option<String> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else {
+        log::error!("event=ai_inference_failed correlation={} stage=model_lookup reason=unsupported_model", correlation);
+        return None;
+    };
 
     // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
     // template here (template-strict models emit EOG immediately on a bare prompt).
@@ -443,28 +487,94 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     // (single-GPU / unassigned model).
     let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+    log::info!(
+        "event=ai_inference_start correlation={} gpu={} model={} max_tokens={}",
+        correlation,
+        dev_id,
+        spec.name,
+        max_tokens
+    );
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
         // The engine hosts another model (or nothing). Inference has priority: release the
         // device's miner to make room, swap the engine to the requested model. The possession
         // walk rebuilds over the mining model at the next `ensure_installed`.
-        log::info!("SlmEngine: swapping the llama engine to '{}' (gpu{})", spec.name, dev_id);
+        log::info!(
+            "event=llama_swap_start correlation={} gpu={} model={} previous_gpu={:?}",
+            correlation,
+            dev_id,
+            spec.name,
+            crate::llama_engine::active_gpu()
+        );
+        log::info!("event=pom_release_start correlation={} gpu={}", correlation, dev_id);
         crate::pom_gpu::uninstall(dev_id);
-        crate::llama_engine::unload();
-        if !crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
-            log::error!(
-                "SlmEngine: cannot load '{}' — libkeryx-llama.so missing or model load failed; response dropped",
-                spec.name
-            );
-            return None;
+        log::info!("event=pom_release_success correlation={} gpu={}", correlation, dev_id);
+        crate::llama_engine::unload(&format!("inference_swap correlation={}", correlation));
+        match crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
+            Ok(attempt) => {
+                mark_model_available(&spec.model_id, "inference_load_success");
+                log::info!(
+                    "event=llama_swap_success correlation={} attempt={} gpu={} model={}",
+                    correlation,
+                    attempt,
+                    dev_id,
+                    spec.name
+                );
+            }
+            Err(e) => {
+                mark_model_unavailable(&spec.model_id, "inference_load_failed");
+                log::error!(
+                    "event=ai_inference_failed correlation={} attempt={} gpu={} model={} stage=load detail=\"{}\"",
+                    correlation,
+                    e.attempt(),
+                    dev_id,
+                    spec.name,
+                    e
+                );
+                return None;
+            }
         }
     }
 
     match crate::llama_engine::generate(&templated, max_tokens) {
-        Some(text) if !text.trim().is_empty() => Some(text),
+        Some(text) if !text.trim().is_empty() => {
+            log::info!(
+                "event=ai_inference_success correlation={} attempt={} gpu={} model={} output_bytes={}",
+                correlation,
+                crate::llama_engine::active_attempt().unwrap_or(0),
+                dev_id,
+                spec.name,
+                text.len()
+            );
+            Some(text)
+        }
         _ => {
-            log::warn!("SlmEngine '{}': llama generate failed or empty — response dropped", spec.name);
+            mark_model_unavailable(&spec.model_id, "generation_failed");
+            log::warn!(
+                "event=ai_inference_failed correlation={} attempt={} gpu={} model={} stage=generate reason=empty_or_failed",
+                correlation,
+                crate::llama_engine::active_attempt().unwrap_or(0),
+                dev_id,
+                spec.name
+            );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_models_are_withdrawn_until_recovered() {
+        let model_id = [0xa5; 32];
+        mark_model_available(&model_id, "test_reset");
+
+        mark_model_unavailable(&model_id, "test_failure");
+        assert!(model_is_unavailable(&model_id));
+
+        mark_model_available(&model_id, "test_recovery");
+        assert!(!model_is_unavailable(&model_id));
     }
 }

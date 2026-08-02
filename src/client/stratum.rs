@@ -652,11 +652,17 @@ impl StratumHandler {
         info!("OPoI challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
 
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
+        let correlation = format!("challenge:{}", nonce_hex);
         let send_channel = self.send_channel.clone();
         let challenge_flag = Arc::clone(&self.challenge_in_flight);
 
         tokio::task::spawn_blocking(move || {
-            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
+            let result = keryx_miner::slm::load_and_run_inference(
+                &model_id,
+                &prompt,
+                CHALLENGE_MAX_TOKENS,
+                &correlation,
+            );
             let text = result.unwrap_or_default();
             // Clear both flags — PoW resumes on the next mining.notify from the bridge.
             miner_flag.store(false, Ordering::SeqCst);
@@ -805,8 +811,14 @@ fn do_inference_and_upload(
     ipfs_url: &str,
     stable_id: &str,
 ) -> Option<String> {
-    info!("OPoI [{}]: starting SLM inference (max_tokens={})", stable_id, max_tokens);
-    let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens)?;
+    let correlation = format!("request:{}", stable_id);
+    info!(
+        "event=ai_inference_queued correlation={} model={} max_tokens={}",
+        correlation,
+        hex::encode(&model_id[..4]),
+        max_tokens
+    );
+    let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens, &correlation)?;
     if text.is_empty() {
         warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;

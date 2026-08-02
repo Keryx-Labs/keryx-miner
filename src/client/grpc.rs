@@ -481,12 +481,22 @@ impl KeryxdHandler {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
                 return;
             }
-            info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
+            let correlation = format!("request:{}", stable_id);
+            info!(
+                "event=ai_inference_queued correlation={} model={} max_tokens={}",
+                correlation,
+                hex::encode(&model_id[..4]),
+                max_tokens
+            );
             let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+                let result =
+                    keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens, &correlation);
                 if result.is_none() {
-                    log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", stable_id);
+                    log::warn!(
+                        "event=ai_response_dropped correlation={} reason=inference_failed",
+                        correlation
+                    );
                 }
                 let _ = tx_done.send(result);
             });
@@ -624,9 +634,21 @@ impl KeryxdHandler {
                                     flag.store(true, Ordering::Relaxed);
                                 }
                                 let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
+                                let correlation = format!("challenge:{}", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
                                 tokio::task::spawn_blocking(move || {
-                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 64);
+                                    let result = keryx_miner::slm::load_and_run_inference(
+                                        &model_id,
+                                        &prompt,
+                                        64,
+                                        &correlation,
+                                    );
+                                    if result.is_none() {
+                                        log::warn!(
+                                            "event=ai_response_dropped correlation={} reason=challenge_inference_failed",
+                                            correlation
+                                        );
+                                    }
                                     let _ = tx_done.send(result);
                                 });
                                 self.challenge_inference_rx = Some((challenge, rx_done));

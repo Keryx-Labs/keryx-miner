@@ -1,6 +1,8 @@
 use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, structs::device::FieldId, Nvml};
+use cudarc::driver::{result, sys};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
@@ -164,15 +166,22 @@ impl MinerStats {
     }
 
     pub fn refresh_gpu_telemetry(&self) {
+        let cuda_bus_ids = cuda_device_bus_ids();
         let mut fresh = HashMap::new();
-        let mut nvml_memory_temps = HashMap::new();
-        let mut nvml_fallbacks = HashMap::new();
 
         let nvml = NVML_HANDLE.get_or_init(|| Nvml::init().ok());
         if let Some(nvml) = nvml.as_ref() {
             if let Ok(device_count) = nvml.device_count() {
                 for idx in 0..device_count {
                     let Ok(device) = nvml.device_by_index(idx) else {
+                        continue;
+                    };
+                    let logical_idx = device
+                        .pci_info()
+                        .ok()
+                        .and_then(|pci| logical_device_number(&pci.bus_id, idx, cuda_bus_ids))
+                        .or_else(|| cuda_bus_ids.is_empty().then_some(idx));
+                    let Some(logical_idx) = logical_idx else {
                         continue;
                     };
 
@@ -194,27 +203,28 @@ impl MinerStats {
                                     nvml_wrapper::enums::device::SampleValue::F64(_) => None,
                                 };
                                 if let Some(temp) = temp.filter(|temp| *temp > 0) {
-                                    nvml_memory_temps.insert(idx as u32, temp as u32);
+                                    fresh.entry(logical_idx).or_insert(GpuTelemetry {
+                                        temp_c: None,
+                                        memory_temp_c: None,
+                                        fan_percent: None,
+                                        power_draw_w: None,
+                                    }).memory_temp_c = Some(temp as u32);
                                 }
                             }
                         }
                     }
 
-                    nvml_fallbacks.insert(
-                        idx as u32,
-                        GpuTelemetry {
-                            temp_c: temp_c.map(|temp| temp as u32),
-                            memory_temp_c: nvml_memory_temps.get(&(idx as u32)).copied(),
-                            fan_percent: fan_percent.map(|fan| fan as u32),
-                            power_draw_w,
-                        },
-                    );
+                    let telemetry = fresh.entry(logical_idx).or_insert(GpuTelemetry {
+                        temp_c: None,
+                        memory_temp_c: None,
+                        fan_percent: None,
+                        power_draw_w: None,
+                    });
+                    telemetry.temp_c = temp_c.map(|temp| temp as u32);
+                    telemetry.fan_percent = fan_percent.map(|fan| fan as u32);
+                    telemetry.power_draw_w = power_draw_w;
                 }
             }
-        }
-
-        if !nvml_fallbacks.is_empty() {
-            fresh = nvml_fallbacks.clone();
         }
 
         let mut memory_temp_supported = self.gpu_memory_temp_supported.lock().expect("gpu telemetry mutex poisoned");
@@ -227,7 +237,7 @@ impl MinerStats {
             Some(
                 Command::new("nvidia-smi")
                     .args([
-                        "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
+                        "--query-gpu=pci.bus_id,temperature.gpu,temperature.memory,fan.speed,power.draw",
                         "--format=csv,noheader,nounits",
                     ])
                     .output(),
@@ -239,14 +249,17 @@ impl MinerStats {
         if let Some(Ok(output)) = output {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                for (idx, line) in stdout.lines().enumerate() {
+                for (fallback_idx, line) in stdout.lines().enumerate() {
                     let mut parts = line.split(',').map(|s| s.trim());
+                    let pci_bus_id = parts.next().unwrap_or_default();
+                    let Some(gpu_idx) = logical_device_number(pci_bus_id, fallback_idx as u32, cuda_bus_ids) else {
+                        continue;
+                    };
                     let temp_c = parts.next().and_then(parse_u32_field);
                     let nvidia_smi_memory_temp_c = parts.next().and_then(parse_u32_field);
                     let fan_percent = parts.next().and_then(parse_u32_field);
                     let power_draw_w = parts.next().and_then(parse_f32_field);
 
-                    let gpu_idx = idx as u32;
                     if let Some(telemetry) = fresh.get_mut(&gpu_idx) {
                         telemetry.temp_c = prefer_nvml_u32_or_nvidia_smi(telemetry.temp_c, temp_c);
                         telemetry.memory_temp_c = normalize_memory_temp_c(
@@ -664,6 +677,49 @@ fn parse_device_number(id: &str) -> Option<u32> {
         .and_then(|s| s.parse::<u32>().ok())
 }
 
+fn cuda_device_bus_ids() -> &'static HashMap<String, u32> {
+    static BUS_IDS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    BUS_IDS.get_or_init(|| {
+        let mut bus_ids = HashMap::new();
+        if result::init().is_err() {
+            return bus_ids;
+        }
+
+        let count = result::device::get_count().unwrap_or(0);
+        for ordinal in 0..count {
+            let Ok(device) = result::device::get(ordinal) else {
+                continue;
+            };
+            let mut buffer = [0i8; 32];
+            if unsafe { sys::cuDeviceGetPCIBusId(buffer.as_mut_ptr(), buffer.len() as i32, device).result() }.is_err() {
+                continue;
+            }
+            let Ok(bus_id) = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str() else {
+                continue;
+            };
+            bus_ids.insert(normalize_pci_bus_id(bus_id), ordinal as u32);
+        }
+        bus_ids
+    })
+}
+
+fn logical_device_number(pci_bus_id: &str, fallback_idx: u32, cuda_bus_ids: &HashMap<String, u32>) -> Option<u32> {
+    if cuda_bus_ids.is_empty() {
+        Some(fallback_idx)
+    } else {
+        cuda_bus_ids.get(&normalize_pci_bus_id(pci_bus_id)).copied()
+    }
+}
+
+fn normalize_pci_bus_id(pci_bus_id: &str) -> String {
+    let pci_bus_id = pci_bus_id.trim().to_ascii_lowercase();
+    let Some((domain, device)) = pci_bus_id.split_once(':') else {
+        return pci_bus_id;
+    };
+    let domain = domain.trim_start_matches('0');
+    format!("{}:{device}", if domain.is_empty() { "0" } else { domain })
+}
+
 fn parse_u32_field(value: &str) -> Option<u32> {
     let filtered = value
         .chars()
@@ -673,5 +729,29 @@ fn parse_u32_field(value: &str) -> Option<u32> {
         None
     } else {
         filtered.parse::<u32>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{logical_device_number, normalize_pci_bus_id};
+    use std::collections::HashMap;
+
+    #[test]
+    fn logical_device_number_follows_cuda_pci_mapping() {
+        let cuda_bus_ids = HashMap::from([
+            (normalize_pci_bus_id("0000:02:00.0"), 0),
+            (normalize_pci_bus_id("0000:01:00.0"), 1),
+        ]);
+
+        assert_eq!(logical_device_number("00000000:01:00.0", 0, &cuda_bus_ids), Some(1));
+        assert_eq!(logical_device_number("00000000:02:00.0", 1, &cuda_bus_ids), Some(0));
+    }
+
+    #[test]
+    fn logical_device_number_falls_back_when_cuda_is_unavailable() {
+        let cuda_bus_ids = HashMap::new();
+
+        assert_eq!(logical_device_number("00000000:01:00.0", 2, &cuda_bus_ids), Some(2));
     }
 }

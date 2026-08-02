@@ -591,13 +591,28 @@ pub fn is_loading() -> bool {
     LOADING.load(Ordering::Relaxed) > 0
 }
 
-/// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+/// Search a nonce batch via the installed miner for a specific device.
+pub fn mine(
+    device_id: u32,
+    pre_pow_hash: &[u8; 32],
+    timestamp: u64,
+    target_le: &[u8; 32],
+    start: u64,
+    batch: u64,
+    h3: bool,
+    walk_v2: bool,
+    h5_1: bool,
+    h5_2: bool,
+) -> Result<Option<u64>> {
     let miner = {
-        let g = miners().lock().ok()?;
-        g.get(&device_id)?.clone()
+        let g = miners().lock().map_err(|_| anyhow!("PoM GPU miner registry lock poisoned"))?;
+        g.get(&device_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("PoM GPU miner is not installed for device #{device_id}"))?
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
+    miner
+        .mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2)
+        .map_err(|e| anyhow!("CUDA mining batch failed on device #{device_id}: {e}"))
 }
 
 /// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous
@@ -664,7 +679,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         // crossing it would keep hosting the previous era's model. Unload it when it lives on this
         // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
         if crate::llama_engine::active_gpu() == Some(dev as usize) && !crate::llama_engine::active_for(&gguf, dev as usize) {
-            crate::llama_engine::unload();
+            crate::llama_engine::unload("mining_era_transition");
         }
         uninstall(dev); // force a resident reload of the new model on the next ensure_installed
     }
@@ -877,8 +892,41 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // handler can banlist + downgrade instead of crashing the mining thread or hot-spinning on a
     // model that doesn't fit this GPU.
     let inference_gpu = device_for_model(&model_id).unwrap_or(0);
-    let mut use_llama =
-        device_id == inference_gpu && crate::llama_engine::ensure_loaded(&gguf, device_id as usize);
+    let mut use_llama = false;
+    let mut llama_attempt = None;
+    if device_id == inference_gpu {
+        match crate::llama_engine::ensure_loaded(&gguf, device_id as usize) {
+            Ok(attempt) => {
+                llama_attempt = Some(attempt);
+                crate::slm::mark_model_available(&model_id, "pom_load_success");
+                log::info!(
+                    "event=pom_llama_ready attempt={} gpu={} model={}",
+                    attempt,
+                    device_id,
+                    hex::encode(&model_id[..4])
+                );
+                use_llama = true;
+            }
+            Err(e) => {
+                llama_attempt = Some(e.attempt());
+                crate::slm::mark_model_unavailable(&model_id, "pom_llama_load_failed");
+                log::warn!(
+                    "event=pom_llama_unavailable attempt={} gpu={} model={} detail=\"{}\"",
+                    e.attempt(),
+                    device_id,
+                    hex::encode(&model_id[..4]),
+                    e
+                );
+                if e.cuda_context_may_be_invalid() {
+                    log::error!(
+                        "PoM[gpu{}]: native llama load touched CUDA before failing; refusing raw fallback in a potentially invalid context",
+                        device_id
+                    );
+                    return false;
+                }
+            }
+        }
+    }
     // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. tied embeddings
     // materialise a separate output.weight), so its resident chunk count differs from the
     // canonical GGUF the walk MUST gather and R_T pins. When that happens the zero-dup walk is
@@ -886,20 +934,34 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // such a model is unavailable without the engine; every current-lineup model is untied.)
     if use_llama {
         let host_n = crate::pom::active_index_for_tier(tier).map(|i| i.n_chunks);
-        let llama_n = crate::llama_engine::tensors().map(|ts| {
+        let Some(llama_n) = crate::llama_engine::tensors().map(|ts| {
             ts.iter().map(|(_, _, nbytes, _)| (*nbytes / CHUNK_BYTES) as u64).sum::<u64>()
-        });
-        if let (Some(hn), Some(ln)) = (host_n, llama_n) {
-            if ln != hn {
+        }) else {
+            crate::slm::mark_model_unavailable(&model_id, "tensor_discovery_failed");
+            crate::llama_engine::unload("tensor_discovery_failed");
+            log::error!("PoM[gpu{}]: llama tensor discovery failed; refusing raw fallback after a native CUDA error", device_id);
+            return false;
+        };
+        if let Some(hn) = host_n {
+            if llama_n != hn {
                 warn!(
                     "PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch) — walking a raw canonical copy; inference for this model is unavailable.",
-                    device_id, ln, hn
+                    device_id, llama_n, hn
                 );
-                crate::llama_engine::unload();
+                crate::llama_engine::unload("canonical_layout_mismatch");
+                crate::slm::mark_model_unavailable(&model_id, "canonical_layout_mismatch");
                 use_llama = false;
             }
         }
     }
+    let llama_attempt = llama_attempt.map_or_else(|| "none".to_string(), |attempt| attempt.to_string());
+    info!(
+        "event=pom_install_start llama_attempt={} gpu={} model={} source={}",
+        llama_attempt,
+        device_id,
+        hex::encode(&model_id[..4]),
+        if use_llama { "llama" } else { "raw" }
+    );
     let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights", device_id);
@@ -965,7 +1027,14 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         }
     }
     install(device_id, gm);
-    info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
+    info!(
+        "event=pom_install_success llama_attempt={} gpu={} model={} source={} chunks={}",
+        llama_attempt,
+        device_id,
+        hex::encode(&model_id[..4]),
+        if use_llama { "llama" } else { "raw" },
+        n
+    );
     true
 }
 
@@ -1011,5 +1080,13 @@ mod tests {
         assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
         assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
         assert!(!is_transient_gpu_runtime_fault("out of memory"));
+    }
+
+    #[test]
+    fn mine_without_installed_device_returns_error() {
+        let error = mine(u32::MAX, &[0; 32], 0, &[0; 32], 0, 1, false, false, false, false)
+            .expect_err("missing miner must not look like a completed nonce batch");
+
+        assert!(error.to_string().contains("not installed"));
     }
 }

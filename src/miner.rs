@@ -376,13 +376,38 @@ impl MinerManager {
                             // before (re)installing, so an already-running miner crosses over
                             // without a restart. No-op with the current fixed post-H5 lineup.
                             keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
-                            keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
+                            if !keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa) {
+                                warn!(
+                                    "{}: PoM GPU miner unavailable; retrying in 5 seconds",
+                                    gpu_work.id()
+                                );
+                                sleep(Duration::from_secs(5));
+                                continue;
+                            }
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
                         let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2);
+                        let found = match keryx_miner::pom_gpu::mine(
+                            worker_device_id,
+                            &pph,
+                            time,
+                            &target_le,
+                            pom_nonce,
+                            POM_BATCH,
+                            h3,
+                            walk_v2,
+                            h5_1,
+                            h5_2,
+                        ) {
+                            Ok(found) => found,
+                            Err(e) => {
+                                error!("{}: {}; stopping this GPU worker", gpu_work.id(), e);
+                                keryx_miner::pom_gpu::uninstall(worker_device_id);
+                                return Ok(());
+                            }
+                        };
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
@@ -401,6 +426,11 @@ impl MinerManager {
                                 if let BlockSeed::FullBlock { .. } = &block_seed {
                                     state = None;
                                 }
+                            } else {
+                                error!(
+                                    "{}: PoM GPU candidate failed CPU verification: nonce={} daa={}",
+                                    gpu_work.id(), nonce, daa
+                                );
                             }
                         } else if let Some(cmd) = block_channel.get_changed()? {
                             state = match cmd {

@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -44,6 +45,26 @@ struct KeryxLlama {
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
 };
+
+static thread_local std::string keryx_last_error;
+
+static void keryx_set_error(const char* stage, const std::string& detail) {
+    keryx_last_error = std::string(stage) + ": " + detail;
+}
+
+#ifndef __APPLE__
+static std::string keryx_cuda_diagnostics() {
+    const cudaError_t pending = cudaPeekAtLastError();
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const cudaError_t memory = cudaMemGetInfo(&free_bytes, &total_bytes);
+    char out[256];
+    snprintf(out, sizeof(out), "; cuda=%s; vram_free=%zu MiB; vram_total=%zu MiB; mem_info=%s",
+             cudaGetErrorString(pending), free_bytes / (1024 * 1024), total_bytes / (1024 * 1024),
+             cudaGetErrorString(memory));
+    return out;
+}
+#endif
 
 // llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
 // device assignment, kv-cache map, sched-reserve…). The miner's own Rust logging already covers
@@ -66,10 +87,26 @@ static void keryx_install_log_filter() {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 2; }
+KERYX_EXPORT int keryx_llama_abi() { return 3; }
+
+KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
 
 KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    keryx_last_error.clear();
+    if (!gguf_path || !*gguf_path) {
+        keryx_set_error("arguments", "GGUF path is empty");
+        return nullptr;
+    }
     keryx_install_log_filter();
+#ifndef __APPLE__
+    const cudaError_t selected = cudaSetDevice(gpu);
+    if (selected != cudaSuccess) {
+        keryx_set_error("cuda_set_device", cudaGetErrorString(selected));
+        return nullptr;
+    }
+#endif
+
+    try {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
@@ -77,12 +114,27 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     mp.main_gpu     = gpu;
     mp.use_mmap     = true;
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
-    if (!model) return nullptr;
+    if (!model) {
+        std::string detail = "llama_model_load_from_file returned null";
+#ifndef __APPLE__
+        detail += keryx_cuda_diagnostics();
+#endif
+        keryx_set_error("model_load", detail);
+        return nullptr;
+    }
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     llama_context* ctx = llama_init_from_model(model, cp);
-    if (!ctx) { llama_model_free(model); return nullptr; }
+    if (!ctx) {
+        llama_model_free(model);
+        std::string detail = "llama_init_from_model returned null";
+#ifndef __APPLE__
+        detail += keryx_cuda_diagnostics();
+#endif
+        keryx_set_error("context_init", detail);
+        return nullptr;
+    }
 
     // User-facing sampling (repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
     // text is not consensus-relevant, but keep the flavor consistent.
@@ -91,6 +143,12 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     // because the observed loops are whole sentences (~25 tokens each), far beyond
     // the classic 64-token window; 1.10 is the battle-tested llama.cpp default.
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (!smpl) {
+        llama_free(ctx);
+        llama_model_free(model);
+        keryx_set_error("sampler_init", "llama_sampler_chain_init returned null");
+        return nullptr;
+    }
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
@@ -101,6 +159,13 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
+    } catch (const std::exception& e) {
+        keryx_set_error("exception", e.what());
+        return nullptr;
+    } catch (...) {
+        keryx_set_error("exception", "unknown native exception");
+        return nullptr;
+    }
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
@@ -123,7 +188,12 @@ KERYX_EXPORT bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** 
     *is_device = 1;
 #else
     cudaPointerAttributes attr{};
-    cudaPointerGetAttributes(&attr, t->data);
+    const cudaError_t status = cudaPointerGetAttributes(&attr, t->data);
+    if (status != cudaSuccess) {
+        keryx_set_error("tensor_info", std::string("cudaPointerGetAttributes failed: ") +
+                           cudaGetErrorString(status) + keryx_cuda_diagnostics());
+        return false;
+    }
     *is_device = attr.type == cudaMemoryTypeDevice ? 1 : 0;
 #endif
     return true;
@@ -132,25 +202,45 @@ KERYX_EXPORT bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** 
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
 KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
-    if (!h || !prompt || !out || cap < 2) return -1;
+    keryx_last_error.clear();
+    if (!h || !prompt || !out || cap < 2) {
+        keryx_set_error("generate_arguments", "invalid generation arguments");
+        return -1;
+    }
     std::lock_guard<std::mutex> g(h->gen_lock);
     const llama_vocab* vocab = llama_model_get_vocab(h->model);
 
     std::vector<llama_token> toks(strlen(prompt) + 16);
     int n = llama_tokenize(vocab, prompt, (int32_t)strlen(prompt), toks.data(), (int32_t)toks.size(), true, true);
-    if (n < 0) return -1;
+    if (n < 0) {
+        keryx_set_error("tokenize", "llama_tokenize failed");
+        return -1;
+    }
     toks.resize(n);
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
     llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
     int written = 0;
     for (int i = 0; i < max_tokens; i++) {
-        if (llama_decode(h->ctx, batch) != 0) break;
+        const int decoded = llama_decode(h->ctx, batch);
+        if (decoded != 0) {
+            std::string detail = "llama_decode returned " + std::to_string(decoded);
+#ifndef __APPLE__
+            detail += keryx_cuda_diagnostics();
+#endif
+            keryx_set_error("decode", detail);
+            if (written == 0) return -1;
+            break;
+        }
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) break;
         char piece[256];
         int pn = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
-        if (pn < 0) break;
+        if (pn < 0) {
+            keryx_set_error("token_piece", "llama_token_to_piece failed");
+            if (written == 0) return -1;
+            break;
+        }
         if (written + pn >= cap - 1) break;
         memcpy(out + written, piece, pn);
         written += pn;

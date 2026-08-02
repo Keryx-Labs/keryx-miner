@@ -189,7 +189,10 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         // wrapper via nvcc (drives cl.exe and knows the CUDA include/lib paths; links
         // cudart statically by default). /openmp pulls vcomp for ggml-cpu's OpenMP use.
         let dll = profile_dir.join("keryx-llama.dll");
-        let lib = |p: &str| build_dir.join(p).into_os_string();
+        let lib = |multi_config: &str, single_config: &str| {
+            let path = build_dir.join(multi_config);
+            if path.exists() { path } else { build_dir.join(single_config) }.into_os_string()
+        };
         run(
             "link of keryx-llama.dll",
             std::process::Command::new(nvcc)
@@ -201,12 +204,12 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .arg("-I").arg(src.join("ggml/include"))
                 .arg("-I").arg(src.join("src"))
                 .arg("-I").arg(src.join("common"))
-                .arg(lib("src/Release/llama.lib"))
-                .arg(lib("ggml/src/ggml-cuda/Release/ggml-cuda.lib"))
-                .arg(lib("ggml/src/Release/ggml-cpu.lib"))
-                .arg(lib("ggml/src/Release/ggml.lib"))
-                .arg(lib("ggml/src/Release/ggml-base.lib"))
-                .args(["-lcublas", "-lcublasLt", "-lcuda"])
+                .arg(lib("src/Release/llama.lib", "src/llama.lib"))
+                .arg(lib("ggml/src/ggml-cuda/Release/ggml-cuda.lib", "ggml/src/ggml-cuda/ggml-cuda.lib"))
+                .arg(lib("ggml/src/Release/ggml-cpu.lib", "ggml/src/ggml-cpu.lib"))
+                .arg(lib("ggml/src/Release/ggml.lib", "ggml/src/ggml.lib"))
+                .arg(lib("ggml/src/Release/ggml-base.lib", "ggml/src/ggml-base.lib"))
+                .args(["-lcublas", "-lcublasLt", "-lcuda", "-ladvapi32"])
                 .arg("-o").arg(&dll),
         )?;
         return Ok(());
