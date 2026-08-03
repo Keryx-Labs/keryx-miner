@@ -12,6 +12,10 @@ use crate::{miner::MinerManager, Error};
 
 /// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
 const MAX_AI_QUEUE_SIZE: usize = 64;
+/// Max boot-time escrow-validation GetBlock requests in flight at once — each answer
+/// sends the next queued one, so thousands of state entries never overwhelm the
+/// HTTP/2 flow-control window or delay the mining stream.
+const VALIDATION_WINDOW: usize = 64;
 /// Max unique stable-ids tracked for deduplication — evict when full.
 const MAX_AI_SEEN_IDS: usize = 10_000;
 
@@ -49,6 +53,11 @@ pub struct KeryxdHandler {
     /// Each entry: (stable_id_hex16, raw_payload_bytes, model_id, prompt, max_tokens).
     /// Fed by both BlockAdded scans and block template scans.
     ai_request_queue: VecDeque<(String, Vec<u8>, [u8; 32], String, usize)>,
+
+    /// Block hashes queued for boot-time escrow-state validation, drained in slices of
+    /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
+    /// flow-control window (each consumed answer sends the next queued request).
+    validation_queue: VecDeque<String>,
 
     /// Stable IDs already queued or in-flight — used for deduplication.
     ai_seen_prefixes: std::collections::HashSet<String>,
@@ -192,6 +201,7 @@ impl KeryxdHandler {
             block_channel,
             block_handle,
             ai_request_queue: VecDeque::new(),
+            validation_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             inference_rx: None,
@@ -649,21 +659,47 @@ impl KeryxdHandler {
                     (None, true, None) => error!("No block and No Error!"),
                 }
             }
-            // GetBlock response: arrives after we requested a full block from BlockAdded.
-            // Scan its transactions for AiRequests and escrow UTXOs.
+            // GetBlock response: either a boot-time validation answer, or a full block we
+            // requested from BlockAdded (scanned for AiRequests and escrow UTXOs).
             Payload::GetBlockResponse(msg) => {
+                let mut was_validation = false;
                 if let Some(e) = msg.error {
-                    warn!("GetBlockResponse error: {}", e.message);
-                } else if let Some(block) = msg.block {
-                    self.scan_txs_for_ai_requests(&block.transactions);
-                    self.try_start_inference();
-                    let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
-                    if let Some(w) = self.escrow_watcher.as_ref() {
-                        let (outputs, sompi) = w.pending_escrow();
-                        miner.record_escrow_pending(outputs, sompi);
+                    // Validation answer: "cannot find header <hash>" — the block never
+                    // existed on this chain, its escrow entries are ghosts.
+                    was_validation = self
+                        .escrow_watcher
+                        .as_mut()
+                        .map_or(false, |w| w.on_block_validation_error(&e.message));
+                    if !was_validation {
+                        warn!("GetBlockResponse error: {}", e.message);
                     }
-                    if let Some(tx) = claim_tx {
-                        self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                } else if let Some(block) = msg.block {
+                    let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
+                    // Chain membership from the node's live verdict: a stored-but-reorged
+                    // block must purge its entries just like a missing one.
+                    let is_chain = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
+                    was_validation = self
+                        .escrow_watcher
+                        .as_mut()
+                        .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
+                    if !was_validation {
+                        self.scan_txs_for_ai_requests(&block.transactions);
+                        self.try_start_inference();
+                        let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
+                        if let Some(w) = self.escrow_watcher.as_ref() {
+                            let (outputs, sompi) = w.pending_escrow();
+                            miner.record_escrow_pending(outputs, sompi);
+                        }
+                        if let Some(tx) = claim_tx {
+                            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+                        }
+                    }
+                }
+                // Self-paced validation flow: every consumed answer pulls the next
+                // queued request, keeping at most VALIDATION_WINDOW in flight.
+                if was_validation {
+                    if let Some(hash) = self.validation_queue.pop_front() {
+                        self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
                     }
                 }
             }
@@ -713,6 +749,17 @@ impl KeryxdHandler {
                 self.client_send(NotifyNewBlockTemplateRequestMessage {}).await?;
                 self.client_send(NotifyBlockAddedRequestMessage {}).await?;
                 self.client_send(NotifyVirtualSelectedParentChainChangedRequestMessage {}).await?;
+                // Boot-time escrow-state validation: check every referenced block against
+                // the node so ghost entries (orphaned-chain coinbases) are purged before
+                // any claim ships. Send an initial slice; each answer sends the next.
+                if let Some(hashes) = self.escrow_watcher.as_mut().map(|w| w.start_state_validation()) {
+                    self.validation_queue = hashes.into();
+                    for _ in 0..VALIDATION_WINDOW {
+                        if let Some(hash) = self.validation_queue.pop_front() {
+                            self.client_send(GetBlockRequestMessage { hash, include_transactions: false }).await?;
+                        }
+                    }
+                }
                 self.client_get_block_template().await?;
             }
             Payload::NotifyNewBlockTemplateResponse(res) => match res.error {

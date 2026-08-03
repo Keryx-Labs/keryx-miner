@@ -84,9 +84,14 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) { llama_model_free(model); return nullptr; }
 
-    // User-facing sampling (temperature 0.7 / top_p 0.9) — the OPoI
+    // User-facing sampling (repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
     // text is not consensus-relevant, but keep the flavor consistent.
+    // The repetition penalty is essential: without it the small quantized models
+    // (9B Q4 especially) degenerate into verbatim sentence loops. 256-token window
+    // because the observed loops are whole sentences (~25 tokens each), far beyond
+    // the classic 64-token window; 1.10 is the battle-tested llama.cpp default.
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
