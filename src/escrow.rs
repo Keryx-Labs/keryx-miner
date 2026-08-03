@@ -9,9 +9,11 @@ use blake2b_simd::Params as Blake2bParams;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
+use tempfile::NamedTempFile;
 
 use crate::proto::{
     RpcOutpoint, RpcScriptPublicKey, RpcTransaction, RpcTransactionInput, RpcTransactionOutput,
@@ -222,7 +224,7 @@ impl EscrowWatcher {
         let payout_spk_script = build_p2pk_script(&payout_spk_bytes);
         let payout_spk_script_hex = hex::encode(&payout_spk_script);
 
-        let state = load_state(&state_path);
+        let state = load_state(&state_path)?;
 
         info!("EscrowWatcher ready: pubkey={}", hex::encode(pubkey_bytes));
 
@@ -286,8 +288,11 @@ impl EscrowWatcher {
     /// which is re-derived from the chain on the next blocks.
     fn maybe_flush(&mut self) {
         if self.dirty && self.last_save.elapsed() >= STATE_SAVE_INTERVAL {
-            self.save_state();
-            self.dirty = false;
+            if let Err(e) = self.save_state() {
+                warn!("EscrowWatcher: failed to save state: {}", e);
+            } else {
+                self.dirty = false;
+            }
             self.last_save = Instant::now();
         }
     }
@@ -968,16 +973,71 @@ impl EscrowWatcher {
         self.maybe_flush();
     }
 
-    fn save_state(&self) {
-        match serde_json::to_string_pretty(&self.state) {
-            Ok(json) => {
-                if let Err(e) = fs::write(&self.state_path, &json) {
-                    warn!("EscrowWatcher: failed to save state: {}", e);
-                }
+    fn save_state(&self) -> Result<(), String> {
+        save_state_atomic(&self.state_path, &self.state)
+    }
+}
+
+impl Drop for EscrowWatcher {
+    fn drop(&mut self) {
+        if self.dirty {
+            if let Err(e) = self.save_state() {
+                warn!("EscrowWatcher: final state flush failed: {}", e);
+            } else {
+                self.dirty = false;
             }
-            Err(e) => warn!("EscrowWatcher: failed to serialize state: {}", e),
         }
     }
+}
+
+fn ensure_parent(path: &Path) -> io::Result<&Path> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_key_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.mode() & 0o077 != 0 {
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_key_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = ensure_parent(path)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|e| e.error)?;
+    sync_parent(parent)
+}
+
+/// Persist escrow state without exposing a partially-written JSON file.
+pub fn save_state_atomic(path: &Path, state: &EscrowState) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(state)
+        .map_err(|e| format!("Failed to serialize escrow state: {}", e))?;
+    atomic_replace(path, &json)
+        .map_err(|e| format!("Failed to atomically write escrow state '{}': {}", path.display(), e))
 }
 
 /// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
@@ -990,6 +1050,8 @@ pub fn load_key(path: &str) -> Result<String, String> {
             path
         ));
     }
+    harden_key_permissions(p)
+        .map_err(|e| format!("Failed to secure escrow key file '{}': {}", path, e))?;
     let s = fs::read_to_string(p)
         .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
     let privkey = s.trim().to_string();
@@ -1008,16 +1070,9 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     use rand::RngCore;
     let p = std::path::Path::new(path);
     if p.exists() {
-        let s = fs::read_to_string(p)
-            .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
-        let privkey = s.trim().to_string();
-        if privkey.len() != 64 || !privkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "Escrow key file '{}' must contain exactly 64 hex chars — delete it to regenerate",
-                path
-            ));
-        }
-        return Ok(privkey);
+        return load_key(path).map_err(|e| {
+            format!("{}. Restore the correct key; do not delete a key that may control rewards.", e)
+        });
     }
 
     let mut privkey_bytes = [0u8; 32];
@@ -1035,8 +1090,20 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     let (xonly, _) = kp.x_only_public_key();
     let pubkey_hex = hex::encode(xonly.serialize());
 
-    fs::write(p, &privkey_hex)
+    let parent = ensure_parent(p)
+        .map_err(|e| format!("Failed to create escrow key directory for '{}': {}", path, e))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Failed to create temporary escrow key file for '{}': {}", path, e))?;
+    temporary.write_all(privkey_hex.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
         .map_err(|e| format!("Failed to write escrow key file '{}': {}", path, e))?;
+
+    match temporary.persist_noclobber(p) {
+        Ok(_) => sync_parent(parent)
+            .map_err(|e| format!("Failed to sync escrow key directory '{}': {}", parent.display(), e))?,
+        Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => return load_key(path),
+        Err(e) => return Err(format!("Failed to install escrow key file '{}': {}", path, e.error)),
+    }
 
     info!("OPoI escrow keypair generated — saved to '{}'", path);
     info!("  Escrow pubkey : {}", pubkey_hex);
@@ -1056,20 +1123,13 @@ pub fn pubkey_hex_from_privkey(privkey_hex: &str) -> Result<String, String> {
     Ok(hex::encode(xonly.serialize()))
 }
 
-fn load_state(path: &PathBuf) -> EscrowState {
-    let state = match fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            warn!("EscrowWatcher: could not parse {}: {} — starting fresh", path.display(), e);
-            EscrowState::default()
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => EscrowState::default(),
-        Err(e) => {
-            warn!("EscrowWatcher: could not read {}: {} — starting fresh", path.display(), e);
-            EscrowState::default()
-        }
-    };
-
-    state
+fn load_state(path: &Path) -> Result<EscrowState, String> {
+    match fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .map_err(|e| format!("Escrow state '{}' is corrupt: {}. Restore it or run --recover-escrow.", path.display(), e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(EscrowState::default()),
+        Err(e) => Err(format!("Failed to read escrow state '{}': {}", path.display(), e)),
+    }
 }
 
 // ── Script builders ───────────────────────────────────────────────────────────
@@ -1277,4 +1337,98 @@ fn decode_address(addr: &str) -> Result<(u16, [u8; 32]), String> {
     let mut spk = [0u8; 32];
     spk.copy_from_slice(&bytes[1..33]);
     Ok((version, spk))
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn state_replacement_is_complete_and_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let empty = EscrowState::default();
+        save_state_atomic(&path, &empty).unwrap();
+
+        let mut updated = EscrowState::default();
+        updated.entries.push(EscrowEntry {
+            coinbase_txid: "01".repeat(32),
+            block_hash: "02".repeat(32),
+            confirm_daa: 42,
+            amount_sompi: 100,
+            output_index: 1,
+            claimed: false,
+            slashed: false,
+            orphan_slashed: false,
+            orphan_retries: 0,
+            orphan_retry_after_daa: None,
+            submit_retries: 0,
+            batch_cap: 0,
+            is_inference: false,
+        });
+        save_state_atomic(&path, &updated).unwrap();
+
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].confirm_daa, 42);
+    }
+
+    #[test]
+    fn concurrent_key_creation_returns_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("escrow.key"));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_generate_key(path.to_str().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(fs::read_to_string(path.as_ref()).unwrap(), keys[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        load_or_generate_key(path.to_str().unwrap()).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_key_permissions_are_hardened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        fs::write(&path, "11".repeat(32)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_or_generate_key(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn corrupt_state_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        fs::write(&path, b"{not-json").unwrap();
+
+        let error = load_state(&path).unwrap_err();
+        assert!(error.contains("corrupt"));
+        assert!(error.contains("--recover-escrow"));
+    }
 }

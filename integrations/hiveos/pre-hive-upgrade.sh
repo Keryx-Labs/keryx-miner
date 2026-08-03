@@ -2,6 +2,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/h-manifest.conf"
+. "$SCRIPT_DIR/h-state.sh"
 
 cleanup_legacy_models() {
     local legacy_dir="$CUSTOM_MINER_DIR/models"
@@ -45,6 +46,11 @@ cleanup_legacy_models() {
 if [[ -x "$SCRIPT_DIR/h-stop.sh" ]]; then
     "$SCRIPT_DIR/h-stop.sh" || true
 fi
+
+prepare_keryx_state "$CUSTOM_MINER_DIR" || {
+    echo "[keryx] ERROR: refusing upgrade because escrow state could not be preserved." >&2
+    exit 1
+}
 
 cleanup_legacy_models
 

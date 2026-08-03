@@ -474,16 +474,19 @@ async fn client_main(
     }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager, stats);
-    tokio::select! {
+    let listen_result = tokio::select! {
         listen_res = client.listen(&mut miner_manager) => {
-            listen_res?;
+            listen_res
         }
         _ = wait_for_shutdown(shutdown_requested) => {
             info!("Shutdown requested, stopping client listen loop");
+            Ok(())
         }
-    }
+    };
+    // Flush funds-critical client state before potentially blocking on worker shutdown.
+    drop(client);
     drop(miner_manager);
-    Ok(())
+    listen_result
 }
 
 async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
@@ -553,8 +556,40 @@ async fn run() -> Result<(), Error> {
     {
         let shutdown_requested = Arc::clone(&shutdown_requested);
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_requested.store(true, Ordering::Release);
+            #[cfg(unix)]
+            {
+                let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+                loop {
+                    match terminate.as_mut() {
+                        Ok(terminate) => {
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {}
+                                _ = terminate.recv() => {}
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to register SIGTERM handler: {}", e);
+                            if tokio::signal::ctrl_c().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if shutdown_requested.swap(true, Ordering::AcqRel) {
+                        eprintln!("Second shutdown signal received; forcing exit");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                if shutdown_requested.swap(true, Ordering::AcqRel) {
+                    eprintln!("Second shutdown signal received; forcing exit");
+                    std::process::exit(1);
+                }
+            }
         });
     }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
@@ -689,8 +724,7 @@ async fn run() -> Result<(), Error> {
         let total_sompi: u64 = entries.iter().map(|e| e.amount_sompi).sum();
         let count = entries.len();
         let state = escrow::EscrowState { entries };
-        let json = serde_json::to_string_pretty(&state)?;
-        fs::write(&opt.escrow_state_file, &json)?;
+        escrow::save_state_atomic(std::path::Path::new(&opt.escrow_state_file), &state)?;
 
         info!(
             "Recovered {} escrow entries — claimable: {:.4} KRX",

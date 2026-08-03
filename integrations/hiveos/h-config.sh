@@ -9,6 +9,8 @@ __MD="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")" && pwd)"
 conf=""
 conf+=" -s $CUSTOM_URL --mining-address $CUSTOM_TEMPLATE"
 conf+=" --plain-log-file $CUSTOM_LOG_BASENAME.log"
+[[ "$CUSTOM_USER_CONFIG" != *"--escrow-key-file"* ]] && conf+=" --escrow-key-file $KERYX_STATE_DIR/escrow.key"
+[[ "$CUSTOM_USER_CONFIG" != *"--escrow-state-file"* ]] && conf+=" --escrow-state-file $KERYX_STATE_DIR/escrow_state.json"
 
 [[ ! -z $CUSTOM_USER_CONFIG ]] && conf+=" $CUSTOM_USER_CONFIG"
 

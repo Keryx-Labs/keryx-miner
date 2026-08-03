@@ -152,6 +152,12 @@ If the miner still downloads a model although the folder is there, check your ti
 
 ---
 
+### HiveOS escrow state
+
+HiveOS stores `escrow.key` and `escrow_state.json` in `/hive/miners/custom/keryx-miner-state`, outside versioned miner packages. Upgrades migrate legacy package-local files without overwriting an existing durable copy. Back up `escrow.key`: it is required to claim accrued OPoI rewards.
+
+Custom `--escrow-key-file` and `--escrow-state-file` values remain supported and take precedence over the HiveOS defaults.
+
 ## Dev Fund
 
 2% of mining rewards support development by default.
