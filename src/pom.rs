@@ -12,9 +12,11 @@
 
 use anyhow::{anyhow, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
@@ -50,6 +52,9 @@ pub const POM_OPENINGS: usize = 32;
 /// Merkle tree checkpoint interval: store every K-th level on disk (level 0 never stored —
 /// recomputed from the GGUF on demand; root always stored).
 const CHECKPOINT_INTERVAL: u32 = 6;
+const CACHE_FORMAT_VERSION: u32 = 1;
+const CANONICAL_LAYOUT_VERSION: u32 = 1;
+const CACHE_METADATA_FILE: &str = "pom-tree.json";
 
 // --- wire structs (field order == node's PomOpening/PomProof) ---
 
@@ -618,6 +623,66 @@ struct StoredLevel {
     count: u64,  // node count at this level
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct CacheMetadata {
+    format_version: u32,
+    layout_version: u32,
+    model_id: [u8; 32],
+    n_chunks: u64,
+    chunk_size: u32,
+    checkpoint_interval: u32,
+    gguf_size: u64,
+    tree_size: u64,
+    tree_sha256: [u8; 32],
+    root: [u8; 32],
+}
+
+fn cache_metadata_path(tree_path: &Path) -> PathBuf {
+    tree_path.with_file_name(CACHE_METADATA_FILE)
+}
+
+fn validate_cache_metadata(
+    metadata: &CacheMetadata,
+    tree_path: &Path,
+    expected_model_id: [u8; 32],
+    n_chunks: u64,
+    gguf_size: u64,
+    root: [u8; 32],
+) -> Result<()> {
+    if metadata.format_version != CACHE_FORMAT_VERSION
+        || metadata.layout_version != CANONICAL_LAYOUT_VERSION
+        || metadata.model_id != expected_model_id
+        || metadata.n_chunks != n_chunks
+        || metadata.chunk_size != 32
+        || metadata.checkpoint_interval != CHECKPOINT_INTERVAL
+        || metadata.gguf_size != gguf_size
+        || metadata.root != root
+    {
+        return Err(anyhow!("PoM: cached tree metadata does not match the verified model or cache format"));
+    }
+
+    let tree_size = std::fs::metadata(tree_path)?.len();
+    if metadata.tree_size != tree_size {
+        return Err(anyhow!("PoM: cached tree length does not match its metadata"));
+    }
+    let digest = crate::integrity::sha256_file(tree_path, |_, _| {})?;
+    if metadata.tree_sha256 != digest {
+        return Err(anyhow!("PoM: cached tree SHA-256 mismatch"));
+    }
+    Ok(())
+}
+
+fn write_cache_metadata(tree_path: &Path, metadata: &CacheMetadata) -> Result<()> {
+    let path = cache_metadata_path(tree_path);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(temp.as_file_mut(), metadata)?;
+    temp.as_file_mut().write_all(b"\n")?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(&path).map_err(|e| anyhow!("persist {}: {}", path.display(), e.error))?;
+    Ok(())
+}
+
 /// Canonical weight index built once at startup from the resident model: the per-chunk
 /// blake3 leaves (for Merkle paths), the recomputed tier root `R_T` (sanity-checked against
 /// the consensus-pinned value), and a chunk reader. Canonical layout = name-sorted GGUF
@@ -681,7 +746,7 @@ fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
 
 /// Open an existing checkpoint tree file and reconstruct the WeightIndex.
 /// Detects legacy full-tree files (size mismatch) and returns an error so the caller can rebuild.
-fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<WeightIndex> {
+fn open_existing_tree(tree_path: &Path, gguf_path: &str, expected_model_id: [u8; 32]) -> Result<WeightIndex> {
     let mut file = File::open(gguf_path)?;
     let meta = crate::gguf::GgufMeta::read(&mut file)?;
     let names = meta.sorted_names();
@@ -734,6 +799,18 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<We
     let mut r_t = [0u8; 32];
     read_exact_at(&tree_file, &mut r_t, root_cp.offset)?;
 
+    let metadata_path = cache_metadata_path(tree_path);
+    let metadata: CacheMetadata = serde_json::from_reader(File::open(&metadata_path)?)
+        .map_err(|e| anyhow!("PoM: invalid cache metadata {}: {}", metadata_path.display(), e))?;
+    validate_cache_metadata(
+        &metadata,
+        tree_path,
+        expected_model_id,
+        n_chunks,
+        std::fs::metadata(gguf_path)?.len(),
+        r_t,
+    )?;
+
     let mmap = unsafe { memmap2::Mmap::map(&File::open(gguf_path)?)? };
     Ok(WeightIndex {
         n_chunks,
@@ -764,7 +841,7 @@ impl WeightIndex {
     /// in `R_T`. The sparse checkpoint Merkle tree is persisted to `pom-tree.bin` next to the
     /// GGUF: only every K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On
     /// subsequent restarts the existing tree is reused (GGUF is immutable), avoiding a rebuild.
-    pub fn build_from_gguf(path: &str) -> Result<Self> {
+    pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let tree_path = dir.join("pom-tree.bin");
 
@@ -782,7 +859,7 @@ impl WeightIndex {
 
         // Reuse existing checkpoint tree if valid.
         if tree_path.exists() {
-            match open_existing_tree(&tree_path, path) {
+            match open_existing_tree(&tree_path, path, model_id) {
                 Ok(idx) => {
                     log::info!("PoM: reusing cached weight index — {} chunks", idx.n_chunks);
                     return Ok(idx);
@@ -790,6 +867,7 @@ impl WeightIndex {
                 Err(e) => {
                     log::warn!("PoM: cached tree invalid ({}), rebuilding…", e);
                     let _ = std::fs::remove_file(&tree_path);
+                    let _ = std::fs::remove_file(cache_metadata_path(&tree_path));
                 }
             }
         }
@@ -861,6 +939,24 @@ impl WeightIndex {
         writer.flush()?;
         drop(writer);
         let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n_chunks)?;
+
+        let tree_size = std::fs::metadata(&tree_path)?.len();
+        let tree_sha256 = crate::integrity::sha256_file(&tree_path, |_, _| {})?;
+        write_cache_metadata(
+            &tree_path,
+            &CacheMetadata {
+                format_version: CACHE_FORMAT_VERSION,
+                layout_version: CANONICAL_LAYOUT_VERSION,
+                model_id,
+                n_chunks,
+                chunk_size: 32,
+                checkpoint_interval: CHECKPOINT_INTERVAL,
+                gguf_size: std::fs::metadata(path)?.len(),
+                tree_size,
+                tree_sha256,
+                root: r_t,
+            },
+        )?;
 
         let mmap = unsafe { memmap2::Mmap::map(&File::open(path)?)? };
         let tree_file = File::open(&tree_path)?;
@@ -1373,7 +1469,8 @@ mod tests {
         // Force a fresh build (don't reuse a possibly-stale cached tree from an older binary).
         let dir = std::path::Path::new(&path).parent().unwrap();
         let _ = std::fs::remove_file(dir.join("pom-tree.bin"));
-        let idx = WeightIndex::build_from_gguf(&path).unwrap();
+        let model_id = crate::integrity::sha256_file(std::path::Path::new(&path), |_, _| {}).unwrap();
+        let idx = WeightIndex::build_from_gguf(&path, model_id).unwrap();
         let got: String = idx.r_t.iter().map(|b| format!("{:02x}", b)).collect();
         assert_eq!(got, expected, "R_T mismatch vs pinned root for {path}");
     }
@@ -1471,7 +1568,9 @@ mod tests {
             eprintln!("skip: GGUF not found at {path}");
             return;
         }
-        let idx = WeightIndex::build_from_gguf(path).expect("build index from real GGUF");
+        let model_id = crate::integrity::sha256_file(std::path::Path::new(path), |_, _| {})
+            .expect("hash real GGUF");
+        let idx = WeightIndex::build_from_gguf(path, model_id).expect("build index from real GGUF");
         eprintln!("real model index: N={} chunks", idx.n_chunks);
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
@@ -1491,6 +1590,36 @@ mod tests {
         let idx = synth_index(n);
         let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
         assert_eq!(idx.r_t, merkle_root(&leaves));
+    }
+
+    #[test]
+    fn cache_metadata_rejects_corruption_and_wrong_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("pom-tree.bin");
+        std::fs::write(&tree, b"authenticated sparse tree").unwrap();
+        let model_id = [0x42; 32];
+        let root = [0x24; 32];
+        let digest = crate::integrity::sha256_file(&tree, |_, _| {}).unwrap();
+        let metadata = CacheMetadata {
+            format_version: CACHE_FORMAT_VERSION,
+            layout_version: CANONICAL_LAYOUT_VERSION,
+            model_id,
+            n_chunks: 123,
+            chunk_size: 32,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+            gguf_size: 456,
+            tree_size: std::fs::metadata(&tree).unwrap().len(),
+            tree_sha256: digest,
+            root,
+        };
+
+        validate_cache_metadata(&metadata, &tree, model_id, 123, 456, root).unwrap();
+        assert!(validate_cache_metadata(&metadata, &tree, [0x43; 32], 123, 456, root).is_err());
+
+        let mut bytes = std::fs::read(&tree).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&tree, bytes).unwrap();
+        assert!(validate_cache_metadata(&metadata, &tree, model_id, 123, 456, root).is_err());
     }
 
     #[test]

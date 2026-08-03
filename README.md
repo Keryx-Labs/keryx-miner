@@ -142,6 +142,8 @@ If IPFS is slow or blocked on your network, download the archive and unzip it in
 
 A correct manual install looks like this — the miner writes the `.ok` marker itself once it has validated the file, so there is no need to create it:
 
+Before advertising a model or mining with it, the miner reconstructs the complete GGUF's UnixFS CIDv0 identity and compares it with the pinned model ID. The sparse `pom-tree.bin` cache is also authenticated and bound to that model and cache format; stale or corrupted caches are rebuilt automatically.
+
 ```
 keryx-miner
 models/

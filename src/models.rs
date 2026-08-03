@@ -1,7 +1,9 @@
 /// Registry of supported inference models.
 ///
-/// model_id = sha2-256(primary_weight_file) = CIDv0_bytes[2..34].
-/// Verifiable: decode the weight CID from base58btc, skip the 2-byte multihash prefix.
+/// model_id = CIDv0_bytes[2..34], the SHA-256 digest of the legacy UnixFS DAG-PB root.
+/// This is not the SHA-256 of the raw GGUF bytes. Verifiable by recreating the pinned
+/// CIDv0 with the legacy Kubo UnixFS importer, or by decoding the CID and skipping its
+/// 2-byte multihash prefix.
 ///
 /// Uncensored five-tier lineup, active at `coin_age_verification_activation_daa()` (the H4
 /// hardfork) — below that DAA this binary refuses to mine (`pom_tier_index` = None). Every
