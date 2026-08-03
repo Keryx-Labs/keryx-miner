@@ -31,6 +31,15 @@ fn unavailable_models() -> &'static RwLock<HashSet<[u8; 32]>> {
     MODELS.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
+fn verified_models() -> &'static RwLock<HashSet<[u8; 32]>> {
+    static MODELS: OnceLock<RwLock<HashSet<[u8; 32]>>> = OnceLock::new();
+    MODELS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+fn model_is_verified(model_id: &[u8; 32]) -> bool {
+    verified_models().read().unwrap().contains(model_id)
+}
+
 pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     if unavailable_models().write().unwrap().insert(*model_id) {
         log::warn!(
@@ -269,6 +278,58 @@ fn ipfs_url(cid: &str) -> String {
     format!("{}/ipfs/{}", IPFS_GATEWAY, cid)
 }
 
+fn verify_model_file(
+    gguf: &std::path::Path,
+    ok_flag: &std::path::Path,
+    expected: [u8; 32],
+    name: &str,
+) -> Result<()> {
+    // A marker never represents a model until the complete current file matches its pinned CID.
+    let _ = std::fs::remove_file(ok_flag);
+    let mut next_percent = 10u64;
+    let digest = crate::integrity::unixfs_v0_digest_file(gguf, |done, total| {
+        if total == 0 {
+            return;
+        }
+        let percent = done.saturating_mul(100) / total;
+        if percent >= next_percent {
+            ui_download_info(&format!("[keryx-miner] Verifying '{}': {}%", name, percent.min(100)));
+            next_percent = (percent / 10 + 1) * 10;
+        }
+    })
+    .with_context(|| format!("verify IPFS identity for model '{}' at {}", name, gguf.display()))?;
+
+    if digest != expected {
+        let _ = std::fs::remove_file(ok_flag);
+        return Err(anyhow!(
+            "model '{}' IPFS CID digest mismatch at {} (expected {}, got {}); replace the GGUF before mining",
+            name,
+            gguf.display(),
+            hex::encode(expected),
+            hex::encode(digest)
+        ));
+    }
+
+    std::fs::write(ok_flag, hex::encode(expected))
+        .with_context(|| format!("write verified .ok flag {}", ok_flag.display()))?;
+    Ok(())
+}
+
+fn verify_gguf(spec: &ModelSpec, gguf: &std::path::Path, ok_flag: &std::path::Path) -> Result<()> {
+    verified_models().write().unwrap().remove(&spec.model_id);
+    ui_download_info(&format!(
+        "[keryx-miner] Verifying model '{}' integrity before mining...",
+        spec.name
+    ));
+    if let Err(error) = verify_model_file(gguf, ok_flag, spec.model_id, spec.name) {
+        mark_model_unavailable(&spec.model_id, "integrity_mismatch");
+        return Err(error);
+    }
+    verified_models().write().unwrap().insert(spec.model_id);
+    ui_download_info(&format!("[keryx-miner] Model '{}' integrity verified.", spec.name));
+    Ok(())
+}
+
 fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let dir = model_dir(spec);
     let tok = dir.join("tokenizer.json");
@@ -283,9 +344,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     // Reuse a complete on-disk GGUF even when `.ok` was lost (HiveOS upgrades, manual copies,
     // interrupted flag write). Never re-download a model that already parses as complete.
     if gguf_ready && tok_ready {
-        if !ok_flag.exists() {
-            let _ = std::fs::write(&ok_flag, b"");
-        }
+        verify_gguf(spec, &gguf, &ok_flag)?;
         log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
@@ -320,7 +379,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
         download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
     }
 
-    std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
+    verify_gguf(spec, &gguf, &ok_flag)?;
     ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
     Ok((tok, gguf))
 }
@@ -434,7 +493,7 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     specs.iter()
-        .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
+        .filter(|s| model_is_verified(&s.model_id) && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
         .collect()
 }
@@ -447,7 +506,7 @@ pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
     specs
         .iter()
         .copied()
-        .filter(|s| crate::models::is_pom_model(&s.model_id) && model_dir(s).join(".ok").exists())
+        .filter(|s| crate::models::is_pom_model(&s.model_id) && model_is_verified(&s.model_id))
         .collect()
 }
 
@@ -458,7 +517,7 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
-    model_dir(spec).join(".ok").exists()
+    model_is_verified(&spec.model_id)
 }
 
 /// Serve an inference request via the in-process llama.cpp engine, swapping it to the requested
@@ -565,6 +624,7 @@ pub fn load_and_run_inference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn failed_models_are_withdrawn_until_recovered() {
@@ -576,5 +636,46 @@ mod tests {
 
         mark_model_available(&model_id, "test_recovery");
         assert!(!model_is_unavailable(&model_id));
+    }
+
+    #[test]
+    fn model_verification_rejects_same_size_corruption_and_removes_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        let marker = dir.path().join(".ok");
+        std::fs::write(&gguf, b"verified model bytes").unwrap();
+        let expected = crate::integrity::unixfs_v0_digest_file(&gguf, |_, _| {}).unwrap();
+
+        verify_model_file(&gguf, &marker, expected, "test-model").unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), hex::encode(expected));
+
+        let mut bytes = std::fs::read(&gguf).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&gguf, bytes).unwrap();
+        assert!(verify_model_file(&gguf, &marker, expected, "test-model").is_err());
+        assert!(!marker.exists(), "stale verification marker must be removed");
+    }
+
+    #[test]
+    fn interrupted_model_never_creates_verified_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        let marker = dir.path().join(".ok");
+        let mut file = std::fs::File::create(&gguf).unwrap();
+        file.write_all(b"partial").unwrap();
+
+        assert!(verify_model_file(&gguf, &marker, [0x5a; 32], "test-model").is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn unreadable_model_removes_stale_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("missing.gguf");
+        let marker = dir.path().join(".ok");
+        std::fs::write(&marker, "stale").unwrap();
+
+        assert!(verify_model_file(&gguf, &marker, [0x5a; 32], "test-model").is_err());
+        assert!(!marker.exists());
     }
 }

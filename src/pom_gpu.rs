@@ -868,7 +868,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         };
         if crate::pom::active_index_for_tier(tier).is_none() {
             info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", tier, device_id);
-            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
+            match crate::pom::WeightIndex::build_from_gguf(&gguf, model_id) {
                 Ok(idx) => {
                     info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
                     crate::pom::set_index(tier, idx);
