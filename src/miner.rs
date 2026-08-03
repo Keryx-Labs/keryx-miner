@@ -326,8 +326,6 @@ impl MinerManager {
                     .and_then(|s| s.split_whitespace().next())
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(0);
-                let mut nonces = vec![0u64; 1];
-
                 let mut state = None;
                 // PoM mining: nonce cursor + per-launch batch. The kernel grinds the whole batch
                 // before returning, so BPS_max = hashrate / POM_BATCH. At 1<<22 this capped a
@@ -337,7 +335,6 @@ impl MinerManager {
                 const POM_BATCH: u64 = 1 << 20;
 
                 loop {
-                    nonces[0] = 0;
                     if state.is_none() {
                         state = match block_channel.wait_for_change() {
                             Ok(cmd) => match cmd {
@@ -350,6 +347,16 @@ impl MinerManager {
                                 return Ok(());
                             }
                         };
+                    }
+                    if let Some(new_cmd) = block_channel.get_changed()? {
+                        state = match new_cmd {
+                            Some(WorkerCommand::Job(s)) => Some(s),
+                            Some(WorkerCommand::Close) => return Ok(()),
+                            None => None,
+                        };
+                        if state.is_none() {
+                            continue;
+                        }
                     }
                     // PoM possession mining (design A): when active, the walk runs on the GPU
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
@@ -388,6 +395,16 @@ impl MinerManager {
                                 sleep(Duration::from_secs(5));
                                 continue;
                             }
+                        }
+                        // Model installation can take seconds. Do not launch stale work or delay
+                        // shutdown when a command arrived while the GPU was being rebuilt.
+                        if let Some(cmd) = block_channel.get_changed()? {
+                            state = match cmd {
+                                Some(WorkerCommand::Job(ns)) => Some(ns),
+                                Some(WorkerCommand::Close) => return Ok(()),
+                                None => None,
+                            };
+                            continue;
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
@@ -446,24 +463,30 @@ impl MinerManager {
                         continue;
                     }
 
-                    let state_ref = match &state {
-                        Some(s) => {
-                            s.load_to_gpu(gpu_work);
-                            s
-                        },
+                    let gpu_result = match &state {
+                        Some(s) => s.load_to_gpu(gpu_work).and_then(|_| s.pow_gpu(gpu_work)).and_then(|_| gpu_work.sync()),
                         None => continue,
                     };
-                    state_ref.pow_gpu(gpu_work);
-                    if let Err(e) = gpu_work.sync() {
-                        warn!("CUDA run ignored: {}", e);
-                        continue
+                    if let Err(e) = gpu_result {
+                        warn!("GPU run ignored: {}", e);
+                        if let Some(new_cmd) = block_channel.get_changed()? {
+                            state = match new_cmd {
+                                Some(WorkerCommand::Job(s)) => Some(s),
+                                Some(WorkerCommand::Close) => return Ok(()),
+                                None => None,
+                            };
+                        } else {
+                            sleep(Duration::from_millis(10));
+                        }
+                        continue;
                     }
 
-                    gpu_work.copy_output_to(&mut nonces)?;
+                    let state_ref = state.as_ref().unwrap();
+                    let winner = gpu_work.read_winner()?;
                     // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
                     // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
-                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {
-                        if let Some(mut block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
+                    if let Some(nonce) = winner.filter(|_| state_ref.daa_score < keryx_miner::pom::pom_activation_daa()) {
+                        if let Some(mut block_seed) = state_ref.generate_block_if_pow(nonce) {
                             block_seed.set_device_id(&device_id);
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(&gpu_work.id()),
@@ -472,13 +495,12 @@ impl MinerManager {
                             if let BlockSeed::FullBlock { .. } = &block_seed {
                                 state = None;
                             }
-                            nonces[0] = 0;
                             hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             worker_hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             continue;
                         } else {
-                            let hash = state_ref.calculate_pow(nonces[0]);
-                            warn!("Something is wrong in GPU results! Got nonce {}, with hash real {:?}  (target: {}*2^196)", nonces[0], hash.0, state_ref.target.0[3]);
+                            let hash = state_ref.calculate_pow(nonce);
+                            warn!("Something is wrong in GPU results! Got nonce {}, with hash real {:?}  (target: {}*2^196)", nonce, hash.0, state_ref.target.0[3]);
                             break;
                         }
                     }

@@ -7,20 +7,23 @@ use log::{info, warn};
 use opencl3::command_queue::{CommandQueue, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE};
 use opencl3::context::Context;
 use opencl3::device::Device;
-use opencl3::event::{release_event, retain_event, wait_for_events};
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer, ClMem, CL_MAP_WRITE, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl3::platform::Platform;
 use opencl3::program::{Program, CL_FINITE_MATH_ONLY, CL_MAD_ENABLE, CL_STD_2_0};
-use opencl3::types::{cl_event, cl_uchar, cl_ulong, CL_BLOCKING};
+use opencl3::types::{cl_uchar, cl_uint, cl_ulong, CL_BLOCKING};
 use rand::{thread_rng, Fill, RngCore};
-use std::borrow::Borrow;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::Arc;
 
 static BINARY_DIR: Dir = include_dir!("./plugins/opencl/resources/bin/");
 static PROGRAM_SOURCE: &str = include_str!("../resources/keryx-opencl.cl");
+const HEAVY_HASH_ARGUMENTS: u32 = 11;
+
+fn opencl_error(error: impl std::fmt::Display) -> Error {
+    std::io::Error::new(std::io::ErrorKind::Other, error.to_string()).into()
+}
 
 /// Capability-driven default for the `--opencl-workload` ratio when the user
 /// didn't set it. The ratio is multiplied by (max_work_group_size * compute_units)
@@ -52,13 +55,13 @@ pub struct OpenCLGPUWorker {
 
     random_state: Buffer<cl_ulong>,
     final_nonce: Buffer<cl_ulong>,
+    winner_found: Buffer<cl_uint>,
     final_hash: Buffer<[cl_ulong; 4]>,
 
     hash_header: Buffer<cl_uchar>,
     matrix: Buffer<cl_uchar>,
     target: Buffer<cl_ulong>,
 
-    events: Vec<cl_event>,
     experimental_amd: bool,
 }
 
@@ -68,7 +71,7 @@ impl Worker for OpenCLGPUWorker {
         device.name().unwrap()
     }
 
-    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]) {
+    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]) -> Result<(), Error> {
         let cl_uchar_matrix = match self.experimental_amd {
             true => matrix
                 .iter()
@@ -77,43 +80,35 @@ impl Worker for OpenCLGPUWorker {
             false => matrix.iter().flat_map(|row| row.map(|v| v as cl_uchar)).collect::<Vec<cl_uchar>>(),
         };
         self.queue
-            .enqueue_write_buffer(&mut self.final_nonce, CL_BLOCKING, 0, &[0], &[])
-            .map_err(|e| e.to_string())
-            .unwrap()
-            .wait()
-            .unwrap();
-        self.queue
             .enqueue_write_buffer(&mut self.hash_header, CL_BLOCKING, 0, hash_header, &[])
-            .map_err(|e| e.to_string())
-            .unwrap()
+            .map_err(opencl_error)?
             .wait()
-            .unwrap();
+            .map_err(opencl_error)?;
         self.queue
             .enqueue_write_buffer(&mut self.matrix, CL_BLOCKING, 0, cl_uchar_matrix.as_slice(), &[])
-            .map_err(|e| e.to_string())
-            .unwrap()
+            .map_err(opencl_error)?
             .wait()
-            .unwrap();
-        let copy_target = self
-            .queue
+            .map_err(opencl_error)?;
+        self.queue
             .enqueue_write_buffer(&mut self.target, CL_BLOCKING, 0, target, &[])
-            .map_err(|e| e.to_string())
-            .unwrap();
-
-        self.events = vec![copy_target.get()];
-        for event in &self.events {
-            retain_event(*event).unwrap();
-        }
+            .map_err(opencl_error)?
+            .wait()
+            .map_err(opencl_error)?;
+        Ok(())
     }
 
-    fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) {
+    fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) -> Result<(), Error> {
+        self.queue
+            .enqueue_write_buffer(&mut self.winner_found, CL_BLOCKING, 0, &[0], &[])
+            .map_err(opencl_error)?
+            .wait()
+            .map_err(opencl_error)?;
         if self.random == NonceGenEnum::Lean {
             self.queue
                 .enqueue_write_buffer(&mut self.random_state, CL_BLOCKING, 0, &[thread_rng().next_u64()], &[])
-                .map_err(|e| e.to_string())
-                .unwrap()
+                .map_err(opencl_error)?
                 .wait()
-                .unwrap();
+                .map_err(opencl_error)?;
         }
         let random_type: cl_uchar = match self.random {
             NonceGenEnum::Lean => 0,
@@ -128,15 +123,14 @@ impl Worker for OpenCLGPUWorker {
             .set_arg(&self.target)
             .set_arg(&random_type)
             .set_arg(&self.random_state)
+            .set_arg(&self.winner_found)
             .set_arg(&self.final_nonce)
             .set_arg(&self.final_hash)
             .set_global_work_size(self.workload)
-            .set_event_wait_list(self.events.borrow())
             .enqueue_nd_range(&self.queue)
-            .map_err(|e| e.to_string())
-            .unwrap();
+            .map_err(opencl_error)?;
 
-        kernel_event.wait().unwrap();
+        kernel_event.wait().map_err(opencl_error)?;
 
         /*let mut nonces = [0u64; 1];
         let mut hash = [[0u64; 4]];
@@ -149,13 +143,10 @@ impl Worker for OpenCLGPUWorker {
         let event = kernel_event.get();
         self.events = vec!(event);
         retain_event(event);*/
+        Ok(())
     }
 
     fn sync(&self) -> Result<(), Error> {
-        wait_for_events(&self.events).map_err(|e| format!("waiting error code {}", e))?;
-        for event in &self.events {
-            release_event(*event).unwrap();
-        }
         Ok(())
     }
 
@@ -163,12 +154,19 @@ impl Worker for OpenCLGPUWorker {
         self.workload as usize
     }
 
-    fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error> {
+    fn read_winner(&mut self) -> Result<Option<u64>, Error> {
+        let mut found = [0u32; 1];
         self.queue
-            .enqueue_read_buffer(&self.final_nonce, CL_BLOCKING, 0, nonces, &[])
-            .map_err(|e| e.to_string())
-            .unwrap();
-        Ok(())
+            .enqueue_read_buffer(&self.winner_found, CL_BLOCKING, 0, &mut found, &[])
+            .map_err(|e| e.to_string())?;
+        if found[0] == 0 {
+            return Ok(None);
+        }
+        let mut nonce = [0u64; 1];
+        self.queue
+            .enqueue_read_buffer(&self.final_nonce, CL_BLOCKING, 0, &mut nonce, &[])
+            .map_err(|e| e.to_string())?;
+        Ok(Some(nonce[0]))
     }
 }
 
@@ -251,7 +249,7 @@ impl OpenCLGPUWorker {
             false => "",
         };
 
-        let program = match use_binary {
+        let mut program = match use_binary {
             true => {
                 let mut device_name = device.name().unwrap_or_else(|_| "Unknown".into()).to_lowercase();
                 if device_name.contains(':') {
@@ -277,8 +275,15 @@ impl OpenCLGPUWorker {
                 .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_binary failed: {}", name, e)),
         };
         info!("Kernels: {:?}", program.kernel_names());
-        let heavy_hash =
+        let mut heavy_hash =
             Kernel::create(&program, "heavy_hash").unwrap_or_else(|_| panic!("{}::Kernel::create failed", name));
+        if heavy_hash.num_args().map_err(|e| e.to_string())? != HEAVY_HASH_ARGUMENTS {
+            warn!("{}: Embedded OpenCL binary uses an older kernel ABI; compiling current source", name);
+            program = from_source(&context, &device, options)
+                .unwrap_or_else(|e| panic!("{}::Program::create_and_build_from_source failed: {}", name, e));
+            heavy_hash =
+                Kernel::create(&program, "heavy_hash").unwrap_or_else(|_| panic!("{}::Kernel::create failed", name));
+        }
 
         let queue =
             CommandQueue::create_with_properties(&context, device.id(), CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, 0)
@@ -289,6 +294,8 @@ impl OpenCLGPUWorker {
                 });
 
         let final_nonce = Buffer::<cl_ulong>::create(context_ref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
+            .expect("Buffer allocation failed");
+        let winner_found = Buffer::<cl_uint>::create(context_ref, CL_MEM_READ_WRITE, 1, ptr::null_mut())
             .expect("Buffer allocation failed");
         let final_hash = Buffer::<[cl_ulong; 4]>::create(context_ref, CL_MEM_WRITE_ONLY, 1, ptr::null_mut())
             .expect("Buffer allocation failed");
@@ -365,17 +372,71 @@ impl OpenCLGPUWorker {
             random_state,
             queue,
             final_nonce,
+            winner_found,
             final_hash,
             hash_header,
             matrix,
             target,
-            events: Vec::<cl_event>::new(),
             // Must equal the kernel's v_dot8 decision: this flag drives the packed
             // (2-nibbles/byte) matrix upload in load_block_constants, which the
             // v_dot8_u32_u4 kernel requires. `experimental_amd_use` already folds in
             // both the capability default and the legacy --experimental-amd flag.
             experimental_amd: experimental_amd_use,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_kernel_source_has_expected_abi() {
+        let Ok(platforms) = opencl3::platform::get_platforms() else {
+            return;
+        };
+        let Some(device_id) = platforms
+            .iter()
+            .filter_map(|platform| platform.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU).ok())
+            .flatten()
+            .next()
+        else {
+            return;
+        };
+        let device = Device::new(device_id);
+        let context = Context::from_device(&device).expect("create OpenCL test context");
+        let program = from_source(&context, &device, "").expect("build current OpenCL source");
+        let kernel = Kernel::create(&program, "heavy_hash").expect("create heavy_hash kernel");
+
+        assert_eq!(kernel.num_args().unwrap(), HEAVY_HASH_ARGUMENTS);
+    }
+
+    #[test]
+    #[ignore = "requires an OpenCL GPU"]
+    fn publishes_nonce_zero_from_multiple_workgroups() {
+        let device_id = opencl3::platform::get_platforms()
+            .expect("enumerate OpenCL platforms")
+            .iter()
+            .filter_map(|platform| platform.get_devices(opencl3::device::CL_DEVICE_TYPE_GPU).ok())
+            .flatten()
+            .next()
+            .expect("find OpenCL GPU");
+        let mut worker = OpenCLGPUWorker::new(
+            Device::new(device_id),
+            4096.0,
+            true,
+            false,
+            false,
+            &NonceGenEnum::Lean,
+        )
+        .expect("create OpenCL worker");
+        worker.load_block_constants(&[0; 72], &[[0; 64]; 64], &[u64::MAX; 4]).expect("load OpenCL constants");
+
+        for _ in 0..100 {
+            worker.calculate_hash(None, 0, 0).expect("launch OpenCL kernel");
+            worker.sync().expect("synchronize OpenCL kernel");
+            assert_eq!(worker.read_winner().unwrap(), Some(0));
+        }
     }
 }
 

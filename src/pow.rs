@@ -284,13 +284,13 @@ impl State {
         Some(block_seed)
     }
 
-    pub fn load_to_gpu(&self, gpu_work: &mut dyn Worker) {
-        gpu_work.load_block_constants(&self.pow_hash_header, &self.matrix.0, &self.target.0);
+    pub fn load_to_gpu(&self, gpu_work: &mut dyn Worker) -> Result<(), keryx_miner::Error> {
+        gpu_work.load_block_constants(&self.pow_hash_header, &self.matrix.0, &self.target.0)
     }
 
     #[inline(always)]
-    pub fn pow_gpu(&self, gpu_work: &mut dyn Worker) {
-        gpu_work.calculate_hash(None, self.nonce_mask, self.nonce_fixed);
+    pub fn pow_gpu(&self, gpu_work: &mut dyn Worker) -> Result<(), keryx_miner::Error> {
+        gpu_work.calculate_hash(None, self.nonce_mask, self.nonce_fixed)
     }
 }
 

@@ -16,6 +16,7 @@ use libloading::{Library, Symbol};
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 pub type PluginLogSink = extern "C" fn(level: u8, msg_ptr: *const u8, msg_len: usize);
+pub const PLUGIN_ABI_VERSION: u32 = 2;
 
 pub const PLUGIN_LOG_ERROR: u8 = 1;
 pub const PLUGIN_LOG_WARN: u8 = 2;
@@ -59,13 +60,35 @@ impl PluginManager {
         app: clap::App<'help>,
         path: &str,
     ) -> Result<clap::App<'help>, (clap::App<'help>, Error)> {
+        type PluginAbiVersion = unsafe extern "C" fn() -> u32;
         type PluginCreate<'help> =
-            unsafe fn(*const clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *mut Error);
+            unsafe extern "C" fn(*mut clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *mut Error);
 
         let lib = match Library::new(path) {
             Ok(l) => l,
             Err(e) => return Err((app, e.to_string().into())),
         };
+
+        let abi_version: Symbol<PluginAbiVersion> = match lib.get(b"_plugin_abi_version") {
+            Ok(version) => version,
+            Err(_) => {
+                return Err((
+                    app,
+                    format!("Plugin {} has no ABI version; install plugins packaged with this miner", path).into(),
+                ))
+            }
+        };
+        let found_abi = abi_version();
+        if found_abi != PLUGIN_ABI_VERSION {
+            return Err((
+                app,
+                format!(
+                    "Plugin {} uses ABI {}, but this miner requires ABI {}; install the matching plugin package",
+                    path, found_abi, PLUGIN_ABI_VERSION
+                )
+                .into(),
+            ));
+        }
 
         self.loaded_libraries.push(lib); // Save library so it persists in memory
         let lib = self.loaded_libraries.last().unwrap();
@@ -159,13 +182,23 @@ pub trait WorkerSpec: Any + Send + Sync {
 pub trait Worker {
     //fn new(device_id: u32, workload: f32, is_absolute: bool) -> Result<Self, Error>;
     fn id(&self) -> String;
-    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]);
+    fn load_block_constants(
+        &mut self,
+        hash_header: &[u8; 72],
+        matrix: &[[u16; 64]; 64],
+        target: &[u64; 4],
+    ) -> Result<(), Error>;
 
-    fn calculate_hash(&mut self, nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64);
+    fn calculate_hash(
+        &mut self,
+        nonces: Option<&Vec<u64>>,
+        nonce_mask: u64,
+        nonce_fixed: u64,
+    ) -> Result<(), Error>;
     fn sync(&self) -> Result<(), Error>;
 
     fn get_workload(&self) -> usize;
-    fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
+    fn read_winner(&mut self) -> Result<Option<u64>, Error>;
 }
 
 pub fn load_plugins<'help>(
@@ -193,9 +226,14 @@ macro_rules! declare_plugin {
     ($plugin_type:ty, $constructor:path, $args:ty) => {
         use clap::Args;
         #[no_mangle]
+        pub extern "C" fn _plugin_abi_version() -> u32 {
+            $crate::PLUGIN_ABI_VERSION
+        }
+
+        #[no_mangle]
         pub unsafe extern "C" fn _plugin_create(
             app: *mut clap::App,
-        ) -> (*mut clap::App, *mut dyn $crate::Plugin, *const $crate::Error) {
+        ) -> (*mut clap::App, *mut dyn $crate::Plugin, *mut $crate::Error) {
             // make sure the constructor is the correct type.
             let constructor: fn() -> Result<$plugin_type, $crate::Error> = $constructor;
 
@@ -204,7 +242,7 @@ macro_rules! declare_plugin {
                 Err(e) => {
                     return (
                         app,
-                        unsafe { std::mem::MaybeUninit::zeroed().assume_init() }, // Translates to null pointer
+                        std::ptr::null_mut::<$plugin_type>() as *mut dyn $crate::Plugin,
                         Box::into_raw(Box::new(e)),
                     );
                 }
@@ -213,7 +251,7 @@ macro_rules! declare_plugin {
             let boxed: Box<dyn $crate::Plugin> = Box::new(object);
 
             let boxed_app = Box::new(<$args>::augment_args(unsafe { *Box::from_raw(app) }));
-            (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null::<Error>())
+            (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null_mut::<Error>())
         }
     };
 }

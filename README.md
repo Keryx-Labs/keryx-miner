@@ -78,6 +78,8 @@ Binary and `libkeryx-llama.so`: `target-cuda/release/`.
 
 > **Runtime dependencies.** Mining needs only `libcuda.so.1` (the driver). Inference additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10`, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
 
+> **Plugin compatibility.** Always deploy the miner and its CUDA/OpenCL plugins from the same build or release archive. The loader rejects missing or mismatched plugin ABI versions instead of calling an incompatible Rust trait interface.
+
 > **Blackwell (RTX 50xx).** Nothing to configure: the committed nextgen fatbin carries native `sm_89`/`sm_90`/`sm_100`/`sm_120` SASS, so a 50-series card runs native code with no JIT. This matters — a Blackwell card falling back to JIT from PTX emitted by CUDA 12.2 loses roughly half its hashrate (measured on RTX 5090 and 5080). If you ever rebuild the fatbins yourself, the nextgen one requires CUDA ≥ 12.8; see [cuda/README.md](cuda/README.md).
 
 ---

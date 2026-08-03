@@ -635,16 +635,63 @@ pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
 /// per-GPU *model*, which the H5 crossing swaps): a device keeps its hardware tier for life; only
 /// the model that tier mines changes at the era boundary.
 static DEVICE_TIERS: OnceLock<Mutex<HashMap<u32, crate::models::Tier>>> = OnceLock::new();
+static EFFECTIVE_DEVICE_TIERS: OnceLock<Mutex<HashMap<u32, crate::models::Tier>>> = OnceLock::new();
+static TIER_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn device_tiers() -> &'static Mutex<HashMap<u32, crate::models::Tier>> {
     DEVICE_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn effective_device_tiers() -> &'static Mutex<HashMap<u32, crate::models::Tier>> {
+    EFFECTIVE_DEVICE_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn tier_state_lock() -> &'static Mutex<()> {
+    TIER_STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn effective_device_tier(device_id: u32, assigned: crate::models::Tier) -> crate::models::Tier {
+    effective_device_tiers().lock().ok().and_then(|g| g.get(&device_id).copied()).unwrap_or(assigned)
+}
+
+fn tier_from_index(index: u8) -> Option<crate::models::Tier> {
+    use crate::models::Tier;
+    match index {
+        0 => Some(Tier::VeryLight),
+        1 => Some(Tier::Light),
+        2 => Some(Tier::Default),
+        3 => Some(Tier::High),
+        4 => Some(Tier::VeryHigh),
+        _ => None,
+    }
+}
+
+fn refresh_supported_specs(daa: u64) {
+    let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
+        Ok(g) => g.iter().map(|(device, tier)| (*device, *tier)).collect(),
+        Err(_) => return,
+    };
+    let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
+    for (device, assigned_tier) in devices {
+        let spec = crate::models::pom_model_for_tier(daa, effective_device_tier(device, assigned_tier));
+        if !union.iter().any(|existing| existing.model_id == spec.model_id) {
+            union.push(spec);
+        }
+    }
+    if !union.is_empty() {
+        crate::slm::init_supported(Box::leak(union.into_boxed_slice()));
+    }
+}
+
 /// Record a GPU's fixed hardware tier so the era crossing can look up which model that tier must
 /// mine at the new DAA (`pom_model_for_tier`).
 pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
+    let Ok(_tier_state) = tier_state_lock().lock() else { return };
     if let Ok(mut g) = device_tiers().lock() {
         g.insert(device_id, tier);
+    }
+    if let Ok(mut g) = effective_device_tiers().lock() {
+        g.remove(&device_id);
     }
 }
 
@@ -653,12 +700,14 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
 /// device's era-correct model actually changes — and inert entirely with the current fixed post-H5
 /// lineup. Called each tick from the loop, so a miner upgraded before a gate crosses over on its own.
 pub fn advance_mining_tier_if_due(daa: u64) {
+    let Ok(_tier_state) = tier_state_lock().lock() else { return };
     let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
         Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
         Err(_) => return,
     };
     let mut swapped = false;
-    for &(dev, tier) in &devices {
+    for &(dev, assigned_tier) in &devices {
+        let tier = effective_device_tier(dev, assigned_tier);
         let spec = crate::models::pom_model_for_tier(daa, tier);
         let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
         if current == Some(spec.model_id) {
@@ -687,17 +736,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     // routing — refresh it as the union of era-correct models so the miner stops announcing the
     // previous era's model_ids after the crossing.
     if swapped {
-        let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
-        for &(_, tier) in &devices {
-            let spec = crate::models::pom_model_for_tier(daa, tier);
-            if !union.iter().any(|s| s.model_id == spec.model_id) {
-                union.push(spec);
-            }
-        }
-        if !union.is_empty() {
-            // Leaked to satisfy the &'static lineup API — at most once per era crossing.
-            crate::slm::init_supported(Box::leak(union.into_boxed_slice()));
-        }
+        refresh_supported_specs(daa);
     }
 }
 
@@ -782,6 +821,7 @@ fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
 /// smaller tier instead of idling. Returns true if a downgrade was applied. No extra prefetch is
 /// needed: the candidate set is the served union (a mixed rig already downloaded the smaller tiers).
 fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> bool {
+    let Ok(_tier_state) = tier_state_lock().lock() else { return false };
     let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
         return false;
     };
@@ -795,6 +835,12 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
             let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
             info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
             set_mining_tier(device_id, spec.model_id, gguf);
+            if let Some(tier) = tier_from_index(tier) {
+                if let Ok(mut g) = effective_device_tiers().lock() {
+                    g.insert(device_id, tier);
+                }
+            }
+            refresh_supported_specs(daa);
             true
         }
         None => {
@@ -1088,5 +1134,27 @@ mod tests {
             .expect_err("missing miner must not look like a completed nonce batch");
 
         assert!(error.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn effective_oom_tier_survives_reconciliation_until_reassigned() {
+        use crate::models::Tier;
+
+        let device_id = u32::MAX - 1;
+        let daa = u64::MAX;
+        let downgraded = crate::models::pom_model_for_tier(daa, Tier::Light);
+        device_tiers().lock().unwrap().insert(device_id, Tier::VeryHigh);
+        effective_device_tiers().lock().unwrap().insert(device_id, Tier::Light);
+        set_mining_tier(device_id, downgraded.model_id, "test.gguf".to_string());
+
+        advance_mining_tier_if_due(daa);
+        assert!(effective_device_tier(device_id, Tier::VeryHigh) == Tier::Light);
+        assert!(mining_tiers().lock().unwrap().get(&device_id).unwrap().0 == downgraded.model_id);
+
+        set_device_tier(device_id, Tier::VeryHigh);
+        assert!(effective_device_tier(device_id, Tier::VeryHigh) == Tier::VeryHigh);
+
+        device_tiers().lock().unwrap().remove(&device_id);
+        mining_tiers().lock().unwrap().remove(&device_id);
     }
 }

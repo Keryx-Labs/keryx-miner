@@ -22,6 +22,7 @@ typedef union _uint256_t {
 #define RANDOM_XOSHIRO 1
 
 #define LT_U256(X,Y) (X.number[3] != Y.number[3] ? X.number[3] < Y.number[3] : X.number[2] != Y.number[2] ? X.number[2] < Y.number[2] : X.number[1] != Y.number[1] ? X.number[1] < Y.number[1] : X.number[0] < Y.number[0])
+#define LE_U256(X,Y) (!LT_U256(Y,X))
 
 __constant__ uint8_t matrix[MATRIX_SIZE][MATRIX_SIZE];
 __constant__ uint8_t hash_header[HASH_HEADER_SIZE];
@@ -166,11 +167,10 @@ extern "C" {
      * Net of the launch-config sweep: upstream defaults win. The lever
      * for speed is on the kernel body, not the launch dispatcher.
      */
-    __global__ void HEAVY_HASH_BOUNDS heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce) {
+    __global__ void HEAVY_HASH_BOUNDS heavy_hash(const uint64_t nonce_mask, const uint64_t nonce_fixed, const uint64_t nonces_len, uint8_t random_type, void* states, uint64_t *final_nonce, uint32_t *winner_found) {
         // assuming header_len is 72
         int nonceId = threadIdx.x + blockIdx.x*blockDim.x;
         if (nonceId < nonces_len) {
-            if (nonceId == 0) *final_nonce = 0;
             uint64_t nonce;
             switch (random_type) {
                 case RANDOM_LEAN:
@@ -287,8 +287,8 @@ extern "C" {
                 #pragma unroll
                 for (int i = 0; i < 4; i++) ((uint64_t *) hash_.hash)[i] = a[i];
             }
-            if (LT_U256(hash_, target)){
-                atomicCAS((unsigned long long int*) final_nonce, 0, (unsigned long long int) nonce);
+            if (LE_U256(hash_, target) && atomicCAS(winner_found, 0, 1) == 0){
+                *final_nonce = nonce;
             }
         }
     }

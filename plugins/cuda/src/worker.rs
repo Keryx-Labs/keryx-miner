@@ -70,6 +70,7 @@ pub struct CudaGPUWorker<'gpu> {
 
     rand_state: DeviceBuffer<u64>,
     final_nonce_buff: DeviceBuffer<u64>,
+    winner_found_buff: DeviceBuffer<u32>,
 
     device_id: u32,
     pub workload: usize,
@@ -84,31 +85,34 @@ impl<'gpu> Worker for CudaGPUWorker<'gpu> {
         format!("#{} ({})", self.device_id, device.name().unwrap())
     }
 
-    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]) {
+    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]) -> Result<(), Error> {
         let u8matrix: Arc<[[u8; 64]; 64]> = Arc::new(matrix.map(|row| row.map(|v| v as u8)));
-        let mut hash_header_gpu = self._module.get_global::<[u8; 72]>(&CString::new("hash_header").unwrap()).unwrap();
-        hash_header_gpu.copy_from(hash_header).map_err(|e| e.to_string()).unwrap();
+        let mut hash_header_gpu = self._module.get_global::<[u8; 72]>(&CString::new("hash_header").unwrap())?;
+        hash_header_gpu.copy_from(hash_header)?;
 
-        let mut matrix_gpu = self._module.get_global::<[[u8; 64]; 64]>(&CString::new("matrix").unwrap()).unwrap();
-        matrix_gpu.copy_from(&u8matrix).map_err(|e| e.to_string()).unwrap();
+        let mut matrix_gpu = self._module.get_global::<[[u8; 64]; 64]>(&CString::new("matrix").unwrap())?;
+        matrix_gpu.copy_from(&u8matrix)?;
 
-        let mut target_gpu = self._module.get_global::<[u64; 4]>(&CString::new("target").unwrap()).unwrap();
-        target_gpu.copy_from(target).map_err(|e| e.to_string()).unwrap();
+        let mut target_gpu = self._module.get_global::<[u64; 4]>(&CString::new("target").unwrap())?;
+        target_gpu.copy_from(target)?;
+        Ok(())
     }
 
     #[inline(always)]
-    fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) {
+    fn calculate_hash(&mut self, _nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) -> Result<(), Error> {
         let func = &self.heavy_hash_kernel.func;
         let stream = &self.stream;
         let random: u8 = match self.random {
             NonceGenEnum::Lean => {
-                self.rand_state.copy_from(&[rand::thread_rng().next_u64()]).unwrap();
+                self.rand_state.copy_from(&[rand::thread_rng().next_u64()])?;
                 0
             }
             NonceGenEnum::Xoshiro => 1,
         };
 
-        self.start_event.record(stream).unwrap();
+        self.final_nonce_buff.copy_from(&[0])?;
+        self.winner_found_buff.copy_from(&[0])?;
+        self.start_event.record(stream)?;
         unsafe {
             launch!(
                 func<<<
@@ -119,12 +123,18 @@ impl<'gpu> Worker for CudaGPUWorker<'gpu> {
                     self.workload,
                     random,
                     self.rand_state.as_device_ptr(),
-                    self.final_nonce_buff.as_device_ptr()
+                    self.final_nonce_buff.as_device_ptr(),
+                    self.winner_found_buff.as_device_ptr()
                 )
-            )
-            .unwrap(); // We see errors in sync
+            )?;
         }
-        self.stop_event.record(stream).unwrap();
+        if let Err(error) = self.stop_event.record(stream) {
+            // The kernel may already be using the shared winner buffers. Drain the stream before
+            // returning so recovery cannot reset them underneath an in-flight launch.
+            stream.synchronize()?;
+            return Err(Box::new(error));
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -142,9 +152,15 @@ impl<'gpu> Worker for CudaGPUWorker<'gpu> {
     }
 
     #[inline(always)]
-    fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error> {
-        self.final_nonce_buff.copy_to(nonces)?;
-        Ok(())
+    fn read_winner(&mut self) -> Result<Option<u64>, Error> {
+        let mut found = [0u32; 1];
+        self.winner_found_buff.copy_to(&mut found)?;
+        if found[0] == 0 {
+            return Ok(None);
+        }
+        let mut nonce = [0u64; 1];
+        self.final_nonce_buff.copy_to(&mut nonce)?;
+        Ok(Some(nonce[0]))
     }
 }
 
@@ -422,6 +438,7 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         heavy_hash_kernel.set_workload(chosen_workload);
 
         let final_nonce_buff = vec![0u64; 1].as_slice().as_dbuf()?;
+        let winner_found_buff = vec![0u32; 1].as_slice().as_dbuf()?;
 
         let rand_state: DeviceBuffer<u64> = match random {
             NonceGenEnum::Xoshiro => {
@@ -459,8 +476,29 @@ impl<'gpu> CudaGPUWorker<'gpu> {
             stream,
             rand_state,
             final_nonce_buff,
+            winner_found_buff,
             heavy_hash_kernel,
             random,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an NVIDIA GPU"]
+    fn publishes_nonce_zero_from_multiple_blocks() {
+        cust::init(cust::CudaFlags::empty()).expect("initialize CUDA");
+        let mut worker = CudaGPUWorker::new(0, 4096.0, true, false, NonceGenEnum::Lean)
+            .expect("create CUDA worker");
+        worker.load_block_constants(&[0; 72], &[[0; 64]; 64], &[u64::MAX; 4]).expect("load CUDA constants");
+
+        for _ in 0..100 {
+            worker.calculate_hash(None, 0, 0).expect("launch CUDA kernel");
+            worker.sync().expect("synchronize CUDA kernel");
+            assert_eq!(worker.read_winner().unwrap(), Some(0));
+        }
     }
 }
