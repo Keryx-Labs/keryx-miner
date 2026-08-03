@@ -275,6 +275,10 @@ impl MinerManager {
     }
 
     pub async fn process_block(&mut self, block: Option<BlockSeed>) -> Result<(), Error> {
+        if block.is_some() && self.opoi_challenge_active.load(Ordering::SeqCst) {
+            info!("OPoI inference owns the GPU — refusing to resume PoW until inference completes");
+            return Ok(());
+        }
         let state = match block {
             Some(b) => {
                 self.is_synced = true;

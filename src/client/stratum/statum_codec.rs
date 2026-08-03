@@ -7,6 +7,8 @@ use std::fmt::{Display, Formatter};
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 
+const MAX_STRATUM_LINE_LENGTH: usize = 1024 * 1024;
+
 #[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
 pub enum ErrorCode {
@@ -159,7 +161,7 @@ pub(crate) struct NewLineJsonCodec {
 
 impl NewLineJsonCodec {
     pub fn new() -> Self {
-        Self { lines_codec: LinesCodec::new() }
+        Self { lines_codec: LinesCodec::new_with_max_length(MAX_STRATUM_LINE_LENGTH) }
     }
 }
 
@@ -197,6 +199,18 @@ impl Encoder<StratumLine> for NewLineJsonCodec {
                 Err(NewLineJsonCodecError::JsonEncodeError)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_stratum_frame_is_rejected() {
+        let mut codec = NewLineJsonCodec::new();
+        let mut input = BytesMut::from(vec![b'x'; MAX_STRATUM_LINE_LENGTH + 1].as_slice());
+        assert!(codec.decode(&mut input).is_err());
     }
 }
 
