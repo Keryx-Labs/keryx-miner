@@ -6,7 +6,7 @@ use std::ffi::CStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +14,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const STATS_READ_TIMEOUT_SECS: u64 = 5;
 const STATS_WRITE_TIMEOUT_SECS: u64 = 5;
 const MAX_REQUEST_LINE_BYTES: usize = 4096;
+const MAX_STATS_CONNECTIONS: usize = 8;
+
+struct StatsConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl StatsConnectionPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_STATS_CONNECTIONS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Self { active: Arc::clone(active) })
+    }
+}
+
+impl Drop for StatsConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 static NVML_HANDLE: OnceLock<Option<Nvml>> = OnceLock::new();
 
@@ -593,11 +615,16 @@ DEVICE #1:
 pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind((bind_addr.as_str(), port))?;
     Ok(thread::spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let Some(permit) = StatsConnectionPermit::acquire(&active) else {
+                        continue;
+                    };
                     let stats = Arc::clone(&stats);
-                    thread::spawn(move || {
+                    let _ = thread::Builder::new().name("keryx-stats".into()).spawn(move || {
+                        let _permit = permit;
                         let _ = handle_connection(stream, &stats);
                     });
                 }
@@ -734,8 +761,15 @@ fn parse_u32_field(value: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{logical_device_number, normalize_pci_bus_id};
+    use super::{
+        handle_connection, logical_device_number, normalize_pci_bus_id, MinerStats, StatsConnectionPermit,
+        MAX_STATS_CONNECTIONS, STATS_READ_TIMEOUT_SECS,
+    };
     use std::collections::HashMap;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn logical_device_number_follows_cuda_pci_mapping() {
@@ -753,5 +787,32 @@ mod tests {
         let cuda_bus_ids = HashMap::new();
 
         assert_eq!(logical_device_number("00000000:01:00.0", 2, &cuda_bus_ids), Some(2));
+    }
+
+    #[test]
+    fn stats_connection_limit_is_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permits: Vec<_> = (0..MAX_STATS_CONNECTIONS)
+            .map(|_| StatsConnectionPermit::acquire(&active).expect("slot should be available"))
+            .collect();
+
+        assert!(StatsConnectionPermit::acquire(&active).is_none());
+        assert_eq!(active.load(Ordering::Acquire), MAX_STATS_CONNECTIONS);
+        drop(permits);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(StatsConnectionPermit::acquire(&active).is_some());
+    }
+
+    #[test]
+    fn stalled_stats_connection_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let started = Instant::now();
+
+        handle_connection(server, &MinerStats::new()).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_secs(STATS_READ_TIMEOUT_SECS - 1));
+        drop(client);
     }
 }
