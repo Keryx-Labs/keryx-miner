@@ -57,6 +57,7 @@ impl BlockSeed {
         }
     }
 
+    #[allow(dead_code)]
     pub fn device_id(&self) -> &str {
         match self {
             BlockSeed::FullBlock { device_id, .. } => device_id,
@@ -132,9 +133,9 @@ impl State {
         let nonce_mask: u64;
         let nonce_fixed: u64;
         let daa_score: u64;
-        match block_seed {
-            BlockSeed::FullBlock { block: ref block, .. } => {
-                let header = &block.header.as_ref().ok_or("Header is missing")?;
+        match &block_seed {
+            BlockSeed::FullBlock { block, .. } => {
+                let header = block.header.as_ref().ok_or("Header is missing")?;
 
                 header_target = target::u256_from_compact_target(header.bits);
                 let mut hasher = HeaderHasher::new();
@@ -158,8 +159,8 @@ impl State {
                 header_timestamp = *timestamp;
                 header_target = *target;
                 daa_score = *block_daa_score;
-                nonce_mask = mask;
-                nonce_fixed = fixed
+                nonce_mask = *mask;
+                nonce_fixed = *fixed
             }
         }
 
@@ -206,12 +207,12 @@ impl State {
     pub fn generate_block_if_pow(&self, nonce: u64) -> Option<BlockSeed> {
         self.check_pow(nonce).then(|| {
             let mut block_seed = (*self.block).clone();
-            match block_seed {
-                BlockSeed::FullBlock { block: ref mut block, .. } => {
-                    let header = &mut block.header.as_mut().expect("We checked that a header exists on creation");
+            match &mut block_seed {
+                BlockSeed::FullBlock { block, .. } => {
+                    let header = block.header.as_mut().expect("We checked that a header exists on creation");
                     header.nonce = nonce;
                 }
-                BlockSeed::PartialBlock { nonce: ref mut header_nonce, ref mut hash, .. } => {
+                BlockSeed::PartialBlock { nonce: header_nonce, hash, .. } => {
                     *header_nonce = nonce;
                     *hash = Some(format!("{:x}", self.calculate_pow(nonce)))
                 }
@@ -267,8 +268,8 @@ impl State {
         let bytes = proof.to_wire_bytes();
 
         let mut block_seed = (*self.block).clone();
-        match block_seed {
-            BlockSeed::FullBlock { block: ref mut block, .. } => {
+        match &mut block_seed {
+            BlockSeed::FullBlock { block, .. } => {
                 let header = block.header.as_mut().expect("We checked that a header exists on creation");
                 header.nonce = nonce;
                 // H3: the header commits to the walk's final state — fill it exactly like the
