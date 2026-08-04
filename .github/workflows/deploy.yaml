@@ -64,6 +64,7 @@ jobs:
           mkdir ${asset_name}
           mv ./target/x86_64-unknown-linux-gnu/release/kaspa-miner ${asset_name}/${asset_name}
           mv ./target/x86_64-unknown-linux-gnu/release/libkaspa*.so ${asset_name}/
+          cp ./assets/coin-sound-LICENSE.txt ${asset_name}/coin-sound-LICENSE.txt
           tar czvf ${asset_name}.tgz ${asset_name}
           echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV
@@ -80,6 +81,7 @@ jobs:
           mv ./target/x86_64-pc-windows-msvc/release/kaspa-miner.exe ${asset_name}/${asset_name}.exe
           mv ./target/x86_64-pc-windows-msvc/release/kaspa*.dll ${asset_name}/
           bash ./integrations/windows/create_bat.sh ${asset_name}
+          cp ./assets/coin-sound-LICENSE.txt ${asset_name}/coin-sound-LICENSE.txt
           7z a -tzip -r ${asset_name}.zip ${asset_name}
           echo "archive=${asset_name}.zip" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.zip" >> $GITHUB_ENV
@@ -91,6 +93,7 @@ jobs:
           asset_name="kaspa-miner-${{ github.event.release.tag_name }}-cpu-only-osx-amd64"
           mkdir ${asset_name}
           mv ./target/x86_64-apple-darwin/release/kaspa-miner ${asset_name}/${asset_name}
+          cp ./assets/coin-sound-LICENSE.txt ${asset_name}/coin-sound-LICENSE.txt
           tar czvf ${asset_name}.tgz ${asset_name}
           echo "archive=${asset_name}.tgz" >> $GITHUB_ENV
           echo "asset_name=${asset_name}.tgz" >> $GITHUB_ENV

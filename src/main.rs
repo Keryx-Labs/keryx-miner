@@ -29,6 +29,7 @@ use crate::target::Uint256;
 use crate::ui::{spawn_ui, UiState};
 
 mod cli;
+mod block_sound;
 mod client;
 mod escrow;
 mod ipfs;

@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use time::{macros::format_description, OffsetDateTime};
 
+use crate::block_sound::BlockSoundPlayer;
 use crate::stats::MinerStats;
 
 const MAX_LOG_LINES: usize = 2000;
@@ -21,27 +22,52 @@ const MIN_LOG_ROWS: u16 = 5;
 const BLOCK_CELEBRATION_DURATION: Duration = Duration::from_millis(2500);
 const BLOCK_COIN_FRAME_RATE: Duration = Duration::from_millis(100);
 const BLOCK_COIN_FRAME_COUNT: usize = 25;
-const BLOCK_COIN_PIXEL_WIDTH: usize = 2;
-// 18x18 indexed-color raster generated from the approved pixel coin concept.
-const BLOCK_COIN_ART: [&str; 18] = [
-    "...BBGGGHHGGGBB...",
-    "..BGHHHHHHHHHHGB..",
-    "..GHBBGGGGGGBBHG..",
-    ".GHBGGHHHHHHGGBHG.",
-    "BGBGHHHKHHHHHHGBGB",
-    "BGBGHHKKHHKKHHGBGB",
-    "BHBGHHKKHKKKHBGBDB",
-    "BGBGHHKKKKDHHBGBDB",
-    "BHBGHHKKKHHHHBGBDB",
-    "BHBGHHKKKKHHHBGBDB",
-    "BGBGHHKKHKDHHBGBDB",
-    "BGBGHHKKHHKKHBGBDB",
-    "BGBGHHKKHHHHHBGBDB",
-    "BGBGHHHKHHHHBHGBDB",
-    ".GGBGGHHHHHHGGBDG.",
-    "..GGBBGGGGGGBBDG..",
-    "..BGGGGGGGGGGDGB..",
-    "...BBGGGDDGGGBB...",
+const BLOCK_COIN_WIDTH: usize = 24;
+const BLOCK_COIN_HEIGHT: usize = 24;
+const BLOCK_COIN_PALETTE: [(u8, u8, u8); 15] = [
+    (254, 214, 86),
+    (247, 200, 75),
+    (245, 194, 67),
+    (242, 190, 67),
+    (238, 179, 51),
+    (234, 167, 34),
+    (225, 164, 44),
+    (216, 152, 38),
+    (211, 136, 24),
+    (204, 124, 18),
+    (166, 108, 28),
+    (129, 73, 18),
+    (113, 59, 12),
+    (62, 48, 31),
+    (19, 20, 26),
+];
+// 24x24 indexed raster generated from the approved coin image. Each terminal
+// row renders two image rows through a foreground/background half block.
+const BLOCK_COIN_ART: [&[u8; BLOCK_COIN_WIDTH]; BLOCK_COIN_HEIGHT] = [
+    b"000000edddddddddde000000",
+    b"00ef552111111111234cfe00",
+    b"0fa921177777777741179a00",
+    b"0fa5488aaaaaaaaaa8815a00",
+    b"0515966655444444666a42c0",
+    b"063766524c422222256a71c0",
+    b"d44a6432be7222222349a2ad",
+    b"d25a5212efc23eff2226ab7d",
+    b"d17a3222efc27fff17769c7d",
+    b"d17a3222efc8eebb17969c7d",
+    b"d37a3222efefe14327969c7d",
+    b"d28a3222efff842227969c7d",
+    b"d28a3222efffe14227969c7d",
+    b"d57a3222efc8fe8827969c7d",
+    b"d57a3222efc18fff17969c7d",
+    b"d57a3422efc22fff17969c7d",
+    b"d57a6222efc222115a46ac6d",
+    b"d56a6432cfc2222474499cad",
+    b"065866527d8777745569acc0",
+    b"0a859a966666666699a88ad0",
+    b"0fa3699a9aaaaaa9a89b8a00",
+    b"0fa95558888888887bb89b00",
+    b"0000bcb888bdd8987acd0000",
+    b"000000edcdddddddce000000",
 ];
 
 #[derive(Copy, Clone)]
@@ -329,15 +355,23 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
             u64,
             u64,
             bool,
+            bool,
         )> = None;
         let mut last_drawn_at = Instant::now();
         let mut last_block_coin_frame = None;
         let mut last_accepted_blocks = stats.snapshot().accepted_blocks;
         let mut block_celebration_started: Option<Instant> = None;
         let mut block_celebrations_enabled = true;
+        let mut block_celebration_sound_enabled = true;
+        let block_sound = BlockSoundPlayer::new();
 
         while !stop_clone.load(Ordering::Acquire) {
-            if handle_input(&ui_state, &shutdown_requested, &mut block_celebrations_enabled) {
+            if handle_input(
+                &ui_state,
+                &shutdown_requested,
+                &mut block_celebrations_enabled,
+                &mut block_celebration_sound_enabled,
+            ) {
                 break;
             }
             if !block_celebrations_enabled {
@@ -372,8 +406,19 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
             };
 
             let snapshot = stats.snapshot();
-            if block_celebrations_enabled && snapshot.accepted_blocks > last_accepted_blocks {
+            let (start_visual, play_sound) = block_celebration_actions(
+                last_accepted_blocks,
+                snapshot.accepted_blocks,
+                block_celebrations_enabled,
+                block_celebration_sound_enabled,
+            );
+            if start_visual {
                 block_celebration_started = Some(Instant::now());
+            }
+            if play_sound {
+                if let Some(player) = &block_sound {
+                    player.play();
+                }
             }
             last_accepted_blocks = snapshot.accepted_blocks;
             let block_coin_frame = block_celebration_started
@@ -392,6 +437,7 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
                 snapshot.accepted_blocks,
                 snapshot.rejected_blocks,
                 block_celebrations_enabled,
+                block_celebration_sound_enabled,
             );
             let animation_ended = last_block_coin_frame.is_some() && block_coin_frame.is_none();
             let periodic_refresh_due =
@@ -694,7 +740,12 @@ fn draw_frame(
             bold: false,
         },
         PanelRow::Plain {
-            text: if compact { " B Block FX" } else { " B            Block animation" }.to_string(),
+            text: if compact { " B Visual" } else { " B            Block visual" }.to_string(),
+            fg: palette().text,
+            bold: false,
+        },
+        PanelRow::Plain {
+            text: if compact { " M Sound" } else { " M            Block sound" }.to_string(),
             fg: palette().text,
             bold: false,
         },
@@ -932,9 +983,9 @@ fn draw_frame(
             ),
             (
                 if compact {
-                    "| U/D Scroll  Pg Fast  Home/End  B FX"
+                    "| U/D Scroll  Pg Fast  Home/End  B Visual  M Sound"
                 } else {
-                    "| Up/Down Scroll  PgUp/PgDn Fast  Home Oldest  End Live  B Block FX"
+                    "| Up/Down Scroll  PgUp/PgDn Fast  Home Oldest  End Live  B Visual  M Sound"
                 }
                 .to_string(),
                 palette().text,
@@ -976,6 +1027,11 @@ fn draw_frame(
     let _ = out.flush();
 }
 
+fn block_celebration_actions(previous: u64, current: u64, visual: bool, sound: bool) -> (bool, bool) {
+    let accepted = current > previous;
+    (accepted && visual, accepted && sound)
+}
+
 fn block_animation_frame(elapsed: Duration) -> Option<usize> {
     if elapsed >= BLOCK_CELEBRATION_DURATION {
         return None;
@@ -988,13 +1044,10 @@ fn block_animation_frame(elapsed: Duration) -> Option<usize> {
 
 fn draw_block_celebration(out: &mut std::io::Stdout, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
     let title = format!("KRX BLOCK ACCEPTED  #{}", accepted_blocks);
-    let art_width = BLOCK_COIN_ART
-        .iter()
-        .map(|line| line.chars().count() * BLOCK_COIN_PIXEL_WIDTH)
-        .max()
-        .unwrap_or(0);
+    let art_width = BLOCK_COIN_WIDTH;
+    let art_height = BLOCK_COIN_HEIGHT / 2;
     let overlay_width = art_width.max(title.len() + 2);
-    let overlay_height = BLOCK_COIN_ART.len() + 2;
+    let overlay_height = art_height + 2;
 
     if (w as usize) < overlay_width || (h as usize) < overlay_height {
         if h > 0 {
@@ -1013,82 +1066,60 @@ fn draw_block_celebration(out: &mut std::io::Stdout, w: u16, h: u16, frame: usiz
         y,
         title.len() + 2,
         &format!(" {} ", title),
-        block_coin_color('H', false),
+        block_coin_color(0, false),
         palette().panel,
         true,
     );
 
-    let logical_width = art_width / BLOCK_COIN_PIXEL_WIDTH;
-    let sweep = frame * (logical_width + 4) / (BLOCK_COIN_FRAME_COUNT - 1);
+    let sweep = frame * (art_width + 4) / (BLOCK_COIN_FRAME_COUNT - 1);
     let art_x = x + ((overlay_width - art_width) / 2) as u16;
-    for (row, line) in BLOCK_COIN_ART.iter().enumerate() {
-        for (column, glyph) in line.chars().enumerate() {
-            if glyph == '.' {
-                if block_coin_halo(row, column) {
-                    let _ = queue!(
-                        out,
-                        MoveTo(art_x + (column * BLOCK_COIN_PIXEL_WIDTH) as u16, y + row as u16 + 2),
-                        SetBackgroundColor(palette().panel),
-                        Print("  "),
-                        ResetColor
-                    );
-                }
+    for row in 0..art_height {
+        for column in 0..art_width {
+            let top = block_coin_pixel(row * 2, column);
+            let bottom = block_coin_pixel(row * 2 + 1, column);
+            if top.is_none() && bottom.is_none() {
                 continue;
             }
-            let color = block_coin_color(glyph, glyph != 'K' && column.abs_diff(sweep) <= 1);
+
+            let highlighted = column.abs_diff(sweep) <= 1;
             let _ = queue!(
                 out,
-                MoveTo(art_x + (column * BLOCK_COIN_PIXEL_WIDTH) as u16, y + row as u16 + 2),
-                SetBackgroundColor(color),
-                Print("  "),
+                MoveTo(art_x + column as u16, y + row as u16 + 2),
+                SetForegroundColor(top.map(|index| block_coin_color(index, highlighted)).unwrap_or(palette().panel)),
+                SetBackgroundColor(bottom.map(|index| block_coin_color(index, highlighted)).unwrap_or(palette().panel)),
+                Print("▀"),
                 ResetColor
             );
         }
     }
 }
 
-fn block_coin_halo(row: usize, column: usize) -> bool {
-    let row_start = row.saturating_sub(1);
-    let row_end = (row + 1).min(BLOCK_COIN_ART.len() - 1);
-    let column_start = column.saturating_sub(1);
-    let column_end = (column + 1).min(BLOCK_COIN_ART[0].len() - 1);
-
-    BLOCK_COIN_ART[row_start..=row_end].iter().any(|line| {
-        line.as_bytes()[column_start..=column_end]
-            .iter()
-            .any(|pixel| *pixel != b'.')
-    })
+fn block_coin_pixel(row: usize, column: usize) -> Option<usize> {
+    match BLOCK_COIN_ART[row][column] {
+        b'1'..=b'9' => Some((BLOCK_COIN_ART[row][column] - b'1') as usize),
+        b'a'..=b'f' => Some((BLOCK_COIN_ART[row][column] - b'a' + 9) as usize),
+        _ => None,
+    }
 }
 
-fn block_coin_color(glyph: char, highlighted: bool) -> Color {
-    let truecolor = matches!(palette().warn, Color::Rgb { .. });
+fn block_coin_color(index: usize, highlighted: bool) -> Color {
+    let (mut r, mut g, mut b) = BLOCK_COIN_PALETTE[index];
     if highlighted {
-        return if truecolor {
-            Color::Rgb { r: 0xff, g: 0xf4, b: 0xb0 }
-        } else {
-            Color::AnsiValue(230)
-        };
+        r = r.saturating_add(28);
+        g = g.saturating_add(28);
+        b = b.saturating_add(20);
     }
 
+    let truecolor = matches!(palette().warn, Color::Rgb { .. });
     if truecolor {
-        match glyph {
-            'K' => Color::Rgb { r: 0x17, g: 0x1a, b: 0x20 },
-            'D' => Color::Rgb { r: 0x6f, g: 0x35, b: 0x0c },
-            'B' => Color::Rgb { r: 0xa9, g: 0x57, b: 0x0d },
-            'G' => Color::Rgb { r: 0xe8, g: 0xa5, b: 0x1f },
-            'H' => Color::Rgb { r: 0xff, g: 0xdd, b: 0x67 },
-            _ => palette().panel,
-        }
+        Color::Rgb { r, g, b }
     } else {
-        match glyph {
-            'K' => Color::AnsiValue(235),
-            'D' => Color::AnsiValue(94),
-            'B' => Color::AnsiValue(136),
-            'G' => Color::AnsiValue(178),
-            'H' => Color::AnsiValue(221),
-            _ => palette().panel,
-        }
+        Color::AnsiValue(16 + 36 * ansi_level(r) + 6 * ansi_level(g) + ansi_level(b))
     }
+}
+
+fn ansi_level(value: u8) -> u8 {
+    ((value as u16 * 5 + 127) / 255) as u8
 }
 
 fn draw_colored_line(
@@ -1274,6 +1305,7 @@ fn handle_input(
     ui_state: &UiState,
     shutdown_requested: &AtomicBool,
     block_celebrations_enabled: &mut bool,
+    block_celebration_sound_enabled: &mut bool,
 ) -> bool {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let Ok(Event::Key(key)) = event::read() else {
@@ -1306,6 +1338,17 @@ fn handle_input(
                         "Block celebration animation enabled"
                     } else {
                         "Block celebration animation disabled"
+                    },
+                );
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                *block_celebration_sound_enabled = !*block_celebration_sound_enabled;
+                ui_state.push_log(
+                    Level::Info,
+                    if *block_celebration_sound_enabled {
+                        "Block celebration sound enabled"
+                    } else {
+                        "Block celebration sound muted"
                     },
                 );
             }
@@ -1449,12 +1492,23 @@ mod tests {
     }
 
     #[test]
-    fn block_coin_art_is_a_complete_indexed_grid() {
-        let art = BLOCK_COIN_ART.join("\n");
-        assert!(BLOCK_COIN_ART.iter().all(|row| row.chars().count() == 18));
-        assert!(['D', 'B', 'G', 'H', 'K'].into_iter().all(|pixel| art.contains(pixel)));
-        assert!(!block_coin_halo(0, 0));
-        assert!(block_coin_halo(0, 2));
+    fn block_visual_and_sound_controls_are_independent() {
+        assert_eq!(block_celebration_actions(1, 1, true, true), (false, false));
+        assert_eq!(block_celebration_actions(1, 2, true, false), (true, false));
+        assert_eq!(block_celebration_actions(1, 2, false, true), (false, true));
+        assert_eq!(block_celebration_actions(1, 2, false, false), (false, false));
+    }
+
+    #[test]
+    fn block_coin_art_is_a_complete_half_block_image() {
+        assert_eq!(BLOCK_COIN_ART.len(), BLOCK_COIN_HEIGHT);
+        assert!(BLOCK_COIN_ART.iter().all(|row| row.len() == BLOCK_COIN_WIDTH));
+        assert_eq!(BLOCK_COIN_HEIGHT % 2, 0);
+        assert!(BLOCK_COIN_ART.iter().flat_map(|row| row.iter()).any(|pixel| *pixel == b'0'));
+        assert!(BLOCK_COIN_ART.iter().flat_map(|row| row.iter()).any(|pixel| *pixel == b'f'));
+        assert_eq!(block_coin_pixel(0, 0), None);
+        assert_eq!(block_coin_pixel(0, 6), Some(13));
+        assert_eq!(BLOCK_COIN_PALETTE.len(), 15);
     }
 }
 
