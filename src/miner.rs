@@ -388,12 +388,13 @@ impl MinerManager {
                                 let idx = keryx_miner::pom::active_index_for_tier(tier)?;
                                 s.generate_block_if_pom(nonce, idx.as_ref(), tier)
                             });
-                            if let Some(block_seed) = built {
+                            if let Some(mut block_seed) = built {
+                                block_seed.set_device_id(&device_id);
                                 match send_channel.blocking_send(block_seed.clone()) {
                                     Ok(()) => block_seed.report_block(&gpu_work.id()),
                                     Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
                                 };
-                                if let BlockSeed::FullBlock(_) = &block_seed {
+                                if let BlockSeed::FullBlock { .. } = &block_seed {
                                     stats.inc_device_blocks_found(&device_id);
                                     state = None;
                                 }
@@ -425,12 +426,13 @@ impl MinerManager {
                     // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
                     // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
                     if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {
-                        if let Some(block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
+                        if let Some(mut block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
+                            block_seed.set_device_id(&device_id);
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(&gpu_work.id()),
                                 Err(e) => error!("Failed submitting block: ({})", e.to_string()),
                             };
-                            if let BlockSeed::FullBlock(_) = &block_seed {
+                            if let BlockSeed::FullBlock { .. } = &block_seed {
                                 stats.inc_device_blocks_found(&device_id);
                                 state = None;
                             }
@@ -550,12 +552,13 @@ impl MinerManager {
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)
                     };
-                    if let Some(block_seed) = found {
+                    if let Some(mut block_seed) = found {
+                        block_seed.set_device_id("CPU");
                         match send_channel.blocking_send(block_seed.clone()) {
                             Ok(()) => block_seed.report_block("CPU"),
                             Err(e) => error!("Failed submitting block: ({})", e.to_string()),
                         };
-                        if let BlockSeed::FullBlock(_) = &block_seed {
+                        if let BlockSeed::FullBlock { .. } = &block_seed {
                             stats.inc_device_blocks_found("CPU");
                             state = None;
                         }

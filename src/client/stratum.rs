@@ -316,7 +316,7 @@ impl StratumHandler {
             while let Some(seed) = recv_stream.next().await {
                 let (nonce, job_id) = match seed {
                     BlockSeed::PartialBlock { nonce, id, .. } => (nonce, id),
-                    BlockSeed::FullBlock(_) => unreachable!(),
+                    BlockSeed::FullBlock { .. } => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
                 share_stats.shares_pending.try_lock().unwrap().insert(msg_id, job_id.clone());

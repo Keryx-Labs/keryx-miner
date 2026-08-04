@@ -23,7 +23,10 @@ mod xoshiro;
 
 #[derive(Clone, Debug)]
 pub enum BlockSeed {
-    FullBlock(Box<RpcBlock>),
+    FullBlock {
+        block: Box<RpcBlock>,
+        device_id: String,
+    },
     PartialBlock {
         id: String,
         header_hash: [u64; 4],
@@ -40,7 +43,7 @@ pub enum BlockSeed {
 impl BlockSeed {
     pub fn report_block(&self, device: &str) {
         match self {
-            BlockSeed::FullBlock(block) => {
+            BlockSeed::FullBlock { block, .. } => {
                 let block_hash =
                     block.block_hash().expect("We just got it from the state, we should be able to hash it");
                 let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
@@ -51,6 +54,19 @@ impl BlockSeed {
                 info!("{}", format_block_found_message(device, &format!("{:x}", block_hash), &block_time_text));
             }
             BlockSeed::PartialBlock { .. } => info!("{}", format_share_found_message(device)),
+        }
+    }
+
+    pub fn device_id(&self) -> &str {
+        match self {
+            BlockSeed::FullBlock { device_id, .. } => device_id,
+            BlockSeed::PartialBlock { .. } => "",
+        }
+    }
+
+    pub fn set_device_id(&mut self, device_id: &str) {
+        if let BlockSeed::FullBlock { device_id: target, .. } = self {
+            *target = device_id.to_string();
         }
     }
 }
@@ -65,7 +81,7 @@ fn format_share_found_message(device: &str) -> String {
 
 #[cfg(test)]
 mod reporting_tests {
-    use super::{format_block_found_message, format_share_found_message};
+    use super::{format_block_found_message, format_share_found_message, BlockSeed};
 
     #[test]
     fn formats_block_found_message_with_device() {
@@ -78,6 +94,15 @@ mod reporting_tests {
     #[test]
     fn formats_share_found_message_with_device() {
         assert_eq!(format_share_found_message("CPU"), "Found a share on CPU");
+    }
+
+    #[test]
+    fn preserves_device_id_for_full_blocks() {
+        let seed = BlockSeed::FullBlock {
+            block: Box::new(crate::proto::RpcBlock::default()),
+            device_id: "GPU #2".to_string(),
+        };
+        assert_eq!(seed.device_id(), "GPU #2");
     }
 }
 
@@ -108,7 +133,7 @@ impl State {
         let nonce_fixed: u64;
         let daa_score: u64;
         match block_seed {
-            BlockSeed::FullBlock(ref block) => {
+            BlockSeed::FullBlock { block: ref block, .. } => {
                 let header = &block.header.as_ref().ok_or("Header is missing")?;
 
                 header_target = target::u256_from_compact_target(header.bits);
@@ -182,7 +207,7 @@ impl State {
         self.check_pow(nonce).then(|| {
             let mut block_seed = (*self.block).clone();
             match block_seed {
-                BlockSeed::FullBlock(ref mut block) => {
+                BlockSeed::FullBlock { block: ref mut block, .. } => {
                     let header = &mut block.header.as_mut().expect("We checked that a header exists on creation");
                     header.nonce = nonce;
                 }
@@ -243,7 +268,7 @@ impl State {
 
         let mut block_seed = (*self.block).clone();
         match block_seed {
-            BlockSeed::FullBlock(ref mut block) => {
+            BlockSeed::FullBlock { block: ref mut block, .. } => {
                 let header = block.header.as_mut().expect("We checked that a header exists on creation");
                 header.nonce = nonce;
                 // H3: the header commits to the walk's final state — fill it exactly like the
