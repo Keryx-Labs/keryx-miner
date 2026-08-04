@@ -5,13 +5,15 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const STATS_READ_TIMEOUT_SECS: u64 = 5;
 const STATS_WRITE_TIMEOUT_SECS: u64 = 5;
 const MAX_REQUEST_LINE_BYTES: usize = 4096;
+
+static NVML_HANDLE: OnceLock<Option<Nvml>> = OnceLock::new();
 
 #[derive(Default)]
 pub struct MinerStats {
@@ -33,6 +35,7 @@ pub struct MinerStats {
     device_blocks_found: Mutex<HashMap<String, u64>>,
     device_blocks_rejected: Mutex<HashMap<String, u64>>,
     gpu_telemetry: Mutex<HashMap<u32, GpuTelemetry>>,
+    gpu_memory_temp_supported: Mutex<HashMap<u32, bool>>,
     hiveos: AtomicBool,
 }
 
@@ -98,6 +101,7 @@ impl MinerStats {
             device_blocks_found: Mutex::new(HashMap::new()),
             device_blocks_rejected: Mutex::new(HashMap::new()),
             gpu_telemetry: Mutex::new(HashMap::new()),
+            gpu_memory_temp_supported: Mutex::new(HashMap::new()),
             hiveos: AtomicBool::new(hiveos),
         }
     }
@@ -164,7 +168,8 @@ impl MinerStats {
         let mut nvml_memory_temps = HashMap::new();
         let mut nvml_fallbacks = HashMap::new();
 
-        if let Ok(nvml) = Nvml::init() {
+        let nvml = NVML_HANDLE.get_or_init(|| Nvml::init().ok());
+        if let Some(nvml) = nvml.as_ref() {
             if let Ok(device_count) = nvml.device_count() {
                 for idx in 0..device_count {
                     let Ok(device) = nvml.device_by_index(idx) else {
@@ -212,7 +217,12 @@ impl MinerStats {
             fresh = nvml_fallbacks.clone();
         }
 
-        let should_query_nvidia_smi = should_query_nvidia_smi(&fresh, self.hiveos.load(Ordering::Acquire));
+        let mut memory_temp_supported = self.gpu_memory_temp_supported.lock().expect("gpu telemetry mutex poisoned");
+        let should_query_nvidia_smi = should_query_nvidia_smi(
+            &fresh,
+            &memory_temp_supported,
+            self.hiveos.load(Ordering::Acquire),
+        );
         let output = if should_query_nvidia_smi {
             Some(
                 Command::new("nvidia-smi")
@@ -236,7 +246,8 @@ impl MinerStats {
                     let fan_percent = parts.next().and_then(parse_u32_field);
                     let power_draw_w = parts.next().and_then(parse_f32_field);
 
-                    if let Some(telemetry) = fresh.get_mut(&(idx as u32)) {
+                    let gpu_idx = idx as u32;
+                    if let Some(telemetry) = fresh.get_mut(&gpu_idx) {
                         telemetry.temp_c = prefer_nvml_u32_or_nvidia_smi(telemetry.temp_c, temp_c);
                         telemetry.memory_temp_c = normalize_memory_temp_c(
                             nvidia_smi_memory_temp_c,
@@ -246,7 +257,7 @@ impl MinerStats {
                         telemetry.power_draw_w = prefer_nvml_f32_or_nvidia_smi(telemetry.power_draw_w, power_draw_w);
                     } else {
                         fresh.insert(
-                            idx as u32,
+                            gpu_idx,
                             GpuTelemetry {
                                 temp_c: temp_c,
                                 memory_temp_c: normalize_memory_temp_c(nvidia_smi_memory_temp_c, None),
@@ -255,24 +266,17 @@ impl MinerStats {
                             },
                         );
                     }
+
+                    if !self.hiveos.load(Ordering::Acquire) {
+                        memory_temp_supported.insert(gpu_idx, fresh.get(&gpu_idx).and_then(|entry| entry.memory_temp_c).is_some());
+                    }
                 }
             }
         }
 
-        if fresh.is_empty() {
-            fresh = nvml_fallbacks;
-        }
-
-        let should_clear = fresh.is_empty();
         let has_any_memory_temp = fresh.values().any(|entry| entry.memory_temp_c.is_some());
         if let Ok(mut map) = self.gpu_telemetry.lock() {
             *map = fresh;
-        }
-
-        if should_clear {
-            if let Ok(mut map) = self.gpu_telemetry.lock() {
-                *map = HashMap::new();
-            }
         }
 
         if self.hiveos.load(Ordering::Acquire) && !has_any_memory_temp {
@@ -387,13 +391,19 @@ fn normalize_power_draw_w(nvml_power_mw: Option<f32>, nvidia_smi_power_w: Option
     nvml_power_w.filter(|value| *value > 0.0).or(nvidia_smi_power_w)
 }
 
-fn should_query_nvidia_smi(telemetry: &HashMap<u32, GpuTelemetry>, hiveos: bool) -> bool {
+fn should_query_nvidia_smi(
+    telemetry: &HashMap<u32, GpuTelemetry>,
+    memory_temp_supported: &HashMap<u32, bool>,
+    hiveos: bool,
+) -> bool {
     telemetry.is_empty()
-        || telemetry.values().any(|entry| {
+        || telemetry.iter().any(|(gpu_idx, entry)| {
             entry.temp_c.is_none()
                 || entry.fan_percent.is_none()
                 || entry.power_draw_w.is_none()
-                || (entry.memory_temp_c.is_none() && !hiveos)
+                || (!hiveos
+                    && entry.memory_temp_c.is_none()
+                    && !memory_temp_supported.get(gpu_idx).copied().unwrap_or(false))
         })
 }
 
@@ -507,7 +517,7 @@ DEVICE #1:
             },
         );
 
-        assert!(!should_query_nvidia_smi(&telemetry, false));
+        assert!(!should_query_nvidia_smi(&telemetry, &HashMap::new(), false));
     }
 
     #[test]
@@ -523,9 +533,25 @@ DEVICE #1:
             },
         );
 
-        assert!(should_query_nvidia_smi(&telemetry, false));
+        assert!(should_query_nvidia_smi(&telemetry, &HashMap::new(), false));
     }
+    #[test]
+    fn skips_nvidia_smi_when_memory_temp_is_known_unsupported() {
+        let mut telemetry = HashMap::new();
+        telemetry.insert(
+            0,
+            super::GpuTelemetry {
+                temp_c: Some(70),
+                memory_temp_c: None,
+                fan_percent: Some(80),
+                power_draw_w: Some(250.0),
+            },
+        );
+        let mut supported = HashMap::new();
+        supported.insert(0, false);
 
+        assert!(!should_query_nvidia_smi(&telemetry, &supported, false));
+    }
 }
 
 pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {

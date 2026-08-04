@@ -25,7 +25,7 @@ use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -77,6 +77,10 @@ pub struct KeryxdHandler {
 
     /// Shared flag with MinerManager — suppresses GPU stall warnings during OPoI inference.
     opoi_challenge_active: Option<Arc<AtomicBool>>,
+
+    /// Tracks pending submit-block requests so rejections can be attributed to the worker
+    /// that originated the submission even though the submit response carries no device id.
+    pending_block_submissions: Arc<Mutex<VecDeque<(String, String)>>>,
 
     /// Last DAA score seen in a block template — used to compute challenge_window_end.
     last_known_daa: u64,
@@ -187,7 +191,8 @@ impl KeryxdHandler {
         let (send_channel, recv) = mpsc::channel(1024);
         send_channel.send(GetInfoRequestMessage {}.into()).await?;
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
-        let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone());
+        let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
+        let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
         Ok(Box::new(Self {
             client,
             stream,
@@ -207,6 +212,7 @@ impl KeryxdHandler {
             inference_rx: None,
             challenge_inference_rx: None,
             opoi_challenge_active: None,
+            pending_block_submissions,
             last_known_daa: 0,
             ipfs_url,
             escrow_pubkey,
@@ -214,15 +220,23 @@ impl KeryxdHandler {
         }))
     }
 
-    fn create_block_channel(send_channel: Sender<KaspadMessage>) -> (Sender<BlockSeed>, BlockHandle) {
+    fn create_block_channel(
+        send_channel: Sender<KaspadMessage>,
+        pending_block_submissions: Arc<Mutex<VecDeque<(String, String)>>>,
+    ) -> (Sender<BlockSeed>, BlockHandle) {
         // KaspadMessage::submit_block(block)
         let (send, recv) = mpsc::channel::<BlockSeed>(1);
         (
             send,
             tokio::spawn(async move {
                 ReceiverStream::new(recv)
-                    .map(|block_seed| match block_seed {
-                        FullBlock(block) => KaspadMessage::submit_block(*block),
+                    .map(move |block_seed| match block_seed {
+                        FullBlock { block, device_id } => {
+                            let block_hash = block.block_hash().map(|hash| format!("{:x}", hash)).unwrap_or_default();
+                            let mut pending = pending_block_submissions.lock().unwrap();
+                            pending.push_back((block_hash, device_id));
+                            KaspadMessage::submit_block(*block)
+                        }
                         PartialBlock { .. } => unreachable!("All blocks sent here should have arrived from here"),
                     })
                     .map(Ok)
@@ -648,9 +662,17 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 match (template.block, template.is_synced, template.error) {
-                    (Some(b), true, None) => miner.process_block(Some(FullBlock(Box::new(b)))).await?,
+                    (Some(b), true, None) => miner.process_block(Some(FullBlock {
+                        block: Box::new(b),
+                        device_id: "CPU".to_string(),
+                    }))
+                    .await?,
                     (Some(b), false, None) if self.mine_when_not_synced => {
-                        miner.process_block(Some(FullBlock(Box::new(b)))).await?
+                        miner.process_block(Some(FullBlock {
+                            block: Box::new(b),
+                            device_id: "CPU".to_string(),
+                        }))
+                        .await?
                     }
                     (_, false, None) => miner.process_block(None).await?,
                     (_, _, Some(e)) => {
@@ -703,17 +725,26 @@ impl KeryxdHandler {
                     }
                 }
             }
-            Payload::SubmitBlockResponse(res) => match res.error {
-                None => {
-                    miner.record_block_accepted();
-                    info!("Block submitted successfully!");
+            Payload::SubmitBlockResponse(res) => {
+                let attributed_device = self
+                    .pending_block_submissions
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map(|(_, device_id)| device_id)
+                    .unwrap_or_else(|| "CPU".to_string());
+                match res.error {
+                    None => {
+                        miner.record_block_accepted();
+                        info!("Block submitted successfully!");
+                    }
+                    Some(e) => {
+                        miner.record_block_rejected();
+                        miner.record_block_rejected_for_device(&attributed_device);
+                        warn!("Failed submitting block: {:?}", e);
+                    }
                 }
-                Some(e) => {
-                    miner.record_block_rejected();
-                    miner.record_block_rejected_for_device("CPU");
-                    warn!("Failed submitting block: {:?}", e);
-                }
-            },
+            }
             Payload::SubmitTransactionResponse(res) => {
                 // Escrow claims and OPoI submissions share this stream. Match responses to
                 // in-flight claims by identity (txid, or the txid embedded in the rejection
