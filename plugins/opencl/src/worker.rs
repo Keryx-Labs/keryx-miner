@@ -44,6 +44,7 @@ fn default_workload_scale(arch: &str) -> f32 {
 }
 
 pub struct OpenCLGPUWorker {
+    device_index: u32,
     context: Arc<Context>,
     random: NonceGenEnum,
     local_size: usize,
@@ -68,7 +69,7 @@ pub struct OpenCLGPUWorker {
 impl Worker for OpenCLGPUWorker {
     fn id(&self) -> String {
         let device = Device::new(self.context.default_device());
-        device.name().unwrap()
+        format!("#{} ({})", self.device_index, device.name().unwrap())
     }
 
     fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]) -> Result<(), Error> {
@@ -172,6 +173,7 @@ impl Worker for OpenCLGPUWorker {
 
 impl OpenCLGPUWorker {
     pub fn new(
+        device_index: u32,
         device: Device,
         workload: f32,
         is_absolute: bool,
@@ -364,6 +366,7 @@ impl OpenCLGPUWorker {
             }
         };
         Ok(Self {
+            device_index,
             context,
             local_size,
             workload: chosen_workload,
@@ -422,6 +425,7 @@ mod tests {
             .next()
             .expect("find OpenCL GPU");
         let mut worker = OpenCLGPUWorker::new(
+            0,
             Device::new(device_id),
             4096.0,
             true,

@@ -297,6 +297,7 @@ pub struct StratumHandler {
     pending_block: Option<BlockSeed>,
     pending_task: Option<(String, String)>,
     pending_challenge: Option<(String, String)>,
+    declared_model_ids: Vec<String>,
 }
 
 #[async_trait(?Send)]
@@ -346,29 +347,14 @@ impl Client for StratumHandler {
             })
             .await?;
 
-        // Declare loaded SLM models so the bridge can challenge with the right model.
-        let model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
-            .into_iter()
-            .map(|id| hex::encode(id))
-            .collect();
-        if !model_ids.is_empty() {
-            info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
-            self.send_channel
-                .send(StratumLine {
-                    id: None,
-                    payload: StratumLinePayload::StratumCommand(
-                        StratumCommand::MiningDeclareCapabilities(model_ids),
-                    ),
-                    jsonrpc: None,
-                    error: None,
-                })
-                .await?;
-        }
+        self.declare_capabilities_if_changed().await?;
         Ok(())
     }
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         info!("Waiting for stuff");
+        let mut capability_refresh = tokio::time::interval(Duration::from_secs(5));
+        capability_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             {
                 if (!self.mining_dev.unwrap_or(true)
@@ -380,6 +366,9 @@ impl Client for StratumHandler {
                 }
             }
             tokio::select! {
+                _ = capability_refresh.tick() => {
+                    self.declare_capabilities_if_changed().await?;
+                }
                 completion = self.inference_complete_rx.recv() => {
                     if completion.is_some() {
                         self.resume_pending_block(miner).await?;
@@ -399,6 +388,30 @@ impl Client for StratumHandler {
 }
 
 impl StratumHandler {
+    async fn declare_capabilities_if_changed(&mut self) -> Result<(), Error> {
+        let mut model_ids: Vec<String> = keryx_miner::slm::loaded_model_ids()
+            .into_iter()
+            .map(hex::encode)
+            .collect();
+        model_ids.sort_unstable();
+        if model_ids == self.declared_model_ids {
+            return Ok(());
+        }
+        info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
+        self.send_channel
+            .send(StratumLine {
+                id: None,
+                payload: StratumLinePayload::StratumCommand(
+                    StratumCommand::MiningDeclareCapabilities(model_ids.clone()),
+                ),
+                jsonrpc: None,
+                error: None,
+            })
+            .await?;
+        self.declared_model_ids = model_ids;
+        Ok(())
+    }
+
     pub async fn connect(
         address: String,
         miner_address: String,
@@ -459,6 +472,7 @@ impl StratumHandler {
             pending_block: None,
             pending_task: None,
             pending_challenge: None,
+            declared_model_ids: Vec::new(),
         }))
     }
 

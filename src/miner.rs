@@ -392,7 +392,17 @@ impl MinerManager {
                                     "{}: PoM GPU miner unavailable; retrying in 5 seconds",
                                     gpu_work.id()
                                 );
-                                sleep(Duration::from_secs(5));
+                                for _ in 0..50 {
+                                    if let Some(cmd) = block_channel.get_changed()? {
+                                        state = match cmd {
+                                            Some(WorkerCommand::Job(ns)) => Some(ns),
+                                            Some(WorkerCommand::Close) => return Ok(()),
+                                            None => None,
+                                        };
+                                        break;
+                                    }
+                                    sleep(Duration::from_millis(100));
+                                }
                                 continue;
                             }
                         }
@@ -424,7 +434,11 @@ impl MinerManager {
                         ) {
                             Ok(found) => found,
                             Err(e) => {
-                                error!("{}: {}; stopping this GPU worker", gpu_work.id(), e);
+                                let error = e.to_string();
+                                if keryx_miner::pom_gpu::recover_after_runtime_error(worker_device_id, &error) {
+                                    continue;
+                                }
+                                error!("{}: {}; stopping this GPU worker", gpu_work.id(), error);
                                 keryx_miner::pom_gpu::uninstall(worker_device_id);
                                 return Ok(());
                             }
@@ -457,7 +471,7 @@ impl MinerManager {
                             state = match cmd {
                                 Some(WorkerCommand::Job(ns)) => Some(ns),
                                 Some(WorkerCommand::Close) => return Ok(()),
-                                None => state,
+                                None => None,
                             };
                         }
                         continue;

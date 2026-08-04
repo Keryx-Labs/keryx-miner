@@ -531,9 +531,22 @@ impl PomGpuMiner {
 
 // Per-GPU PoM miners. Host-side WeightIndex remains shared; only the CUDA-resident worker state
 // is duplicated per device. This avoids all workers contending over a single GPU0-bound miner.
-fn miners() -> &'static Mutex<HashMap<u32, Arc<PomGpuMiner>>> {
-    static MINERS: OnceLock<Mutex<HashMap<u32, Arc<PomGpuMiner>>>> = OnceLock::new();
+type InstalledPomMiner = Arc<Mutex<Option<PomGpuMiner>>>;
+type DeviceLifecycleLock = Arc<Mutex<()>>;
+
+fn miners() -> &'static Mutex<HashMap<u32, InstalledPomMiner>> {
+    static MINERS: OnceLock<Mutex<HashMap<u32, InstalledPomMiner>>> = OnceLock::new();
     MINERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn device_lifecycle_locks() -> &'static Mutex<HashMap<u32, DeviceLifecycleLock>> {
+    static LOCKS: OnceLock<Mutex<HashMap<u32, DeviceLifecycleLock>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn device_lifecycle_lock(device_id: u32) -> DeviceLifecycleLock {
+    let mut locks = device_lifecycle_locks().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(locks.entry(device_id).or_insert_with(|| Arc::new(Mutex::new(()))))
 }
 
 // Guards the one-time shared host index build. All workers may race into PoM activation, but the
@@ -544,18 +557,23 @@ fn index_build_lock() -> &'static Mutex<()> {
 }
 
 /// Install the GPU miner for a specific CUDA device.
-pub fn install(device_id: u32, m: PomGpuMiner) {
+fn install_locked(device_id: u32, m: PomGpuMiner) {
     if let Ok(mut g) = miners().lock() {
-        g.insert(device_id, Arc::new(m));
+        g.insert(device_id, Arc::new(Mutex::new(Some(m))));
     }
 }
 
 /// Removes only `device_id`'s entry from a `device -> miner` map, leaving every other device's
 /// entry untouched. Pulled out as a tiny generic helper (over the map's value type) purely so
 /// this scoping behavior is unit-testable without a real, CUDA-backed `PomGpuMiner` — production
-/// always calls it through `uninstall` against `HashMap<u32, Arc<PomGpuMiner>>`.
-fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
-    map.remove(&device_id);
+/// always calls it through `uninstall` against the installed-miner map.
+fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) -> Option<T> {
+    map.remove(&device_id)
+}
+
+fn deactivate_installed<T>(installed: &Arc<Mutex<Option<T>>>) {
+    let mut value = installed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    drop(value.take());
 }
 
 /// Drop the GPU miner for `device_id` only, releasing its hold on that device's mining-model VRAM
@@ -571,15 +589,38 @@ fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
 /// model swap — needlessly forcing GPU1+ rigs to fully reload their GGUF from disk and rebuild
 /// the gather index (`ensure_installed_inner`'s own doc comment calls this reload "Heavy") even
 /// though nothing about them changed.
+fn uninstall_locked(device_id: u32) {
+    let installed = miners().lock().ok().and_then(|mut g| remove_device_entry(&mut g, device_id));
+    let Some(installed) = installed else {
+        return;
+    };
+
+    // Wait for any cloned handle that is currently mining, then make all later clones observe
+    // an empty slot before releasing CUDA allocations. This is the lifetime barrier protecting
+    // llama-owned zero-copy tensor pointers during model swaps and transient-fault recovery.
+    deactivate_installed(&installed);
+}
+
 pub fn uninstall(device_id: u32) {
-    if let Ok(mut g) = miners().lock() {
-        remove_device_entry(&mut g, device_id);
-    }
+    let lifecycle = device_lifecycle_lock(device_id);
+    let _guard = lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    uninstall_locked(device_id);
+}
+
+/// Drain mining and exclude rebuilds until the process-global llama model is released.
+pub fn release_llama_for_gpu(device_id: u32, reason: &str) {
+    let lifecycle = device_lifecycle_lock(device_id);
+    let _guard = lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    uninstall_locked(device_id);
+    crate::llama_engine::unload_for_gpu(device_id as usize, reason);
 }
 
 /// Whether the GPU miner is currently installed for `device_id`.
 pub fn is_installed(device_id: u32) -> bool {
-    miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
+    let installed = miners().lock().ok().and_then(|g| g.get(&device_id).cloned());
+    installed
+        .and_then(|slot| slot.lock().ok().map(|miner| miner.is_some()))
+        .unwrap_or(false)
 }
 
 /// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
@@ -604,13 +645,16 @@ pub fn mine(
     h5_1: bool,
     h5_2: bool,
 ) -> Result<Option<u64>> {
-    let miner = {
+    let installed = {
         let g = miners().lock().map_err(|_| anyhow!("PoM GPU miner registry lock poisoned"))?;
         g.get(&device_id)
             .cloned()
             .ok_or_else(|| anyhow!("PoM GPU miner is not installed for device #{device_id}"))?
     };
+    let miner = installed.lock().map_err(|_| anyhow!("PoM GPU miner lock poisoned for device #{device_id}"))?;
     miner
+        .as_ref()
+        .ok_or_else(|| anyhow!("PoM GPU miner is not installed for device #{device_id}"))?
         .mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2)
         .map_err(|e| anyhow!("CUDA mining batch failed on device #{device_id}: {e}"))
 }
@@ -700,12 +744,13 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
 /// device's era-correct model actually changes — and inert entirely with the current fixed post-H5
 /// lineup. Called each tick from the loop, so a miner upgraded before a gate crosses over on its own.
 pub fn advance_mining_tier_if_due(daa: u64) {
-    let Ok(_tier_state) = tier_state_lock().lock() else { return };
+    let Ok(tier_state) = tier_state_lock().lock() else { return };
     let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
         Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
         Err(_) => return,
     };
     let mut swapped = false;
+    let mut evictions = Vec::new();
     for &(dev, assigned_tier) in &devices {
         let tier = effective_device_tier(dev, assigned_tier);
         let spec = crate::models::pom_model_for_tier(daa, tier);
@@ -724,19 +769,26 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         if let Some(t) = crate::models::pom_tier_index(&spec.model_id, daa) {
             crate::pom::clear_index(t);
         }
-        // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
-        // crossing it would keep hosting the previous era's model. Unload it when it lives on this
-        // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
-        if crate::llama_engine::active_gpu() == Some(dev as usize) && !crate::llama_engine::active_for(&gguf, dev as usize) {
-            crate::llama_engine::unload("mining_era_transition");
-        }
-        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
+        evictions.push((dev, gguf));
     }
     // The served lineup (`SUPPORTED_SPECS`) drives the coinbase `ai:cap` announcement + inference
     // routing — refresh it as the union of era-correct models so the miner stops announcing the
     // previous era's model_ids after the crossing.
     if swapped {
         refresh_supported_specs(daa);
+    }
+    drop(tier_state);
+
+    for (dev, gguf) in evictions {
+        // Keep the per-device lifecycle excluded from miner drain through llama release so a
+        // concurrent worker cannot rebuild against pointers from the model being replaced.
+        if crate::llama_engine::active_gpu() == Some(dev as usize)
+            && !crate::llama_engine::active_for(&gguf, dev as usize)
+        {
+            release_llama_for_gpu(dev, "mining_era_transition");
+        } else {
+            uninstall(dev);
+        }
     }
 }
 
@@ -745,6 +797,8 @@ pub fn advance_mining_tier_if_due(daa: u64) {
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
+    let lifecycle = device_lifecycle_lock(device_id);
+    let _guard = lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if is_installed(device_id) {
         return true;
     }
@@ -882,13 +936,43 @@ fn is_transient_gpu_runtime_fault(err: &str) -> bool {
         || s.contains("cuda_error_illegal_address")
         || s.contains("invalid device pointer")
         || s.contains("misaligned address")
+        || s.contains("launch failed")
+        || s.contains("cuda_error_launch_failed")
+        || s.contains("launch timeout")
+        || s.contains("cuda_error_launch_timeout")
+        || s.contains("context is destroyed")
+        || s.contains("cuda_error_context_is_destroyed")
+        || s.contains("device unavailable")
+        || s.contains("cuda_error_device_unavailable")
+        || s.contains("device-side assert")
+        || s.contains("cuda_error_assert")
+        || s.contains("hardware stack error")
+        || s.contains("cuda_error_hardware_stack_error")
 }
 
-fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
+fn reset_stale_gpu_state_locked(device_id: u32, use_llama: bool) {
+    uninstall_locked(device_id);
     if use_llama {
-        crate::llama_engine::unload_for_gpu(device_id as usize);
+        crate::llama_engine::unload_for_gpu(device_id as usize, "transient_gpu_fault");
     }
-    uninstall(device_id);
+}
+
+/// Drop stale per-device state after a recoverable CUDA execution fault. The worker retries on
+/// its next loop iteration, rebuilding only this GPU's miner.
+pub fn recover_after_runtime_error(device_id: u32, error: &str) -> bool {
+    if !is_transient_gpu_runtime_fault(error) {
+        return false;
+    }
+    let use_llama = crate::llama_engine::active_gpu() == Some(device_id as usize);
+    log::warn!(
+        "PoM[gpu{}]: transient GPU runtime fault while mining ({}); dropping stale state for rebuild",
+        device_id,
+        error
+    );
+    let lifecycle = device_lifecycle_lock(device_id);
+    let _guard = lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_stale_gpu_state_locked(device_id, use_llama);
+    true
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
@@ -944,7 +1028,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         match crate::llama_engine::ensure_loaded(&gguf, device_id as usize) {
             Ok(attempt) => {
                 llama_attempt = Some(attempt);
-                crate::slm::mark_model_available(&model_id, "pom_load_success");
+                crate::slm::mark_model_available(&model_id, "pom_llama_load_recovered");
                 log::info!(
                     "event=pom_llama_ready attempt={} gpu={} model={}",
                     attempt,
@@ -1026,7 +1110,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     device_id,
                     e_msg
                 );
-                reset_stale_gpu_state(device_id, use_llama);
+                reset_stale_gpu_state_locked(device_id, use_llama);
                 return false;
             }
             match classify_miner_load_error(&e_msg) {
@@ -1072,7 +1156,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             return false;
         }
     }
-    install(device_id, gm);
+    install_locked(device_id, gm);
     info!(
         "event=pom_install_success llama_attempt={} gpu={} model={} source={} chunks={}",
         llama_attempt,
@@ -1102,7 +1186,7 @@ mod tests {
         map.insert(1, "gpu1-miner");
         map.insert(2, "gpu2-miner");
 
-        remove_device_entry(&mut map, 0);
+        let _ = remove_device_entry(&mut map, 0);
 
         assert!(!map.contains_key(&0));
         assert_eq!(map.get(&1), Some(&"gpu1-miner"));
@@ -1115,7 +1199,7 @@ mod tests {
         let mut map: HashMap<u32, &str> = HashMap::new();
         map.insert(1, "gpu1-miner");
 
-        remove_device_entry(&mut map, 0);
+        let _ = remove_device_entry(&mut map, 0);
 
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&1), Some(&"gpu1-miner"));
@@ -1125,6 +1209,9 @@ mod tests {
     fn detects_transient_illegal_address_faults() {
         assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
         assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
+        assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_LAUNCH_FAILED"));
+        assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_CONTEXT_IS_DESTROYED"));
+        assert!(is_transient_gpu_runtime_fault("device-side assert triggered"));
         assert!(!is_transient_gpu_runtime_fault("out of memory"));
     }
 
@@ -1134,6 +1221,57 @@ mod tests {
             .expect_err("missing miner must not look like a completed nonce batch");
 
         assert!(error.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn deactivation_waits_for_in_flight_user_and_blocks_late_users() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let installed = Arc::new(Mutex::new(Some("miner")));
+        let active = Arc::clone(&installed);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let active_thread = thread::spawn(move || {
+            let guard = active.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert_eq!(guard.as_deref(), Some("miner"));
+        });
+        locked_rx.recv().unwrap();
+
+        let deactivating = Arc::clone(&installed);
+        let (done_tx, done_rx) = mpsc::channel();
+        let deactivate_thread = thread::spawn(move || {
+            deactivate_installed(&deactivating);
+            done_tx.send(()).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_tx.send(()).unwrap();
+        active_thread.join().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        deactivate_thread.join().unwrap();
+        assert!(installed.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn lifecycle_lock_excludes_unload_during_construction() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let device_id = u32::MAX - 2;
+        let lifecycle = device_lifecycle_lock(device_id);
+        let building = lifecycle.lock().unwrap();
+        let waiting = device_lifecycle_lock(device_id);
+        let (done_tx, done_rx) = mpsc::channel();
+        let unload_thread = thread::spawn(move || {
+            let _guard = waiting.lock().unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(building);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        unload_thread.join().unwrap();
     }
 
     #[test]

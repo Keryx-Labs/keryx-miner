@@ -106,6 +106,10 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     }
 #endif
 
+    llama_model* model = nullptr;
+    llama_context* ctx = nullptr;
+    llama_sampler* smpl = nullptr;
+    KeryxLlama* h = nullptr;
     try {
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -113,7 +117,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
     mp.main_gpu     = gpu;
     mp.use_mmap     = true;
-    llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    model = llama_model_load_from_file(gguf_path, mp);
     if (!model) {
         std::string detail = "llama_model_load_from_file returned null";
 #ifndef __APPLE__
@@ -125,7 +129,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
-    llama_context* ctx = llama_init_from_model(model, cp);
+    ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         llama_model_free(model);
         std::string detail = "llama_init_from_model returned null";
@@ -142,7 +146,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     // (9B Q4 especially) degenerate into verbatim sentence loops. 256-token window
     // because the observed loops are whole sentences (~25 tokens each), far beyond
     // the classic 64-token window; 1.10 is the battle-tested llama.cpp default.
-    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (!smpl) {
         llama_free(ctx);
         llama_model_free(model);
@@ -154,15 +158,23 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
-    auto* h = new KeryxLlama();
+    h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl;
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
     } catch (const std::exception& e) {
+        delete h;
+        if (smpl) llama_sampler_free(smpl);
+        if (ctx) llama_free(ctx);
+        if (model) llama_model_free(model);
         keryx_set_error("exception", e.what());
         return nullptr;
     } catch (...) {
+        delete h;
+        if (smpl) llama_sampler_free(smpl);
+        if (ctx) llama_free(ctx);
+        if (model) llama_model_free(model);
         keryx_set_error("exception", "unknown native exception");
         return nullptr;
     }

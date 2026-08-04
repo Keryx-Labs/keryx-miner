@@ -565,13 +565,24 @@ pub fn load_and_run_inference(
             spec.name,
             crate::llama_engine::active_gpu()
         );
-        log::info!("event=pom_release_start correlation={} gpu={}", correlation, dev_id);
-        crate::pom_gpu::uninstall(dev_id);
-        log::info!("event=pom_release_success correlation={} gpu={}", correlation, dev_id);
-        crate::llama_engine::unload(&format!("inference_swap correlation={}", correlation));
+        let previous_gpu = crate::llama_engine::active_gpu();
+        if let Some(host_gpu) = previous_gpu {
+            // The active engine's zero-copy PoM miner owns pointers into the model. Release that
+            // miner before moving the process-global engine to another GPU.
+            log::info!("event=pom_release_start correlation={} gpu={}", correlation, host_gpu);
+            crate::pom_gpu::release_llama_for_gpu(
+                host_gpu as u32,
+                &format!("inference_swap correlation={}", correlation),
+            );
+            log::info!("event=pom_release_success correlation={} gpu={}", correlation, host_gpu);
+        }
+        if previous_gpu != Some(dev_id as usize) {
+            log::info!("event=pom_release_start correlation={} gpu={}", correlation, dev_id);
+            crate::pom_gpu::uninstall(dev_id);
+            log::info!("event=pom_release_success correlation={} gpu={}", correlation, dev_id);
+        }
         match crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
             Ok(attempt) => {
-                mark_model_available(&spec.model_id, "inference_load_success");
                 log::info!(
                     "event=llama_swap_success correlation={} attempt={} gpu={} model={}",
                     correlation,
@@ -597,6 +608,7 @@ pub fn load_and_run_inference(
 
     match crate::llama_engine::generate(&templated, max_tokens) {
         Some(text) if !text.trim().is_empty() => {
+            mark_model_available(&spec.model_id, "generation_success");
             log::info!(
                 "event=ai_inference_success correlation={} attempt={} gpu={} model={} output_bytes={}",
                 correlation,
@@ -608,11 +620,15 @@ pub fn load_and_run_inference(
             Some(text)
         }
         _ => {
-            mark_model_unavailable(&spec.model_id, "generation_failed");
+            let attempt = crate::llama_engine::active_attempt().unwrap_or(0);
+            // A single request can fail transiently after a healthy load. Keep the capability
+            // routable and force a clean reload on the next request instead of deadlocking
+            // recovery behind the unavailable-model gate.
+            crate::pom_gpu::release_llama_for_gpu(dev_id, "generation_failed");
             log::warn!(
                 "event=ai_inference_failed correlation={} attempt={} gpu={} model={} stage=generate reason=empty_or_failed",
                 correlation,
-                crate::llama_engine::active_attempt().unwrap_or(0),
+                attempt,
                 dev_id,
                 spec.name
             );

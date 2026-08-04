@@ -1,6 +1,7 @@
 use clap::ArgMatches;
 use std::any::Any;
 use std::error::Error as StdError;
+use std::ffi::CStr;
 use std::io::IsTerminal;
 
 pub mod gguf;
@@ -23,6 +24,80 @@ pub const PLUGIN_LOG_WARN: u8 = 2;
 pub const PLUGIN_LOG_INFO: u8 = 3;
 pub const PLUGIN_LOG_DEBUG: u8 = 4;
 pub const PLUGIN_LOG_TRACE: u8 = 5;
+
+/// Resolve an unambiguous physical PCI bus number to the CUDA logical ordinal used by the miner.
+/// Returns `None` when multiple PCI domains contain the same bus number.
+pub fn cuda_ordinal_for_pci_bus(bus_id: u32) -> Option<u32> {
+    use cudarc::driver::{result, sys};
+
+    result::init().ok()?;
+    let count = result::device::get_count().ok()?;
+    let mut matched = None;
+    for ordinal in 0..count {
+        let Ok(device) = result::device::get(ordinal) else {
+            continue;
+        };
+        let Ok(device_bus) = (unsafe {
+            result::device::get_attribute(
+                device,
+                sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID,
+            )
+        }) else {
+            continue;
+        };
+        if device_bus as u32 == bus_id {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(ordinal as u32);
+        }
+    }
+    matched
+}
+
+/// Resolve a full PCI domain/bus/device/function identity to the CUDA logical ordinal.
+pub fn cuda_ordinal_for_pci(
+    domain: u32,
+    bus: u32,
+    device_id: u32,
+    function: u32,
+) -> Option<u32> {
+    use cudarc::driver::{result, sys};
+
+    result::init().ok()?;
+    let count = result::device::get_count().ok()?;
+    for ordinal in 0..count {
+        let Ok(device) = result::device::get(ordinal) else {
+            continue;
+        };
+        let mut buffer = [0i8; 32];
+        let status = unsafe {
+            sys::cuDeviceGetPCIBusId(buffer.as_mut_ptr(), buffer.len() as i32, device)
+        };
+        if status.result().is_err() {
+            continue;
+        }
+        let Ok(value) = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str() else {
+            continue;
+        };
+        if parse_pci_address(value) == Some((domain, bus, device_id, function)) {
+            return Some(ordinal as u32);
+        }
+    }
+    None
+}
+
+fn parse_pci_address(value: &str) -> Option<(u32, u32, u32, u32)> {
+    let (domain, rest) = value.trim().split_once(':')?;
+    let (bus, rest) = rest.split_once(':')?;
+    let (device, function) = rest.split_once('.')?;
+    Some((
+        u32::from_str_radix(domain, 16).ok()?,
+        u32::from_str_radix(bus, 16).ok()?,
+        u32::from_str_radix(device, 16).ok()?,
+        u32::from_str_radix(function, 16).ok()?,
+    ))
+}
 
 #[derive(Default)]
 pub struct PluginManager {
@@ -254,4 +329,16 @@ macro_rules! declare_plugin {
             (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null_mut::<Error>())
         }
     };
+}
+
+#[cfg(test)]
+mod pci_tests {
+    use super::parse_pci_address;
+
+    #[test]
+    fn parses_full_cuda_pci_identity() {
+        assert_eq!(parse_pci_address("00000000:01:02.3"), Some((0, 1, 2, 3)));
+        assert_eq!(parse_pci_address("0000:af:00.0"), Some((0, 0xaf, 0, 0)));
+        assert_eq!(parse_pci_address("invalid"), None);
+    }
 }

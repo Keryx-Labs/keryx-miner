@@ -320,17 +320,18 @@ pub fn unload(reason: &str) {
 
 /// Free the resident model and disable the engine only if the given GPU currently hosts it.
 /// This is used for stale-GPU recovery after a transient fault on that specific device.
-pub fn unload_for_gpu(gpu: usize) {
+pub fn unload_for_gpu(gpu: usize, reason: &str) {
     if let Ok(mut g) = engine().lock() {
         if g.as_ref().is_some_and(|e| e.gpu != gpu) {
             return;
         }
         if let Some(e) = g.take() {
             log::info!(
-                "event=llama_unload_start attempt={} gpu={} model={} reason=\"transient_gpu_fault\"",
+                "event=llama_unload_start attempt={} gpu={} model={} reason=\"{}\"",
                 e.attempt,
                 e.gpu,
-                model_label(&e.gguf)
+                model_label(&e.gguf),
+                reason
             );
             unsafe { (e.free)(e.model) };
             log::info!("event=llama_unload_success attempt={} gpu={}", e.attempt, e.gpu);
