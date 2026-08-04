@@ -258,6 +258,10 @@ impl MinerManager {
         self.stats.inc_rejected_blocks();
     }
 
+    pub fn record_block_accepted_for_device(&self, device_id: &str) {
+        self.stats.inc_device_blocks_accepted(device_id);
+    }
+
     pub fn record_block_rejected_for_device(&self, device_id: &str) {
         self.stats.inc_device_blocks_rejected(device_id);
     }
@@ -304,7 +308,7 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         spec: Box<dyn WorkerSpec>,
         worker_hashes_tried: Arc<AtomicU64>,
-        stats: Arc<MinerStats>,
+        _stats: Arc<MinerStats>,
         device_id: String,
     ) -> MinerHandler {
         std::thread::spawn(move || {
@@ -395,7 +399,6 @@ impl MinerManager {
                                     Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
                                 };
                                 if let BlockSeed::FullBlock { .. } = &block_seed {
-                                    stats.inc_device_blocks_found(&device_id);
                                     state = None;
                                 }
                             }
@@ -433,7 +436,6 @@ impl MinerManager {
                                 Err(e) => error!("Failed submitting block: ({})", e.to_string()),
                             };
                             if let BlockSeed::FullBlock { .. } = &block_seed {
-                                stats.inc_device_blocks_found(&device_id);
                                 state = None;
                             }
                             nonces[0] = 0;
@@ -504,7 +506,7 @@ impl MinerManager {
         send_channel: Sender<BlockSeed>,
         mut block_channel: watch::Receiver<Option<WorkerCommand>>,
         hashes_tried: Arc<AtomicU64>,
-        stats: Arc<MinerStats>,
+        _stats: Arc<MinerStats>,
     ) -> MinerHandler {
         let mut nonce = Wrapping(thread_rng().next_u64());
         let mut mask = Wrapping(0);
@@ -559,7 +561,6 @@ impl MinerManager {
                             Err(e) => error!("Failed submitting block: ({})", e.to_string()),
                         };
                         if let BlockSeed::FullBlock { .. } = &block_seed {
-                            stats.inc_device_blocks_found("CPU");
                             state = None;
                         }
                     }

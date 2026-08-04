@@ -32,7 +32,7 @@ pub struct MinerStats {
     api_port: AtomicU64,
     mining_address: Mutex<Option<String>>,
     device_hashrate_hs: Mutex<HashMap<String, u64>>,
-    device_blocks_found: Mutex<HashMap<String, u64>>,
+    device_blocks_accepted: Mutex<HashMap<String, u64>>,
     device_blocks_rejected: Mutex<HashMap<String, u64>>,
     gpu_telemetry: Mutex<HashMap<u32, GpuTelemetry>>,
     gpu_memory_temp_supported: Mutex<HashMap<u32, bool>>,
@@ -51,7 +51,7 @@ struct GpuTelemetry {
 pub struct DeviceRate {
     pub id: String,
     pub hashrate_hs: u64,
-    pub blocks_found: u64,
+    pub blocks_accepted: u64,
     pub blocks_rejected: u64,
     // Backward-compatible alias for core temp.
     pub temp_c: Option<u32>,
@@ -98,7 +98,7 @@ impl MinerStats {
             api_port: AtomicU64::new(0),
             mining_address: Mutex::new(None),
             device_hashrate_hs: Mutex::new(HashMap::new()),
-            device_blocks_found: Mutex::new(HashMap::new()),
+            device_blocks_accepted: Mutex::new(HashMap::new()),
             device_blocks_rejected: Mutex::new(HashMap::new()),
             gpu_telemetry: Mutex::new(HashMap::new()),
             gpu_memory_temp_supported: Mutex::new(HashMap::new()),
@@ -137,8 +137,8 @@ impl MinerStats {
         self.last_update_epoch_s.store(now_epoch_s(), Ordering::Release);
     }
 
-    pub fn inc_device_blocks_found(&self, device_id: &str) {
-        let mut map = self.device_blocks_found.lock().expect("device block count mutex poisoned");
+    pub fn inc_device_blocks_accepted(&self, device_id: &str) {
+        let mut map = self.device_blocks_accepted.lock().expect("device block count mutex poisoned");
         *map.entry(device_id.to_string()).or_insert(0) += 1;
     }
 
@@ -314,7 +314,7 @@ impl MinerStats {
             .expect("mining address mutex poisoned")
             .clone();
 
-        let device_blocks_found = self.device_blocks_found.lock().expect("device block count mutex poisoned").clone();
+        let device_blocks_accepted = self.device_blocks_accepted.lock().expect("device block count mutex poisoned").clone();
         let device_blocks_rejected = self.device_blocks_rejected.lock().expect("device rejected block count mutex poisoned").clone();
         let mut devices = self
             .device_hashrate_hs
@@ -327,7 +327,7 @@ impl MinerStats {
                 DeviceRate {
                     id: id.clone(),
                     hashrate_hs: *rate,
-                    blocks_found: device_blocks_found.get(id).copied().unwrap_or(0),
+                    blocks_accepted: device_blocks_accepted.get(id).copied().unwrap_or(0),
                     blocks_rejected: device_blocks_rejected.get(id).copied().unwrap_or(0),
                     temp_c: telem.and_then(|t| t.temp_c),
                     memory_temp_c: telem.and_then(|t| t.memory_temp_c),
@@ -367,6 +367,27 @@ impl MinerStats {
             last_update_epoch_s: self.last_update_epoch_s.load(Ordering::Acquire),
             devices,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_accepted_block_counts_are_reported_separately_from_rejections() {
+        let stats = MinerStats::new(false);
+        let mut per_device_hashrates = HashMap::new();
+        per_device_hashrates.insert("GPU0".to_string(), 100);
+        stats.set_hashrates(100, &per_device_hashrates);
+
+        stats.inc_device_blocks_accepted("GPU0");
+        stats.inc_device_blocks_rejected("GPU0");
+
+        let snapshot = stats.snapshot();
+        let device = snapshot.devices.iter().find(|device| device.id == "GPU0").unwrap();
+        assert_eq!(device.blocks_accepted, 1);
+        assert_eq!(device.blocks_rejected, 1);
     }
 }
 

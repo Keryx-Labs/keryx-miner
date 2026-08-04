@@ -420,7 +420,7 @@ fn draw_frame(
 
     let hashrate_value = format_hashrate(snapshot.total_hashrate_hs);
     let opoi_pause_value = if snapshot.opoi_challenge_active { "Active" } else { "Idle" };
-    let blocks_found_value = snapshot.accepted_blocks;
+    let accepted_blocks_value = snapshot.accepted_blocks;
     let rejected_value = snapshot.rejected_blocks;
     let claims_value = format!(
         "{} ({:.2} KRX)",
@@ -556,7 +556,7 @@ fn draw_frame(
             (format!(" {:<16}", "Address"), palette().dim),
             (address_metric, palette().ok),
         ]),
-        metric_row("Blocks Accepted", blocks_found_value.to_string(), palette().bright),
+        metric_row("Blocks Accepted", accepted_blocks_value.to_string(), palette().bright),
         metric_row(
             "Blocks Rejected",
             rejected_value.to_string(),
@@ -758,7 +758,7 @@ fn draw_frame(
                 brand_color,
             ),
         ]));
-        let blocks_found_color = if d.blocks_found > 0 { palette().bright } else { detail_color };
+        let blocks_accepted_color = if d.blocks_accepted > 0 { palette().bright } else { detail_color };
         let blocks_rejected_color = if d.blocks_rejected > 0 { palette().err } else { detail_color };
         right_rows.push(PanelRow::Segments(vec![
             ("   ".to_string(), palette().muted),
@@ -768,8 +768,8 @@ fn draw_frame(
             ("Eff: ".to_string(), palette().muted),
             (efficiency_short, detail_color),
             ("  ".to_string(), palette().muted),
-            ("Blocks Found: ".to_string(), palette().muted),
-            (d.blocks_found.to_string(), blocks_found_color),
+            ("Blocks Accepted: ".to_string(), palette().muted),
+            (d.blocks_accepted.to_string(), blocks_accepted_color),
             ("  ".to_string(), palette().muted),
             ("Blocks Rejected: ".to_string(), palette().muted),
             (d.blocks_rejected.to_string(), blocks_rejected_color),

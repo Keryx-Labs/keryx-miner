@@ -736,6 +736,7 @@ impl KeryxdHandler {
                 match res.error {
                     None => {
                         miner.record_block_accepted();
+                        miner.record_block_accepted_for_device(&attributed_device);
                         info!("Block submitted successfully!");
                     }
                     Some(e) => {
