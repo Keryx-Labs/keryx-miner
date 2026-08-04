@@ -84,7 +84,12 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.as_ref() {
-        return e.gguf == gguf && e.gpu == gpu;
+        if e.gguf == gguf && e.gpu == gpu {
+            return true;
+        }
+        if let Some(e) = g.take() {
+            unsafe { (e.free)(e.model) };
+        }
     }
     let Some(so) = so_path() else { return false };
     // Never unloaded (the old dlopen path never dlclosed either): the Engine keeps raw fn
@@ -157,6 +162,19 @@ pub fn available() -> bool {
 /// the caller walks a raw canonical upload instead.
 pub fn unload() {
     if let Ok(mut g) = engine().lock() {
+        if let Some(e) = g.take() {
+            unsafe { (e.free)(e.model) };
+        }
+    }
+}
+
+/// Free the resident model and disable the engine only if the given GPU currently hosts it.
+/// This is used for stale-GPU recovery after a transient fault on that specific device.
+pub fn unload_for_gpu(gpu: usize) {
+    if let Ok(mut g) = engine().lock() {
+        if g.as_ref().is_some_and(|e| e.gpu != gpu) {
+            return;
+        }
         if let Some(e) = g.take() {
             unsafe { (e.free)(e.model) };
         }

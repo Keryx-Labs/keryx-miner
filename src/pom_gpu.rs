@@ -825,7 +825,7 @@ fn is_transient_gpu_runtime_fault(err: &str) -> bool {
 
 fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
     if use_llama {
-        crate::llama_engine::unload();
+        crate::llama_engine::unload_for_gpu(device_id as usize);
     }
     uninstall(device_id);
 }
