@@ -65,8 +65,13 @@ pub struct EscrowEntry {
     /// Max claim-batch size this entry may join (0 = uncapped). Halved every time a
     /// batch containing this entry is rejected: batches bisect until dead inputs are
     /// isolated into solo claims and valid inputs re-group into accepted batches.
+    /// The cap is TRANSIENT: unless re-confirmed by a fresh rejection it expires after
+    /// CAP_EXPIRY_DAA (see find_claim) and the entry returns to the full-batch flow.
     #[serde(default)]
     pub batch_cap: u8,
+    /// DAA score at which batch_cap was last set/halved — drives cap expiry.
+    #[serde(default)]
+    pub cap_set_daa: u64,
     /// True for AI inference escrow entries (from AiRequest output[1]).
     /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
     #[serde(default)]
@@ -85,25 +90,28 @@ pub struct EscrowState {
 /// Max escrow outputs per claim TX. Compute mass is `506 + 1118 * inputs` grams (1,000 per
 /// sig-op + 118 serialized bytes per input, plus the single-output overhead) against the
 /// node's 100,000-gram standard-TX cap, so 88 inputs is the hard ceiling (89 lands at
-/// 100,008 and is rejected). 80 keeps a margin for any future growth of the input layout.
+/// 100,008 and is rejected). 87 (97,772 grams) keeps one input of margin under the cap.
 /// Transient mass (size * 4) and storage mass are never binding here: an N-to-1
 /// consolidation has zero storage mass under KIP-9.
 /// Batching also amortizes the flat CLAIM_FEE_SOMPI across the whole batch instead of
 /// paying it per output — the mass-derived minimum fee (~90k sompi at this size) stays far
 /// below the node's flat 0.3 KRX floor, so a bigger batch costs exactly the same.
-const MAX_CLAIM_BATCH: usize = 80;
+const MAX_CLAIM_BATCH: usize = 87;
 /// Minimum outputs per claim TX: the flat claim fee is amortized across the batch, so
-/// uncapped claims are held back until a full batch is ready instead of paying the fee
-/// on many small TXs. Batches carrying a bisection cap are exempt and keep flowing.
+/// nominal claims ship ONLY as full MAX_CLAIM_BATCH batches — partial batches are never
+/// submitted, no matter how long the entries have been waiting. Waiting costs nothing
+/// beyond deferred liquidity — the outputs are matured UTXOs sitting in the UTXO set,
+/// with no expiry and no slash risk. Repair batches (bisection caps, dead-pool grinding)
+/// are exempt and keep flowing at any size so dead inputs still get isolated.
 const MIN_CLAIM_BATCH: usize = MAX_CLAIM_BATCH;
-/// How long (DAA score, 24h at 10 BPS) the oldest matured entry may wait for a full batch.
-/// Past this, the partial batch is submitted anyway — a remnant below MIN_CLAIM_BATCH is
-/// never held indefinitely. This is a safety net, not the normal release path: filling 80
-/// outputs in one hour would take 80 blocks/h (~0.2% of a 10 BPS network), so a short
-/// timeout would fire before nearly every batch and defeat the amortization. Over 24h the
-/// same batch needs ~3.3 blocks/h. Waiting costs nothing beyond deferred liquidity — the
-/// outputs are matured UTXOs sitting in the UTXO set, with no expiry and no slash risk.
-const CLAIM_BATCH_TIMEOUT_DAA: u64 = 864_000;
+/// A repair verdict (bisection cap, orphan-death flag) not re-confirmed by a fresh
+/// rejection for this many DAA (~1 h at 10 BPS) expires and the entry returns to the
+/// nominal full-batch flow. Bisection isolates a dead input within minutes; a verdict
+/// that outlives that by an hour is stale state (e.g. inherited from a network
+/// incident), and letting it persist would turn the repair path into a permanent
+/// small-batch claim regime. The orphan_retries counter survives forgiveness, so real
+/// dead entries still converge to the permanent slash across forgiveness cycles.
+const CAP_EXPIRY_DAA: u64 = 36_000;
 /// Max claim TXs awaiting a SubmitTransactionResponse at once.
 const MAX_IN_FLIGHT_CLAIMS: usize = 4;
 
@@ -175,6 +183,13 @@ pub struct EscrowWatcher {
     blocks_since_compact: u32,
     /// handle_block call counter for the periodic INFO status line.
     blocks_since_status: u32,
+    /// Block hashes still awaiting boot-time existence validation against the node
+    /// (GetBlock round-trip). While non-empty, claim building is disabled so no batch
+    /// ships with ghost entries — coinbases of blocks orphaned by a network incident
+    /// (e.g. a wedge re-join) whose UTXOs never existed on the surviving chain.
+    validation_pending: HashSet<String>,
+    /// Entries purged by boot-time validation, for the completion log line.
+    validation_purged: u64,
 }
 
 /// A claim TX submitted to the node, awaiting its SubmitTransactionResponse.
@@ -231,6 +246,8 @@ impl EscrowWatcher {
             last_save: Instant::now(),
             blocks_since_compact: 0,
             blocks_since_status: 0,
+            validation_pending: HashSet::new(),
+            validation_purged: 0,
         };
         watcher.rebuild_indexes();
         Ok(watcher)
@@ -400,6 +417,7 @@ impl EscrowWatcher {
                         orphan_retry_after_daa: None,
                         submit_retries: 0,
                         batch_cap: 0,
+                        cap_set_daa: 0,
                         is_inference: false,
                     });
                     self.outpoint_set.insert(key);
@@ -452,43 +470,176 @@ impl EscrowWatcher {
         }
     }
 
+    /// Start boot-time state validation: returns every distinct block hash referenced by
+    /// a live entry, for the caller to check against the node with GetBlock. Claim
+    /// building stays disabled until every hash has been answered, so no batch ships
+    /// with ghost entries. Inference entries (empty block_hash) are not checkable this
+    /// way and are left alone.
+    pub fn start_state_validation(&mut self) -> Vec<String> {
+        let mut hashes: HashSet<String> = HashSet::new();
+        for e in &self.state.entries {
+            if !e.claimed && !e.slashed && !e.block_hash.is_empty() {
+                hashes.insert(e.block_hash.clone());
+            }
+        }
+        self.validation_pending = hashes.clone();
+        self.validation_purged = 0;
+        if !self.validation_pending.is_empty() {
+            info!(
+                "EscrowWatcher: validating {} block(s) against the node before claiming — ghost entries will be purged",
+                self.validation_pending.len()
+            );
+        }
+        hashes.into_iter().collect()
+    }
+
+    /// Record a validation answer for one block hash. `exists == false` purges every
+    /// live entry of that block: its coinbase never existed on the surviving chain, so
+    /// claiming it can only poison a batch.
+    pub fn on_block_validated(&mut self, hash: &str, exists: bool) {
+        if !self.validation_pending.remove(hash) {
+            return;
+        }
+        if !exists {
+            if let Some(indices) = self.block_index.get(hash) {
+                for &i in indices {
+                    let e = &mut self.state.entries[i];
+                    if !e.claimed && !e.slashed {
+                        e.slashed = true;
+                        self.validation_purged += 1;
+                    }
+                }
+            }
+            self.mark_dirty();
+        }
+        if self.validation_pending.is_empty() {
+            info!(
+                "EscrowWatcher: state validation complete — {} ghost entr{} purged, claiming enabled",
+                self.validation_purged,
+                if self.validation_purged == 1 { "y" } else { "ies" }
+            );
+            self.maybe_flush();
+        }
+    }
+
+    /// True while boot-time validation is still awaiting node answers.
+    pub fn validation_in_progress(&self) -> bool {
+        !self.validation_pending.is_empty()
+    }
+
+    /// Match a GetBlock error message against the pending validation set (the node's
+    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed:
+    /// the block does not exist on this chain, its entries are ghosts and get purged.
+    pub fn on_block_validation_error(&mut self, message: &str) -> bool {
+        let hash = match self.validation_pending.iter().find(|h| message.contains(h.as_str())) {
+            Some(h) => h.clone(),
+            None => return false,
+        };
+        self.on_block_validated(&hash, false);
+        true
+    }
+
+    /// Consume a successful GetBlock answer for a pending validation hash. Returns true
+    /// when the response belonged to the validation flow (the caller then skips the
+    /// regular block-scan path — validation responses carry no transactions).
+    ///
+    /// `is_chain_block` is the node's CURRENT verdict: escrow entries come from chain-block
+    /// coinbases, so a block that got reorged out of the selected chain (still stored,
+    /// no longer chain — invisible to a pure existence check, especially on archival
+    /// nodes) never materialized its coinbase and its entries are ghosts too. Entries are
+    /// at least a challenge-window old when claimed, so the chain verdict is final here.
+    pub fn consume_validation_ok(&mut self, hash: &str, is_chain_block: bool) -> bool {
+        if self.validation_pending.contains(hash) {
+            self.on_block_validated(hash, is_chain_block);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Scan for matured, eligible escrow entries and build a batched claim TX (if any).
     fn find_claim(&mut self, daa_score: u64) -> Option<RpcTransaction> {
         if self.in_flight.len() >= MAX_IN_FLIGHT_CLAIMS {
             return None;
+        }
+        // No claims while the state is still being validated against the node.
+        if self.validation_in_progress() {
+            return None;
+        }
+
+        // Repair verdicts are transient: a bisection cap or an orphan-death verdict that
+        // has not been re-confirmed by a fresh rejection for CAP_EXPIRY_DAA expires and
+        // the entry returns to the nominal full-batch flow. A network incident can mark
+        // thousands of perfectly live entries dead in one sweep (one orphan rejection
+        // each); grinding those through solo claims would take days of 1-output TXs.
+        // Forgiveness is safe because orphan_retries is NOT reset: a genuinely dead
+        // entry re-fails its full batch, re-bisects to a solo rejection, increments the
+        // counter and still converges to the permanent slash at MAX_ORPHAN_RETRIES.
+        let mut healed = false;
+        for e in self.state.entries.iter_mut() {
+            if e.batch_cap != 0 && daa_score >= e.cap_set_daa + CAP_EXPIRY_DAA {
+                e.batch_cap = 0;
+                healed = true;
+            }
+            // Forgiveness backs off exponentially with the solo-rejection count: an entry
+            // rejected once (network hiccup) is retried in a full batch after ~2 h, but a
+            // repeat offender (a ghost outpoint, e.g. inherited from recover-escrow built
+            // on a lying indexer) stays quarantined in the dead pool for exponentially
+            // longer instead of poisoning a fresh 80-output batch every hour — the solo
+            // grinding path slashes it permanently at MAX_ORPHAN_RETRIES meanwhile.
+            if e.orphan_slashed {
+                let holdoff = CAP_EXPIRY_DAA.saturating_mul(1u64 << e.orphan_retries.min(10) as u32);
+                if e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa.saturating_add(holdoff)) {
+                    e.orphan_slashed = false;
+                    healed = true;
+                }
+            }
+        }
+        if healed {
+            self.mark_dirty();
         }
 
         // +10 margin: OP_CSV validation uses the selected-chain blue score, which can lag the
         // virtual-state DAA score by several blocks in the BlockDAG.  A single +1 margin is
         // often not enough, causing seq-lock rejections that get retried every block.
         // Per-entry cooldowns are checked individually so they don't block other claims.
-        // Batch sizing honors every member's batch_cap (the bisection state): the batch never
-        // grows past the smallest cap among its members, and entries whose cap is smaller than
-        // the batch being formed are left for a later, smaller batch. Uncapped batches are
-        // additionally held for MIN_CLAIM_BATCH outputs (fee amortization, see below).
         //
-        // Selection runs in priority passes, and a batch never mixes passes:
-        //   0 — inference entries: they carry user fees and must not be starved by the
-        //       large coinbase entry queue;
-        //   1 — coinbase entries never rejected SOLO (not proven dead): the common case,
-        //       including batches mid-bisection — a batch rejection says nothing about an
-        //       individual member, so it must not demote it behind the dead pool. Without
-        //       this pass, a large backlog of dead relics cycling through retry cooldowns
-        //       sits ahead in queue order and starves everything else indefinitely
-        //       (at most one new claim per block, first-eligible-first);
+        // Selection runs in priority passes; each pass builds its own candidate batch and
+        // the first RELEASABLE one wins, so a held-back pass never starves the ones below:
+        //   0 — nominal: uncapped live entries, inference first within the batch (they
+        //       carry user fees and must not be starved by the coinbase queue). Releasable
+        //       ONLY as a full MAX_CLAIM_BATCH batch — the flat claim fee is amortized
+        //       across the whole TX and partial batches never ship. Nominal goes FIRST so
+        //       full batches are never delayed behind repair grinding;
+        //   1 — repair: live entries carrying a bisection cap (survivors of a rejected
+        //       batch). They regroup among themselves — never with uncapped entries, which
+        //       would bleed fresh outputs into small immediate batches — and flow at any
+        //       size (in the gaps between full batches) so dead inputs get isolated;
         //   2 — the known-dead pool (solo-orphaned at least once), ground down whenever
         //       nothing fresher is claimable.
-        // Mixing passes would batch live entries with known-dead ones: one dead input
-        // orphans the whole TX and stalls the live entries' bisection.
+        // A batch never mixes passes: batching live entries with known-dead ones would let
+        // one dead input orphan the whole TX and stall the live entries.
         let mut batch: Vec<usize> = Vec::new();
-        let mut limit = MAX_CLAIM_BATCH;
-        'select: for pass in 0..3u8 {
-            for (i, e) in self.state.entries.iter().enumerate() {
-                let proven_dead = e.orphan_slashed || e.orphan_retries > 0;
+        let mut selected = false;
+        for pass in 0..3u8 {
+            batch.clear();
+            let mut limit = MAX_CLAIM_BATCH;
+            // Nominal pass: iterate inference entries first so they get batch priority;
+            // the sort is stable, so queue order is preserved within each kind.
+            let mut indices: Vec<usize> = (0..self.state.entries.len()).collect();
+            if pass == 0 {
+                indices.sort_by_key(|&i| !self.state.entries[i].is_inference);
+            }
+            for &i in &indices {
+                let e = &self.state.entries[i];
+                // Only the (transient, forgivable) flag decides the dead pool; the
+                // orphan_retries counter is the cumulative memory driving the permanent
+                // slash and must not keep an entry in the dead pool forever on its own.
+                let proven_dead = e.orphan_slashed;
                 let in_pass = match pass {
-                    0 => e.is_inference,
-                    1 => !e.is_inference && !proven_dead,
-                    _ => !e.is_inference && proven_dead,
+                    0 => e.batch_cap == 0 && !proven_dead,
+                    1 => e.batch_cap != 0 && !proven_dead,
+                    _ => proven_dead,
                 };
                 if !in_pass {
                     continue;
@@ -508,32 +659,22 @@ impl EscrowWatcher {
                 limit = limit.min(cap);
                 batch.push(i);
                 if batch.len() >= limit {
-                    break 'select;
+                    break; // batch is full for this pass
                 }
             }
-            if !batch.is_empty() {
-                break; // partial batch stays single-pass — never top it up from a lower one
+            let releasable = match pass {
+                // Nominal batches ship full or not at all (fee amortization).
+                0 => batch.len() >= MIN_CLAIM_BATCH,
+                // Repair and dead-pool batches flow at any size.
+                _ => !batch.is_empty(),
+            };
+            if releasable {
+                selected = true;
+                break;
             }
         }
-        if batch.is_empty() {
+        if !selected {
             return None;
-        }
-        // Fee amortization: an uncapped partial batch waits until MIN_CLAIM_BATCH outputs
-        // are ready, so the flat claim fee is split across a full TX. Two release valves:
-        // a batch carrying a bisection cap (limit < MAX_CLAIM_BATCH) keeps flowing so dead
-        // inputs still get isolated, and once the oldest member has been claimable for
-        // CLAIM_BATCH_TIMEOUT_DAA the partial batch is submitted anyway. The timeout is
-        // derived from confirm_daa (no extra state), so an old backlog flows immediately —
-        // only freshly matured entries wait for a full batch.
-        if limit == MAX_CLAIM_BATCH && batch.len() < MIN_CLAIM_BATCH {
-            let oldest_eligible = batch
-                .iter()
-                .map(|&i| self.state.entries[i].confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10)
-                .min()
-                .expect("batch is non-empty");
-            if daa_score < oldest_eligible + CLAIM_BATCH_TIMEOUT_DAA {
-                return None;
-            }
         }
         let entries: Vec<EscrowEntry> = batch.iter().map(|&i| self.state.entries[i].clone()).collect();
 
@@ -633,6 +774,7 @@ impl EscrowWatcher {
                             // dead one can never be slashed by association, and the halves
                             // retry immediately (bisection strictly shrinks, so it ends).
                             e.batch_cap = halved_cap;
+                            e.cap_set_daa = last_daa;
                         } else {
                             e.orphan_retries += 1;
                             if e.orphan_retries >= MAX_ORPHAN_RETRIES {
@@ -658,6 +800,7 @@ impl EscrowWatcher {
                         // state from an error string has lost real funds before.
                         if batch_rejected {
                             e.batch_cap = halved_cap;
+                            e.cap_set_daa = last_daa;
                         }
                         e.submit_retries = e.submit_retries.saturating_add(1);
                         let cooldown = UNKNOWN_RETRY_BASE_COOLDOWN_DAA
@@ -666,6 +809,8 @@ impl EscrowWatcher {
                         e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
                 }
+                // Debug level: with boot-time state validation in place, rejections are
+                // rare and transient (bisection repair) — not worth operator noise.
                 debug!(
                     "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
                     claim_txid,
@@ -815,6 +960,7 @@ impl EscrowWatcher {
             orphan_retry_after_daa: None,
             submit_retries: 0,
             batch_cap: 0,
+            cap_set_daa: 0,
             is_inference: true,
         });
         self.outpoint_set.insert(key);
