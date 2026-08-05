@@ -20,7 +20,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build a fallback ladder so mixed/older rigs don't fail on a single too-new .target.
     println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
     println!("cargo:rerun-if-env-changed=NVCC");
-    println!("cargo:rerun-if-env-changed=POM_SM_LIST");
     println!("cargo:rerun-if-env-changed=POM_FATBIN_LEGACY");
     println!("cargo:rerun-if-env-changed=POM_FATBIN_NEXTGEN");
     println!("cargo:rerun-if-changed=cuda/pom_mine_legacy.fatbin");
@@ -31,16 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     {
         let out_dir = env::var("OUT_DIR").unwrap();
-        let sm_list = env::var("POM_SM_LIST").unwrap_or_else(|_| "90,89,86,80,75,70,61".to_string());
-        let sms: Vec<String> = sm_list
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        assert!(!sms.is_empty(), "POM_SM_LIST resolved to an empty set");
-
-        for sm in sms {
+        for sm in ["90", "89", "86", "80", "75", "70", "61"] {
             let ptx = format!("{out_dir}/pom_mine_sm{sm}.ptx");
             let output = std::process::Command::new(&nvcc)
                 .args(["-ptx", "-O3", &format!("-arch=sm_{sm}"), "cuda/pom_mine.cu", "-o", &ptx])
