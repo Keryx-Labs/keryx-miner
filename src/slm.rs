@@ -326,6 +326,7 @@ fn verify_gguf(spec: &ModelSpec, gguf: &std::path::Path, ok_flag: &std::path::Pa
         return Err(error);
     }
     verified_models().write().unwrap().insert(spec.model_id);
+    mark_model_available(&spec.model_id, "integrity_verified");
     ui_download_info(&format!("[keryx-miner] Model '{}' integrity verified.", spec.name));
     Ok(())
 }
