@@ -7,6 +7,8 @@ use std::fmt::{Display, Formatter};
 use std::{fmt, io};
 use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 
+const MAX_STRATUM_LINE_LENGTH: usize = 1024 * 1024;
+
 #[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
 pub enum ErrorCode {
@@ -159,7 +161,7 @@ pub(crate) struct NewLineJsonCodec {
 
 impl NewLineJsonCodec {
     pub fn new() -> Self {
-        Self { lines_codec: LinesCodec::new() }
+        Self { lines_codec: LinesCodec::new_with_max_length(MAX_STRATUM_LINE_LENGTH) }
     }
 }
 
@@ -197,6 +199,39 @@ impl Encoder<StratumLine> for NewLineJsonCodec {
                 Err(NewLineJsonCodecError::JsonEncodeError)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stratum_frame_limit_accepts_limit_and_recovers_after_oversize() {
+        let encode_line = |value: String| {
+            serde_json::to_string(&StratumLine {
+                id: None,
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(vec![value])),
+                jsonrpc: None,
+                error: None,
+            })
+            .unwrap()
+        };
+
+        let empty = encode_line(String::new());
+        let line = encode_line("x".repeat(MAX_STRATUM_LINE_LENGTH - empty.len()));
+        assert_eq!(line.len(), MAX_STRATUM_LINE_LENGTH);
+
+        let mut codec = NewLineJsonCodec::new();
+        let mut at_limit = BytesMut::from(format!("{line}\n").as_bytes());
+        assert!(codec.decode(&mut at_limit).unwrap().is_some());
+
+        let mut oversized = BytesMut::from(vec![b'x'; MAX_STRATUM_LINE_LENGTH + 1].as_slice());
+        assert!(codec.decode(&mut oversized).is_err());
+        oversized.extend_from_slice(b"\n");
+        oversized.extend_from_slice(format!("{}\n", encode_line(String::new())).as_bytes());
+        let recovered = codec.decode(&mut oversized).unwrap().or_else(|| codec.decode(&mut oversized).unwrap());
+        assert!(recovered.is_some());
     }
 }
 

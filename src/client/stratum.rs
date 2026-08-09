@@ -38,6 +38,56 @@ const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v2";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 
+fn target_from_difficulty(difficulty: f32) -> Result<Uint256, Error> {
+    if !difficulty.is_finite() || difficulty <= 0.0 {
+        return Err("Stratum difficulty must be finite and positive".into());
+    }
+    let reciprocal = difficulty.recip();
+    if !reciprocal.is_finite() || reciprocal <= 0.0 {
+        return Err("Stratum difficulty is outside the supported range".into());
+    }
+
+    let (mantissa, exponent, _) = reciprocal.integer_decode();
+    let new_mantissa = mantissa.checked_mul(DIFFICULTY_1_TARGET.0).ok_or("Stratum target mantissa overflow")?;
+    let new_exponent = i32::from(DIFFICULTY_1_TARGET.1) + i32::from(exponent);
+    if new_exponent < 0 {
+        return Err("Stratum difficulty produces a target below one".into());
+    }
+    let start = usize::try_from(new_exponent / 64).map_err(|_| "Invalid Stratum target exponent")?;
+    if start >= 4 {
+        return Err("Stratum difficulty produces a target larger than 256 bits".into());
+    }
+    let remainder = (new_exponent % 64) as u32;
+    if start == 3 && remainder > new_mantissa.leading_zeros() {
+        return Err("Stratum difficulty produces a target larger than 256 bits".into());
+    }
+
+    let mut limbs = [0u64; 4];
+    limbs[start] = new_mantissa << remainder;
+    if remainder != 0 && start < 3 {
+        limbs[start + 1] = new_mantissa >> (64 - remainder);
+    }
+    Ok(Uint256::new(limbs))
+}
+
+fn nonce_partition(extranonce: &str, variable_bytes: u32) -> Result<(u64, u64), Error> {
+    if variable_bytes > 8 {
+        return Err("Stratum nonce size exceeds 8 bytes".into());
+    }
+    if extranonce.len() % 2 != 0 {
+        return Err("Stratum extranonce must have an even number of hexadecimal digits".into());
+    }
+    let fixed_bytes = hex::decode(extranonce).map_err(|_| "Stratum extranonce contains invalid hexadecimal")?;
+    if fixed_bytes.len() > 8 - variable_bytes as usize {
+        return Err("Stratum extranonce and variable nonce exceed 8 bytes".into());
+    }
+    let fixed = fixed_bytes.iter().fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+    let variable_bits = variable_bytes * 8;
+    let nonce_fixed = if variable_bits == 64 { 0 } else { fixed << variable_bits };
+    let nonce_mask = if variable_bits == 64 { u64::MAX } else { (1u64 << variable_bits) - 1 };
+    Ok((nonce_fixed, nonce_mask))
+}
+
 // ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
 
 /// AiRequest task dispatched by the bridge in a `mining.notify` 5th parameter (JSON).
@@ -88,10 +138,60 @@ pub struct ShareStats {
     pub shares_pending: Mutex<HashMap<u32, String>>,
 }
 
+impl ShareStats {
+    async fn insert_pending(&self, id: u32, job_id: String) {
+        self.shares_pending.lock().await.insert(id, job_id);
+    }
+
+    async fn take_pending(&self, id: u32) -> Option<String> {
+        self.shares_pending.lock().await.remove(&id)
+    }
+
+    async fn record_rejection(&self, id: u32, code: ErrorCode, message: String) -> Result<(), Error> {
+        let job_id = self.take_pending(id).await;
+        match code {
+            ErrorCode::Unauthorized | ErrorCode::NotSubscribed => {
+                error!("Stratum connection rejected request {} ({}): {}", id, code, message);
+                Err(message.into())
+            }
+            ErrorCode::Unknown | ErrorCode::JobNotFound | ErrorCode::DuplicateShare | ErrorCode::LowDifficultyShare => {
+                let Some(job_id) = job_id else {
+                    warn!("Ignoring share rejection for unknown request id {} ({}): {}", id, code, message);
+                    return Ok(());
+                };
+                match code {
+                    ErrorCode::Unknown => {
+                        warn!("Share rejected by pool (Job id: {:?}): {}", job_id, message);
+                    }
+                    ErrorCode::JobNotFound => {
+                        self.stale.fetch_add(1, Ordering::SeqCst);
+                        warn!("Stale share (Job id: {:?}): {}", job_id, message);
+                    }
+                    ErrorCode::DuplicateShare => {
+                        self.duplicate.fetch_add(1, Ordering::SeqCst);
+                        warn!("Duplicate share (Job id: {:?}): {}", job_id, message);
+                    }
+                    ErrorCode::LowDifficultyShare => {
+                        self.low_diff.fetch_add(1, Ordering::SeqCst);
+                        warn!("Low difficulty share (Job id: {:?}): {}", job_id, message);
+                    }
+                    ErrorCode::Unauthorized | ErrorCode::NotSubscribed => return Err(message.into()),
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 static SHARE_STATS: OnceLock<Arc<ShareStats>> = OnceLock::new();
 
 impl Display for ShareStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let pending = self
+            .shares_pending
+            .try_lock()
+            .map(|shares| shares.len().to_string())
+            .unwrap_or_else(|_| "busy".to_string());
         write!(
             f,
             "Shares: {}{}{}{}Pending: {}",
@@ -111,7 +211,7 @@ impl Display for ShareStats {
                 0 => "".to_string(),
                 v => format!("Duplicate: {} ", v),
             },
-            self.shares_pending.try_lock().unwrap().len()
+            pending
         )
     }
 }
@@ -319,7 +419,7 @@ impl StratumHandler {
                     BlockSeed::FullBlock { .. } => unreachable!(),
                 };
                 let msg_id = last_stratum_id.fetch_add(1, Ordering::SeqCst);
-                share_stats.shares_pending.try_lock().unwrap().insert(msg_id, job_id.clone());
+                share_stats.insert_pending(msg_id, job_id.clone()).await;
                 let nonce_hex = format!("{:016x}", nonce);
                 let opoi_tag = keryx_inference::tag_fixed(nonce);
 
@@ -371,6 +471,7 @@ impl StratumHandler {
                 };
 
                 if send_channel.send(line).await.is_err() {
+                    share_stats.take_pending(msg_id).await;
                     break;
                 }
             }
@@ -382,21 +483,26 @@ impl StratumHandler {
         match msg.clone() {
             StratumLine { id, payload, error: None, .. } => {
                 match payload {
-                    StratumLinePayload::StratumResult { result } if id.is_some() => {
+                    StratumLinePayload::StratumResult { result } => {
+                        let Some(id) = id else {
+                            return Err(format!("Stratum result is missing a request id: {:?}", msg).into());
+                        };
                         match result {
                             StratumResult::Plain(Some(true)) | StratumResult::Eth((true, _)) => {
-                                if let Some(_jobid) = self
-                                    .shares_stats
-                                    .shares_pending
-                                    .try_lock()
-                                    .unwrap()
-                                    .remove(&id.expect("We checked id is not none"))
-                                {
+                                if self.shares_stats.take_pending(id).await.is_some() {
                                     self.shares_stats.accepted.fetch_add(1, Ordering::SeqCst);
                                     info!("Share accepted");
                                 } else {
                                     info!("{:?} (Last: {})", msg.clone(), self.last_stratum_id.load(Ordering::SeqCst));
-                                    warn!("Ignoring result for now");
+                                    warn!("Ignoring result for unknown request id {}", id);
+                                }
+                                Ok(())
+                            }
+                            StratumResult::Plain(Some(false)) | StratumResult::Eth((false, _)) => {
+                                if let Some(job_id) = self.shares_stats.take_pending(id).await {
+                                    warn!("Share rejected without pool error details (Job id: {:?})", job_id);
+                                } else {
+                                    warn!("Ignoring rejection for unknown request id {}", id);
                                 }
                                 Ok(())
                             }
@@ -526,7 +632,6 @@ impl StratumHandler {
                         }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
                     },
-                    _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
                 }
             }
             StratumLine {
@@ -534,72 +639,27 @@ impl StratumHandler {
                 payload: StratumLinePayload::StratumResult { .. },
                 error: Some(StratumError(code, error, _)),
                 ..
-            } => {
-                let jobid = { self.shares_stats.shares_pending.try_lock().unwrap().remove(&id) }.unwrap();
-                match code {
-                    ErrorCode::Unknown => {
-                        // Match solo-mining behaviour (grpc.rs SubmitBlockResponse): a rejected
-                        // share/block is logged but never fatal. Returning Err here tore down the
-                        // whole connection and caused an infinite reconnect loop on every share.
-                        self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
-                        warn!("Share rejected by pool (Job id: {:?}): {}", jobid, error);
-                        Ok(())
-                    }
-                    ErrorCode::JobNotFound => {
-                        self.shares_stats.stale.fetch_add(1, Ordering::SeqCst);
-                        warn!("Stale share (Job id: {:?})", jobid);
-                        Ok(())
-                    }
-                    ErrorCode::DuplicateShare => {
-                        self.shares_stats.duplicate.fetch_add(1, Ordering::SeqCst);
-                        warn!("Duplicate share (Job id: {:?})", jobid);
-                        Ok(())
-                    }
-                    ErrorCode::LowDifficultyShare => {
-                        self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
-                        warn!("Low difficulty share (Job id: {:?})", jobid);
-                        Ok(())
-                    }
-                    ErrorCode::Unauthorized => {
-                        error!("Got error code {}: {}", code, error);
-                        Err(error.into())
-                    }
-                    ErrorCode::NotSubscribed => {
-                        error!("Got error code {}: {}", code, error);
-                        Err(error.into())
-                    }
-                }
+            } => self.shares_stats.record_rejection(id, code, error).await,
+            StratumLine { id: None, error: Some(StratumError(code, error, _)), .. } => {
+                warn!("Ignoring Stratum error without request id ({}): {}", code, error);
+                Ok(())
             }
             _ => Err(format!("Unhandled stratum response: {:?}", msg).into()),
         }
     }
 
     fn set_difficulty(&mut self, difficulty: &f32) -> Result<(), Error> {
-        let mut buf = [0u64, 0u64, 0u64, 0u64];
-        let (mantissa, exponent, _) = difficulty.recip().integer_decode();
-        let new_mantissa = mantissa * DIFFICULTY_1_TARGET.0;
-        let new_exponent = (DIFFICULTY_1_TARGET.1 + exponent) as u64;
-        let start = (new_exponent / 64) as usize;
-        let remainder = new_exponent % 64;
-
-        buf[start] = new_mantissa << remainder; // bottom
-        if start < 3 {
-            buf[start + 1] = new_mantissa >> (64 - remainder); // top
-        } else if new_mantissa.leading_zeros() < remainder as u32 {
-            return Err("Target is too big".into());
-        }
-
-        self.target_pool = Uint256::new(buf);
+        self.target_pool = target_from_difficulty(*difficulty)?;
         info!("Difficulty: {:?}, Target: 0x{}", difficulty, hex::encode(self.target_pool.to_be_bytes()));
         Ok(())
     }
 
     fn set_extranonce(&mut self, extranonce: &str, nonce_size: &u32) -> Result<(), Error> {
+        let (nonce_fixed, nonce_mask) = nonce_partition(extranonce, *nonce_size)?;
         self.extranonce = Some(extranonce.to_string());
-        info!("Extra! {:?}", extranonce);
-        self.nonce_fixed = u64::from_str_radix(extranonce, 16)? << (nonce_size * 8);
-        info!("Extra Done!");
-        self.nonce_mask = (1 << (nonce_size * 8)) - 1;
+        self.nonce_fixed = nonce_fixed;
+        self.nonce_mask = nonce_mask;
+        info!("Extranonce: {:?}", extranonce);
         Ok(())
     }
 
@@ -822,5 +882,55 @@ fn do_inference_and_upload(
             warn!("OPoI [{}]: IPFS upload failed: {}", stable_id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn difficulty_validation_rejects_non_finite_and_out_of_range_values() {
+        assert!(target_from_difficulty(1.0).is_ok());
+        assert!(target_from_difficulty(f32::MAX).is_ok());
+        for difficulty in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::MIN_POSITIVE] {
+            assert!(target_from_difficulty(difficulty).is_err(), "accepted {difficulty:?}");
+        }
+    }
+
+    #[test]
+    fn extranonce_validation_bounds_nonce_partition() {
+        let (fixed, mask) = nonce_partition("abcd", 6).unwrap();
+        assert_eq!(fixed, 0xabcd_0000_0000_0000);
+        assert_eq!(mask, 0x0000_ffff_ffff_ffff);
+        assert_eq!(nonce_partition("", 8).unwrap(), (0, u64::MAX));
+
+        assert!(nonce_partition("abc", 6).unwrap_err().to_string().contains("even number"));
+        assert!(nonce_partition("zz", 6).unwrap_err().to_string().contains("invalid hexadecimal"));
+        for (extra, bytes) in [("abcd", 7), ("", 9)] {
+            assert!(nonce_partition(extra, bytes).is_err(), "accepted extra={extra:?} bytes={bytes}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_share_access_is_non_panicking_and_unknown_ids_are_ignored() {
+        let stats = ShareStats::default();
+        stats.insert_pending(7, "job-7".to_string()).await;
+        assert_eq!(stats.take_pending(7).await.as_deref(), Some("job-7"));
+        assert_eq!(stats.take_pending(7).await, None);
+
+        stats.insert_pending(8, "job-8".to_string()).await;
+        stats.record_rejection(8, ErrorCode::Unknown, "pool rejection".to_string()).await.unwrap();
+        assert_eq!(stats.low_diff.load(Ordering::SeqCst), 0);
+
+        stats.record_rejection(99, ErrorCode::LowDifficultyShare, "unknown id".to_string()).await.unwrap();
+        assert_eq!(stats.low_diff.load(Ordering::SeqCst), 0);
+
+        stats.insert_pending(9, "job-9".to_string()).await;
+        stats.record_rejection(9, ErrorCode::LowDifficultyShare, "too easy".to_string()).await.unwrap();
+        assert_eq!(stats.low_diff.load(Ordering::SeqCst), 1);
+
+        let _pending_guard = stats.shares_pending.lock().await;
+        assert!(format!("{stats}").contains("Pending: busy"));
     }
 }
