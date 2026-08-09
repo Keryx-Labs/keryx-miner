@@ -297,6 +297,19 @@ impl EscrowWatcher {
         hex::encode(self.pubkey_bytes)
     }
 
+    /// V2 responder identity for an AiResponse: schnorr signature with the escrow key over the
+    /// domain-hashed v1 payload bytes — MUST match the node's `verified_responder`
+    /// (blake2b-256("KeryxServiceResponderV1" || signed_bytes)).
+    pub fn sign_responder(&self, signed_bytes: &[u8]) -> keryx_inference::AiResponder {
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(signed_bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        keryx_inference::AiResponder { escrow_pubkey: self.pubkey_bytes, signature: *sig.as_ref() }
+    }
+
     /// Scan a confirmed block for the miner's escrow output and check for mature claims.
     /// Returns a claim TX to submit if one is ready; `None` otherwise.
     pub fn handle_block(&mut self, block: &crate::proto::RpcBlock) -> Option<RpcTransaction> {
@@ -1277,4 +1290,47 @@ fn decode_address(addr: &str) -> Result<(u16, [u8; 32]), String> {
     let mut spk = [0u8; 32];
     spk.copy_from_slice(&bytes[1..33]);
     Ok((version, spk))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The responder signature must verify exactly the way the node's `verified_responder`
+    /// does: schnorr over blake2b-256("KeryxServiceResponderV1" || v1 payload bytes) with the
+    /// x-only escrow pubkey.
+    #[test]
+    fn responder_signature_verifies_like_the_node() {
+        let dir = std::env::temp_dir().join(format!("keryx-escrow-test-{}", std::process::id()));
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let w = EscrowWatcher::new(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            dir,
+        )
+        .unwrap();
+
+        let resp = keryx_inference::AiResponsePayload::new([9u8; 32], 123, [7u8; 34], 5);
+        let signed_bytes = resp.signed_bytes();
+        let r = w.sign_responder(&signed_bytes);
+        assert_eq!(r.escrow_pubkey, w.pubkey_bytes);
+
+        // Node-side verification, replicated bit-for-bit.
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(&signed_bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).unwrap();
+        let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok());
+
+        // A tampered payload byte must fail verification.
+        let mut bad = signed_bytes.clone();
+        bad[0] ^= 1;
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(&bad);
+        let bad_msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &bad_msg, &pk).is_err());
+    }
 }

@@ -526,8 +526,24 @@ impl KeryxdHandler {
 
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
-        let resp = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
-        info!("OPoI: uploading response CID={}, challenge_window_end={}", resp.cid_v0(), challenge_window_end);
+        // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
+        // as served for the tier cohort — an unsigned response no longer cancels a strike. The
+        // era rule mirrors the node's: V2 is rejected before the gate, so v1 is kept below it.
+        let v2 = self.last_known_daa >= keryx_miner::pom::pom_v3_activation_daa();
+        let resp = match (&self.escrow_watcher, v2) {
+            (Some(w), true) => {
+                let unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+                let responder = w.sign_responder(&unsigned.signed_bytes());
+                keryx_inference::AiResponsePayload::new_v2(request_hash, challenge_window_end, cid, response_length, responder)
+            }
+            (None, true) => {
+                warn!("OPoI: no escrow key configured — submitting an unsigned (v1) response; it will NOT count for the service bond");
+                keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length)
+            }
+            (_, false) => keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length),
+        };
+        info!("OPoI: uploading response CID={}, challenge_window_end={}{}", resp.cid_v0(), challenge_window_end,
+            if resp.responder.is_some() { " (signed, V2)" } else { "" });
 
         let rpc_tx = crate::proto::RpcTransaction {
             version: 0,
