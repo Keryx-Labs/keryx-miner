@@ -57,6 +57,67 @@ pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
 type Hash = Uint256;
 
+const CUDA_INSTALL_SCRIPT: &str = r#"set -euo pipefail
+umask 077
+tmp_dir=$(mktemp -d /tmp/keryx-cuda.XXXXXX)
+cleanup() { rm -rf -- "$tmp_dir"; }
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+keyring="$tmp_dir/cuda-keyring.deb"
+curl --fail --silent --show-error --location \
+  --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --connect-timeout 15 --max-time 300 \
+  'https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb' \
+  --output "$keyring"
+printf '%s  %s\n' 'd93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df' "$keyring" | sha256sum -c -
+
+test "$(dpkg-deb -f "$keyring" Package)" = 'cuda-keyring'
+test "$(dpkg-deb -f "$keyring" Version)" = '1.1-1'
+test "$(dpkg-deb -f "$keyring" Architecture)" = 'all'
+dpkg -i "$keyring"
+apt-get update -qq
+apt-get install -y -qq libcublas-12-2 libcurand-12-2 cuda-cudart-12-2
+
+library_path() {
+  package=$1
+  soname=$2
+  path=$(dpkg -L "$package" | awk -v soname="$soname" '
+    { count = split($0, parts, "/") }
+    parts[count] == soname { match = $0 }
+    END { if (match) print match }
+  ')
+  test -n "$path"
+  test -e "$path"
+  readlink -f "$path"
+}
+
+cublas_path=$(library_path libcublas-12-2 libcublas.so.12)
+curand_path=$(library_path libcurand-12-2 libcurand.so.10)
+cudart_path=$(library_path cuda-cudart-12-2 libcudart.so.12)
+cublas_dir=$(dirname "$cublas_path")
+curand_dir=$(dirname "$curand_path")
+cudart_dir=$(dirname "$cudart_path")
+printf '%s\n' "$cublas_dir" "$curand_dir" "$cudart_dir" | sort -u > "$tmp_dir/keryx-cuda.conf"
+install -m 0644 "$tmp_dir/keryx-cuda.conf" /etc/ld.so.conf.d/keryx-cuda.conf
+ldconfig
+
+loader_has() {
+  soname=$1
+  directory=$2
+  ldconfig -p | awk -v soname="$soname" -v prefix="$directory/" '
+    $1 == soname && index($NF, prefix) == 1 { found = 1 }
+    END { exit !found }
+  '
+}
+
+loader_has libcublas.so.12 "$cublas_dir"
+loader_has libcurand.so.10 "$curand_dir"
+loader_has libcudart.so.12 "$cudart_dir"
+"#;
+
 /// Attempt to install the CUDA runtime libraries inference needs, on a Debian/Ubuntu host (HiveOS).
 ///
 /// OPoI GPU inference (the in-process llama engine) needs cuBLAS/cuBLASLt; cuRAND is kept for
@@ -82,25 +143,8 @@ fn install_cuda_libs() -> bool {
         error!("CUDA lib auto-install needs apt-get (Debian/Ubuntu) — not found on this system.");
         return false;
     }
-    // The CUDA libs install into /usr/local/cuda-*/targets/x86_64-linux/lib, which is NOT in
-    // the default loader search path. Installing alone is not enough: we must register that
-    // directory with ldconfig so dlopen("libcublas.so.12" / "libcurand.so.10") resolves it.
-    let script = r#"set -e
-cd /tmp
-wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O cuda-keyring.deb
-dpkg -i cuda-keyring.deb
-apt-get update -qq
-apt-get install -y -qq libcublas-12-2 libcurand-12-2 cuda-cudart-12-2
-CUBLAS_PATH=$(find /usr/local /usr/lib -name 'libcublas.so.12' 2>/dev/null | head -1)
-if [ -z "$CUBLAS_PATH" ]; then echo "libcublas.so.12 not found after install"; exit 1; fi
-echo "$(dirname "$CUBLAS_PATH")" > /etc/ld.so.conf.d/keryx-cuda.conf
-ldconfig
-ldconfig -p | grep -q libcublas.so.12 || { echo "libcublas still not in loader cache"; exit 1; }
-ldconfig -p | grep -q libcurand.so   || { echo "libcurand still not in loader cache"; exit 1; }
-ldconfig -p | grep -q libcudart.so.12 || { echo "libcudart still not in loader cache"; exit 1; }
-rm -f cuda-keyring.deb"#;
     let output = match Command::new("bash")
-        .args(["-c", script])
+        .args(["-c", CUDA_INSTALL_SCRIPT])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -128,6 +172,51 @@ rm -f cuda-keyring.deb"#;
     } else {
         error!("CUDA lib auto-install failed with status {}", output.status);
         false
+    }
+}
+
+#[cfg(test)]
+mod installer_tests {
+    use super::CUDA_INSTALL_SCRIPT;
+
+    #[test]
+    fn cuda_installer_security_invariants() {
+        let checksum = CUDA_INSTALL_SCRIPT.find("sha256sum -c").unwrap();
+        let metadata = CUDA_INSTALL_SCRIPT.find("dpkg-deb -f").unwrap();
+        let install = CUDA_INSTALL_SCRIPT.find("dpkg -i").unwrap();
+
+        assert!(CUDA_INSTALL_SCRIPT.contains("mktemp -d /tmp/keryx-cuda.XXXXXX"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("umask 077"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap cleanup EXIT"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap 'exit 129' HUP"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap 'exit 130' INT"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap 'exit 143' TERM"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--proto '=https'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--proto-redir '=https'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--tlsv1.2"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--connect-timeout 15 --max-time 300"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df"));
+        assert!(checksum < metadata && metadata < install);
+        assert!(CUDA_INSTALL_SCRIPT.contains("Package)\" = 'cuda-keyring'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("Version)\" = '1.1-1'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("Architecture)\" = 'all'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("dpkg -L \"$package\""));
+        assert!(CUDA_INSTALL_SCRIPT.contains("readlink -f \"$path\""));
+        assert!(CUDA_INSTALL_SCRIPT.contains("$1 == soname && index($NF, prefix) == 1"));
+        assert!(!CUDA_INSTALL_SCRIPT.contains("print; exit"));
+        assert!(!CUDA_INSTALL_SCRIPT.contains("find /usr"));
+        assert!(!CUDA_INSTALL_SCRIPT.contains("/tmp/cuda-keyring.deb"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cuda_installer_is_valid_bash() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("bash").args(["-n"]).stdin(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(CUDA_INSTALL_SCRIPT.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
     }
 }
 

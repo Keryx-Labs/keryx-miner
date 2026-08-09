@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const STATS_READ_TIMEOUT_SECS: u64 = 5;
 const STATS_WRITE_TIMEOUT_SECS: u64 = 5;
 const MAX_REQUEST_LINE_BYTES: usize = 4096;
+const MAX_STATS_CONNECTIONS: usize = 8;
+
+struct StatsConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl StatsConnectionPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_STATS_CONNECTIONS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Self { active: Arc::clone(active) })
+    }
+}
+
+impl Drop for StatsConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
 
 static NVML_HANDLE: OnceLock<Option<Nvml>> = OnceLock::new();
 
@@ -580,11 +602,16 @@ DEVICE #1:
 pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind((bind_addr.as_str(), port))?;
     Ok(thread::spawn(move || {
+        let active_connections = Arc::new(AtomicUsize::new(0));
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    let Some(permit) = StatsConnectionPermit::acquire(&active_connections) else {
+                        continue;
+                    };
                     let stats = Arc::clone(&stats);
-                    thread::spawn(move || {
+                    let _ = thread::Builder::new().name("stats-handler".into()).spawn(move || {
+                        let _permit = permit;
                         let _ = handle_connection(stream, &stats);
                     });
                 }
@@ -673,5 +700,23 @@ fn parse_u32_field(value: &str) -> Option<u32> {
         None
     } else {
         filtered.parse::<u32>().ok()
+    }
+}
+#[cfg(test)]
+mod connection_tests {
+    use super::{StatsConnectionPermit, MAX_STATS_CONNECTIONS};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    #[test]
+    fn stats_connection_limit_is_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permits = (0..MAX_STATS_CONNECTIONS)
+            .map(|_| StatsConnectionPermit::acquire(&active).expect("connection slot"))
+            .collect::<Vec<_>>();
+
+        assert!(StatsConnectionPermit::acquire(&active).is_none());
+        drop(permits);
+        assert!(StatsConnectionPermit::acquire(&active).is_some());
     }
 }
