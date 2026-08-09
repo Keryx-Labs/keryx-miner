@@ -11,8 +11,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # This script is executed by HiveOS when stopping the custom miner.
 
-# If Hive launched this miner in a screen session, close that session too so a
-# parent shell/wrapper cannot relaunch the binary.
+miner_pids() {
+	{
+		pgrep -x "${CUSTOM_MINERBIN}" || true
+		pgrep -f -- "${CUSTOM_MINER_DIR}/${CUSTOM_MINERBIN}" || true
+	} | sort -un
+}
+
+signal_miner() {
+	local signal="$1"
+	local -a pids=()
+	mapfile -t pids < <(miner_pids)
+	(( ${#pids[@]} == 0 )) || kill "-$signal" "${pids[@]}" || true
+}
+
+# Give the miner time to flush escrow state before stopping wrappers or screen.
+signal_miner TERM
+for ((i = 0; i < 15; i++)); do
+	[[ -n "$(miner_pids)" ]] || break
+	sleep 1
+done
+
+# Force-stop only after the complete graceful shutdown window.
+signal_miner KILL
+
 if command -v screen >/dev/null 2>&1; then
 	screen -S "miner" -X quit || true
 	screen -S "${CUSTOM_NAME}" -X quit || true
@@ -21,14 +43,3 @@ fi
 pkill -f "${CUSTOM_MINER_DIR}/h-run.sh" || true
 pkill -f "screen.*${CUSTOM_MINERBIN}" || true
 pkill -f "screen.*${CUSTOM_NAME}" || true
-
-# Kill by the exact installed binary path first, then by common invocation patterns.
-pkill -f "${CUSTOM_MINER_DIR}/${CUSTOM_MINERBIN}" || true
-pkill -x "${CUSTOM_MINERBIN}" || true
-pkill -f "./${CUSTOM_MINERBIN}" || true
-pkill -f "/${CUSTOM_NAME}/${CUSTOM_MINERBIN}" || true
-
-# Some wrappers ignore TERM briefly; force-stop if still alive.
-sleep 1
-pkill -9 -f "${CUSTOM_MINER_DIR}/${CUSTOM_MINERBIN}" || true
-pkill -9 -x "${CUSTOM_MINERBIN}" || true
