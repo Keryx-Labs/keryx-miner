@@ -82,6 +82,11 @@ pub struct PomProof {
     /// H4 recompute-from-chunks walk record. `None` on every pre-H4 proof. MUST keep the exact
     /// field order/types of the node's `PomProof::steps_v2` (borsh wire format).
     pub steps_v2: Option<Vec<PomStep>>,
+    /// H6 matrix-walk witness. When present the legacy fields above are canonical placeholders
+    /// (`trace_root` zeroed, empty paths/openings, `steps_v2 = None`) except `tier` (mirrored),
+    /// `final_state` (= `pom_v3::fold64(roots[K])`) and `pow_value` (era pow fold of it).
+    /// Trailing field, same era-exact wire mechanism as `steps_v2` — mirror of the node's.
+    pub v3: Option<crate::pom_v3::PomProofV3>,
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
@@ -98,13 +103,74 @@ pub struct PomProofPreH4 {
     pub openings: Vec<PomOpening>,
 }
 
+/// Exact pre-H6 layout of `PomProof` (no `v3`) — mirror of the node's `PomProofPreV3`. A proof
+/// without the v3 extension MUST serialize through this so pre-H6 nodes keep accepting it
+/// byte-for-byte. See `PomProof::to_wire_bytes`.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreV3 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+impl From<PomProofPreV3> for PomProof {
+    fn from(p: PomProofPreV3) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: None,
+        }
+    }
+}
+
+impl From<PomProofPreH4> for PomProof {
+    fn from(p: PomProofPreH4) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: None,
+            v3: None,
+        }
+    }
+}
+
 impl PomProof {
-    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`. A proof
-    /// without the v2 extension encodes byte-identically to the pre-H4 layout, so a not-yet-H4 node
-    /// (7-field decode) still accepts it. The submit path MUST use this, never `borsh::to_vec`.
+    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`: a proof
+    /// without the v3 extension encodes byte-identically to the pre-H6 layout, and without the v2
+    /// extension to the pre-H4 layout. The submit path MUST use this, never `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        match &self.steps_v2 {
-            None => borsh::to_vec(&PomProofPreH4 {
+        if self.v3.is_some() {
+            borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.steps_v2.is_some() {
+            borsh::to_vec(&PomProofPreV3 {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+                steps_v2: self.steps_v2.clone(),
+            })
+            .expect("PomProof borsh serialize")
+        } else {
+            borsh::to_vec(&PomProofPreH4 {
                 tier: self.tier,
                 trace_root: self.trace_root,
                 pow_value: self.pow_value,
@@ -113,9 +179,15 @@ impl PomProof {
                 final_trace_path: self.final_trace_path.clone(),
                 openings: self.openings.clone(),
             })
-            .expect("PomProof borsh serialize"),
-            Some(_) => borsh::to_vec(self).expect("PomProof borsh serialize"),
+            .expect("PomProof borsh serialize")
         }
+    }
+
+    /// Decode the canonical wire encoding, any era — mirror of the node's `from_wire_bytes`.
+    pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
+            .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 }
 
@@ -349,7 +421,7 @@ pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     path
 }
 
-fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
+pub(crate) fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
     let mut acc = leaf;
     let mut idx = index;
     for sib in path {
@@ -482,6 +554,7 @@ where
         final_trace_path: merkle_proof(&trace_leaves, k as usize),
         openings,
         steps_v2: None,
+        v3: None,
     }
 }
 
@@ -526,6 +599,7 @@ where
         final_trace_path: vec![],
         openings: vec![],
         steps_v2: Some(steps),
+        v3: None,
     }
 }
 
@@ -1224,6 +1298,13 @@ pub fn h5_2_activation_daa() -> u64 {
     gate(59_170_000, 4_000)
 }
 
+/// H6 matrix-walk gate. At/after this score (the TEMPLATE's daa_score, never wall clock or tip)
+/// the miner grinds the v3 walk and builds `PomProofV3`. MUST equal the node's
+/// `pom_v3_activation`: mainnet never (armed in a later release), testnet 5_000.
+pub fn pom_v3_activation_daa() -> u64 {
+    gate(u64::MAX, 5_000)
+}
+
 /// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
 /// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
 /// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
@@ -1261,6 +1342,54 @@ pub fn any_active_index() -> Option<(u8, Arc<WeightIndex>)> {
     pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(t, _)| **t).map(|(t, i)| (*t, i.clone())))
 }
 
+/// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) —
+/// real checkpoint tree + merkle paths, no GGUF.
+#[cfg(test)]
+pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+    let uid = UNIQ.fetch_add(1, O::Relaxed);
+    let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
+    let _ = std::fs::remove_file(&tree_path);
+
+    let n = (data.len() / 32) as u64;
+    let k = CHECKPOINT_INTERVAL;
+    let batch_size = 1u64 << k; // 64 for K=6
+
+    // Write level-K nodes from batches of chunk leaves.
+    let mut writer = BufWriter::new(
+        OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
+    );
+    let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+    for o in 0..n as usize {
+        batch.push(blake(&data[o * 32..o * 32 + 32]));
+        if batch.len() == batch_size as usize {
+            let level_k_node = fold_levels(&batch, k);
+            writer.write_all(&level_k_node).unwrap();
+            batch.clear();
+        }
+    }
+    // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
+    if !batch.is_empty() {
+        writer.write_all(&fold_levels(&batch, k)).unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+
+    let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
+    let tree_file = File::open(&tree_path).unwrap();
+    WeightIndex {
+        n_chunks: n,
+        r_t,
+        chunks: ChunkSource::Ram(data),
+        tree_file,
+        tree_path,
+        checkpoints,
+        total_levels,
+        dense: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,54 +1405,11 @@ mod tests {
     // Synthetic WeightIndex (no GGUF) — exercises the real read_chunk + O(log N) merkle_path
     // with the sparse checkpoint tree (same structure as production).
     fn synth_index(n: u64) -> WeightIndex {
-        use std::sync::atomic::{AtomicU64, Ordering as O};
-        static UNIQ: AtomicU64 = AtomicU64::new(0);
-        let uid = UNIQ.fetch_add(1, O::Relaxed);
-        let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
-        let _ = std::fs::remove_file(&tree_path);
-
-        let k = CHECKPOINT_INTERVAL;
-        let batch_size = 1u64 << k; // 64 for K=6
-
-        // Write level-K nodes from batches of synth chunks.
-        let mut writer = BufWriter::new(
-            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
-        );
-        let mut data = Vec::new();
-        let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
-
+        let mut data = Vec::with_capacity(n as usize * 32);
         for o in 0..n {
-            let b = words_to_bytes(&synth_chunk(o));
-            data.extend_from_slice(&b);
-            batch.push(blake(&b));
-            if batch.len() == batch_size as usize {
-                let level_k_node = fold_levels(&batch, k);
-                writer.write_all(&level_k_node).unwrap();
-                batch.clear();
-            }
+            data.extend_from_slice(&words_to_bytes(&synth_chunk(o)));
         }
-        // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
-        if !batch.is_empty() {
-            writer.write_all(&fold_levels(&batch, k)).unwrap();
-        }
-
-        writer.flush().unwrap();
-        drop(writer);
-
-        // Build higher checkpoints
-        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
-
-        let tree_file = File::open(&tree_path).unwrap();
-        WeightIndex {
-            n_chunks: n,
-            r_t,
-            chunks: ChunkSource::Ram(data),
-            tree_file,
-            tree_path,
-            checkpoints,
-            total_levels,
-            dense: None,
-        }
+        index_from_ram(data)
     }
 
     /// Regression for the sparse-checkpoint R_T bug (commit e1811a0): the checkpoint-built root MUST
@@ -1571,9 +1657,10 @@ mod tests {
         assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true, false));
         assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true, false));
 
-        // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
+        // Wire round-trip: a v2 proof encodes through the pre-H6 layout (era-exact) and
+        // decodes back through the fallback chain.
         let bytes = proof.to_wire_bytes();
-        let back: PomProof = borsh::from_slice(&bytes).unwrap();
+        let back = PomProof::from_wire_bytes(&bytes).unwrap();
         assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
     }
 

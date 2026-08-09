@@ -9,6 +9,7 @@ pub mod llama_engine;
 pub mod models;
 pub mod pom;
 pub mod pom_gpu;
+pub mod pom_v3;
 pub mod slm;
 pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};

@@ -331,6 +331,7 @@ impl MinerManager {
                 // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
+                const POM_V3_BATCH: u64 = 512;
 
                 loop {
                     nonces[0] = 0;
@@ -382,15 +383,19 @@ impl MinerManager {
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
                         let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2);
-                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
-                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
-                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
+                        // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
+                        // walk: small batches keep template latency low at 10 BPS.
+                        let batch = if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3);
+                        pom_nonce = pom_nonce.wrapping_add(batch);
+                        hashes_tried.fetch_add(batch, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             let built = state.as_ref().and_then(|s| {
                                 let tier = keryx_miner::pom_gpu::current_tier(worker_device_id, s.daa_score)?;
                                 let idx = keryx_miner::pom::active_index_for_tier(tier)?;
-                                s.generate_block_if_pom(nonce, idx.as_ref(), tier)
+                                s.generate_block_if_pom(nonce, idx.as_ref(), tier, worker_device_id)
                             });
                             if let Some(mut block_seed) = built {
                                 block_seed.set_device_id(&device_id);
@@ -544,12 +549,15 @@ impl MinerManager {
                     };
                     nonce = (nonce & mask) | fixed;
 
-                    // PoM possession path (CPU) once active; else legacy kHeavyHash.
-                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
-                        // The CPU/fallback walk has no per-device tier assignment — mine whichever
+                    // PoM possession path once active; else legacy kHeavyHash. The v3 (H6)
+                    // matrix walk only grinds on the GPU kernel — this fallback loop idles there.
+                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_v3_activation_daa() {
+                        None
+                    } else if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
+                        // The fallback walk has no per-device tier assignment — mine whichever
                         // tier's index is built (lowest present).
                         keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
-                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier)
+                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier, 0)
                         })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)

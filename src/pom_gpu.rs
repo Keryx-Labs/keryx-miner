@@ -31,6 +31,10 @@ const FATBIN_LEGACY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_
 const FATBIN_NEXTGEN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_nextgen.fatbin"));
 const CHUNK_BYTES: usize = 32;
 const POM_KERNEL_NAME: &str = "pom_mine";
+const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
+const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
+/// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
+const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
 
 const POM_PTX_CANDIDATES: [(&str, &str, &str); 7] = [
     ("pom_mine_mod_sm90", "sm_90", PTX_SM90),
@@ -87,6 +91,10 @@ pub fn list_gpu_kernel_info() -> Vec<GpuKernelInfo> {
 struct LoadedPomKernel {
     module: sys::CUmodule,
     function: sys::CUfunction,
+    /// v3 (H6) entries — `None` when the loaded image predates the v3 kernel (stale fatbin)
+    /// or the card cannot take the 64 KB opt-in shared attribute. Legacy mining is unaffected.
+    function_v3: Option<sys::CUfunction>,
+    function_v3_dump: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -111,14 +119,16 @@ impl LoadedPomKernel {
         }
         let module = unsafe { result::module::load_data(fatbin.as_ptr() as *const c_void) }?;
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
-        Ok(Self { module, function })
+        let (function_v3, function_v3_dump) = load_v3_functions(module);
+        Ok(Self { module, function, function_v3, function_v3_dump })
     }
 
     fn from_ptx(_label: &'static str, ptx: &'static str) -> Result<Self> {
         let c_src = CString::new(ptx)?;
         let module = unsafe { result::module::load_data(c_src.as_ptr() as *const c_void) }?;
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
-        Ok(Self { module, function })
+        let (function_v3, function_v3_dump) = load_v3_functions(module);
+        Ok(Self { module, function, function_v3, function_v3_dump })
     }
 
     fn launch(
@@ -180,6 +190,142 @@ impl LoadedPomKernel {
         let w = stream.clone_dtoh(&winner)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
+
+    /// v3 (H6) grind: one CUDA block per nonce over `[start, start + batch)`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v3(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_tiles: u64,
+        p_words: &[u64; 4],
+        s_words: &[u64; 4],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u64,
+    ) -> Result<Option<u64>> {
+        let function = self.function_v3.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no v3 entry"))?;
+        let t = words4(target_le);
+        let k = crate::pom_v3::POM_V3_K as u32;
+        let winner = stream.clone_htod(&[u64::MAX])?;
+        let cfg = LaunchConfig {
+            grid_dim: (batch as u32, 1, 1),
+            block_dim: (crate::pom_v3::POM_V3_D as u32, 1, 1),
+            shared_mem_bytes: POM_V3_SHARED_BYTES,
+        };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
+
+        let mut params: [*mut c_void; 21] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void),
+            (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void),
+            (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void),
+            (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void),
+            (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void),
+            (&batch as *const _ as *mut c_void),
+            (&winner_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
+
+        let w = stream.clone_dtoh(&winner)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
+    /// v3 (H6) dump: re-walk ONE (winning) nonce and return (states S_0..=S_K concatenated,
+    /// snippets, fold64(root_K)) for the host proof-build.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v3_dump(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_tiles: u64,
+        s_words: &[u64; 4],
+        timestamp: u64,
+        nonce: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+        let function =
+            self.function_v3_dump.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no v3 dump entry"))?;
+        let k = crate::pom_v3::POM_V3_K;
+        let d = crate::pom_v3::POM_V3_D;
+        let states = stream.clone_htod(vec![0u8; (k + 1) * d * d].as_slice())?;
+        let snippets = stream.clone_htod(vec![0u8; k * crate::pom_v3::POM_V3_SNIPPET_BYTES].as_slice())?;
+        let final_state = stream.clone_htod(&[0u64])?;
+        let k32 = k as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (d as u32, 1, 1),
+            shared_mem_bytes: POM_V3_SHARED_BYTES,
+        };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (states_ptr, _states_guard) = states.device_ptr(stream);
+        let (snippets_ptr, _snippets_guard) = snippets.device_ptr(stream);
+        let (final_ptr, _final_guard) = final_state.device_ptr(stream);
+
+        let mut params: [*mut c_void; 14] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k32 as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&nonce as *const _ as *mut c_void),
+            (&states_ptr as *const _ as *mut c_void),
+            (&snippets_ptr as *const _ as *mut c_void),
+            (&final_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
+
+        Ok((stream.clone_dtoh(&states)?, stream.clone_dtoh(&snippets)?, stream.clone_dtoh(&final_state)?[0]))
+    }
+}
+
+/// Best-effort v3 entry lookup + opt-in shared attribute. `None` entries mean the image
+/// predates the v3 kernel or the card cannot honor 64 KB of dynamic shared.
+fn load_v3_functions(module: sys::CUmodule) -> (Option<sys::CUfunction>, Option<sys::CUfunction>) {
+    let get = |name: &str| unsafe { result::module::get_function(module, CString::new(name).unwrap()) }.ok();
+    let arm = |f: sys::CUfunction| {
+        unsafe {
+            result::function::set_function_attribute(
+                f,
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                POM_V3_SHARED_BYTES as i32,
+            )
+        }
+        .is_ok()
+        .then_some(f)
+    };
+    (get(POM_V3_KERNEL_NAME).and_then(arm), get(POM_V3_DUMP_KERNEL_NAME).and_then(arm))
 }
 
 fn is_nextgen_device(device_id: usize) -> bool {
@@ -507,11 +653,30 @@ impl PomGpuMiner {
     /// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1` swaps the SEED words to the
     /// v2 salt (POM_H5_1_PPH_SALT) while the pow words stay H3 — the kernel is era-agnostic,
     /// it folds whatever word sets it receives.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Result<Option<u64>> {
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Result<Option<u64>> {
         // Worker threads rotate; make sure this device's context is current before raw launches.
         self.ctx.bind_to_thread()?;
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        if v3 {
+            let n_tiles = self.n_total_chunks / crate::pom_v3::POM_V3_TILE_CHUNKS;
+            if n_tiles == 0 {
+                return Err(anyhow!("PoM GPU: blob too small for the v3 walk"));
+            }
+            return self.kernel.launch_v3(
+                &self.stream,
+                &self.bases_dev,
+                &self.prefix_dev,
+                self.t_count,
+                n_tiles,
+                &p_words,
+                &s_words,
+                timestamp,
+                target_le,
+                start,
+                batch,
+            );
+        }
         self.kernel.launch(
             &self.stream,
             &self.bases_dev,
@@ -526,6 +691,17 @@ impl PomGpuMiner {
             batch,
             walk_v2 as u32,
         )
+    }
+
+    /// v3 dump for the winning nonce: (states S_0..=S_K, snippets, fold64(root_K)).
+    pub fn dump_v3(&self, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+        self.ctx.bind_to_thread()?;
+        let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        let n_tiles = self.n_total_chunks / crate::pom_v3::POM_V3_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return Err(anyhow!("PoM GPU: blob too small for the v3 walk"));
+        }
+        self.kernel.launch_v3_dump(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &s_words, timestamp, nonce)
     }
 }
 
@@ -592,12 +768,22 @@ pub fn is_loading() -> bool {
 }
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+#[allow(clippy::too_many_arguments)]
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3).ok().flatten()
+}
+
+/// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
+pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    let miner = {
+        let g = miners().lock().ok()?;
+        g.get(&device_id)?.clone()
+    };
+    miner.dump_v3(pre_pow_hash, timestamp, nonce, h3, h5_1, h5_2).ok()
 }
 
 /// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous
@@ -1026,5 +1212,101 @@ mod tests {
         assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
         assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
         assert!(!is_transient_gpu_runtime_fault("out of memory"));
+    }
+}
+
+#[cfg(test)]
+impl PomGpuMiner {
+    /// Test-only walk source: upload arbitrary chunk-aligned segments (no GGUF, no llama).
+    pub(crate) fn load_test_segments(device_id: usize, segments: Vec<Vec<u8>>) -> Result<Self> {
+        let ctx = CudaContext::new(device_id)?;
+        ctx.bind_to_thread()?;
+        let stream = ctx.default_stream();
+        let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        for seg in &segments {
+            let chunks = (seg.len() / CHUNK_BYTES) as u64;
+            if chunks == 0 {
+                continue;
+            }
+            let dev = stream.clone_htod(seg.as_slice())?;
+            bases.push(dev.device_ptr(&stream).0 as u64);
+            uploads.push(dev);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        let bases_dev = stream.clone_htod(bases.as_slice())?;
+        let prefix_dev = stream.clone_htod(prefix.as_slice())?;
+        let kernel = select_pom_kernel(device_id)?;
+        Ok(Self {
+            ctx,
+            stream,
+            kernel,
+            bases_dev,
+            prefix_dev,
+            t_count: bases.len() as u32,
+            n_total_chunks,
+            _uploads: uploads,
+        })
+    }
+}
+
+/// GPU lockstep tests — need a CUDA card: `cargo test --release -- --ignored v3_kernel`.
+#[cfg(test)]
+mod v3_kernel_tests {
+    use super::*;
+    use crate::pom_v3;
+
+    const PPH: [u8; 32] = [7u8; 32];
+    const TIMESTAMP: u64 = 0x11_2233_4455;
+
+    /// Chunk-aligned but NOT tile-aligned segment cuts — tiles straddle segment boundaries,
+    /// exercising the per-chunk gather.
+    fn split_blob(blob: &[u8]) -> Vec<Vec<u8>> {
+        let cuts = [999 * 32, 5000 * 32, blob.len()];
+        let mut segs = Vec::new();
+        let mut start = 0;
+        for &c in &cuts {
+            segs.push(blob[start..c].to_vec());
+            start = c;
+        }
+        segs
+    }
+
+    #[test]
+    #[ignore]
+    fn v3_kernel_matches_host_reference() {
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        let nonce = 42u64;
+        let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, nonce, true, true, true).unwrap();
+
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, nonce, true, true, true);
+        let (ref_states, ref_snippets, _) = pom_v3::ref_walk(seed, &blob);
+        assert_eq!(snippets, ref_snippets, "GPU snippets differ from the host reference");
+        assert_eq!(states, ref_states, "GPU states differ from the host reference");
+
+        let d2 = pom_v3::POM_V3_D * pom_v3::POM_V3_D;
+        let root = pom_v3::v3_state_root(&ref_states[pom_v3::POM_V3_K * d2..]);
+        assert_eq!(final_state, pom_v3::fold64(&root), "GPU blake3 tree differs from the host");
+    }
+
+    #[test]
+    #[ignore]
+    fn v3_grind_end_to_end() {
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        // Trivial target: every nonce wins, atomicMin returns the batch base.
+        let target = [0xFFu8; 32];
+        let found = miner.mine(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true, true, true).unwrap().unwrap();
+        assert_eq!(found, 1000);
+
+        let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, found, true, true, true).unwrap();
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, found, true, true, true);
+        let index = crate::pom::index_from_ram(blob);
+        let proof = pom_v3::build_proof_v3(0, &PPH, found, seed, &states, &snippets, &index).unwrap();
+        assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
+        assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
     }
 }

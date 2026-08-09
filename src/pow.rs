@@ -14,6 +14,7 @@ use crate::{
     Error, Hash,
 };
 use keryx_miner::pom::{self, WeightIndex};
+use keryx_miner::pom_v3;
 use keryx_miner::Worker;
 
 mod hasher;
@@ -225,7 +226,7 @@ impl State {
     /// `index` (the resident tier weights) yields `pom_pow_value <= target` for `nonce`,
     /// build the possession proof, set the nonce, attach the borsh-encoded proof, and return
     /// the full block to submit. Solo only: a pool `PartialBlock` cannot carry a per-miner proof.
-    pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8) -> Option<BlockSeed> {
+    pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8, device_id: u32) -> Option<BlockSeed> {
         let mut pph = [0u8; 32];
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
         let timestamp = u64::from_le_bytes(self.pow_hash_header[32..40].try_into().unwrap());
@@ -239,6 +240,41 @@ impl State {
         let h5_1 = self.daa_score >= pom::h5_1_activation_daa();
         let h5_2 = self.daa_score >= pom::h5_2_activation_daa();
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1, h5_2);
+
+        // H6: matrix-walk era — the winning nonce is re-walked on the GPU (state dump) and the
+        // witness is built host-side from the dump. The seed/pow folds are era-stable.
+        if self.daa_score >= pom::pom_v3_activation_daa() {
+            let (states, snippets, final_state) =
+                keryx_miner::pom_gpu::dump_v3(device_id, &pph, timestamp, nonce, h3, h5_1, h5_2)?;
+            if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
+                return None;
+            }
+            let v3 = pom_v3::build_proof_v3(tier, &pph, nonce, seed, &states, &snippets, index)
+                .map_err(|e| info!("PoM v3 proof build failed: {e}"))
+                .ok()?;
+            // Kernel/host lockstep gate: the GPU tree fold must equal the host-recomputed one.
+            if pom_v3::fold64(&v3.roots[pom_v3::POM_V3_K]) != final_state {
+                info!("PoM v3 proof discarded: GPU final-state fold differs from the host tree");
+                return None;
+            }
+            if !pom_v3::verify_proof_v3(&pph, nonce, seed, &v3, &index.r_t, index.n_chunks) {
+                info!("PoM v3 proof discarded: self-check failed");
+                return None;
+            }
+            let proof = pom::PomProof {
+                tier,
+                trace_root: [0u8; 32],
+                pow_value: pom::pom_pow_value(final_state, &pph, h3),
+                final_state,
+                initial_trace_path: vec![],
+                final_trace_path: vec![],
+                openings: vec![],
+                steps_v2: None,
+                v3: Some(v3),
+            };
+            return self.assemble_pom_block(nonce, final_state, proof.to_wire_bytes());
+        }
+
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
         if !pom::le_leq(&pom::pom_pow_value(final_state, &pph, h3), &self.target.to_le_bytes()) {
             return None;
@@ -265,8 +301,10 @@ impl State {
         };
         // `to_wire_bytes` keeps a pre-H4 proof byte-identical to the 7-field layout the running
         // node still decodes; a v2 proof encodes the full struct (only H4 nodes decode it).
-        let bytes = proof.to_wire_bytes();
+        self.assemble_pom_block(nonce, final_state, proof.to_wire_bytes())
+    }
 
+    fn assemble_pom_block(&self, nonce: u64, final_state: u64, proof_bytes: Vec<u8>) -> Option<BlockSeed> {
         let mut block_seed = (*self.block).clone();
         match &mut block_seed {
             BlockSeed::FullBlock { block, .. } => {
@@ -277,7 +315,7 @@ impl State {
                 if header.daa_score >= pom::pom_level_activation_daa() {
                     header.pom_final_state = final_state;
                 }
-                block.pom_proof = bytes; // plain bytes field (empty = none on the wire)
+                block.pom_proof = proof_bytes; // plain bytes field (empty = none on the wire)
             }
             BlockSeed::PartialBlock { .. } => return None,
         }

@@ -121,3 +121,264 @@ extern "C" __global__ void pom_mine(const unsigned long long* bases, const unsig
         }
     }
 }
+
+// ============================ PoM v3 (H6 matrix-state walk) ============================
+// Byte-exact mirror of the node's consensus/core/src/pom_v3.rs / POM_V3_SPEC.md.
+// One CUDA block = one nonce; blockDim.x == 256 == D; thread x owns state row x as 64
+// packed uint32 registers. The 64 KB tile lives in dynamic shared memory (requires the
+// opt-in shared attribute; cc >= 7.0).
+
+#define V3_D 256
+#define V3_D4 (V3_D / 4)
+#define V3_K_MAX 256
+#define V3_TILE_BYTES 65536
+#define V3_TILE_CHUNKS 2048
+
+#define V3_S0_ROW_SALT 0x6B61F28F3CC48744ULL
+#define V3_OFFSET_FIRST_SALT 0x3F1F886D659E316AULL
+#define V3_OFFSET_STEP_SALT 0xD4C194F3ADB3B1C7ULL
+
+// --- blake3 (single-chunk path: inputs <= 1024 B, counter 0) ---
+
+__device__ static const unsigned int B3_IV[8] = {
+    0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
+    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u,
+};
+
+__device__ static const unsigned char B3_SCHED[7][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8},
+    {3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1},
+    {10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6},
+    {12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4},
+    {9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7},
+    {11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13},
+};
+
+#define B3_CHUNK_START 1u
+#define B3_CHUNK_END 2u
+#define B3_ROOT 8u
+
+__device__ __forceinline__ unsigned int b3_rotr(unsigned int x, int n) {
+    return __funnelshift_r(x, x, n);
+}
+
+__device__ __forceinline__ void b3_g(unsigned int* v, int a, int b, int c, int d,
+                                     unsigned int mx, unsigned int my) {
+    v[a] += v[b] + mx; v[d] = b3_rotr(v[d] ^ v[a], 16);
+    v[c] += v[d];      v[b] = b3_rotr(v[b] ^ v[c], 12);
+    v[a] += v[b] + my; v[d] = b3_rotr(v[d] ^ v[a], 8);
+    v[c] += v[d];      v[b] = b3_rotr(v[b] ^ v[c], 7);
+}
+
+__device__ __forceinline__ void b3_compress(unsigned int cv[8], const unsigned int m[16],
+                                            unsigned int block_len, unsigned int flags) {
+    unsigned int v[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    v[8] = B3_IV[0]; v[9] = B3_IV[1]; v[10] = B3_IV[2]; v[11] = B3_IV[3];
+    v[12] = 0; v[13] = 0; v[14] = block_len; v[15] = flags;
+    #pragma unroll
+    for (int r = 0; r < 7; r++) {
+        const unsigned char* s = B3_SCHED[r];
+        b3_g(v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+        b3_g(v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+        b3_g(v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+        b3_g(v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+        b3_g(v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+        b3_g(v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        b3_g(v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+        b3_g(v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[i + 8];
+}
+
+// blake3 of one 256 B state row (64 packed words): 4 blocks of one chunk.
+__device__ __forceinline__ void b3_hash_row(const unsigned int row[64], unsigned int out[8]) {
+    unsigned int cv[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    #pragma unroll
+    for (int b = 0; b < 4; b++) {
+        unsigned int flags = (b == 0 ? B3_CHUNK_START : 0u) | (b == 3 ? (B3_CHUNK_END | B3_ROOT) : 0u);
+        b3_compress(cv, row + b * 16, 64, flags);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) out[i] = cv[i];
+}
+
+// blake3 of a 64 B concat (two child hashes): single block.
+__device__ __forceinline__ void b3_hash_pair(const unsigned int m[16], unsigned int out[8]) {
+    unsigned int cv[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    b3_compress(cv, m, 64, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) out[i] = cv[i];
+}
+
+// --- v3 walk primitives ---
+
+__device__ __forceinline__ unsigned int v3_rho8(int acc, unsigned int tweak) {
+    unsigned int z = (unsigned int)acc ^ tweak;
+    z *= 0x9E3779B9u; z ^= z >> 16;
+    z *= 0x85EBCA6Bu; z ^= z >> 13;
+    return z & 0xffu;
+}
+
+// Gather one 64 KB tile (2048 canonical chunks) from the segmented blob into shared.
+__device__ __forceinline__ void v3_load_tile(const unsigned long long* bases,
+                                             const unsigned long long* prefix, unsigned int T,
+                                             unsigned long long tile_index, unsigned int* s_tile32) {
+    const unsigned long long chunk0 = tile_index * (unsigned long long)V3_TILE_CHUNKS;
+    for (unsigned int c = threadIdx.x; c < V3_TILE_CHUNKS; c += blockDim.x) {
+        unsigned long long idx = chunk0 + c;
+        unsigned int lo = 0, hi = T;
+        while (lo + 1 < hi) {
+            unsigned int mid = (lo + hi) >> 1;
+            if (prefix[mid] <= idx) lo = mid; else hi = mid;
+        }
+        const ulonglong2* q = (const ulonglong2*)bases[lo];
+        unsigned long long b = (idx - prefix[lo]) * 2ULL;
+        ulonglong2* dst = (ulonglong2*)(s_tile32 + c * 8);
+        dst[0] = q[b];
+        dst[1] = q[b + 1];
+    }
+}
+
+// The walk body shared by grind and dump. Fits in EXACTLY 64 KB of dynamic shared (the
+// tile; reused as the hash-tree scratch after the last step) with zero static shared — the
+// Turing per-block ceiling. Each thread redundantly derives the offset chain in registers
+// (8 mix64 per step) instead of a shared broadcast. When states_out != nullptr every state
+// S_0..S_K is written there (row x of S_t at states_out + t*65536 + x*256) and each step's
+// snippet to snippets_out (32 B per step); proof-build consumes the dump. The returned
+// fold64(root_K) is valid on thread 0 ONLY.
+__device__ __forceinline__ unsigned long long v3_walk_block(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K, unsigned long long seed,
+    unsigned int* s_tile32, unsigned char* states_out, unsigned char* snippets_out) {
+    const unsigned int x = threadIdx.x;
+
+    // S_0: mix64 keystream per row (spec §4.2).
+    unsigned int row4[V3_D4];
+    {
+        unsigned long long h = mix64(seed ^ (V3_S0_ROW_SALT + (unsigned long long)x));
+        #pragma unroll
+        for (int k4 = 0; k4 < V3_D4; k4++) { h = mix64(h); row4[k4] = (unsigned int)h; }
+    }
+    if (states_out) {
+        unsigned int* dst = (unsigned int*)(states_out + (unsigned long long)x * V3_D);
+        #pragma unroll
+        for (int k4 = 0; k4 < V3_D4; k4++) dst[k4] = row4[k4];
+    }
+
+    unsigned long long off = mix64(seed ^ V3_OFFSET_FIRST_SALT) % n_tiles;
+
+    for (unsigned int step = 1; step <= K; step++) {
+        v3_load_tile(bases, prefix, T, off, s_tile32);
+        __syncthreads();
+
+        if (x == 0 && snippets_out) {
+            unsigned int* sn = (unsigned int*)(snippets_out + (unsigned long long)(step - 1) * 32);
+            #pragma unroll
+            for (int w = 0; w < 8; w++) sn[w] = s_tile32[w];
+        }
+        // Next offset from the CURRENT tile's snippet (spec §4.3), derived by every thread.
+        {
+            unsigned long long sf = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) sf = mix64(sf ^ (unsigned long long)s_tile32[w]);
+            off = mix64(seed ^ (unsigned long long)(step + 1) * V3_OFFSET_STEP_SALT ^ sf) % n_tiles;
+        }
+
+        // S_t[x][j] = rho8(dot_i8(row, col_j), tweak(step, x, j)) — fully unrolled dp4a.
+        const unsigned int step_tweak = step * 0x9E3779B9u + x * 0xC2B2AE35u;
+        unsigned int new4[V3_D4];
+        #pragma unroll
+        for (int j4 = 0; j4 < V3_D4; j4++) {
+            unsigned int packed = 0;
+            #pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+                const int j = j4 * 4 + jj;
+                const uint4* col = (const uint4*)&s_tile32[j * V3_D4];
+                int a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+                #pragma unroll
+                for (int k16 = 0; k16 < V3_D4 / 4; k16++) {
+                    const uint4 tv = col[k16];
+                    a0 = __dp4a((int)row4[k16 * 4 + 0], (int)tv.x, a0);
+                    a1 = __dp4a((int)row4[k16 * 4 + 1], (int)tv.y, a1);
+                    a2 = __dp4a((int)row4[k16 * 4 + 2], (int)tv.z, a2);
+                    a3 = __dp4a((int)row4[k16 * 4 + 3], (int)tv.w, a3);
+                }
+                packed |= v3_rho8((a0 + a1) + (a2 + a3),
+                                  step_tweak + (unsigned int)j * 0x85EBCA6Bu) << (8 * jj);
+            }
+            new4[j4] = packed;
+        }
+        #pragma unroll
+        for (int k4 = 0; k4 < V3_D4; k4++) row4[k4] = new4[k4];
+        if (states_out) {
+            unsigned int* dst =
+                (unsigned int*)(states_out + (unsigned long long)step * V3_TILE_BYTES + (unsigned long long)x * V3_D);
+            #pragma unroll
+            for (int k4 = 0; k4 < V3_D4; k4++) dst[k4] = new4[k4];
+        }
+        __syncthreads();
+    }
+
+    // root_K: blake3 row leaves + complete depth-8 tree (spec §4.5-4.6), scratch = the tile
+    // region (the last step's trailing barrier fenced all reads of it).
+    b3_hash_row(row4, s_tile32 + x * 8);
+    __syncthreads();
+    unsigned int* src = s_tile32;
+    unsigned int* dst = s_tile32 + V3_D * 8;
+    for (unsigned int n = V3_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        __syncthreads();
+        unsigned int* tmp = src; src = dst; dst = tmp;
+    }
+    return (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+}
+
+// v3 grind: one block per nonce. Dynamic shared = 64 KB (the tile).
+extern "C" __global__ void pom_mine_v3(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned long long* winner) {
+    extern __shared__ unsigned int s_tile32[];
+    if ((unsigned long long)blockIdx.x >= n_nonces) return;
+    const unsigned long long nonce = nonce_base + blockIdx.x;
+    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+
+    const unsigned long long fin = v3_walk_block(bases, prefix, T, n_tiles, K, seed, s_tile32, nullptr, nullptr);
+
+    if (threadIdx.x == 0) {
+        unsigned long long pv[4];
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) {
+            atomicMin(winner, nonce);
+        }
+    }
+}
+
+// v3 dump: re-walk ONE (winning) nonce, writing all K+1 states and K snippets for the host
+// proof-build. Launch with a single block.
+extern "C" __global__ void pom_mine_v3_dump(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_, unsigned long long nonce,
+    unsigned char* states_out, unsigned char* snippets_out, unsigned long long* final_state_out) {
+    extern __shared__ unsigned int s_tile32[];
+    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+
+    const unsigned long long fin = v3_walk_block(bases, prefix, T, n_tiles, K, seed, s_tile32, states_out, snippets_out);
+
+    if (threadIdx.x == 0) *final_state_out = fin;
+}
