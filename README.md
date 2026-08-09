@@ -157,6 +157,12 @@ If the miner still downloads a model although the folder is there, check your ti
 ./keryx-miner --help
 ```
 
+### Block celebration
+
+When the terminal UI is active, it displays a short coin animation and plays a sound on the miner host after a locally mined block is accepted. Press `B` to toggle the animation and `M` to mute or enable the sound independently. If the host has no audio device, mining continues without sound.
+
+The embedded sound is a trimmed adaptation of "Coin Drop" by Universfield under the Pixabay Content License. See `assets/coin-sound-LICENSE.txt` for details.
+
 
 ---
 

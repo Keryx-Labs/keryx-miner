@@ -28,6 +28,7 @@ use crate::stats::{spawn_stats_server, MinerStats};
 use crate::target::Uint256;
 use crate::ui::{spawn_ui, UiState};
 
+mod block_sound;
 mod cli;
 mod client;
 mod escrow;

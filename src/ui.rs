@@ -10,14 +10,64 @@ use std::io::{stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::{macros::format_description, OffsetDateTime};
 
+use crate::block_sound::BlockSoundPlayer;
 use crate::stats::MinerStats;
 
 const MAX_LOG_LINES: usize = 2000;
 const REDRAW_RATE: Duration = Duration::from_millis(300);
 const MIN_LOG_ROWS: u16 = 5;
+const BLOCK_CELEBRATION_DURATION: Duration = Duration::from_millis(2500);
+const BLOCK_COIN_FRAME_RATE: Duration = Duration::from_millis(100);
+const BLOCK_COIN_FRAME_COUNT: usize = 25;
+const BLOCK_COIN_WIDTH: usize = 24;
+const BLOCK_COIN_HEIGHT: usize = 24;
+const BLOCK_COIN_PALETTE: [(u8, u8, u8); 15] = [
+    (254, 214, 86),
+    (247, 200, 75),
+    (245, 194, 67),
+    (242, 190, 67),
+    (238, 179, 51),
+    (234, 167, 34),
+    (225, 164, 44),
+    (216, 152, 38),
+    (211, 136, 24),
+    (204, 124, 18),
+    (166, 108, 28),
+    (129, 73, 18),
+    (113, 59, 12),
+    (62, 48, 31),
+    (19, 20, 26),
+];
+// 24x24 indexed raster. Each terminal row renders two image rows with a half block.
+const BLOCK_COIN_ART: [&[u8; BLOCK_COIN_WIDTH]; BLOCK_COIN_HEIGHT] = [
+    b"000000edddddddddde000000",
+    b"00ef552111111111234cfe00",
+    b"0fa921177777777741179a00",
+    b"0fa5488aaaaaaaaaa8815a00",
+    b"0515966655444444666a42c0",
+    b"063766524c422222256a71c0",
+    b"d44a6432be7222222349a2ad",
+    b"d25a5212efc23eff2226ab7d",
+    b"d17a3222efc27fff17769c7d",
+    b"d17a3222efc8eebb17969c7d",
+    b"d37a3222efefe14327969c7d",
+    b"d28a3222efff842227969c7d",
+    b"d28a3222efffe14227969c7d",
+    b"d57a3222efc8fe8827969c7d",
+    b"d57a3222efc18fff17969c7d",
+    b"d57a3422efc22fff17969c7d",
+    b"d57a6222efc222115a46ac6d",
+    b"d56a6432cfc2222474499cad",
+    b"065866527d8777745569acc0",
+    b"0a859a966666666699a88ad0",
+    b"0fa3699a9aaaaaa9a89b8a00",
+    b"0fa95558888888887bb89b00",
+    b"0000bcb888bdd8987acd0000",
+    b"000000edcdddddddce000000",
+];
 
 #[derive(Copy, Clone)]
 struct Palette {
@@ -293,12 +343,26 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
         let mut last_size: Option<(u16, u16)> = None;
         let mut pending_resize: Option<(u16, u16)> = None;
         let mut first_frame = true;
-        let mut last_draw_key: Option<(u16, u16, bool, bool, u64, usize, u64, u64, u64)> = None;
-        let mut last_drawn_at = std::time::Instant::now();
+        let mut last_draw_key: Option<(u16, u16, bool, bool, u64, usize, u64, u64, u64, bool, bool)> = None;
+        let mut last_drawn_at = Instant::now();
+        let mut last_block_coin_frame = None;
+        let mut last_accepted_blocks = stats.snapshot().accepted_blocks;
+        let mut block_celebration_started: Option<Instant> = None;
+        let mut block_celebrations_enabled = true;
+        let mut block_celebration_sound_enabled = true;
+        let block_sound = BlockSoundPlayer::new();
 
         while !stop_clone.load(Ordering::Acquire) {
-            if handle_input(&ui_state, &shutdown_requested) {
+            if handle_input(
+                &ui_state,
+                &shutdown_requested,
+                &mut block_celebrations_enabled,
+                &mut block_celebration_sound_enabled,
+            ) {
                 break;
+            }
+            if !block_celebrations_enabled {
+                block_celebration_started = None;
             }
             let current_size = terminal::size()
                 .ok()
@@ -329,6 +393,26 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
             };
 
             let snapshot = stats.snapshot();
+            let (start_visual, play_sound) = block_celebration_actions(
+                last_accepted_blocks,
+                snapshot.accepted_blocks,
+                block_celebrations_enabled,
+                block_celebration_sound_enabled,
+            );
+            if start_visual {
+                block_celebration_started = Some(Instant::now());
+            }
+            if play_sound {
+                if let Some(player) = &block_sound {
+                    player.play();
+                }
+            }
+            last_accepted_blocks = snapshot.accepted_blocks;
+            let block_coin_frame =
+                block_celebration_started.and_then(|started| block_animation_frame(started.elapsed()));
+            if block_celebration_started.is_some() && block_coin_frame.is_none() {
+                block_celebration_started = None;
+            }
             let draw_key = (
                 current_size.0,
                 current_size.1,
@@ -339,14 +423,24 @@ pub fn spawn_ui(stats: Arc<MinerStats>, ui_state: Arc<UiState>, shutdown_request
                 snapshot.last_update_epoch_s,
                 snapshot.accepted_blocks,
                 snapshot.rejected_blocks,
+                block_celebrations_enabled,
+                block_celebration_sound_enabled,
             );
-            let periodic_refresh_due = last_drawn_at.elapsed() >= Duration::from_secs(1);
-            if should_clear || periodic_refresh_due || last_draw_key != Some(draw_key) {
-                draw_frame(&mut out, current_size, &snapshot, &ui_state, should_clear);
+            let animation_ended = last_block_coin_frame.is_some() && block_coin_frame.is_none();
+            let periodic_refresh_due = block_coin_frame.is_none() && last_drawn_at.elapsed() >= Duration::from_secs(1);
+            if should_clear || animation_ended || periodic_refresh_due || last_draw_key != Some(draw_key) {
+                draw_frame(&mut out, current_size, &snapshot, &ui_state, should_clear, block_coin_frame);
                 last_draw_key = Some(draw_key);
-                last_drawn_at = std::time::Instant::now();
+                last_drawn_at = Instant::now();
+                last_block_coin_frame = block_coin_frame;
+            } else if block_coin_frame != last_block_coin_frame {
+                if let Some(frame) = block_coin_frame {
+                    draw_block_celebration(&mut out, current_size.0, current_size.1, frame, snapshot.accepted_blocks);
+                    let _ = out.flush();
+                }
+                last_block_coin_frame = block_coin_frame;
             }
-            thread::sleep(REDRAW_RATE);
+            thread::sleep(if block_coin_frame.is_some() { BLOCK_COIN_FRAME_RATE } else { REDRAW_RATE });
         }
 
         let _ = execute!(out, Show, LeaveAlternateScreen);
@@ -392,6 +486,7 @@ fn draw_frame(
     snapshot: &crate::stats::MinerStatsSnapshot,
     ui_state: &UiState,
     _clear_screen: bool,
+    block_coin_frame: Option<usize>,
 ) {
     let (w, h) = size;
     let total_width = w as usize;
@@ -614,6 +709,11 @@ fn draw_frame(
                 " Home/End     Oldest/Live"
             }
             .to_string(),
+            fg: palette().text,
+            bold: false,
+        },
+        PanelRow::Plain {
+            text: " B Visual  M Sound".to_string(),
             fg: palette().text,
             bold: false,
         },
@@ -887,8 +987,103 @@ fn draw_frame(
         draw_colored_cell(out, 0, y, total_width, "", palette().text, palette().bg, false);
     }
 
+    if let Some(frame) = block_coin_frame {
+        draw_block_celebration(out, w, h, frame, snapshot.accepted_blocks);
+    }
+
     let _ = queue!(out, ResetColor, SetAttribute(Attribute::Reset));
     let _ = out.flush();
+}
+
+fn block_celebration_actions(previous: u64, current: u64, visual: bool, sound: bool) -> (bool, bool) {
+    let accepted = current > previous;
+    (accepted && visual, accepted && sound)
+}
+
+fn block_animation_frame(elapsed: Duration) -> Option<usize> {
+    if elapsed >= BLOCK_CELEBRATION_DURATION {
+        return None;
+    }
+    Some(((elapsed.as_millis() / BLOCK_COIN_FRAME_RATE.as_millis()) as usize).min(BLOCK_COIN_FRAME_COUNT - 1))
+}
+
+fn draw_block_celebration(out: &mut std::io::Stdout, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
+    let title = format!("KRX BLOCK ACCEPTED  #{}", accepted_blocks);
+    let art_width = BLOCK_COIN_WIDTH;
+    let art_height = BLOCK_COIN_HEIGHT / 2;
+    let overlay_width = art_width.max(title.len() + 2);
+    let overlay_height = art_height + 2;
+
+    if (w as usize) < overlay_width || (h as usize) < overlay_height {
+        if h > 0 {
+            let clipped_title: String = title.chars().take(w as usize).collect();
+            draw_colored_cell(out, 0, 0, w as usize, &clipped_title, palette().bright, palette().panel, true);
+        }
+        return;
+    }
+
+    let x = (w as usize - overlay_width) as u16 / 2;
+    let y = (h as usize - overlay_height) as u16 / 2;
+    let title_x = x + ((overlay_width - title.len() - 2) / 2) as u16;
+    draw_colored_cell(
+        out,
+        title_x,
+        y,
+        title.len() + 2,
+        &format!(" {} ", title),
+        block_coin_color(0, false),
+        palette().panel,
+        true,
+    );
+
+    let sweep = frame * (art_width + 4) / (BLOCK_COIN_FRAME_COUNT - 1);
+    let art_x = x + ((overlay_width - art_width) / 2) as u16;
+    for row in 0..art_height {
+        for column in 0..art_width {
+            let top = block_coin_pixel(row * 2, column);
+            let bottom = block_coin_pixel(row * 2 + 1, column);
+            if top.is_none() && bottom.is_none() {
+                continue;
+            }
+
+            let highlighted = column.abs_diff(sweep) <= 1;
+            let _ = queue!(
+                out,
+                MoveTo(art_x + column as u16, y + row as u16 + 2),
+                SetForegroundColor(top.map(|index| block_coin_color(index, highlighted)).unwrap_or(palette().panel)),
+                SetBackgroundColor(bottom.map(|index| block_coin_color(index, highlighted)).unwrap_or(palette().panel)),
+                Print("▀"),
+                ResetColor
+            );
+        }
+    }
+}
+
+fn block_coin_pixel(row: usize, column: usize) -> Option<usize> {
+    match BLOCK_COIN_ART[row][column] {
+        b'1'..=b'9' => Some((BLOCK_COIN_ART[row][column] - b'1') as usize),
+        b'a'..=b'f' => Some((BLOCK_COIN_ART[row][column] - b'a' + 9) as usize),
+        _ => None,
+    }
+}
+
+fn block_coin_color(index: usize, highlighted: bool) -> Color {
+    let (mut r, mut g, mut b) = BLOCK_COIN_PALETTE[index];
+    if highlighted {
+        r = r.saturating_add(28);
+        g = g.saturating_add(28);
+        b = b.saturating_add(20);
+    }
+
+    if matches!(palette().warn, Color::Rgb { .. }) {
+        Color::Rgb { r, g, b }
+    } else {
+        Color::AnsiValue(16 + 36 * ansi_level(r) + 6 * ansi_level(g) + ansi_level(b))
+    }
+}
+
+fn ansi_level(value: u8) -> u8 {
+    ((value as u16 * 5 + 127) / 255) as u8
 }
 
 fn draw_colored_line(
@@ -1070,7 +1265,12 @@ fn load_average_summary() -> Option<(f64, f64, f64)> {
     Some((load_1m, load_5m, load_15m))
 }
 
-fn handle_input(ui_state: &UiState, shutdown_requested: &AtomicBool) -> bool {
+fn handle_input(
+    ui_state: &UiState,
+    shutdown_requested: &AtomicBool,
+    block_celebrations_enabled: &mut bool,
+    block_celebration_sound_enabled: &mut bool,
+) -> bool {
     while event::poll(Duration::from_millis(0)).unwrap_or(false) {
         let Ok(Event::Key(key)) = event::read() else {
             continue;
@@ -1094,6 +1294,28 @@ fn handle_input(ui_state: &UiState, shutdown_requested: &AtomicBool) -> bool {
             KeyCode::PageDown => ui_state.scroll_down(10),
             KeyCode::Home => ui_state.scroll_to_top(),
             KeyCode::End => ui_state.scroll_to_live(),
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                *block_celebrations_enabled = !*block_celebrations_enabled;
+                ui_state.push_log(
+                    Level::Info,
+                    if *block_celebrations_enabled {
+                        "Block celebration animation enabled"
+                    } else {
+                        "Block celebration animation disabled"
+                    },
+                );
+            }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                *block_celebration_sound_enabled = !*block_celebration_sound_enabled;
+                ui_state.push_log(
+                    Level::Info,
+                    if *block_celebration_sound_enabled {
+                        "Block celebration sound enabled"
+                    } else {
+                        "Block celebration sound muted"
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -1215,6 +1437,42 @@ fn uppercase_first_char(s: &str) -> String {
     match chars.next() {
         Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_animation_advances_and_expires() {
+        assert_eq!(block_animation_frame(Duration::ZERO), Some(0));
+        assert_eq!(block_animation_frame(BLOCK_COIN_FRAME_RATE), Some(1));
+        assert_eq!(
+            block_animation_frame(BLOCK_CELEBRATION_DURATION - Duration::from_millis(1)),
+            Some(BLOCK_COIN_FRAME_COUNT - 1),
+        );
+        assert_eq!(block_animation_frame(BLOCK_CELEBRATION_DURATION), None);
+    }
+
+    #[test]
+    fn block_visual_and_sound_controls_are_independent() {
+        assert_eq!(block_celebration_actions(1, 1, true, true), (false, false));
+        assert_eq!(block_celebration_actions(1, 2, true, false), (true, false));
+        assert_eq!(block_celebration_actions(1, 2, false, true), (false, true));
+        assert_eq!(block_celebration_actions(1, 2, false, false), (false, false));
+    }
+
+    #[test]
+    fn block_coin_art_is_a_complete_half_block_image() {
+        assert_eq!(BLOCK_COIN_ART.len(), BLOCK_COIN_HEIGHT);
+        assert!(BLOCK_COIN_ART.iter().all(|row| row.len() == BLOCK_COIN_WIDTH));
+        assert_eq!(BLOCK_COIN_HEIGHT % 2, 0);
+        assert!(BLOCK_COIN_ART.iter().flat_map(|row| row.iter()).any(|pixel| *pixel == b'0'));
+        assert!(BLOCK_COIN_ART.iter().flat_map(|row| row.iter()).any(|pixel| *pixel == b'f'));
+        assert_eq!(block_coin_pixel(0, 0), None);
+        assert_eq!(block_coin_pixel(0, 6), Some(13));
+        assert_eq!(BLOCK_COIN_PALETTE.len(), 15);
     }
 }
 
