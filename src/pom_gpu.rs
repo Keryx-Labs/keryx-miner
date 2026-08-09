@@ -564,8 +564,8 @@ impl PomGpuMiner {
     /// engine's resident device tensors in canonical name-sorted order (the wrapper pre-sorts;
     /// byte-identity to the on-disk GGUF proven by `tools/llama_zerodup_spike`). Host-resident
     /// tensors (e.g. `token_embd` on the CPU buffer) get a small device upload of our own.
-    /// `tier` selects the host possession index for the consensus byte-gate.
-    pub fn load_llama(device_id: usize, tier: u8) -> Result<Self> {
+    /// `model_id` selects the host possession index for the consensus byte-gate.
+    pub fn load_llama(device_id: usize, model_id: &[u8; 32]) -> Result<Self> {
         let ctx = CudaContext::new(device_id)?;
         ctx.bind_to_thread()?;
         let stream = ctx.default_stream();
@@ -608,7 +608,7 @@ impl PomGpuMiner {
         // device memory and compare them byte-for-byte against the host index (GGUF pread) — any
         // mismatch refuses to mine. Full-model byte-identity for this llama build was proven once
         // by `tools/llama_zerodup_spike`; this guards every startup against regressions.
-        if let Some(idx) = crate::pom::active_index_for_tier(tier) {
+        if let Some(idx) = crate::pom::active_index_for_model(model_id) {
             if idx.n_chunks == n_total_chunks {
                 let samples = 128u64;
                 for kk in 0..=samples {
@@ -839,12 +839,10 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
         set_mining_tier(dev, spec.model_id, gguf.clone());
-        // The host possession index is keyed by tier POSITION and a crossing swaps which model
-        // occupies that position, so the pre-crossing index must be dropped — otherwise
-        // `ensure_installed` keeps it (key present) and the gather/index N-guard refuses to mine
-        // forever.
-        if let Some(t) = crate::models::pom_tier_index(&spec.model_id, daa) {
-            crate::pom::clear_index(t);
+        // Free the retired model's possession index (indices are keyed by MODEL, so the new
+        // model's index simply builds under its own key at the next ensure_installed).
+        if let Some(old_id) = current {
+            crate::pom::clear_index(&old_id);
         }
         // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
         // crossing it would keep hosting the previous era's model. Unload it when it lives on this
@@ -893,6 +891,11 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
 pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
     let model_id = mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)?;
     crate::models::pom_tier_index(&model_id, daa)
+}
+
+/// The model a CUDA device currently mines, if assigned.
+pub fn mining_model_id(device_id: u32) -> Option<[u8; 32]> {
+    mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)
 }
 
 /// The CUDA device that mines `model_id` (from the per-GPU tier assignment), if any. Inference for a
@@ -1029,15 +1032,15 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     if is_oom_banlisted(device_id, &model_id) {
         return false; // this model OOM'd on this GPU before — don't retry (avoids a hot reload spin).
     }
-    // Build THIS tier's possession index once (host, heavy) — deferred from boot so the pre-PoM
-    // legacy phase starts immediately, and keyed by tier so a mixed rig builds one index per
-    // distinct tier it mines (shared across every GPU on that tier).
-    if crate::pom::active_index_for_tier(tier).is_none() {
+    // Build THIS model's possession index once (host, heavy) — deferred from boot so the pre-PoM
+    // legacy phase starts immediately, and keyed by model so a mixed rig builds one index per
+    // distinct model it mines (shared across every GPU on it).
+    if crate::pom::active_index_for_model(&model_id).is_none() {
         let _guard = match index_build_lock().lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if crate::pom::active_index_for_tier(tier).is_none() {
+        if crate::pom::active_index_for_model(&model_id).is_none() {
             info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", tier, device_id);
             match crate::pom::WeightIndex::build_from_gguf(&gguf) {
                 Ok(mut idx) => {
@@ -1057,7 +1060,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         }
                     }
                     info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
-                    crate::pom::set_index(tier, idx);
+                    crate::pom::set_index(model_id, idx);
                 }
                 Err(e) => {
                     log::error!("PoM: host index build failed for tier {} on gpu{}: {}", tier, device_id, e);
@@ -1086,7 +1089,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // impossible — free llama's VRAM and walk a raw canonical upload instead. (Inference for
     // such a model is unavailable without the engine; every current-lineup model is untied.)
     if use_llama {
-        let host_n = crate::pom::active_index_for_tier(tier).map(|i| i.n_chunks);
+        let host_n = crate::pom::active_index_for_model(&model_id).map(|i| i.n_chunks);
         let llama_n = crate::llama_engine::tensors().map(|ts| {
             ts.iter().map(|(_, _, nbytes, _)| (*nbytes / CHUNK_BYTES) as u64).sum::<u64>()
         });
@@ -1104,7 +1107,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights", device_id);
-            PomGpuMiner::load_llama(device_id as usize, tier)
+            PomGpuMiner::load_llama(device_id as usize, &model_id)
         } else {
             PomGpuMiner::load_raw(&gguf, device_id as usize)
         }
@@ -1159,7 +1162,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     };
     let n = gm.n_chunks();
     // N-guard: the gather must match the host index, else blocks would be rejected.
-    if let Some(idx) = crate::pom::active_index_for_tier(tier) {
+    if let Some(idx) = crate::pom::active_index_for_model(&model_id) {
         if n != idx.n_chunks {
             log::error!("PoM[gpu{}]: gather N={} != tier {} index N={} — refusing to mine", device_id, n, tier, idx.n_chunks);
             return false;

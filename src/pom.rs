@@ -1305,41 +1305,40 @@ pub fn pom_v3_activation_daa() -> u64 {
     gate(u64::MAX, 5_000)
 }
 
-/// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
-/// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
-/// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
-static POM_INDICES: OnceLock<Mutex<HashMap<u8, Arc<WeightIndex>>>> = OnceLock::new();
+/// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
+/// A tier POSITION shifts across eras (a lineup insertion renumbers the models below it) while
+/// the model's index bytes are identical — keying by position would strand a built index at a
+/// crossing. A heterogeneous rig mines several models at once (one per GPU); each model's index
+/// is built once and shared (`Arc`) across every GPU on it.
+static POM_INDICES: OnceLock<Mutex<HashMap<[u8; 32], Arc<WeightIndex>>>> = OnceLock::new();
 
-fn pom_indices() -> &'static Mutex<HashMap<u8, Arc<WeightIndex>>> {
+fn pom_indices() -> &'static Mutex<HashMap<[u8; 32], Arc<WeightIndex>>> {
     POM_INDICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Install a tier's possession index (built from that tier's resident model). Idempotent per tier.
-pub fn set_index(tier: u8, index: WeightIndex) {
+/// Install a model's possession index (built from that resident model). Idempotent per model.
+pub fn set_index(model_id: [u8; 32], index: WeightIndex) {
     if let Ok(mut g) = pom_indices().lock() {
-        g.insert(tier, Arc::new(index));
+        g.insert(model_id, Arc::new(index));
     }
 }
 
-/// Drop a tier's possession index so the next `ensure_installed` rebuilds it from the CURRENT
-/// model. Needed at an era crossing: the map is keyed by tier POSITION, and the crossing swaps
-/// which model occupies that position, so the built index no longer matches the resident model
-/// (the gather/index N-guard would refuse to mine forever otherwise).
-pub fn clear_index(tier: u8) {
+/// Drop a model's possession index (era crossing retires the model — frees the RAM).
+pub fn clear_index(model_id: &[u8; 32]) {
     if let Ok(mut g) = pom_indices().lock() {
-        g.remove(&tier);
+        g.remove(model_id);
     }
 }
 
-/// The possession index for a specific tier, if built.
-pub fn active_index_for_tier(tier: u8) -> Option<Arc<WeightIndex>> {
-    pom_indices().lock().ok().and_then(|g| g.get(&tier).cloned())
+/// The possession index for a specific model, if built.
+pub fn active_index_for_model(model_id: &[u8; 32]) -> Option<Arc<WeightIndex>> {
+    pom_indices().lock().ok().and_then(|g| g.get(model_id).cloned())
 }
 
-/// Any built index — the lowest tier present. Used by the CPU/fallback walk, which has no per-device
-/// tier assignment, and by "is any index ready" checks.
-pub fn any_active_index() -> Option<(u8, Arc<WeightIndex>)> {
-    pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(t, _)| **t).map(|(t, i)| (*t, i.clone())))
+/// Any built index (lowest model_id for determinism). Used by the fallback walk, which has no
+/// per-device tier assignment, and by "is any index ready" checks.
+pub fn any_active_index() -> Option<([u8; 32], Arc<WeightIndex>)> {
+    pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(m, _)| **m).map(|(m, i)| (*m, i.clone())))
 }
 
 /// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) —

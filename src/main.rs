@@ -264,17 +264,31 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// Per-tier VRAM floor (MB) for **auto-assignment** — the practical minimum to load that tier's
 /// model (weights + KV cache + CUDA workspace). Distinct from `ModelSpec.min_vram_mb`, which is 0
 /// for the smallest tiers (never gated out of `ai:cap`) and so can't rank tier 0 vs 1 by VRAM.
-/// Largest tier first, so a device picks the biggest tier it can hold.
-const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
-    (keryx_miner::models::Tier::VeryHigh, 28_000),
-    (keryx_miner::models::Tier::High, 22_000),
-    (keryx_miner::models::Tier::Default, 11_000),
-    (keryx_miner::models::Tier::Light, 7_000),
-    // Qwen3-8B tier 0 loads in ~5,409 MiB @ ctx 4096; floor sits ~300 MiB below its 6 GB min_vram so
-    // a 6 GB card reporting slightly under 6000 (total_mem) keeps tier 0, and ~300 MiB above the load
-    // need for OOM margin. Its need is close to min_vram, so it can't take the full −1000 headroom.
-    (keryx_miner::models::Tier::VeryLight, 5_700),
-];
+/// Largest tier first, so a device picks the biggest tier it can hold. Era-aware: staging targets
+/// the latest scheduled lineup (`spec_for_tier`), so the floors MUST rank against that lineup's
+/// models — with H6 staged the tier-0 model is 8 GB-class and tier 2 is 16 GB-class.
+fn pom_tier_ladder() -> &'static [(keryx_miner::models::Tier, u64)] {
+    if keryx_miner::models::h6_staged() {
+        &[
+            (keryx_miner::models::Tier::VeryHigh, 28_000),
+            (keryx_miner::models::Tier::High, 22_000),
+            (keryx_miner::models::Tier::Default, 15_000),
+            (keryx_miner::models::Tier::Light, 11_000),
+            (keryx_miner::models::Tier::VeryLight, 7_000),
+        ]
+    } else {
+        &[
+            (keryx_miner::models::Tier::VeryHigh, 28_000),
+            (keryx_miner::models::Tier::High, 22_000),
+            (keryx_miner::models::Tier::Default, 11_000),
+            (keryx_miner::models::Tier::Light, 7_000),
+            // Qwen3-8B tier 0 loads in ~5,409 MiB @ ctx 4096; floor sits ~300 MiB below its 6 GB
+            // min_vram so a 6 GB card reporting slightly under 6000 (total_mem) keeps tier 0, and
+            // ~300 MiB above the load need for OOM margin.
+            (keryx_miner::models::Tier::VeryLight, 5_700),
+        ]
+    }
+}
 
 /// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
 fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
@@ -321,7 +335,7 @@ fn assign_pom_tiers(
     }
     let ceiling_rank = tier_rank(ceiling);
     // Assignment floor + tier + model for each tier ≤ ceiling, largest first.
-    let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
+    let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = pom_tier_ladder()
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
         .map(|(t, floor)| (*floor, *t, keryx_miner::models::spec_for_tier(*t)))
