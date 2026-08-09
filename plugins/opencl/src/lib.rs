@@ -15,6 +15,21 @@ mod worker;
 use crate::cli::{NonceGenEnum, OpenCLOpt};
 use crate::worker::OpenCLGPUWorker;
 
+fn cuda_ordinal_for_opencl_device(device_id: cl_device_id) -> Option<u32> {
+    use cl3::ffi::cl_ext::CL_DEVICE_PCI_BUS_INFO_KHR;
+
+    let pci = cl3::device::get_device_info(device_id, CL_DEVICE_PCI_BUS_INFO_KHR)
+        .ok()
+        .map(Vec::<u8>::from)
+        .filter(|bytes| bytes.len() == std::mem::size_of::<cl3::ffi::cl_ext::cl_device_pci_bus_info_khr>())
+        .map(|bytes| cl3::device::get_device_pci_bus_info_khr(&bytes))
+        .and_then(|pci| {
+            keryx_miner::cuda_ordinal_for_pci(pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function)
+        });
+
+    pci.or_else(|| Device::new(device_id).pci_bus_id_nv().ok().and_then(keryx_miner::cuda_ordinal_for_pci_bus))
+}
+
 // Sentinel: user did not pass --opencl-workload, so the worker resolves a
 // capability-driven default ratio from the GPU arch (see worker::default_workload_scale).
 const AUTO_WORKLOAD: f32 = 0.;
@@ -103,31 +118,47 @@ impl Plugin for OpenCLPlugin {
             );
 
             let device_ids = _platform.get_devices(CL_DEVICE_TYPE_ALL).unwrap();
-            let gpus = match opts.opencl_device {
+            let gpus: Vec<(usize, cl_device_id)> = match opts.opencl_device {
                 Some(dev) => {
                     self._enabled = true;
-                    dev.iter().map(|d| device_ids[*d as usize]).collect::<Vec<cl_device_id>>()
+                    dev.iter().map(|d| (*d as usize, device_ids[*d as usize])).collect()
                 }
-                None => device_ids,
+                None => device_ids.into_iter().enumerate().collect(),
             };
 
+            let is_nvidia = _platform.vendor().map(|vendor| vendor.contains("NVIDIA")).unwrap_or(false);
             self.specs = (0..gpus.len())
-                .map(|i| OpenCLWorkerSpec {
-                    _platform: *_platform,
-                    index: i,
-                    device_id: Device::new(gpus[i]),
-                    workload: match &opts.opencl_workload {
-                        Some(workload) if i < workload.len() => workload[i],
-                        Some(workload) if !workload.is_empty() => *workload.last().unwrap(),
-                        // AUTO: no --opencl-workload given. 0.0 is a sentinel that
-                        // tells the worker to pick a capability-driven default ratio
-                        // per GPU arch (the old flat 512 under-saturated big cards).
-                        _ => AUTO_WORKLOAD,
-                    },
-                    is_absolute: opts.opencl_workload_absolute,
-                    experimental_amd: opts.experimental_amd,
-                    use_amd_binary: !opts.opencl_no_amd_binary,
-                    random: opts.opencl_nonce_gen,
+                .filter_map(|i| {
+                    let physical_index = gpus[i].0;
+                    let device_id = Device::new(gpus[i].1);
+                    let index = match cuda_ordinal_for_opencl_device(device_id.id()) {
+                        Some(ordinal) => ordinal as usize,
+                        None if is_nvidia => {
+                            warn!(
+                                "Skipping NVIDIA OpenCL device {} because its PCI identity cannot be mapped safely to a visible CUDA device",
+                                device_id.name().unwrap_or_else(|_| "unknown".into())
+                            );
+                            return None;
+                        }
+                        None => physical_index,
+                    };
+                    Some(OpenCLWorkerSpec {
+                        _platform: *_platform,
+                        index,
+                        device_id,
+                        workload: match &opts.opencl_workload {
+                            Some(workload) if i < workload.len() => workload[i],
+                            Some(workload) if !workload.is_empty() => *workload.last().unwrap(),
+                            // AUTO: no --opencl-workload given. 0.0 is a sentinel that
+                            // tells the worker to pick a capability-driven default ratio
+                            // per GPU arch (the old flat 512 under-saturated big cards).
+                            _ => AUTO_WORKLOAD,
+                        },
+                        is_absolute: opts.opencl_workload_absolute,
+                        experimental_amd: opts.experimental_amd,
+                        use_amd_binary: !opts.opencl_no_amd_binary,
+                        random: opts.opencl_nonce_gen,
+                    })
                 })
                 .collect();
         }
@@ -161,6 +192,7 @@ impl WorkerSpec for OpenCLWorkerSpec {
     fn build(&self) -> Box<dyn Worker> {
         Box::new(
             OpenCLGPUWorker::new(
+                self.index as u32,
                 self.device_id,
                 self.workload,
                 self.is_absolute,
@@ -174,3 +206,31 @@ impl WorkerSpec for OpenCLWorkerSpec {
 }
 
 declare_plugin!(OpenCLPlugin, OpenCLPlugin::new, OpenCLOpt);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_nvidia_opencl_devices_map_to_cuda_ordinals() {
+        let Ok(platforms) = get_platforms() else {
+            return;
+        };
+        for platform in platforms {
+            let Ok(devices) = platform.get_devices(CL_DEVICE_TYPE_ALL) else {
+                continue;
+            };
+            for device_id in devices {
+                let device = Device::new(device_id);
+                if !device.vendor().unwrap_or_default().to_ascii_lowercase().contains("nvidia") {
+                    continue;
+                }
+                assert!(
+                    cuda_ordinal_for_opencl_device(device_id).is_some(),
+                    "NVIDIA OpenCL device {} was not mapped to a visible CUDA ordinal",
+                    device.name().unwrap_or_else(|_| "unknown".into())
+                );
+            }
+        }
+    }
+}

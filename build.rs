@@ -27,17 +27,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=cuda/pom_mine_nextgen.fatbin");
     let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
         let pinned = "/home/slash/cuda-12.2/bin/nvcc";
-        if std::path::Path::new(pinned).exists() { pinned.to_string() } else { "nvcc".to_string() }
+        if std::path::Path::new(pinned).exists() {
+            pinned.to_string()
+        } else {
+            "nvcc".to_string()
+        }
     });
     {
         let out_dir = env::var("OUT_DIR").unwrap();
         let sm_list = env::var("POM_SM_LIST").unwrap_or_else(|_| "90,89,86,80,75,70,61".to_string());
-        let sms: Vec<String> = sm_list
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        let sms: Vec<String> =
+            sm_list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
         assert!(!sms.is_empty(), "POM_SM_LIST resolved to an empty set");
 
         for sm in sms {
@@ -48,30 +48,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|e| panic!("nvcc ({nvcc}) failed to run for sm_{sm}: {e}"));
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                panic!(
-                    "nvcc failed to compile cuda/pom_mine.cu for sm_{sm}:\n{}",
-                    stderr
-                );
+                panic!("nvcc failed to compile cuda/pom_mine.cu for sm_{sm}:\n{}", stderr);
             }
         }
 
         // Optional prebuilt fatbins: staged into OUT_DIR so runtime can embed/package them now,
         // then start loading them in a follow-up refactor.
-        let legacy_src = env::var("POM_FATBIN_LEGACY")
-            .unwrap_or_else(|_| "cuda/pom_mine_legacy.fatbin".to_string());
-        let nextgen_src = env::var("POM_FATBIN_NEXTGEN")
-            .unwrap_or_else(|_| "cuda/pom_mine_nextgen.fatbin".to_string());
+        let legacy_src = env::var("POM_FATBIN_LEGACY").unwrap_or_else(|_| "cuda/pom_mine_legacy.fatbin".to_string());
+        let nextgen_src = env::var("POM_FATBIN_NEXTGEN").unwrap_or_else(|_| "cuda/pom_mine_nextgen.fatbin".to_string());
         let legacy_dst = format!("{out_dir}/pom_mine_legacy.fatbin");
         let nextgen_dst = format!("{out_dir}/pom_mine_nextgen.fatbin");
 
         if std::path::Path::new(&legacy_src).exists() {
-            fs::copy(&legacy_src, &legacy_dst).unwrap_or_else(|e| {
-                panic!("failed copying POM_FATBIN_LEGACY from {legacy_src} to {legacy_dst}: {e}")
-            });
+            fs::copy(&legacy_src, &legacy_dst)
+                .unwrap_or_else(|e| panic!("failed copying POM_FATBIN_LEGACY from {legacy_src} to {legacy_dst}: {e}"));
         } else {
-            fs::write(&legacy_dst, []).unwrap_or_else(|e| {
-                panic!("failed creating empty legacy fatbin placeholder {legacy_dst}: {e}")
-            });
+            fs::write(&legacy_dst, [])
+                .unwrap_or_else(|e| panic!("failed creating empty legacy fatbin placeholder {legacy_dst}: {e}"));
         }
 
         if std::path::Path::new(&nextgen_src).exists() {
@@ -79,9 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panic!("failed copying POM_FATBIN_NEXTGEN from {nextgen_src} to {nextgen_dst}: {e}")
             });
         } else {
-            fs::write(&nextgen_dst, []).unwrap_or_else(|e| {
-                panic!("failed creating empty nextgen fatbin placeholder {nextgen_dst}: {e}")
-            });
+            fs::write(&nextgen_dst, [])
+                .unwrap_or_else(|e| panic!("failed creating empty nextgen fatbin placeholder {nextgen_dst}: {e}"));
         }
     }
 
@@ -130,50 +122,52 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("cloning llama.cpp {LLAMA_TAG} (first build only; use KERYX_LLAMA_SRC for an offline checkout)");
         run(
             "git clone of llama.cpp",
-            std::process::Command::new("git").args([
-                "clone", "--quiet", "--depth", "1", "--branch", LLAMA_TAG,
-                "https://github.com/ggml-org/llama.cpp",
-            ]).arg(&src),
+            std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    LLAMA_TAG,
+                    "https://github.com/ggml-org/llama.cpp",
+                ])
+                .arg(&src),
         )?;
     }
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
     // Ship real kernels for common GPUs plus compute_89 PTX, which drivers JIT-forward
     // to newer architectures such as Blackwell. Override for machine-specific builds.
-    let archs = env::var("KERYX_LLAMA_ARCHS")
-        .unwrap_or_else(|_| "75-real;80-real;86-real;89-real;89-virtual".to_string());
+    let archs =
+        env::var("KERYX_LLAMA_ARCHS").unwrap_or_else(|_| "75-real;80-real;86-real;89-real;89-virtual".to_string());
     let mut cfg = std::process::Command::new("cmake");
-    cfg.arg("-S").arg(&src)
-        .arg("-B").arg(&build_dir)
-        .args([
-            "-DGGML_CUDA=ON",
-            &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
-            "-DBUILD_SHARED_LIBS=OFF",
-            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-            "-DLLAMA_CURL=OFF",
-            "-DGGML_NATIVE=OFF",
-            // No-AVX CPU baseline (mirrors hiveos/build-keryx-llama.sh): BMI2/AVX code
-            // traps with SIGILL on pre-Haswell CPUs, and the CPU path is only a fallback —
-            // GPU inference is unaffected by these flags.
-            "-DGGML_AVX=OFF",
-            "-DGGML_AVX2=OFF",
-            "-DGGML_FMA=OFF",
-            "-DGGML_F16C=OFF",
-            "-DGGML_BMI2=OFF",
-            "-DGGML_CUDA_NCCL=OFF",
-            "-DCMAKE_BUILD_TYPE=Release",
-            &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
-        ]);
+    cfg.arg("-S").arg(&src).arg("-B").arg(&build_dir).args([
+        "-DGGML_CUDA=ON",
+        &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        "-DLLAMA_CURL=OFF",
+        "-DGGML_NATIVE=OFF",
+        // No-AVX CPU baseline (mirrors hiveos/build-keryx-llama.sh): BMI2/AVX code
+        // traps with SIGILL on pre-Haswell CPUs, and the CPU path is only a fallback —
+        // GPU inference is unaffected by these flags.
+        "-DGGML_AVX=OFF",
+        "-DGGML_AVX2=OFF",
+        "-DGGML_FMA=OFF",
+        "-DGGML_F16C=OFF",
+        "-DGGML_BMI2=OFF",
+        "-DGGML_CUDA_NCCL=OFF",
+        "-DCMAKE_BUILD_TYPE=Release",
+        &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
+    ]);
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         // -march=nehalem pins a no-AVX/no-BMI ISA baseline for everything the GGML guards
         // miss (and for toolchains whose default baseline is above x86-64). MSVC has no
         // -march and defaults to SSE2, so Windows needs no pin.
         cfg.args(["-DCMAKE_C_FLAGS=-march=nehalem", "-DCMAKE_CXX_FLAGS=-march=nehalem"]);
     }
-    run(
-        "cmake configure of llama.cpp (if it cannot detect a GPU, set KERYX_LLAMA_ARCHS explicitly)",
-        &mut cfg,
-    )?;
+    run("cmake configure of llama.cpp (if it cannot detect a GPU, set KERYX_LLAMA_ARCHS explicitly)", &mut cfg)?;
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "8".to_string());
     run(
         "cmake build of llama.cpp static libs",
@@ -189,7 +183,10 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         // wrapper via nvcc (drives cl.exe and knows the CUDA include/lib paths; links
         // cudart statically by default). /openmp pulls vcomp for ggml-cpu's OpenMP use.
         let dll = profile_dir.join("keryx-llama.dll");
-        let lib = |p: &str| build_dir.join(p).into_os_string();
+        let lib = |multi_config: &str, single_config: &str| {
+            let multi_config = build_dir.join(multi_config);
+            if multi_config.exists() { multi_config } else { build_dir.join(single_config) }.into_os_string()
+        };
         run(
             "link of keryx-llama.dll",
             std::process::Command::new(nvcc)
@@ -201,12 +198,12 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .arg("-I").arg(src.join("ggml/include"))
                 .arg("-I").arg(src.join("src"))
                 .arg("-I").arg(src.join("common"))
-                .arg(lib("src/Release/llama.lib"))
-                .arg(lib("ggml/src/ggml-cuda/Release/ggml-cuda.lib"))
-                .arg(lib("ggml/src/Release/ggml-cpu.lib"))
-                .arg(lib("ggml/src/Release/ggml.lib"))
-                .arg(lib("ggml/src/Release/ggml-base.lib"))
-                .args(["-lcublas", "-lcublasLt", "-lcuda"])
+                .arg(lib("src/Release/llama.lib", "src/llama.lib"))
+                .arg(lib("ggml/src/ggml-cuda/Release/ggml-cuda.lib", "ggml/src/ggml-cuda/ggml-cuda.lib"))
+                .arg(lib("ggml/src/Release/ggml-cpu.lib", "ggml/src/ggml-cpu.lib"))
+                .arg(lib("ggml/src/Release/ggml.lib", "ggml/src/ggml.lib"))
+                .arg(lib("ggml/src/Release/ggml-base.lib", "ggml/src/ggml-base.lib"))
+                .args(["-lcublas", "-lcublasLt", "-lcuda", "-ladvapi32"])
                 .arg("-o").arg(&dll),
         )?;
         return Ok(());
@@ -261,7 +258,10 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
     if default.exists() {
         return Ok(default.to_path_buf());
     }
-    Err(format!("cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}").into())
+    Err(format!(
+        "cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}"
+    )
+    .into())
 }
 
 fn run(desc: &str, cmd: &mut std::process::Command) -> Result<(), Box<dyn std::error::Error>> {

@@ -1,6 +1,8 @@
+use cudarc::driver::{result, sys};
 use nvml_wrapper::{enum_wrappers::device::TemperatureSensor, structs::device::FieldId, Nvml};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
@@ -164,9 +166,9 @@ impl MinerStats {
     }
 
     pub fn refresh_gpu_telemetry(&self) {
+        let cuda_bus_ids = cuda_device_bus_ids();
         let mut fresh = HashMap::new();
-        let mut nvml_memory_temps = HashMap::new();
-        let mut nvml_fallbacks = HashMap::new();
+        let mut physical_to_logical = HashMap::new();
 
         let nvml = NVML_HANDLE.get_or_init(|| Nvml::init().ok());
         if let Some(nvml) = nvml.as_ref() {
@@ -175,6 +177,15 @@ impl MinerStats {
                     let Ok(device) = nvml.device_by_index(idx) else {
                         continue;
                     };
+                    let logical_idx = device
+                        .pci_info()
+                        .ok()
+                        .and_then(|pci| logical_device_number(&pci.bus_id, idx, cuda_bus_ids))
+                        .or_else(|| cuda_bus_ids.is_empty().then_some(idx));
+                    let Some(logical_idx) = logical_idx else {
+                        continue;
+                    };
+                    physical_to_logical.insert(idx, logical_idx);
 
                     let temp_c = device.temperature(TemperatureSensor::Gpu).ok();
                     let fan_percent = device.fan_speed(0).ok();
@@ -194,40 +205,41 @@ impl MinerStats {
                                     nvml_wrapper::enums::device::SampleValue::F64(_) => None,
                                 };
                                 if let Some(temp) = temp.filter(|temp| *temp > 0) {
-                                    nvml_memory_temps.insert(idx as u32, temp as u32);
+                                    fresh
+                                        .entry(logical_idx)
+                                        .or_insert(GpuTelemetry {
+                                            temp_c: None,
+                                            memory_temp_c: None,
+                                            fan_percent: None,
+                                            power_draw_w: None,
+                                        })
+                                        .memory_temp_c = Some(temp as u32);
                                 }
                             }
                         }
                     }
 
-                    nvml_fallbacks.insert(
-                        idx as u32,
-                        GpuTelemetry {
-                            temp_c: temp_c.map(|temp| temp as u32),
-                            memory_temp_c: nvml_memory_temps.get(&(idx as u32)).copied(),
-                            fan_percent: fan_percent.map(|fan| fan as u32),
-                            power_draw_w,
-                        },
-                    );
+                    let telemetry = fresh.entry(logical_idx).or_insert(GpuTelemetry {
+                        temp_c: None,
+                        memory_temp_c: None,
+                        fan_percent: None,
+                        power_draw_w: None,
+                    });
+                    telemetry.temp_c = temp_c.map(|temp| temp as u32);
+                    telemetry.fan_percent = fan_percent.map(|fan| fan as u32);
+                    telemetry.power_draw_w = power_draw_w;
                 }
             }
         }
 
-        if !nvml_fallbacks.is_empty() {
-            fresh = nvml_fallbacks.clone();
-        }
-
         let mut memory_temp_supported = self.gpu_memory_temp_supported.lock().expect("gpu telemetry mutex poisoned");
-        let should_query_nvidia_smi = should_query_nvidia_smi(
-            &fresh,
-            &memory_temp_supported,
-            self.hiveos.load(Ordering::Acquire),
-        );
+        let should_query_nvidia_smi =
+            should_query_nvidia_smi(&fresh, &memory_temp_supported, self.hiveos.load(Ordering::Acquire));
         let output = if should_query_nvidia_smi {
             Some(
                 Command::new("nvidia-smi")
                     .args([
-                        "--query-gpu=temperature.gpu,temperature.memory,fan.speed,power.draw",
+                        "--query-gpu=pci.bus_id,temperature.gpu,temperature.memory,fan.speed,power.draw",
                         "--format=csv,noheader,nounits",
                     ])
                     .output(),
@@ -239,27 +251,29 @@ impl MinerStats {
         if let Some(Ok(output)) = output {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                for (idx, line) in stdout.lines().enumerate() {
+                for (fallback_idx, line) in stdout.lines().enumerate() {
                     let mut parts = line.split(',').map(|s| s.trim());
+                    let pci_bus_id = parts.next().unwrap_or_default();
+                    let Some(gpu_idx) = logical_device_number(pci_bus_id, fallback_idx as u32, cuda_bus_ids) else {
+                        continue;
+                    };
+                    physical_to_logical.insert(fallback_idx as u32, gpu_idx);
                     let temp_c = parts.next().and_then(parse_u32_field);
                     let nvidia_smi_memory_temp_c = parts.next().and_then(parse_u32_field);
                     let fan_percent = parts.next().and_then(parse_u32_field);
                     let power_draw_w = parts.next().and_then(parse_f32_field);
 
-                    let gpu_idx = idx as u32;
                     if let Some(telemetry) = fresh.get_mut(&gpu_idx) {
                         telemetry.temp_c = prefer_nvml_u32_or_nvidia_smi(telemetry.temp_c, temp_c);
-                        telemetry.memory_temp_c = normalize_memory_temp_c(
-                            nvidia_smi_memory_temp_c,
-                            telemetry.memory_temp_c,
-                        );
+                        telemetry.memory_temp_c =
+                            normalize_memory_temp_c(nvidia_smi_memory_temp_c, telemetry.memory_temp_c);
                         telemetry.fan_percent = prefer_nvml_u32_or_nvidia_smi(telemetry.fan_percent, fan_percent);
                         telemetry.power_draw_w = prefer_nvml_f32_or_nvidia_smi(telemetry.power_draw_w, power_draw_w);
                     } else {
                         fresh.insert(
                             gpu_idx,
                             GpuTelemetry {
-                                temp_c: temp_c,
+                                temp_c,
                                 memory_temp_c: normalize_memory_temp_c(nvidia_smi_memory_temp_c, None),
                                 fan_percent,
                                 power_draw_w,
@@ -268,25 +282,31 @@ impl MinerStats {
                     }
 
                     if !self.hiveos.load(Ordering::Acquire) {
-                        memory_temp_supported.insert(gpu_idx, fresh.get(&gpu_idx).and_then(|entry| entry.memory_temp_c).is_some());
+                        memory_temp_supported
+                            .insert(gpu_idx, fresh.get(&gpu_idx).and_then(|entry| entry.memory_temp_c).is_some());
                     }
                 }
             }
         }
 
-        let has_any_memory_temp = fresh.values().any(|entry| entry.memory_temp_c.is_some());
+        let has_missing_memory_temp = fresh.is_empty() || fresh.values().any(|entry| entry.memory_temp_c.is_none());
         if let Ok(mut map) = self.gpu_telemetry.lock() {
             *map = fresh;
         }
 
-        if self.hiveos.load(Ordering::Acquire) && !has_any_memory_temp {
+        if self.hiveos.load(Ordering::Acquire) && has_missing_memory_temp {
+            merge_physical_to_logical(&mut physical_to_logical, nvidia_smi_device_map(cuda_bus_ids));
             if let Some(hiveos_memtemps) = read_hiveos_nvtool_memtemps() {
                 if let Ok(mut map) = self.gpu_telemetry.lock() {
-                    for (idx, memtemp) in hiveos_memtemps {
-                        if let Some(entry) = map.get_mut(&idx) {
+                    for (physical_idx, memtemp) in hiveos_memtemps {
+                        let Some(logical_idx) =
+                            logical_nvtool_device_number(physical_idx, &physical_to_logical, cuda_bus_ids)
+                        else {
+                            continue;
+                        };
+                        let entry = map.entry(logical_idx).or_default();
+                        if entry.memory_temp_c.is_none() {
                             entry.memory_temp_c = Some(memtemp);
-                        } else {
-                            map.insert(idx, GpuTelemetry { temp_c: None, memory_temp_c: Some(memtemp), fan_percent: None, power_draw_w: None });
                         }
                     }
                 }
@@ -296,26 +316,16 @@ impl MinerStats {
 
     pub fn snapshot(&self) -> MinerStatsSnapshot {
         let started_epoch_s = self.started_epoch_s.load(Ordering::Acquire);
-        let uptime_s = self
-            .started_at
-            .lock()
-            .expect("start time mutex poisoned")
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        let uptime_s =
+            self.started_at.lock().expect("start time mutex poisoned").map(|t| t.elapsed().as_secs()).unwrap_or(0);
 
-        let telemetry = self
-            .gpu_telemetry
-            .lock()
-            .expect("gpu telemetry mutex poisoned")
-            .clone();
-        let mining_address = self
-            .mining_address
-            .lock()
-            .expect("mining address mutex poisoned")
-            .clone();
+        let telemetry = self.gpu_telemetry.lock().expect("gpu telemetry mutex poisoned").clone();
+        let mining_address = self.mining_address.lock().expect("mining address mutex poisoned").clone();
 
-        let device_blocks_accepted = self.device_blocks_accepted.lock().expect("device block count mutex poisoned").clone();
-        let device_blocks_rejected = self.device_blocks_rejected.lock().expect("device rejected block count mutex poisoned").clone();
+        let device_blocks_accepted =
+            self.device_blocks_accepted.lock().expect("device block count mutex poisoned").clone();
+        let device_blocks_rejected =
+            self.device_blocks_rejected.lock().expect("device rejected block count mutex poisoned").clone();
         let mut devices = self
             .device_hashrate_hs
             .lock()
@@ -371,7 +381,7 @@ impl MinerStats {
 }
 
 #[cfg(test)]
-mod tests {
+mod snapshot_tests {
     use super::*;
 
     #[test]
@@ -392,10 +402,7 @@ mod tests {
 }
 
 fn parse_f32_field(value: &str) -> Option<f32> {
-    value
-        .split_whitespace()
-        .next()
-        .and_then(|x| x.parse::<f32>().ok())
+    value.split_whitespace().next().and_then(|x| x.parse::<f32>().ok())
 }
 
 fn prefer_nvml_u32_or_nvidia_smi(nvml_value: Option<u32>, nvidia_smi_value: Option<u32>) -> Option<u32> {
@@ -476,7 +483,11 @@ fn parse_nvtool_memtemp_output(output: &str) -> HashMap<u32, u32> {
 
 #[cfg(test)]
 mod telemetry_tests {
-    use super::{normalize_memory_temp_c, parse_nvtool_memtemp_output, prefer_nvml_f32_or_nvidia_smi, prefer_nvml_u32_or_nvidia_smi, should_query_nvidia_smi};
+    use super::{
+        logical_nvtool_device_number, merge_physical_to_logical, normalize_memory_temp_c, parse_nvidia_smi_device_map,
+        parse_nvtool_memtemp_output, prefer_nvml_f32_or_nvidia_smi, prefer_nvml_u32_or_nvidia_smi,
+        should_query_nvidia_smi,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -525,6 +536,33 @@ DEVICE #1:
         let memtemps = parse_nvtool_memtemp_output(output);
         assert_eq!(memtemps.get(&0), Some(&72));
         assert!(memtemps.get(&1).is_none());
+    }
+
+    #[test]
+    fn maps_hiveos_nvtool_ordinals_to_cuda_devices() {
+        let physical_to_logical = HashMap::from([(0, 2), (1, 0)]);
+        let cuda_bus_ids = HashMap::from([("0:01:00.0".to_string(), 2)]);
+
+        assert_eq!(logical_nvtool_device_number(0, &physical_to_logical, &cuda_bus_ids), Some(2));
+        assert_eq!(logical_nvtool_device_number(1, &physical_to_logical, &cuda_bus_ids), Some(0));
+        assert_eq!(logical_nvtool_device_number(3, &physical_to_logical, &cuda_bus_ids), None);
+        assert_eq!(logical_nvtool_device_number(3, &HashMap::new(), &HashMap::new()), Some(3));
+    }
+
+    #[test]
+    fn maps_nvidia_smi_physical_ordinals_by_pci_identity() {
+        let cuda_bus_ids = HashMap::from([("0:02:00.0".to_string(), 0), ("0:01:00.0".to_string(), 1)]);
+        let output = b"0, 00000000:01:00.0\n1, 00000000:02:00.0\n";
+
+        assert_eq!(parse_nvidia_smi_device_map(output, &cuda_bus_ids), HashMap::from([(0, 1), (1, 0)]));
+    }
+
+    #[test]
+    fn completes_partial_physical_device_mapping_without_overwriting_nvml() {
+        let mut mapping = HashMap::from([(0, 2)]);
+        merge_physical_to_logical(&mut mapping, HashMap::from([(0, 7), (1, 0)]));
+
+        assert_eq!(mapping, HashMap::from([(0, 2), (1, 0)]));
     }
 
     #[test]
@@ -577,7 +615,11 @@ DEVICE #1:
     }
 }
 
-pub fn spawn_stats_server(stats: Arc<MinerStats>, bind_addr: String, port: u16) -> std::io::Result<thread::JoinHandle<()>> {
+pub fn spawn_stats_server(
+    stats: Arc<MinerStats>,
+    bind_addr: String,
+    port: u16,
+) -> std::io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind((bind_addr.as_str(), port))?;
     Ok(thread::spawn(move || {
         for stream in listener.incoming() {
@@ -600,15 +642,10 @@ fn handle_connection(mut stream: TcpStream, stats: &MinerStats) -> std::io::Resu
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = Vec::with_capacity(256);
-    let read_res = reader
-        .by_ref()
-        .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
-        .read_until(b'\n', &mut request_line);
+    let read_res = reader.by_ref().take((MAX_REQUEST_LINE_BYTES + 1) as u64).read_until(b'\n', &mut request_line);
     let bytes_read = match read_res {
         Ok(n) => n,
-        Err(err)
-            if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut =>
-        {
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock || err.kind() == std::io::ErrorKind::TimedOut => {
             return Ok(());
         }
         Err(err) => return Err(err),
@@ -617,11 +654,7 @@ fn handle_connection(mut stream: TcpStream, stats: &MinerStats) -> std::io::Resu
         return Ok(());
     }
     if request_line.len() > MAX_REQUEST_LINE_BYTES {
-        return write_json_response(
-            &mut stream,
-            "414 URI Too Long",
-            b"{\"error\":\"request line too long\"}".to_vec(),
-        );
+        return write_json_response(&mut stream, "414 URI Too Long", b"{\"error\":\"request line too long\"}".to_vec());
     }
 
     let request_line = String::from_utf8_lossy(&request_line);
@@ -630,7 +663,8 @@ fn handle_connection(mut stream: TcpStream, stats: &MinerStats) -> std::io::Resu
     let (status, body) = if path == "/stats" || path == "/v1/miner/stats" {
         (
             "200 OK",
-            serde_json::to_vec(&stats.snapshot()).unwrap_or_else(|_| b"{\"error\":\"failed to serialize stats\"}".to_vec()),
+            serde_json::to_vec(&stats.snapshot())
+                .unwrap_or_else(|_| b"{\"error\":\"failed to serialize stats\"}".to_vec()),
         )
     } else {
         ("404 Not Found", b"{\"error\":\"not found\"}".to_vec())
@@ -652,26 +686,123 @@ fn write_json_response(stream: &mut TcpStream, status: &str, body: Vec<u8>) -> s
 }
 
 fn now_epoch_s() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn parse_device_number(id: &str) -> Option<u32> {
-    id.strip_prefix('#')
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| s.parse::<u32>().ok())
+    id.strip_prefix('#').and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<u32>().ok())
+}
+
+fn cuda_device_bus_ids() -> &'static HashMap<String, u32> {
+    static BUS_IDS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+    BUS_IDS.get_or_init(|| {
+        let mut bus_ids = HashMap::new();
+        if result::init().is_err() {
+            return bus_ids;
+        }
+
+        let count = result::device::get_count().unwrap_or(0);
+        for ordinal in 0..count {
+            let Ok(device) = result::device::get(ordinal) else {
+                continue;
+            };
+            let mut buffer = [0i8; 32];
+            if unsafe { sys::cuDeviceGetPCIBusId(buffer.as_mut_ptr(), buffer.len() as i32, device).result() }.is_err() {
+                continue;
+            }
+            let Ok(bus_id) = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str() else {
+                continue;
+            };
+            bus_ids.insert(normalize_pci_bus_id(bus_id), ordinal as u32);
+        }
+        bus_ids
+    })
+}
+
+fn logical_device_number(pci_bus_id: &str, fallback_idx: u32, cuda_bus_ids: &HashMap<String, u32>) -> Option<u32> {
+    if cuda_bus_ids.is_empty() {
+        Some(fallback_idx)
+    } else {
+        cuda_bus_ids.get(&normalize_pci_bus_id(pci_bus_id)).copied()
+    }
+}
+
+fn nvidia_smi_device_map(cuda_bus_ids: &HashMap<String, u32>) -> HashMap<u32, u32> {
+    let output =
+        Command::new("nvidia-smi").args(["--query-gpu=index,pci.bus_id", "--format=csv,noheader,nounits"]).output();
+    let Ok(output) = output else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    parse_nvidia_smi_device_map(&output.stdout, cuda_bus_ids)
+}
+
+fn parse_nvidia_smi_device_map(output: &[u8], cuda_bus_ids: &HashMap<String, u32>) -> HashMap<u32, u32> {
+    output
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let line = String::from_utf8_lossy(line);
+            let mut fields = line.split(',').map(str::trim);
+            let physical_idx = fields.next()?.parse::<u32>().ok()?;
+            let bus_id = normalize_pci_bus_id(fields.next()?);
+            cuda_bus_ids.get(&bus_id).copied().map(|logical_idx| (physical_idx, logical_idx))
+        })
+        .collect()
+}
+
+fn merge_physical_to_logical(existing: &mut HashMap<u32, u32>, supplemental: HashMap<u32, u32>) {
+    for (physical_idx, logical_idx) in supplemental {
+        existing.entry(physical_idx).or_insert(logical_idx);
+    }
+}
+
+fn logical_nvtool_device_number(
+    physical_idx: u32,
+    physical_to_logical: &HashMap<u32, u32>,
+    cuda_bus_ids: &HashMap<String, u32>,
+) -> Option<u32> {
+    physical_to_logical.get(&physical_idx).copied().or_else(|| cuda_bus_ids.is_empty().then_some(physical_idx))
+}
+
+fn normalize_pci_bus_id(pci_bus_id: &str) -> String {
+    let pci_bus_id = pci_bus_id.trim().to_ascii_lowercase();
+    let Some((domain, device)) = pci_bus_id.split_once(':') else {
+        return pci_bus_id;
+    };
+    let domain = domain.trim_start_matches('0');
+    format!("{}:{device}", if domain.is_empty() { "0" } else { domain })
 }
 
 fn parse_u32_field(value: &str) -> Option<u32> {
-    let filtered = value
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>();
+    let filtered = value.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
     if filtered.is_empty() {
         None
     } else {
         filtered.parse::<u32>().ok()
+    }
+}
+
+#[cfg(test)]
+mod pci_tests {
+    use super::{logical_device_number, normalize_pci_bus_id};
+    use std::collections::HashMap;
+
+    #[test]
+    fn logical_device_number_follows_cuda_pci_mapping() {
+        let cuda_bus_ids =
+            HashMap::from([(normalize_pci_bus_id("0000:02:00.0"), 0), (normalize_pci_bus_id("0000:01:00.0"), 1)]);
+
+        assert_eq!(logical_device_number("00000000:01:00.0", 0, &cuda_bus_ids), Some(1));
+        assert_eq!(logical_device_number("00000000:02:00.0", 1, &cuda_bus_ids), Some(0));
+    }
+
+    #[test]
+    fn logical_device_number_falls_back_when_cuda_is_unavailable() {
+        let cuda_bus_ids = HashMap::new();
+
+        assert_eq!(logical_device_number("00000000:01:00.0", 2, &cuda_bus_ids), Some(2));
     }
 }

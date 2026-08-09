@@ -26,7 +26,10 @@ use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
+use tokio::sync::{
+    mpsc::{self, error::SendError, Sender},
+    oneshot,
+};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::{PollSendError, PollSender};
@@ -192,7 +195,8 @@ impl KeryxdHandler {
         send_channel.send(GetInfoRequestMessage {}.into()).await?;
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
         let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
-        let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
+        let (block_channel, block_handle) =
+            Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
         Ok(Box::new(Self {
             client,
             stream,
@@ -264,10 +268,7 @@ impl KeryxdHandler {
         // OPoI Phase 2: run the deterministic fixed-point MLP (matches node validation).
         let opoi_tag = keryx_miner::inference::compute_opoi_tag(&nonce_hex);
         // Embed escrow pubkey so the node routes 20% to the CSV-locked escrow output.
-        let escrow_part = self.escrow_pubkey
-            .as_deref()
-            .map(|pk| format!("/escrow:{}", pk))
-            .unwrap_or_default();
+        let escrow_part = self.escrow_pubkey.as_deref().map(|pk| format!("/escrow:{}", pk)).unwrap_or_default();
         // Announce loaded model capabilities so the node can enforce model_id matching.
         let cap_part = {
             let ids = keryx_miner::slm::loaded_model_ids();
@@ -286,7 +287,7 @@ impl KeryxdHandler {
                     // challenge_str = "model_id_hex:nonce_hex"
                     let mut parts = challenge_str.splitn(2, ':');
                     let model_id_hex = parts.next().unwrap_or("");
-                    let nonce_hex_c  = parts.next().unwrap_or("");
+                    let nonce_hex_c = parts.next().unwrap_or("");
                     info!("OPoI: sending challenge response model={:.8}", model_id_hex);
                     if let Some(flag) = &self.opoi_challenge_active {
                         flag.store(false, Ordering::Relaxed);
@@ -391,7 +392,9 @@ impl KeryxdHandler {
                 // template or block notifications, so without this fallback the escrow
                 // outpoint is never tracked and the inference_reward is never claimed.
                 if inference_reward > 0 {
-                    let txid_opt = tx.verbose_data.as_ref()
+                    let txid_opt = tx
+                        .verbose_data
+                        .as_ref()
                         .map(|v| v.transaction_id.clone())
                         .filter(|id| !id.is_empty())
                         .or_else(|| Self::compute_rpc_txid(tx));
@@ -481,12 +484,19 @@ impl KeryxdHandler {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
                 return;
             }
-            info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
+            let correlation = format!("request:{}", stable_id);
+            info!(
+                "event=ai_inference_queued correlation={} model={} max_tokens={}",
+                correlation,
+                hex::encode(&model_id[..4]),
+                max_tokens
+            );
             let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
             tokio::task::spawn_blocking(move || {
-                let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
+                let result =
+                    keryx_miner::slm::load_and_run_inference_correlated(&model_id, &prompt, max_tokens, &correlation);
                 if result.is_none() {
-                    log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", stable_id);
+                    log::warn!("event=ai_response_dropped correlation={} reason=inference_failed", correlation);
                 }
                 let _ = tx_done.send(result);
             });
@@ -520,8 +530,14 @@ impl KeryxdHandler {
         let result_clone = result.clone();
         let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload(&result_clone, &ipfs_url)).await {
             Ok(Ok(cid)) => cid,
-            Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
-            Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
+            Ok(Err(e)) => {
+                warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e);
+                return true;
+            }
+            Err(e) => {
+                warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e);
+                return true;
+            }
         };
 
         let challenge_window_end = self.last_known_daa + 1000;
@@ -576,17 +592,9 @@ impl KeryxdHandler {
                         }
                     } else {
                         // Transactions absent — fetch the full block from the node.
-                        let hash = block
-                            .verbose_data
-                            .as_ref()
-                            .map(|v| v.hash.clone())
-                            .unwrap_or_default();
+                        let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
                         if !hash.is_empty() {
-                            self.client_send(GetBlockRequestMessage {
-                                hash,
-                                include_transactions: true,
-                            })
-                            .await?;
+                            self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
                         }
                     }
                 }
@@ -594,10 +602,7 @@ impl KeryxdHandler {
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
             Payload::GetBlockTemplateResponse(template) => {
                 // Track DAA score for challenge_window_end computation.
-                if let Some(daa) = template.block.as_ref()
-                    .and_then(|b| b.header.as_ref())
-                    .map(|h| h.daa_score)
-                {
+                if let Some(daa) = template.block.as_ref().and_then(|b| b.header.as_ref()).map(|h| h.daa_score) {
                     if daa > self.last_known_daa {
                         self.last_known_daa = daa;
                     }
@@ -619,14 +624,30 @@ impl KeryxdHandler {
                             let mut model_id = [0u8; 32];
                             model_id.copy_from_slice(&model_id_bytes);
                             if keryx_miner::slm::is_model_ready(&model_id) {
-                                info!("OPoI: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
+                                info!(
+                                    "OPoI: challenge received model={:.8} nonce={:.8} — spawning inference",
+                                    model_id_hex, nonce_hex
+                                );
                                 if let Some(flag) = &self.opoi_challenge_active {
                                     flag.store(true, Ordering::Relaxed);
                                 }
-                                let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
+                                let prompt =
+                                    format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
+                                let correlation = format!("challenge:{}", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
                                 tokio::task::spawn_blocking(move || {
-                                    let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, 64);
+                                    let result = keryx_miner::slm::load_and_run_inference_correlated(
+                                        &model_id,
+                                        &prompt,
+                                        64,
+                                        &correlation,
+                                    );
+                                    if result.is_none() {
+                                        log::warn!(
+                                            "event=ai_response_dropped correlation={} reason=challenge_inference_failed",
+                                            correlation
+                                        );
+                                    }
                                     let _ = tx_done.send(result);
                                 });
                                 self.challenge_inference_rx = Some((challenge, rx_done));
@@ -662,17 +683,15 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 match (template.block, template.is_synced, template.error) {
-                    (Some(b), true, None) => miner.process_block(Some(FullBlock {
-                        block: Box::new(b),
-                        device_id: "CPU".to_string(),
-                    }))
-                    .await?,
+                    (Some(b), true, None) => {
+                        miner
+                            .process_block(Some(FullBlock { block: Box::new(b), device_id: "CPU".to_string() }))
+                            .await?
+                    }
                     (Some(b), false, None) if self.mine_when_not_synced => {
-                        miner.process_block(Some(FullBlock {
-                            block: Box::new(b),
-                            device_id: "CPU".to_string(),
-                        }))
-                        .await?
+                        miner
+                            .process_block(Some(FullBlock { block: Box::new(b), device_id: "CPU".to_string() }))
+                            .await?
                     }
                     (_, false, None) => miner.process_block(None).await?,
                     (_, _, Some(e)) => {
@@ -688,10 +707,8 @@ impl KeryxdHandler {
                 if let Some(e) = msg.error {
                     // Validation answer: "cannot find header <hash>" — the block never
                     // existed on this chain, its escrow entries are ghosts.
-                    was_validation = self
-                        .escrow_watcher
-                        .as_mut()
-                        .map_or(false, |w| w.on_block_validation_error(&e.message));
+                    was_validation =
+                        self.escrow_watcher.as_mut().map_or(false, |w| w.on_block_validation_error(&e.message));
                     if !was_validation {
                         warn!("GetBlockResponse error: {}", e.message);
                     }
@@ -700,10 +717,8 @@ impl KeryxdHandler {
                     // Chain membership from the node's live verdict: a stored-but-reorged
                     // block must purge its entries just like a missing one.
                     let is_chain = block.verbose_data.as_ref().map_or(false, |v| v.is_chain_block);
-                    was_validation = self
-                        .escrow_watcher
-                        .as_mut()
-                        .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
+                    was_validation =
+                        self.escrow_watcher.as_mut().map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
                         self.scan_txs_for_ai_requests(&block.transactions);
                         self.try_start_inference();
@@ -752,12 +767,9 @@ impl KeryxdHandler {
                 // text) — attributing by position slashed valid escrow entries before.
                 use crate::escrow::SubmitResponseOutcome;
                 let err = res.error.as_ref().map(|e| e.message.clone());
-                let outcome = self
-                    .escrow_watcher
-                    .as_mut()
-                    .map_or(SubmitResponseOutcome::NotOurs, |w| {
-                        w.on_submit_response(&res.transaction_id, err.as_deref())
-                    });
+                let outcome = self.escrow_watcher.as_mut().map_or(SubmitResponseOutcome::NotOurs, |w| {
+                    w.on_submit_response(&res.transaction_id, err.as_deref())
+                });
                 match outcome {
                     SubmitResponseOutcome::Accepted { outputs, amount_sompi } => {
                         miner.record_claim_accepted(outputs, amount_sompi);

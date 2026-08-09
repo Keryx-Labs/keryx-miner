@@ -42,21 +42,13 @@ fn model_is_verified(model_id: &[u8; 32]) -> bool {
 
 pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     if unavailable_models().write().unwrap().insert(*model_id) {
-        log::warn!(
-            "event=ai_capability_withdrawn model={} reason=\"{}\"",
-            hex::encode(&model_id[..4]),
-            reason
-        );
+        log::warn!("event=ai_capability_withdrawn model={} reason=\"{}\"", hex::encode(&model_id[..4]), reason);
     }
 }
 
 pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
     if unavailable_models().write().unwrap().remove(model_id) {
-        log::info!(
-            "event=ai_capability_restored model={} reason=\"{}\"",
-            hex::encode(&model_id[..4]),
-            reason
-        );
+        log::info!("event=ai_capability_restored model={} reason=\"{}\"", hex::encode(&model_id[..4]), reason);
     }
 }
 
@@ -122,70 +114,68 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         let status = response.status();
 
         // Decide whether to append (server honored the range) or (re)start, and the total size.
-        let (mut file, mut downloaded, total): (std::fs::File, u64, Option<u64>) =
-            if resume_from > 0 && status == 206 {
-                // Content-Range: "bytes <start>-<end>/<total>"
-                let total = response
-                    .header("Content-Range")
-                    .and_then(|cr| cr.rsplit('/').next())
-                    .and_then(|t| t.trim().parse::<u64>().ok());
-                let f = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(dest)
-                    .with_context(|| format!("open append {}", dest.display()))?;
-                (f, resume_from, total)
-            } else if resume_from > 0 && status == 416 {
-                // Range not satisfiable ⇒ the file is already fully downloaded.
-                if ui_progress_to_stderr() {
-                    eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
-                } else {
-                    ui_download_info(&format!("[keryx-miner] already complete ({} MB).", resume_from / 1_000_000));
-                }
-                return Ok(());
+        let (mut file, mut downloaded, total): (std::fs::File, u64, Option<u64>) = if resume_from > 0 && status == 206 {
+            // Content-Range: "bytes <start>-<end>/<total>"
+            let total = response
+                .header("Content-Range")
+                .and_then(|cr| cr.rsplit('/').next())
+                .and_then(|t| t.trim().parse::<u64>().ok());
+            let f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dest)
+                .with_context(|| format!("open append {}", dest.display()))?;
+            (f, resume_from, total)
+        } else if resume_from > 0 && status == 416 {
+            // Range not satisfiable ⇒ the file is already fully downloaded.
+            if ui_progress_to_stderr() {
+                eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
             } else {
-                // 200, or the server ignored Range. Never wipe a local file that already matches
-                // the remote size — IPFS gateways often ignore Range and answer 200 + full
-                // Content-Length, which previously truncated multi-GB GGUFs back to zero.
-                let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
-                if resume_from > 0 {
-                    if let Some(t) = total {
-                        if resume_from >= t {
-                            if ui_progress_to_stderr() {
-                                eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
-                            } else {
-                                ui_download_info(&format!(
-                                    "[keryx-miner] already complete ({} MB).",
-                                    resume_from / 1_000_000
-                                ));
-                            }
-                            return Ok(());
-                        }
-                    }
-                    // Partial local file + no Range support: keep the bytes and resume via a
-                    // fresh request without Range only when we have nothing useful; otherwise
-                    // refuse to truncate and retry later (gateway may regain Range support).
-                    if resume_from > 1_000_000 {
-                        drop(response);
-                        attempt += 1;
-                        if attempt >= MAX_ATTEMPTS {
-                            return Err(anyhow!(
-                                "download {} cannot resume: server ignored Range and local partial is {} MB",
-                                url,
+                ui_download_info(&format!("[keryx-miner] already complete ({} MB).", resume_from / 1_000_000));
+            }
+            return Ok(());
+        } else {
+            // 200, or the server ignored Range. Never wipe a local file that already matches
+            // the remote size — IPFS gateways often ignore Range and answer 200 + full
+            // Content-Length, which previously truncated multi-GB GGUFs back to zero.
+            let total = response.header("Content-Length").and_then(|s| s.parse::<u64>().ok());
+            if resume_from > 0 {
+                if let Some(t) = total {
+                    if resume_from >= t {
+                        if ui_progress_to_stderr() {
+                            eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                        } else {
+                            ui_download_info(&format!(
+                                "[keryx-miner] already complete ({} MB).",
                                 resume_from / 1_000_000
                             ));
                         }
-                        ui_download_warn(&format!(
+                        return Ok(());
+                    }
+                }
+                // Partial local file + no Range support: keep the bytes and resume via a
+                // fresh request without Range only when we have nothing useful; otherwise
+                // refuse to truncate and retry later (gateway may regain Range support).
+                if resume_from > 1_000_000 {
+                    drop(response);
+                    attempt += 1;
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(anyhow!(
+                            "download {} cannot resume: server ignored Range and local partial is {} MB",
+                            url,
+                            resume_from / 1_000_000
+                        ));
+                    }
+                    ui_download_warn(&format!(
                             "[keryx-miner] server ignored Range (HTTP {status}); keeping local {} MB, retry {attempt}/{MAX_ATTEMPTS} in {BACKOFF_SECS}s…",
                             resume_from / 1_000_000
                         ));
-                        std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
-                        continue;
-                    }
+                    std::thread::sleep(std::time::Duration::from_secs(BACKOFF_SECS));
+                    continue;
                 }
-                let f = std::fs::File::create(dest)
-                    .with_context(|| format!("create {}", dest.display()))?;
-                (f, 0u64, total)
-            };
+            }
+            let f = std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+            (f, 0u64, total)
+        };
 
         let mut reader = response.into_reader();
         let mut buf = vec![0u8; 65_536];
@@ -202,10 +192,12 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     if let Some(t) = total {
                         let pct = downloaded * 100 / t.max(1);
                         if ui_progress_to_stderr() {
-                            eprint!("\r  {:.1}/{:.1} MB ({}%)   ",
+                            eprint!(
+                                "\r  {:.1}/{:.1} MB ({}%)   ",
                                 downloaded as f64 / 1_000_000.0,
                                 t as f64 / 1_000_000.0,
-                                pct);
+                                pct
+                            );
                             let _ = std::io::stderr().flush();
                         } else if pct >= last_logged_percent.saturating_add(10) || pct == 100 {
                             last_logged_percent = pct;
@@ -218,7 +210,10 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                         }
                     }
                 }
-                Err(e) => { stream_err = Some(e.to_string()); break; }
+                Err(e) => {
+                    stream_err = Some(e.to_string());
+                    break;
+                }
             }
         }
         let _ = file.flush();
@@ -239,8 +234,12 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
 
         attempt += 1;
         if attempt >= MAX_ATTEMPTS {
-            return Err(anyhow!("download {} interrupted after {} attempts (got {} MB)",
-                url, attempt, downloaded / 1_000_000));
+            return Err(anyhow!(
+                "download {} interrupted after {} attempts (got {} MB)",
+                url,
+                attempt,
+                downloaded / 1_000_000
+            ));
         }
         let why = stream_err.unwrap_or_else(|| "short read".into());
         ui_download_warn(&format!(
@@ -278,12 +277,7 @@ fn ipfs_url(cid: &str) -> String {
     format!("{}/ipfs/{}", IPFS_GATEWAY, cid)
 }
 
-fn verify_model_file(
-    gguf: &std::path::Path,
-    ok_flag: &std::path::Path,
-    expected: [u8; 32],
-    name: &str,
-) -> Result<()> {
+fn verify_model_file(gguf: &std::path::Path, ok_flag: &std::path::Path, expected: [u8; 32], name: &str) -> Result<()> {
     // A marker never represents a model until the complete current file matches its pinned CID.
     let _ = std::fs::remove_file(ok_flag);
     let mut next_percent = 10u64;
@@ -317,10 +311,7 @@ fn verify_model_file(
 
 fn verify_gguf(spec: &ModelSpec, gguf: &std::path::Path, ok_flag: &std::path::Path) -> Result<()> {
     verified_models().write().unwrap().remove(&spec.model_id);
-    ui_download_info(&format!(
-        "[keryx-miner] Verifying model '{}' integrity before mining...",
-        spec.name
-    ));
+    ui_download_info(&format!("[keryx-miner] Verifying model '{}' integrity before mining...", spec.name));
     if let Err(error) = verify_model_file(gguf, ok_flag, spec.model_id, spec.name) {
         mark_model_unavailable(&spec.model_id, "integrity_mismatch");
         return Err(error);
@@ -356,10 +347,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     }
 
     if !gguf_ready {
-        ui_download_info(&format!(
-            "[keryx-miner] Downloading model '{}' via IPFS. This happens once.",
-            spec.name
-        ));
+        ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
         download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
         if !crate::gguf::is_complete_file(&gguf) {
             return Err(anyhow!(
@@ -369,11 +357,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
             ));
         }
     } else {
-        ui_download_info(&format!(
-            "[keryx-miner] Reusing existing GGUF for '{}' at {}",
-            spec.name,
-            gguf.display()
-        ));
+        ui_download_info(&format!("[keryx-miner] Reusing existing GGUF for '{}' at {}", spec.name, gguf.display()));
     }
 
     if tok_needed && !tok.exists() {
@@ -395,10 +379,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
         // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
         // fold the system prompt into the user turn instead.
-        "glm-4-9b-0414" => format!(
-            "[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n",
-            SYSTEM_PROMPT_NEXT, prompt
-        ),
+        "glm-4-9b-0414" => format!("[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n", SYSTEM_PROMPT_NEXT, prompt),
         // Qwen3 family (tier-0 Qwen3-8B + tier-3 Qwen3.6-27B) — ChatML + a pre-filled empty think
         // block so the visible answer starts immediately (an open think block would eat the whole
         // max_tokens budget).
@@ -500,7 +481,8 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
 /// Return the model_ids of supported models that have fully-downloaded files (.ok flag present).
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    specs.iter()
+    specs
+        .iter()
         .filter(|s| model_is_verified(&s.model_id) && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
         .collect()
@@ -521,8 +503,10 @@ pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
 /// True only when the model is supported and its files are completely downloaded.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
-    model_is_verified(&spec.model_id)
+    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else {
+        return false;
+    };
+    model_is_verified(&spec.model_id) && !model_is_unavailable(&spec.model_id)
 }
 
 /// Serve an inference request via the in-process llama.cpp engine, swapping it to the requested
@@ -532,8 +516,23 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
 /// submitted): a miner must not be rewarded for garbage.
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    load_and_run_inference_correlated(model_id, prompt, max_tokens, "legacy")
+}
+
+pub fn load_and_run_inference_correlated(
+    model_id: &[u8; 32],
+    prompt: &str,
+    max_tokens: usize,
+    correlation: &str,
+) -> Option<String> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else {
+        log::error!(
+            "event=ai_inference_failed correlation={} stage=model_lookup reason=unsupported_model",
+            correlation
+        );
+        return None;
+    };
 
     // llama.cpp gets the raw tokens of whatever string we pass — apply the model's chat
     // template here (template-strict models emit EOG immediately on a bare prompt).
@@ -543,27 +542,82 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     // (single-GPU / unassigned model).
     let dev_id = crate::pom_gpu::device_for_model(model_id).unwrap_or(0);
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
+    log::info!(
+        "event=ai_inference_start correlation={} gpu={} model={} max_tokens={}",
+        correlation,
+        dev_id,
+        spec.name,
+        max_tokens
+    );
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
         // The engine hosts another model (or nothing). Inference has priority: release the
         // device's miner to make room, swap the engine to the requested model. The possession
         // walk rebuilds over the mining model at the next `ensure_installed`.
-        log::info!("SlmEngine: swapping the llama engine to '{}' (gpu{})", spec.name, dev_id);
-        crate::pom_gpu::uninstall(dev_id);
-        crate::llama_engine::unload();
-        if !crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
-            log::error!(
-                "SlmEngine: cannot load '{}' — libkeryx-llama.so missing or model load failed; response dropped",
+        let previous_gpu = crate::llama_engine::active_gpu();
+        log::info!(
+            "event=llama_swap_start correlation={} gpu={} model={} previous_gpu={:?}",
+            correlation,
+            dev_id,
+            spec.name,
+            previous_gpu
+        );
+        if let Some(host_gpu) = previous_gpu {
+            log::info!("event=pom_release_start correlation={} gpu={}", correlation, host_gpu);
+            crate::pom_gpu::release_llama_for_gpu(host_gpu as u32, "inference_swap");
+            log::info!("event=pom_release_success correlation={} gpu={}", correlation, host_gpu);
+        }
+        if previous_gpu != Some(dev_id as usize) {
+            log::info!("event=pom_release_start correlation={} gpu={}", correlation, dev_id);
+            crate::pom_gpu::uninstall(dev_id);
+            log::info!("event=pom_release_success correlation={} gpu={}", correlation, dev_id);
+        }
+        match crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
+            Ok(attempt) => log::info!(
+                "event=llama_swap_success correlation={} attempt={} gpu={} model={}",
+                correlation,
+                attempt,
+                dev_id,
                 spec.name
-            );
-            return None;
+            ),
+            Err(error) => {
+                mark_model_unavailable(&spec.model_id, "inference_load_failed");
+                log::error!(
+                    "event=ai_inference_failed correlation={} attempt={} gpu={} model={} stage=load detail=\"{}\"",
+                    correlation,
+                    error.attempt(),
+                    dev_id,
+                    spec.name,
+                    error
+                );
+                return None;
+            }
         }
     }
 
     match crate::llama_engine::generate(&templated, max_tokens) {
-        Some(text) if !text.trim().is_empty() => Some(text),
+        Some(text) if !text.trim().is_empty() => {
+            mark_model_available(&spec.model_id, "generation_success");
+            log::info!(
+                "event=ai_inference_success correlation={} attempt={} gpu={} model={} output_bytes={}",
+                correlation,
+                crate::llama_engine::active_attempt().unwrap_or(0),
+                dev_id,
+                spec.name,
+                text.len()
+            );
+            Some(text)
+        }
         _ => {
-            log::warn!("SlmEngine '{}': llama generate failed or empty — response dropped", spec.name);
+            let attempt = crate::llama_engine::active_attempt().unwrap_or(0);
+            crate::pom_gpu::release_llama_for_gpu(dev_id, "generation_failed");
+            log::warn!(
+                "event=ai_inference_failed correlation={} attempt={} gpu={} model={} stage=generate reason=empty_or_failed",
+                correlation,
+                attempt,
+                dev_id,
+                spec.name
+            );
             None
         }
     }

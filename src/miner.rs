@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
-use crate::{pow, watch, Error};
 use crate::stats::MinerStats;
+use crate::{pow, watch, Error};
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use tokio::sync::mpsc::Sender;
@@ -157,15 +157,25 @@ const GPU_TELEMETRY_RATE: Duration = Duration::from_secs(10);
 const STALL_GRACE_TICKS: u32 = 3;
 
 impl MinerManager {
-    pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager, stats: Arc<MinerStats>) -> Self {
+    pub fn new(
+        send_channel: Sender<BlockSeed>,
+        n_cpus: Option<u16>,
+        manager: &PluginManager,
+        stats: Arc<MinerStats>,
+    ) -> Self {
         register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
         let opoi_challenge_active = Arc::new(AtomicBool::new(false));
         let (send, recv) = watch::channel(None);
-        let mut handles =
-            Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus, Arc::clone(&stats))
-                .collect::<Vec<MinerHandler>>();
+        let mut handles = Self::launch_cpu_threads(
+            send_channel.clone(),
+            Arc::clone(&hashes_tried),
+            recv.clone(),
+            n_cpus,
+            Arc::clone(&stats),
+        )
+        .collect::<Vec<MinerHandler>>();
         if manager.has_specs() {
             handles.append(&mut Self::launch_gpu_threads(
                 send_channel.clone(),
@@ -215,8 +225,14 @@ impl MinerManager {
     ) -> impl Iterator<Item = MinerHandler> {
         let n_cpus = get_num_cpus(n_cpus);
         info!("launching: {} cpu miners", n_cpus);
-        (0..n_cpus)
-            .map(move |_| Self::launch_cpu_miner(send_channel.clone(), work_channel.clone(), Arc::clone(&hashes_tried), Arc::clone(&stats)))
+        (0..n_cpus).map(move |_| {
+            Self::launch_cpu_miner(
+                send_channel.clone(),
+                work_channel.clone(),
+                Arc::clone(&hashes_tried),
+                Arc::clone(&stats),
+            )
+        })
     }
 
     fn launch_gpu_threads(
@@ -239,6 +255,7 @@ impl MinerManager {
                 Arc::clone(&hashes_tried),
                 spec,
                 worker_hashes_tried,
+                Arc::clone(&hashes_by_worker),
                 Arc::clone(&stats),
                 device_id,
             ));
@@ -308,13 +325,14 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         spec: Box<dyn WorkerSpec>,
         worker_hashes_tried: Arc<AtomicU64>,
+        hashes_by_worker: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
         _stats: Arc<MinerStats>,
         device_id: String,
     ) -> MinerHandler {
         std::thread::spawn(move || {
             let mut box_ = spec.build();
             let gpu_work = box_.as_mut();
-            (|| {
+            let result = (|| {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
                 let worker_device_id = gpu_work
                     .id()
@@ -322,8 +340,6 @@ impl MinerManager {
                     .and_then(|s| s.split_whitespace().next())
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(0);
-                let mut nonces = vec![0u64; 1];
-
                 let mut state = None;
                 // PoM mining: nonce cursor + per-launch batch. The kernel grinds the whole batch
                 // before returning, so BPS_max = hashrate / POM_BATCH. At 1<<22 this capped a
@@ -333,7 +349,6 @@ impl MinerManager {
                 const POM_BATCH: u64 = 1 << 20;
 
                 loop {
-                    nonces[0] = 0;
                     if state.is_none() {
                         state = match block_channel.wait_for_change() {
                             Ok(cmd) => match cmd {
@@ -343,9 +358,19 @@ impl MinerManager {
                             },
                             Err(e) => {
                                 info!("{}: GPU thread crashed: {}", gpu_work.id(), e.to_string());
-                                return Ok(());
+                                return Err(e.into());
                             }
                         };
+                    }
+                    if let Some(new_cmd) = block_channel.get_changed()? {
+                        state = match new_cmd {
+                            Some(WorkerCommand::Job(s)) => Some(s),
+                            Some(WorkerCommand::Close) => return Ok(()),
+                            None => None,
+                        };
+                        if state.is_none() {
+                            continue;
+                        }
                     }
                     // PoM possession mining (design A): when active, the walk runs on the GPU
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
@@ -376,13 +401,62 @@ impl MinerManager {
                             // before (re)installing, so an already-running miner crosses over
                             // without a restart. No-op with the current fixed post-H5 lineup.
                             keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
-                            keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
+                            if !keryx_miner::pom_gpu::ensure_installed_checked(worker_device_id, daa)? {
+                                warn!(
+                                    "{}: PoM GPU miner unavailable; retrying in 5 seconds",
+                                    gpu_work.id()
+                                );
+                                for _ in 0..50 {
+                                    if let Some(cmd) = block_channel.get_changed()? {
+                                        state = match cmd {
+                                            Some(WorkerCommand::Job(ns)) => Some(ns),
+                                            Some(WorkerCommand::Close) => return Ok(()),
+                                            None => None,
+                                        };
+                                        break;
+                                    }
+                                    sleep(Duration::from_millis(100));
+                                }
+                                continue;
+                            }
+                        }
+                        // Model installation can take seconds. Do not launch stale work or delay
+                        // shutdown when a command arrived while the GPU was being rebuilt.
+                        if let Some(cmd) = block_channel.get_changed()? {
+                            state = match cmd {
+                                Some(WorkerCommand::Job(ns)) => Some(ns),
+                                Some(WorkerCommand::Close) => return Ok(()),
+                                None => None,
+                            };
+                            continue;
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
                         let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2);
+                        let found = match keryx_miner::pom_gpu::mine(
+                            worker_device_id,
+                            &pph,
+                            time,
+                            &target_le,
+                            pom_nonce,
+                            POM_BATCH,
+                            h3,
+                            walk_v2,
+                            h5_1,
+                            h5_2,
+                        ) {
+                            Ok(found) => found,
+                            Err(e) => {
+                                let error = e.to_string();
+                                if keryx_miner::pom_gpu::recover_after_runtime_error(worker_device_id, &error) {
+                                    continue;
+                                }
+                                error!("{}: {}; stopping this GPU worker", gpu_work.id(), error);
+                                keryx_miner::pom_gpu::uninstall(worker_device_id);
+                                return Err(e.into());
+                            }
+                        };
                         pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
                         hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
@@ -401,35 +475,36 @@ impl MinerManager {
                                 if let BlockSeed::FullBlock { .. } = &block_seed {
                                     state = None;
                                 }
+                            } else {
+                                error!(
+                                    "{}: PoM GPU candidate failed CPU verification: nonce={} daa={}",
+                                    gpu_work.id(), nonce, daa
+                                );
                             }
                         } else if let Some(cmd) = block_channel.get_changed()? {
                             state = match cmd {
                                 Some(WorkerCommand::Job(ns)) => Some(ns),
                                 Some(WorkerCommand::Close) => return Ok(()),
-                                None => state,
+                                None => None,
                             };
                         }
                         continue;
                     }
 
-                    let state_ref = match &state {
-                        Some(s) => {
-                            s.load_to_gpu(gpu_work);
-                            s
-                        },
+                    let gpu_result = match &state {
+                        Some(s) => s.load_to_gpu(gpu_work).and_then(|_| s.pow_gpu(gpu_work)).and_then(|_| gpu_work.sync()),
                         None => continue,
                     };
-                    state_ref.pow_gpu(gpu_work);
-                    if let Err(e) = gpu_work.sync() {
-                        warn!("CUDA run ignored: {}", e);
-                        continue
+                    if let Err(e) = gpu_result {
+                        return Err(e);
                     }
 
-                    gpu_work.copy_output_to(&mut nonces)?;
+                    let state_ref = state.as_ref().unwrap();
+                    let winner = gpu_work.read_winner()?;
                     // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
                     // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
-                    if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {
-                        if let Some(mut block_seed) = state_ref.generate_block_if_pow(nonces[0]) {
+                    if let Some(nonce) = winner.filter(|_| state_ref.daa_score < keryx_miner::pom::pom_activation_daa()) {
+                        if let Some(mut block_seed) = state_ref.generate_block_if_pow(nonce) {
                             block_seed.set_device_id(&device_id);
                             match send_channel.blocking_send(block_seed.clone()) {
                                 Ok(()) => block_seed.report_block(&gpu_work.id()),
@@ -438,13 +513,12 @@ impl MinerManager {
                             if let BlockSeed::FullBlock { .. } = &block_seed {
                                 state = None;
                             }
-                            nonces[0] = 0;
                             hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             worker_hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             continue;
                         } else {
-                            let hash = state_ref.calculate_pow(nonces[0]);
-                            warn!("Something is wrong in GPU results! Got nonce {}, with hash real {:?}  (target: {}*2^196)", nonces[0], hash.0, state_ref.target.0[3]);
+                            let hash = state_ref.calculate_pow(nonce);
+                            warn!("Something is wrong in GPU results! Got nonce {}, with hash real {:?}  (target: {}*2^196)", nonce, hash.0, state_ref.target.0[3]);
                             break;
                         }
                     }
@@ -497,7 +571,11 @@ impl MinerManager {
             .map_err(|e: Error| {
                 error!("{}: GPU thread crashed: {}", gpu_work.id(), e.to_string());
                 e
-            })
+            });
+            if let Ok(mut workers) = hashes_by_worker.lock() {
+                workers.remove(&device_id);
+            }
+            result
         })
     }
 
@@ -515,78 +593,78 @@ impl MinerManager {
             .name("cpu-miner".into())
             .stack_size(256 * 1024)
             .spawn(move || {
-            (|| {
-                let mut state = None;
+                (|| {
+                    let mut state = None;
 
-                loop {
-                    if state.is_none() {
-                        state = match block_channel.wait_for_change() {
-                            Ok(cmd) => match cmd {
-                                Some(WorkerCommand::Job(s)) => Some(s),
-                                Some(WorkerCommand::Close) => {
+                    loop {
+                        if state.is_none() {
+                            state = match block_channel.wait_for_change() {
+                                Ok(cmd) => match cmd {
+                                    Some(WorkerCommand::Job(s)) => Some(s),
+                                    Some(WorkerCommand::Close) => {
+                                        return Ok(());
+                                    }
+                                    None => None,
+                                },
+                                Err(e) => {
+                                    info!("CPU thread crashed: {}", e.to_string());
                                     return Ok(());
                                 }
-                                None => None,
-                            },
-                            Err(e) => {
-                                info!("CPU thread crashed: {}", e.to_string());
-                                return Ok(());
-                            }
-                        };
-                        if let Some(s) = &state {
-                            mask = Wrapping(s.nonce_mask);
-                            fixed = Wrapping(s.nonce_fixed);
-                        }
-                    }
-                    let state_ref = match state.as_mut() {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    nonce = (nonce & mask) | fixed;
-
-                    // PoM possession path (CPU) once active; else legacy kHeavyHash.
-                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
-                        // The CPU/fallback walk has no per-device tier assignment — mine whichever
-                        // tier's index is built (lowest present).
-                        keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
-                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier)
-                        })
-                    } else {
-                        state_ref.generate_block_if_pow(nonce.0)
-                    };
-                    if let Some(mut block_seed) = found {
-                        block_seed.set_device_id("CPU");
-                        match send_channel.blocking_send(block_seed.clone()) {
-                            Ok(()) => block_seed.report_block("CPU"),
-                            Err(e) => error!("Failed submitting block: ({})", e.to_string()),
-                        };
-                        if let BlockSeed::FullBlock { .. } = &block_seed {
-                            state = None;
-                        }
-                    }
-                    nonce += Wrapping(1);
-                    // TODO: Is this really necessary? can we just use Relaxed?
-                    hashes_tried.fetch_add(1, Ordering::AcqRel);
-
-                    if nonce.0 % 128 == 0 {
-                        if let Some(new_cmd) = block_channel.get_changed()? {
-                            state = match new_cmd {
-                                Some(WorkerCommand::Job(s)) => Some(s),
-                                Some(WorkerCommand::Close) => {
-                                    return Ok(());
-                                }
-                                None => None,
                             };
+                            if let Some(s) = &state {
+                                mask = Wrapping(s.nonce_mask);
+                                fixed = Wrapping(s.nonce_fixed);
+                            }
+                        }
+                        let state_ref = match state.as_mut() {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        nonce = (nonce & mask) | fixed;
+
+                        // PoM possession path (CPU) once active; else legacy kHeavyHash.
+                        let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
+                            // The CPU/fallback walk has no per-device tier assignment — mine whichever
+                            // tier's index is built (lowest present).
+                            keryx_miner::pom::any_active_index()
+                                .and_then(|(tier, idx)| state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier))
+                        } else {
+                            state_ref.generate_block_if_pow(nonce.0)
+                        };
+                        if let Some(mut block_seed) = found {
+                            block_seed.set_device_id("CPU");
+                            match send_channel.blocking_send(block_seed.clone()) {
+                                Ok(()) => block_seed.report_block("CPU"),
+                                Err(e) => error!("Failed submitting block: ({})", e.to_string()),
+                            };
+                            if let BlockSeed::FullBlock { .. } = &block_seed {
+                                state = None;
+                            }
+                        }
+                        nonce += Wrapping(1);
+                        // TODO: Is this really necessary? can we just use Relaxed?
+                        hashes_tried.fetch_add(1, Ordering::AcqRel);
+
+                        if nonce.0 % 128 == 0 {
+                            if let Some(new_cmd) = block_channel.get_changed()? {
+                                state = match new_cmd {
+                                    Some(WorkerCommand::Job(s)) => Some(s),
+                                    Some(WorkerCommand::Close) => {
+                                        return Ok(());
+                                    }
+                                    None => None,
+                                };
+                            }
                         }
                     }
-                }
-                Ok(())
-            })()
-            .map_err(|e: Error| {
-                error!("CPU thread crashed: {}", e.to_string());
-                e
+                    Ok(())
+                })()
+                .map_err(|e: Error| {
+                    error!("CPU thread crashed: {}", e.to_string());
+                    e
+                })
             })
-        }).expect("failed to spawn cpu-miner thread")
+            .expect("failed to spawn cpu-miner thread")
     }
 
     fn log_hashrate(
@@ -607,8 +685,7 @@ impl MinerManager {
             let duration = last_instant.elapsed().as_secs_f64();
             last_instant = Instant::now();
             // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
-            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
-                || keryx_miner::pom_gpu::is_loading();
+            let challenge_active = opoi_challenge_active.load(Ordering::Relaxed) || keryx_miner::pom_gpu::is_loading();
             stats.set_opoi_challenge_active(challenge_active);
             let total = hashes_tried.swap(0, Ordering::AcqRel);
 

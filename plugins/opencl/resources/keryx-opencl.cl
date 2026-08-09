@@ -297,10 +297,7 @@ inline uint64_t xoshiro256_next(global ulong4 *s) {
 #define RANDOM_TYPE_XOSHIRO 1
 
 #define LT_U256(X,Y) (X.w != Y->w ? X.w < Y->w : X.z != Y->z ? X.z < Y->z : X.y != Y->y ? X.y < Y->y : X.x < Y->x)
-
-#ifndef cl_khr_int64_base_atomics
-global int lock = false;
-#endif
+#define LE_U256(X,Y) (!((Y)->w != (X).w ? (Y)->w < (X).w : (Y)->z != (X).z ? (Y)->z < (X).z : (Y)->y != (X).y ? (Y)->y < (X).y : (Y)->x < (X).x))
 
 #if defined(NVIDIA_CUDA) && (__COMPUTE_MAJOR__ > 6 || (__COMPUTE_MAJOR__ == 6 && __COMPUTE_MINOR__ >= 1))
 #define amul4bit(X,Y,Z) _amul4bit((constant uint32_t*)(X), (private uint32_t*)(Y), (uint32_t *)(Z))
@@ -386,6 +383,7 @@ kernel void heavy_hash(
     __constant const ulong4 *target,
     const uint8_t random_type,
     global void * restrict random_state,
+    volatile global uint *winner_found,
     volatile global uint64_t *final_nonce,
     volatile global ulong4 *final_hash
 ) {
@@ -393,12 +391,6 @@ kernel void heavy_hash(
     int nonceId = get_group_id(0)*local_size + get_local_id(0);
     #else
     int nonceId = get_global_id(0);
-    #endif
-
-    #ifndef cl_khr_int64_base_atomics
-    if (nonceId == 0)
-       lock = 0;
-    work_group_barrier(CLK_GLOBAL_MEM_FENCE);
     #endif
 
     private uint64_t nonce;
@@ -466,16 +458,12 @@ kernel void heavy_hash(
 
     hash(heavyP, (const ulong*)buffer, &hash_.hash);
 
-    if (LT_U256(hash_.hash, target)){
+    if (LE_U256(hash_.hash, target)){
         //printf("%lu: %lu < %lu: %d %d\n", nonce, ((uint64_t *)hash_)[3], target[3], ((uint64_t *)hash_)[3] < target[3], LT_U256((uint64_t *)hash_, target));
-        #ifdef cl_khr_int64_base_atomics
-        atom_cmpxchg(final_nonce, 0, nonce);
-        #else
-        if (!atom_cmpxchg(&lock, 0, 1)) {
+        if (atomic_cmpxchg(winner_found, 0, 1) == 0) {
             *final_nonce = nonce;
             //for(int i=0;i<4;i++) final_hash[i] = ((uint64_t volatile *)hash_)[i];
         }
-        #endif
     }
     /*if (nonceId==1) {
         //printf("%lu: %lu < %lu: %d %d\n", nonce, ((uint64_t *)hash2_)[3], target[3], ((uint64_t *)hash_)[3] < target[3]);

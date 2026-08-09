@@ -248,7 +248,17 @@ impl State {
         // 32/256-opening proof. Node switches its verifier at the SAME score — lockstep.
         let h4 = self.daa_score >= pom::coin_age_verification_activation_daa();
         let proof = if h4 {
-            pom::build_proof_v2(tier, &pph, seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), |o| index.merkle_path(o), h3, walk_v2)
+            pom::build_proof_v2(
+                tier,
+                &pph,
+                seed,
+                index.n_chunks,
+                pom::POM_WALK_STEPS,
+                |o| index.read_chunk(o),
+                |o| index.merkle_path(o),
+                h3,
+                walk_v2,
+            )
         } else {
             pom::build_proof(
                 tier,
@@ -284,13 +294,13 @@ impl State {
         Some(block_seed)
     }
 
-    pub fn load_to_gpu(&self, gpu_work: &mut dyn Worker) {
-        gpu_work.load_block_constants(&self.pow_hash_header, &self.matrix.0, &self.target.0);
+    pub fn load_to_gpu(&self, gpu_work: &mut dyn Worker) -> Result<(), keryx_miner::Error> {
+        gpu_work.load_block_constants(&self.pow_hash_header, &self.matrix.0, &self.target.0)
     }
 
     #[inline(always)]
-    pub fn pow_gpu(&self, gpu_work: &mut dyn Worker) {
-        gpu_work.calculate_hash(None, self.nonce_mask, self.nonce_fixed);
+    pub fn pow_gpu(&self, gpu_work: &mut dyn Worker) -> Result<(), keryx_miner::Error> {
+        gpu_work.calculate_hash(None, self.nonce_mask, self.nonce_fixed)
     }
 }
 

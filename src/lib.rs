@@ -1,11 +1,12 @@
 use clap::ArgMatches;
 use std::any::Any;
 use std::error::Error as StdError;
+use std::ffi::CStr;
 use std::io::IsTerminal;
 
 pub mod gguf;
-pub mod integrity;
 pub mod inference;
+pub mod integrity;
 pub mod llama_engine;
 pub mod models;
 pub mod pom;
@@ -16,12 +17,77 @@ use libloading::{Library, Symbol};
 
 pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 pub type PluginLogSink = extern "C" fn(level: u8, msg_ptr: *const u8, msg_len: usize);
+pub const PLUGIN_ABI_VERSION: u32 = 2;
 
 pub const PLUGIN_LOG_ERROR: u8 = 1;
 pub const PLUGIN_LOG_WARN: u8 = 2;
 pub const PLUGIN_LOG_INFO: u8 = 3;
 pub const PLUGIN_LOG_DEBUG: u8 = 4;
 pub const PLUGIN_LOG_TRACE: u8 = 5;
+
+/// Resolve an unambiguous physical PCI bus number to the CUDA logical ordinal used by the miner.
+/// Returns `None` when multiple PCI domains contain the same bus number.
+pub fn cuda_ordinal_for_pci_bus(bus_id: u32) -> Option<u32> {
+    use cudarc::driver::{result, sys};
+
+    result::init().ok()?;
+    let count = result::device::get_count().ok()?;
+    let mut matched = None;
+    for ordinal in 0..count {
+        let Ok(device) = result::device::get(ordinal) else {
+            continue;
+        };
+        let Ok(device_bus) = (unsafe {
+            result::device::get_attribute(device, sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)
+        }) else {
+            continue;
+        };
+        if device_bus as u32 == bus_id {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(ordinal as u32);
+        }
+    }
+    matched
+}
+
+/// Resolve a full PCI domain/bus/device/function identity to the CUDA logical ordinal.
+pub fn cuda_ordinal_for_pci(domain: u32, bus: u32, device_id: u32, function: u32) -> Option<u32> {
+    use cudarc::driver::{result, sys};
+
+    result::init().ok()?;
+    let count = result::device::get_count().ok()?;
+    for ordinal in 0..count {
+        let Ok(device) = result::device::get(ordinal) else {
+            continue;
+        };
+        let mut buffer = [0i8; 32];
+        let status = unsafe { sys::cuDeviceGetPCIBusId(buffer.as_mut_ptr(), buffer.len() as i32, device) };
+        if status.result().is_err() {
+            continue;
+        }
+        let Ok(value) = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str() else {
+            continue;
+        };
+        if parse_pci_address(value) == Some((domain, bus, device_id, function)) {
+            return Some(ordinal as u32);
+        }
+    }
+    None
+}
+
+fn parse_pci_address(value: &str) -> Option<(u32, u32, u32, u32)> {
+    let (domain, rest) = value.trim().split_once(':')?;
+    let (bus, rest) = rest.split_once(':')?;
+    let (device, function) = rest.split_once('.')?;
+    Some((
+        u32::from_str_radix(domain, 16).ok()?,
+        u32::from_str_radix(bus, 16).ok()?,
+        u32::from_str_radix(device, 16).ok()?,
+        u32::from_str_radix(function, 16).ok()?,
+    ))
+}
 
 #[derive(Default)]
 pub struct PluginManager {
@@ -36,11 +102,7 @@ pub struct PluginManager {
 */
 impl PluginManager {
     pub fn new() -> Self {
-        Self {
-            plugins: Vec::new(),
-            loaded_libraries: Vec::new(),
-            startup_warnings: Vec::new(),
-        }
+        Self { plugins: Vec::new(), loaded_libraries: Vec::new(), startup_warnings: Vec::new() }
     }
 
     fn record_startup_warning(&mut self, message: String) {
@@ -59,13 +121,35 @@ impl PluginManager {
         app: clap::App<'help>,
         path: &str,
     ) -> Result<clap::App<'help>, (clap::App<'help>, Error)> {
+        type PluginAbiVersion = unsafe extern "C" fn() -> u32;
         type PluginCreate<'help> =
-            unsafe fn(*const clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *mut Error);
+            unsafe extern "C" fn(*mut clap::App<'help>) -> (*mut clap::App<'help>, *mut dyn Plugin, *mut Error);
 
         let lib = match Library::new(path) {
             Ok(l) => l,
             Err(e) => return Err((app, e.to_string().into())),
         };
+
+        let abi_version: Symbol<PluginAbiVersion> = match lib.get(b"_plugin_abi_version") {
+            Ok(version) => version,
+            Err(_) => {
+                return Err((
+                    app,
+                    format!("Plugin {} has no ABI version; install plugins packaged with this miner", path).into(),
+                ))
+            }
+        };
+        let found_abi = abi_version();
+        if found_abi != PLUGIN_ABI_VERSION {
+            return Err((
+                app,
+                format!(
+                    "Plugin {} uses ABI {}, but this miner requires ABI {}; install the matching plugin package",
+                    path, found_abi, PLUGIN_ABI_VERSION
+                )
+                .into(),
+            ));
+        }
 
         self.loaded_libraries.push(lib); // Save library so it persists in memory
         let lib = self.loaded_libraries.last().unwrap();
@@ -159,13 +243,18 @@ pub trait WorkerSpec: Any + Send + Sync {
 pub trait Worker {
     //fn new(device_id: u32, workload: f32, is_absolute: bool) -> Result<Self, Error>;
     fn id(&self) -> String;
-    fn load_block_constants(&mut self, hash_header: &[u8; 72], matrix: &[[u16; 64]; 64], target: &[u64; 4]);
+    fn load_block_constants(
+        &mut self,
+        hash_header: &[u8; 72],
+        matrix: &[[u16; 64]; 64],
+        target: &[u64; 4],
+    ) -> Result<(), Error>;
 
-    fn calculate_hash(&mut self, nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64);
+    fn calculate_hash(&mut self, nonces: Option<&Vec<u64>>, nonce_mask: u64, nonce_fixed: u64) -> Result<(), Error>;
     fn sync(&self) -> Result<(), Error>;
 
     fn get_workload(&self) -> usize;
-    fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error>;
+    fn read_winner(&mut self) -> Result<Option<u64>, Error>;
 }
 
 pub fn load_plugins<'help>(
@@ -193,9 +282,14 @@ macro_rules! declare_plugin {
     ($plugin_type:ty, $constructor:path, $args:ty) => {
         use clap::Args;
         #[no_mangle]
+        pub extern "C" fn _plugin_abi_version() -> u32 {
+            $crate::PLUGIN_ABI_VERSION
+        }
+
+        #[no_mangle]
         pub unsafe extern "C" fn _plugin_create(
             app: *mut clap::App,
-        ) -> (*mut clap::App, *mut dyn $crate::Plugin, *const $crate::Error) {
+        ) -> (*mut clap::App, *mut dyn $crate::Plugin, *mut $crate::Error) {
             // make sure the constructor is the correct type.
             let constructor: fn() -> Result<$plugin_type, $crate::Error> = $constructor;
 
@@ -204,7 +298,7 @@ macro_rules! declare_plugin {
                 Err(e) => {
                     return (
                         app,
-                        unsafe { std::mem::MaybeUninit::zeroed().assume_init() }, // Translates to null pointer
+                        std::ptr::null_mut::<$plugin_type>() as *mut dyn $crate::Plugin,
                         Box::into_raw(Box::new(e)),
                     );
                 }
@@ -213,7 +307,19 @@ macro_rules! declare_plugin {
             let boxed: Box<dyn $crate::Plugin> = Box::new(object);
 
             let boxed_app = Box::new(<$args>::augment_args(unsafe { *Box::from_raw(app) }));
-            (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null::<Error>())
+            (Box::into_raw(boxed_app), Box::into_raw(boxed), std::ptr::null_mut::<Error>())
         }
     };
+}
+
+#[cfg(test)]
+mod pci_tests {
+    use super::parse_pci_address;
+
+    #[test]
+    fn parses_full_cuda_pci_identity() {
+        assert_eq!(parse_pci_address("00000000:01:02.3"), Some((0, 1, 2, 3)));
+        assert_eq!(parse_pci_address("0000:af:00.0"), Some((0, 0xaf, 0, 0)));
+        assert_eq!(parse_pci_address("invalid"), None);
+    }
 }

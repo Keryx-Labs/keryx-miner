@@ -9,6 +9,7 @@ keryx_miner = {path = "../../", package="keryx-miner"}
 clap = { version = "3.0", features = ["color", "derive"]}
 env_logger = "0.9"
 opencl3 = {version = "0.6", features = ["CL_VERSION_2_1", "CL_VERSION_2_2", "CL_VERSION_3_0"]}
+cl3 = "0.6.5"
 log = "0.4"
 rand = "0.8"
 include_dir = "0.7"

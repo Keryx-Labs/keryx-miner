@@ -12,23 +12,93 @@
 //! untouched; `ensure_installed_inner`'s N-guard cross-checks the gather against the host index.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
+type ErrorFn = unsafe extern "C" fn() -> *const c_char;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
-type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
+type InfoFn =
+    unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 
-const ABI: c_int = 2;
+const ABI: c_int = 3;
 
-struct Engine {
-    model: *mut c_void,
+#[derive(Clone, Debug)]
+pub struct LoadError {
+    attempt: u64,
+    stage: &'static str,
+    detail: String,
+    cuda_touched: bool,
+}
+
+impl LoadError {
+    fn new(attempt: u64, stage: &'static str, detail: impl Into<String>, cuda_touched: bool) -> Self {
+        Self { attempt, stage, detail: detail.into(), cuda_touched }
+    }
+
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
+    pub fn is_oom(&self) -> bool {
+        let detail = self.detail.to_ascii_lowercase();
+        detail.contains("out of memory")
+            || detail.contains("cuda_error_out_of_memory")
+            || detail.contains("memory allocation")
+    }
+
+    pub fn cuda_context_may_be_invalid(&self) -> bool {
+        if !self.cuda_touched {
+            return false;
+        }
+        let detail = self.detail.to_ascii_lowercase();
+        detail.contains("illegal address")
+            || detail.contains("illegal memory")
+            || detail.contains("cuda_error_illegal_address")
+            || detail.contains("misaligned address")
+            || detail.contains("launch failed")
+            || detail.contains("cuda_error_launch_failed")
+            || detail.contains("launch timeout")
+            || detail.contains("cuda_error_launch_timeout")
+            || detail.contains("context is destroyed")
+            || detail.contains("cuda_error_context_is_destroyed")
+            || detail.contains("device-side assert")
+            || detail.contains("cuda_error_assert")
+            || detail.contains("hardware stack error")
+            || detail.contains("cuda_error_hardware_stack_error")
+    }
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "attempt={} stage={}: {}", self.attempt, self.stage, self.detail)
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+#[derive(Copy, Clone)]
+struct Api {
+    last_error: ErrorFn,
+    load: LoadFn,
     count: CountFn,
     info: InfoFn,
     generate: GenFn,
     free: FreeFn,
+}
+
+struct Engine {
+    model: *mut c_void,
+    last_error: ErrorFn,
+    count: CountFn,
+    info: InfoFn,
+    generate: GenFn,
+    free: FreeFn,
+    attempt: u64,
     gpu: usize,
     gguf: String,
 }
@@ -76,6 +146,52 @@ unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
     lib.get::<T>(name.as_bytes()).ok().map(|s| *s)
 }
 
+unsafe fn required_symbol<T: Copy>(
+    lib: &libloading::Library,
+    path: &std::path::Path,
+    name: &'static str,
+) -> Result<T, (&'static str, String)> {
+    sym::<T>(lib, name).ok_or_else(|| ("symbols", format!("{} is missing required symbol {}", path.display(), name)))
+}
+
+unsafe fn resolve_api(lib: &libloading::Library, path: &std::path::Path) -> Result<Api, (&'static str, String)> {
+    let abi = required_symbol::<AbiFn>(lib, path, "keryx_llama_abi")?;
+    let last_error = required_symbol::<ErrorFn>(lib, path, "keryx_llama_last_error")?;
+    let load = required_symbol::<LoadFn>(lib, path, "keryx_llama_load")?;
+    let count = required_symbol::<CountFn>(lib, path, "keryx_llama_tensor_count")?;
+    let info = required_symbol::<InfoFn>(lib, path, "keryx_llama_tensor_info")?;
+    let generate = required_symbol::<GenFn>(lib, path, "keryx_llama_generate")?;
+    let free = required_symbol::<FreeFn>(lib, path, "keryx_llama_free")?;
+    let got = abi();
+    if got != ABI {
+        return Err(("abi", format!("{} has ABI {}, this miner expects {}", path.display(), got, ABI)));
+    }
+    Ok(Api { last_error, load, count, info, generate, free })
+}
+
+fn next_attempt() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn model_label(gguf: &str) -> String {
+    let path = std::path::Path::new(gguf);
+    let name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name.eq_ignore_ascii_case("model.gguf") => path.parent().and_then(|parent| parent.file_name()),
+        _ => path.file_stem().or_else(|| path.file_name()),
+    };
+    name.map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "unknown".to_string())
+}
+
+unsafe fn native_error(error: ErrorFn) -> String {
+    let ptr = error();
+    if ptr.is_null() {
+        "native operation failed without details".to_string()
+    } else {
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
+}
+
 /// Startup probe: is the inference engine library actually usable?
 ///
 /// The engine is only ever dlopened lazily, on the first inference request. A deleted, renamed or
@@ -98,37 +214,27 @@ pub fn probe_library() -> Result<std::path::PathBuf, String> {
         let name = "libkeryx-llama.so";
         return Err(format!("{} not found next to the miner binary", name));
     };
-    let lib = unsafe { libloading::Library::new(&so) }
-        .map_err(|e| format!("{} failed to load: {}", so.display(), e))?;
-    unsafe {
-        let (Some(abi), Some(_load), Some(_count), Some(_info), Some(_gen), Some(_free)) = (
-            sym::<AbiFn>(&lib, "keryx_llama_abi"),
-            sym::<LoadFn>(&lib, "keryx_llama_load"),
-            sym::<CountFn>(&lib, "keryx_llama_tensor_count"),
-            sym::<InfoFn>(&lib, "keryx_llama_tensor_info"),
-            sym::<GenFn>(&lib, "keryx_llama_generate"),
-            sym::<FreeFn>(&lib, "keryx_llama_free"),
-        ) else {
-            return Err(format!("{} is missing engine symbols", so.display()));
-        };
-        let got = abi();
-        if got != ABI {
-            return Err(format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI));
-        }
-    }
+    let lib =
+        unsafe { libloading::Library::new(&so) }.map_err(|e| format!("{} failed to load: {}", so.display(), e))?;
+    unsafe { resolve_api(&lib, &so).map_err(|(_, detail)| detail)? };
     Ok(so)
+}
+
+/// Capability checks derive from the same complete resolver used by startup and real loads.
+pub fn library_available() -> bool {
+    probe_library().is_ok()
 }
 
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns
 /// whether the engine is active for `gguf` on `gpu`. Safe to call from multiple threads.
-pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
+pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
     let mut g = match engine().lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
     if let Some(e) = g.as_ref() {
         if e.gguf == gguf && e.gpu == gpu {
-            return true;
+            return Ok(e.attempt);
         }
         // Only a SAME-GPU model swap may free-and-reload: the caller reaches here from
         // `ensure_installed_inner` with its own walk uninstalled. A different GPU must not
@@ -136,53 +242,92 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> bool {
         // resident tensors, so freeing them here would be a device use-after-free (and the
         // two GPUs would thrash full model loads stealing the singleton back and forth).
         if e.gpu != gpu {
-            return false;
+            let attempt = next_attempt();
+            let error = LoadError::new(
+                attempt,
+                "active_gpu",
+                format!("GPU {} already hosts model {}", e.gpu, model_label(&e.gguf)),
+                false,
+            );
+            log::error!(
+                "event=llama_load_failed attempt={} gpu={} model={} stage=active_gpu cuda_touched=false detail=\"{}\"",
+                attempt,
+                gpu,
+                model_label(gguf),
+                error.detail
+            );
+            return Err(error);
         }
         if let Some(e) = g.take() {
+            log::info!(
+                "event=llama_unload_start attempt={} gpu={} model={} reason=\"same_gpu_model_swap\"",
+                e.attempt,
+                e.gpu,
+                model_label(&e.gguf)
+            );
             unsafe { (e.free)(e.model) };
+            log::info!("event=llama_unload_success attempt={} gpu={}", e.attempt, e.gpu);
         }
     }
-    let Some(so) = so_path() else { return false };
+    let attempt = next_attempt();
+    let model_name = model_label(gguf);
+    let failed = |stage, detail, cuda_touched| {
+        let error = LoadError::new(attempt, stage, detail, cuda_touched);
+        log::error!(
+            "event=llama_load_failed attempt={} gpu={} model={} stage={} cuda_touched={} detail=\"{}\"",
+            attempt,
+            gpu,
+            model_name,
+            error.stage,
+            cuda_touched,
+            error.detail
+        );
+        error
+    };
+    let Some(so) = so_path() else {
+        return Err(failed("library", "keryx-llama shared library not found".to_string(), false));
+    };
     // Never unloaded (the old dlopen path never dlclosed either): the Engine keeps raw fn
     // pointers into the library for the life of the process, so leak it deliberately.
     let lib: &'static libloading::Library = match unsafe { libloading::Library::new(&so) } {
         Ok(l) => Box::leak(Box::new(l)),
         Err(e) => {
-            log::warn!("llama engine: load({}) failed: {} — inference unavailable.", so.display(), e);
-            return false;
+            return Err(failed("library", format!("load({}) failed: {}", so.display(), e), false));
         }
     };
     unsafe {
-        let (Some(abi), Some(load), Some(count), Some(info), Some(gen), Some(free)) = (
-            sym::<AbiFn>(lib, "keryx_llama_abi"),
-            sym::<LoadFn>(lib, "keryx_llama_load"),
-            sym::<CountFn>(lib, "keryx_llama_tensor_count"),
-            sym::<InfoFn>(lib, "keryx_llama_tensor_info"),
-            sym::<GenFn>(lib, "keryx_llama_generate"),
-            sym::<FreeFn>(lib, "keryx_llama_free"),
-        ) else {
-            log::warn!("llama engine: {} is missing symbols — inference unavailable.", so.display());
-            return false;
-        };
-        let got = abi();
-        if got != ABI {
-            log::warn!("llama engine: {} ABI {} != expected {} — inference unavailable.", so.display(), got, ABI);
-            return false;
-        }
+        let api = resolve_api(lib, &so).map_err(|(stage, detail)| failed(stage, detail, false))?;
         let cg = match CString::new(gguf) {
             Ok(c) => c,
-            Err(_) => return false,
+            Err(_) => return Err(failed("path", "GGUF path contains a NUL byte".to_string(), false)),
         };
-        log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
         let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        log::info!(
+            "event=llama_load_start attempt={} gpu={} model={} abi={} context={} dll={}",
+            attempt,
+            gpu,
+            model_name,
+            ABI,
+            n_ctx,
+            so.display()
+        );
+        let model = (api.load)(cg.as_ptr(), gpu as c_int, n_ctx);
         if model.is_null() {
-            log::warn!("llama engine: model load failed (VRAM? arch?) — inference unavailable.");
-            return false;
+            return Err(failed("native_load", native_error(api.last_error), true));
         }
-        *g = Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string() });
-        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
-        true
+        *g = Some(Engine {
+            model,
+            last_error: api.last_error,
+            count: api.count,
+            info: api.info,
+            generate: api.generate,
+            free: api.free,
+            attempt,
+            gpu,
+            gguf: gguf.to_string(),
+        });
+        log::info!("event=llama_load_success attempt={} gpu={} model={}", attempt, gpu, model_name);
+        Ok(attempt)
     }
 }
 
@@ -199,6 +344,10 @@ pub fn active_gpu() -> Option<usize> {
     engine().lock().ok()?.as_ref().map(|e| e.gpu)
 }
 
+pub fn active_attempt() -> Option<u64> {
+    engine().lock().ok()?.as_ref().map(|e| e.attempt)
+}
+
 pub fn available() -> bool {
     match engine().lock() {
         Ok(g) => g.is_some(),
@@ -211,23 +360,39 @@ pub fn available() -> bool {
 /// layout is NOT byte-compatible with the canonical possession index (e.g. repacked tied
 /// embeddings) — the walk must gather the canonical GGUF bytes, so we free llama's VRAM and
 /// the caller walks a raw canonical upload instead.
-pub fn unload() {
+pub fn unload(reason: &str) {
     if let Ok(mut g) = engine().lock() {
         if let Some(e) = g.take() {
+            log::info!(
+                "event=llama_unload_start attempt={} gpu={} model={} reason=\"{}\"",
+                e.attempt,
+                e.gpu,
+                model_label(&e.gguf),
+                reason
+            );
             unsafe { (e.free)(e.model) };
+            log::info!("event=llama_unload_success attempt={} gpu={}", e.attempt, e.gpu);
         }
     }
 }
 
 /// Free the resident model and disable the engine only if the given GPU currently hosts it.
 /// This is used for stale-GPU recovery after a transient fault on that specific device.
-pub fn unload_for_gpu(gpu: usize) {
+pub fn unload_for_gpu(gpu: usize, reason: &str) {
     if let Ok(mut g) = engine().lock() {
         if g.as_ref().is_some_and(|e| e.gpu != gpu) {
             return;
         }
         if let Some(e) = g.take() {
+            log::info!(
+                "event=llama_unload_start attempt={} gpu={} model={} reason=\"{}\"",
+                e.attempt,
+                e.gpu,
+                model_label(&e.gguf),
+                reason
+            );
             unsafe { (e.free)(e.model) };
+            log::info!("event=llama_unload_success attempt={} gpu={}", e.attempt, e.gpu);
         }
     }
 }
@@ -245,6 +410,13 @@ pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
         let mut is_dev: c_int = 0;
         let ok = unsafe { (e.info)(e.model, i, &mut name, &mut data, &mut nbytes, &mut is_dev) };
         if !ok || name.is_null() || data.is_null() {
+            log::error!(
+                "event=llama_tensor_failed attempt={} gpu={} index={} detail=\"{}\"",
+                e.attempt,
+                e.gpu,
+                i,
+                unsafe { native_error(e.last_error) }
+            );
             return None;
         }
         let nm = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
@@ -259,10 +431,42 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     let e = g.as_ref()?;
     let cp = CString::new(prompt).ok()?;
     let mut buf = vec![0u8; 64 * 1024];
-    let n = unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
+    let n = unsafe {
+        (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int)
+    };
     if n <= 0 {
+        log::error!("event=llama_generate_failed attempt={} gpu={} detail=\"{}\"", e.attempt, e.gpu, unsafe {
+            native_error(e.last_error)
+        });
         return None;
     }
     buf.truncate(n as usize);
     String::from_utf8(buf).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_error_distinguishes_oom_from_corrupt_context() {
+        let oom = LoadError::new(7, "native_load", "model_load: CUDA_ERROR_OUT_OF_MEMORY", true);
+        let corrupt = LoadError::new(8, "native_load", "decode: CUDA_ERROR_ILLEGAL_ADDRESS", true);
+
+        assert_eq!(oom.to_string(), "attempt=7 stage=native_load: model_load: CUDA_ERROR_OUT_OF_MEMORY");
+        assert_eq!(oom.attempt(), 7);
+        assert!(oom.is_oom());
+        assert!(!oom.cuda_context_may_be_invalid());
+        assert!(!corrupt.is_oom());
+        assert!(corrupt.cuda_context_may_be_invalid());
+    }
+
+    #[test]
+    fn model_label_identifies_canonical_and_standalone_ggufs() {
+        let canonical = std::path::Path::new("models").join("Qwen3-8B").join("model.gguf");
+        let standalone = std::path::Path::new("tmp").join("qwen3-smoke.gguf");
+
+        assert_eq!(model_label(canonical.to_str().unwrap()), "Qwen3-8B");
+        assert_eq!(model_label(standalone.to_str().unwrap()), "qwen3-smoke");
+    }
 }
