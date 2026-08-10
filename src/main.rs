@@ -86,8 +86,8 @@ library_path() {
   soname=$2
   path=$(dpkg -L "$package" | awk -v soname="$soname" '
     { count = split($0, parts, "/") }
-    parts[count] == soname { match = $0 }
-    END { if (match) print match }
+    parts[count] == soname { matched_path = $0 }
+    END { if (matched_path) print matched_path }
   ')
   test -n "$path"
   test -e "$path"
@@ -106,16 +106,18 @@ ldconfig
 
 loader_has() {
   soname=$1
-  directory=$2
-  ldconfig -p | awk -v soname="$soname" -v prefix="$directory/" '
-    $1 == soname && index($NF, prefix) == 1 { found = 1 }
-    END { exit !found }
-  '
+  expected_path=$2
+  while IFS= read -r path; do
+    if [ "$(readlink -f "$path")" = "$expected_path" ]; then
+      return 0
+    fi
+  done < <(ldconfig -p | awk -v soname="$soname" '$1 == soname { print $NF }')
+  return 1
 }
 
-loader_has libcublas.so.12 "$cublas_dir"
-loader_has libcurand.so.10 "$curand_dir"
-loader_has libcudart.so.12 "$cudart_dir"
+loader_has libcublas.so.12 "$cublas_path"
+loader_has libcurand.so.10 "$curand_path"
+loader_has libcudart.so.12 "$cudart_path"
 "#;
 
 /// Attempt to install the CUDA runtime libraries inference needs, on a Debian/Ubuntu host (HiveOS).
@@ -202,7 +204,8 @@ mod installer_tests {
         assert!(CUDA_INSTALL_SCRIPT.contains("Architecture)\" = 'all'"));
         assert!(CUDA_INSTALL_SCRIPT.contains("dpkg -L \"$package\""));
         assert!(CUDA_INSTALL_SCRIPT.contains("readlink -f \"$path\""));
-        assert!(CUDA_INSTALL_SCRIPT.contains("$1 == soname && index($NF, prefix) == 1"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("$(readlink -f \"$path\")"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("$1 == soname { print $NF }"));
         assert!(!CUDA_INSTALL_SCRIPT.contains("print; exit"));
         assert!(!CUDA_INSTALL_SCRIPT.contains("find /usr"));
         assert!(!CUDA_INSTALL_SCRIPT.contains("/tmp/cuda-keyring.deb"));
