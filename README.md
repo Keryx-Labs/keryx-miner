@@ -128,9 +128,9 @@ Nothing to download by hand: on first run the miner fetches the model for your t
 <directory of the keryx-miner executable>/models/<Model-Name>/model.gguf
 ```
 
-Point it somewhere else with `--models-dir /path/to/models` (or the `KERYX_MODELS_DIR` environment variable). The path you give is the **root** — the miner still appends `<Model-Name>/model.gguf` under it.
+Point it somewhere else with `--models-dir /path/to/models` (or the `KERYX_MODELS_DIR` environment variable). The path you give is the **root**. A symlink or Windows junction is allowed as that root.
 
-If IPFS is slow or blocked on your network, download the archive and unzip it into that models folder. Keep the folder name exactly as listed below, and use `--ipfs-url` if you would rather point at a different gateway.
+If IPFS is slow or blocked on your network, download the archive and unzip it anywhere under that models root. When the canonical `<Model-Name>/model.gguf` is missing or has the wrong identity, the miner scans regular `.gguf` files below the root, identifies known models by their UnixFS CIDv0, and moves a verified match to the canonical path when safe. Nested symlinks and junctions are not followed. Existing destinations are never overwritten and duplicate files are never deleted; if a verified file cannot be moved, the miner uses it in place for that run. Use `--ipfs-url` if you would rather point at a different gateway.
 
 | Model | Hugging Face | Direct | Torrent |
 |-------|--------------|--------|---------|
@@ -139,6 +139,10 @@ If IPFS is slow or blocked on your network, download the archive and unzip it in
 | GLM-4-9B-0414 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/GLM-4-9B-0414.zip) | [zip](https://keryx-labs.com/GLM-4-9B-0414.zip) | [torrent](https://keryx-labs.com/GLM-4-9B-0414.zip.torrent) |
 | Qwen3.6-27B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3.6-27B.zip) | [zip](https://keryx-labs.com/Qwen3.6-27B.zip) | [torrent](https://keryx-labs.com/Qwen3.6-27B.zip.torrent) |
 | Kimi-Linear-48B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Kimi-Linear-48B.zip) | [zip](https://keryx-labs.com/Kimi-Linear-48B.zip) | [torrent](https://keryx-labs.com/Kimi-Linear-48B.zip.torrent) |
+| Qwen3.5-9B-abliterated (H6) | [Q5_K_M GGUF](https://huggingface.co/mradermacher/Huihui-Qwen3.5-9B-abliterated-GGUF/resolve/9f646d7eda193ddf2348134f3bff3d49eed7a2c6/Huihui-Qwen3.5-9B-abliterated.Q5_K_M.gguf) | n/a | n/a |
+| Gemma-4-12B-abliterated (H6) | [Q6_K GGUF](https://huggingface.co/mradermacher/Huihui-gemma-4-12B-it-abliterated-GGUF/resolve/a1aefdaefe83e63588bab0d7850d968955e58b75/Huihui-gemma-4-12B-it-abliterated.Q6_K.gguf) | n/a | n/a |
+
+The H6 links are pinned to immutable Hugging Face revisions. Their full files were verified against registry CIDs `Qmb5E3zospd78SfiRHB9iZWNz29xuwRJufieZbWzEFBuGB` and `QmSDVicqRDwitecBaPitHsAePLUEamgL4KfrBWYHVWQyx9` using the same UnixFS CIDv0 calculation as the miner.
 
 A correct manual install looks like this — the miner writes the `.ok` marker itself once it has validated the file, so there is no need to create it:
 

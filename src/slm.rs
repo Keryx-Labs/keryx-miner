@@ -6,11 +6,12 @@
 /// served-lineup state (`ai:cap`), the model downloads, and the per-model chat templates.
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-use crate::models::ModelSpec;
+use crate::models::{ModelSpec, REGISTRY};
 
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
 /// Shared system prompt for the whole lineup (vendor-agnostic wording).
@@ -58,21 +59,347 @@ fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
 
 // ── File management ──────────────────────────────────────────────────────────
 
-fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
+fn configured_model_root() -> PathBuf {
     if let Some(root) = std::env::var_os("KERYX_MODELS_DIR") {
-        return std::path::PathBuf::from(root).join(spec.dir_name);
+        return PathBuf::from(root);
     }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    exe_dir.join("models").join(spec.dir_name)
+        .unwrap_or_else(|| PathBuf::from("."));
+    exe_dir.join("models")
 }
 
-/// Path to a model's GGUF file (`<exe_dir>/models/<dir_name>/model.gguf`). Used by PoM to
-/// build the possession weight index from the resident model.
-pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
-    model_dir(spec).join("model.gguf")
+fn prepare_model_root(root: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(root).with_context(|| format!("create model root {}", root.display()))?;
+    root.canonicalize().with_context(|| format!("resolve model root {}", root.display()))
+}
+
+fn model_dir_name_is_safe(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!((components.next(), components.next()), (Some(Component::Normal(_)), None))
+}
+
+fn model_dir_is_safe(root: &Path, dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir)
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+        && dir.canonicalize().map(|path| path.starts_with(root)).unwrap_or(false)
+}
+
+fn prepare_model_dir(root: &Path, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create model directory {}", dir.display()))?;
+    if !model_dir_is_safe(root, dir) {
+        return Err(anyhow!("model directory is unsafe: {}", dir.display()));
+    }
+    Ok(())
+}
+
+fn canonical_gguf_is_complete(root: &Path, gguf: &Path) -> bool {
+    gguf.parent().map(|dir| model_dir_is_safe(root, dir)).unwrap_or(false)
+        && std::fs::symlink_metadata(gguf)
+            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        && crate::gguf::is_complete_file(gguf)
+}
+
+fn prepare_model_file(root: &Path, path: &Path) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| anyhow!("model path has no parent: {}", path.display()))?;
+    prepare_model_dir(root, dir)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(anyhow!("model file path is unsafe: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn resolved_model_root() -> Result<&'static Path> {
+    static ROOT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
+    ROOT.get_or_init(|| prepare_model_root(&configured_model_root()).map_err(|e| e.to_string()))
+        .as_deref()
+        .map_err(|e| anyhow!(e.clone()))
+}
+
+fn model_dir(spec: &ModelSpec) -> PathBuf {
+    let root = resolved_model_root().map(Path::to_path_buf).unwrap_or_else(|_| configured_model_root());
+    if model_dir_name_is_safe(spec.dir_name) {
+        root.join(spec.dir_name)
+    } else {
+        root.join(hex::encode(spec.model_id))
+    }
+}
+
+fn registered_model_spec(spec: &ModelSpec) -> Result<&'static ModelSpec> {
+    let known = REGISTRY
+        .iter()
+        .copied()
+        .find(|known| known.model_id == spec.model_id)
+        .ok_or_else(|| anyhow!("model '{}' is not registered", spec.name))?;
+    if !model_dir_name_is_safe(known.dir_name) {
+        return Err(anyhow!("unsafe registered model directory name: {}", known.dir_name));
+    }
+    Ok(known)
+}
+
+fn resolved_model_paths() -> &'static RwLock<HashMap<[u8; 32], PathBuf>> {
+    static PATHS: OnceLock<RwLock<HashMap<[u8; 32], PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn remember_resolved_model_path(model_id: [u8; 32], path: PathBuf) {
+    resolved_model_paths().write().unwrap().insert(model_id, path);
+}
+
+/// Path to the verified model GGUF. This is normally the canonical model path, but may be the
+/// discovered source when safe relocation was not possible.
+pub fn gguf_path_for(spec: &ModelSpec) -> PathBuf {
+    resolved_model_paths()
+        .read()
+        .unwrap()
+        .get(&spec.model_id)
+        .cloned()
+        .unwrap_or_else(|| model_dir(spec).join("model.gguf"))
+}
+
+fn verification_marker(gguf: &Path, canonical: &Path, model_id: &[u8; 32]) -> PathBuf {
+    if gguf == canonical {
+        canonical.parent().unwrap().join(".ok")
+    } else {
+        gguf.with_extension(format!("{}.ok", hex::encode(model_id)))
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    nix::fcntl::renameat2(None, source, None, destination, nix::fcntl::RenameFlags::RENAME_NOREPLACE)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(once(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(once(0)).collect();
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), windows)))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unsupported on this platform",
+    ))
+}
+
+fn discover_model_files_with<D, R>(
+    root: &Path,
+    specs: &[&ModelSpec],
+    force: bool,
+    mut digest_file: D,
+    mut rename_file: R,
+) -> Result<HashMap<[u8; 32], PathBuf>>
+where
+    D: FnMut(&Path) -> Result<[u8; 32]>,
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let mut missing = HashMap::new();
+    let mut excluded = HashSet::new();
+    for spec in specs.iter().copied() {
+        if !model_dir_name_is_safe(spec.dir_name) {
+            return Err(anyhow!("unsafe registered model directory name: {}", spec.dir_name));
+        }
+        let canonical = root.join(spec.dir_name).join("model.gguf");
+        if canonical_gguf_is_complete(root, &canonical) {
+            if let Ok(path) = canonical.canonicalize() {
+                excluded.insert(path);
+            }
+            if force {
+                missing.insert(spec.model_id, spec);
+            }
+        } else {
+            missing.insert(spec.model_id, spec);
+        }
+    }
+    for spec in REGISTRY.iter().copied() {
+        let canonical = root.join(spec.dir_name).join("model.gguf");
+        if canonical_gguf_is_complete(root, &canonical) {
+            if let Ok(path) = canonical.canonicalize() {
+                excluded.insert(path);
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut found = HashMap::new();
+    let mut visited = HashSet::from([root.to_path_buf()]);
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if directory == root => {
+                return Err(error).with_context(|| format!("scan model root {}", root.display()));
+            }
+            Err(error) => {
+                log::warn!(
+                    "SlmEngine: could not scan nested model directory {}: {}; skipping",
+                    directory.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    log::warn!("SlmEngine: could not read an entry in {}: {}; skipping", directory.display(), error);
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    log::warn!("SlmEngine: could not inspect {}: {}; skipping", entry.path().display(), error);
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                let resolved = match path.canonicalize() {
+                    Ok(path) if path.starts_with(root) => path,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        log::warn!(
+                            "SlmEngine: could not resolve nested model directory {}: {}; skipping",
+                            path.display(),
+                            error
+                        );
+                        continue;
+                    }
+                };
+                if visited.insert(resolved.clone()) {
+                    directories.push(resolved);
+                }
+                continue;
+            }
+            if !file_type.is_file()
+                || path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| !ext.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(true)
+                || !crate::gguf::is_complete_file(&path)
+            {
+                continue;
+            }
+            let source = match path.canonicalize() {
+                Ok(path) if path.starts_with(root) => path,
+                Ok(_) => continue,
+                Err(error) => {
+                    log::warn!("SlmEngine: could not resolve GGUF {}: {}; skipping", path.display(), error);
+                    continue;
+                }
+            };
+            if excluded.contains(&source) {
+                continue;
+            }
+            let digest = match digest_file(&source) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    log::warn!("SlmEngine: could not identify GGUF {}: {}; skipping", source.display(), error);
+                    continue;
+                }
+            };
+            let Some(spec) = missing.remove(&digest) else {
+                continue;
+            };
+
+            let destination_dir = root.join(spec.dir_name);
+            let safe_dir = match prepare_model_dir(root, &destination_dir) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!(
+                        "SlmEngine: could not create model directory {}: {}; using source path",
+                        destination_dir.display(),
+                        error
+                    );
+                    false
+                }
+            };
+            let destination = destination_dir.join("model.gguf");
+            let source_is_safe = std::fs::symlink_metadata(&source)
+                .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                .unwrap_or(false)
+                && source.canonicalize().map(|path| path.starts_with(root)).unwrap_or(false);
+            let destination_is_missing = matches!(
+                std::fs::symlink_metadata(&destination),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
+            let selected = if safe_dir && source_is_safe && destination_is_missing {
+                match rename_file(&source, &destination) {
+                    Ok(()) => destination,
+                    Err(error) => {
+                        log::warn!(
+                            "SlmEngine: verified model '{}' at {} but could not move it to {}: {}; using source path",
+                            spec.name,
+                            source.display(),
+                            destination.display(),
+                            error
+                        );
+                        source
+                    }
+                }
+            } else {
+                log::warn!(
+                    "SlmEngine: verified model '{}' at {} but destination {} already exists or is unsafe; using source path",
+                    spec.name,
+                    source.display(),
+                    destination.display()
+                );
+                source
+            };
+            found.insert(digest, selected);
+            if missing.is_empty() {
+                return Ok(found);
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn discover_model_files(
+    root: &Path,
+    specs: &[&ModelSpec],
+    force: bool,
+    digests: &mut HashMap<PathBuf, [u8; 32]>,
+) -> Result<HashMap<[u8; 32], PathBuf>> {
+    discover_model_files_with(
+        root,
+        specs,
+        force,
+        |path| {
+            if let Some(digest) = digests.get(path) {
+                return Ok(*digest);
+            }
+            let digest = crate::integrity::unixfs_v0_digest_file(path, |_, _| {})?;
+            digests.insert(path.to_path_buf(), digest);
+            Ok(digest)
+        },
+        rename_no_replace,
+    )
 }
 
 /// Downloads `url` to `dest` with automatic resume. A partially downloaded file is
@@ -322,26 +649,85 @@ fn verify_gguf(spec: &ModelSpec, gguf: &std::path::Path, ok_flag: &std::path::Pa
     Ok(())
 }
 
-fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
-    let dir = model_dir(spec);
+fn verify_canonical_or_discover<V>(
+    spec: &ModelSpec,
+    root: &Path,
+    canonical: &Path,
+    ok_flag: &Path,
+    digests: &mut HashMap<PathBuf, [u8; 32]>,
+    mut verify: V,
+) -> Result<PathBuf>
+where
+    V: FnMut(&Path, &Path) -> Result<()>,
+{
+    match verify(canonical, ok_flag) {
+        Ok(()) => Ok(canonical.to_path_buf()),
+        Err(original_error) => {
+            let mut found = discover_model_files(root, &[spec], true, digests)?;
+            let Some(path) = found.remove(&spec.model_id) else {
+                return Err(original_error);
+            };
+            let marker = verification_marker(&path, canonical, &spec.model_id);
+            verify(&path, &marker)?;
+            Ok(path)
+        }
+    }
+}
+
+fn ensure_gguf(
+    spec: &ModelSpec,
+    discovered: Option<PathBuf>,
+    root: &Path,
+    digests: &mut HashMap<PathBuf, [u8; 32]>,
+) -> Result<(PathBuf, PathBuf)> {
+    let dir = root.join(spec.dir_name);
     let tok = dir.join("tokenizer.json");
     let gguf = dir.join("model.gguf");
     let ok_flag = dir.join(".ok");
 
     // Separate tokenizer.json is optional for the lineup — llama uses the GGUF-embedded one.
     let tok_needed = !spec.tokenizer_cid.is_empty();
-    let gguf_ready = crate::gguf::is_complete_file(&gguf);
-    let tok_ready = !tok_needed || tok.exists();
+    let gguf_ready = canonical_gguf_is_complete(root, &gguf);
+    let tok_ready = !tok_needed
+        || (model_dir_is_safe(root, &dir)
+            && std::fs::symlink_metadata(&tok)
+                .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                .unwrap_or(false));
 
-    // Reuse a complete on-disk GGUF even when `.ok` was lost (HiveOS upgrades, manual copies,
-    // interrupted flag write). Never re-download a model that already parses as complete.
-    if gguf_ready && tok_ready {
-        verify_gguf(spec, &gguf, &ok_flag)?;
-        log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
-        return Ok((tok, gguf));
+    // Hash a complete canonical file once. If it has the wrong CID, preserve it and search for
+    // the requested content elsewhere under the root before any download is attempted.
+    if gguf_ready {
+        let path = verify_canonical_or_discover(spec, root, &gguf, &ok_flag, digests, |path, marker| {
+            verify_gguf(spec, path, marker)
+        })?;
+        if !tok_ready {
+            prepare_model_file(root, &tok)?;
+            if let Err(error) = download_file(&ipfs_url(spec.tokenizer_cid), &tok) {
+                mark_model_unavailable(&spec.model_id, "tokenizer_unavailable");
+                return Err(error);
+            }
+        }
+        remember_resolved_model_path(spec.model_id, path.clone());
+        log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, path.display());
+        return Ok((tok, path));
     }
 
-    std::fs::create_dir_all(&dir)?;
+    if let Some(path) = discovered {
+        let marker = verification_marker(&path, &gguf, &spec.model_id);
+        verify_gguf(spec, &path, &marker)?;
+        if !tok_ready {
+            prepare_model_file(root, &tok)?;
+            if let Err(error) = download_file(&ipfs_url(spec.tokenizer_cid), &tok) {
+                mark_model_unavailable(&spec.model_id, "tokenizer_unavailable");
+                return Err(error);
+            }
+        }
+        remember_resolved_model_path(spec.model_id, path.clone());
+        ui_download_info(&format!("[keryx-miner] Model '{}' ready at {}.", spec.name, path.display()));
+        return Ok((tok, path));
+    }
+
+    prepare_model_file(root, &gguf)?;
     if ok_flag.exists() && !gguf_ready {
         let _ = std::fs::remove_file(&ok_flag); // clear stale flag before repairing
     }
@@ -349,7 +735,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     if !gguf_ready {
         ui_download_info(&format!("[keryx-miner] Downloading model '{}' via IPFS. This happens once.", spec.name));
         download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
-        if !crate::gguf::is_complete_file(&gguf) {
+        if !canonical_gguf_is_complete(root, &gguf) {
             return Err(anyhow!(
                 "model '{}' download finished but GGUF is incomplete at {}",
                 spec.name,
@@ -360,11 +746,13 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
         ui_download_info(&format!("[keryx-miner] Reusing existing GGUF for '{}' at {}", spec.name, gguf.display()));
     }
 
-    if tok_needed && !tok.exists() {
+    if !tok_ready {
+        prepare_model_file(root, &tok)?;
         download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
     }
 
     verify_gguf(spec, &gguf, &ok_flag)?;
+    remember_resolved_model_path(spec.model_id, gguf.clone());
     ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
     Ok((tok, gguf))
 }
@@ -464,9 +852,14 @@ pub fn probe_gpu_inference() -> GpuProbe {
 /// the first inference request doesn't stall the mining workers mid-session.
 /// Returns Err if any model fails to download; mining must not start in that case.
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
-    for spec in specs {
+    let root = resolved_model_root()?;
+    let requested: Vec<_> = specs.iter().map(|spec| registered_model_spec(spec)).collect::<Result<_>>()?;
+    let mut digests = HashMap::new();
+    let mut discovered = discover_model_files(root, &requested, false, &mut digests)?;
+    for spec in requested {
+        resolved_model_paths().write().unwrap().remove(&spec.model_id);
         log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
-        let result = ensure_gguf(spec).map(|_| ());
+        let result = ensure_gguf(spec, discovered.remove(&spec.model_id), root, &mut digests).map(|_| ());
         match result {
             Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
             Err(e) => {
@@ -627,6 +1020,58 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn write_minimal_gguf(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.resize(32, 0);
+        std::fs::write(path, bytes).unwrap();
+        assert!(crate::gguf::is_complete_file(path));
+    }
+
+    fn test_spec(model_id: [u8; 32], dir_name: &'static str) -> ModelSpec {
+        ModelSpec {
+            name: "test-model",
+            model_id,
+            format: crate::models::ModelFormat::Gguf,
+            tokenizer_cid: "",
+            weight_cids: &["unused"],
+            dir_name,
+            min_vram_mb: 0,
+        }
+    }
+
+    fn discover(root: &Path, specs: &[&ModelSpec]) -> HashMap<[u8; 32], PathBuf> {
+        discover_model_files(root, specs, false, &mut HashMap::new()).unwrap()
+    }
+
+    #[test]
+    fn noncanonical_verification_marker_is_adjacent_and_model_specific() {
+        let source = Path::new("nested/misnamed.gguf");
+        let canonical = Path::new("expected/model.gguf");
+        let model_id = [0x5a; 32];
+
+        assert_eq!(verification_marker(canonical, canonical, &model_id), Path::new("expected/.ok"));
+        assert_eq!(
+            verification_marker(source, canonical, &model_id),
+            Path::new(&format!("nested/misnamed.{}.ok", hex::encode(model_id)))
+        );
+    }
+
+    #[test]
+    fn registry_identity_owns_the_model_directory() {
+        let known = REGISTRY[0];
+        let supplied = test_spec(known.model_id, "../outside");
+
+        assert_eq!(registered_model_spec(&supplied).unwrap().dir_name, known.dir_name);
+        assert!(registered_model_spec(&test_spec([0xff; 32], "Expected")).is_err());
+        assert!(model_dir_name_is_safe(known.dir_name));
+        assert!(!model_dir_name_is_safe("../outside"));
+        assert!(!model_dir_name_is_safe("nested/model"));
+    }
+
     #[test]
     fn failed_models_are_withdrawn_until_recovered() {
         let model_id = [0xa5; 32];
@@ -678,5 +1123,273 @@ mod tests {
 
         assert!(verify_model_file(&gguf, &marker, [0x5a; 32], "test-model").is_err());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn discovers_misnamed_nested_gguf_and_moves_it_to_canonical_path() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let nested = root.path().join("odd/layout");
+        std::fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("weights.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+
+        let found = discover(&resolved_root, &[&spec]);
+        let canonical = resolved_root.join("Expected/model.gguf");
+
+        assert_eq!(found.get(&model_id), Some(&canonical));
+        assert!(canonical.exists());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn existing_destination_is_not_overwritten_and_source_is_used() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let source = root.path().join("misnamed.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        let destination = root.path().join("Expected/model.gguf");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(&destination, b"keep me").unwrap();
+
+        let found = discover(&resolved_root, &[&spec]);
+
+        assert_eq!(found.get(&model_id), Some(&source.canonicalize().unwrap()));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn rename_failure_keeps_verified_source_path() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let source = root.path().join("misnamed.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+
+        let found = discover_model_files_with(
+            &resolved_root,
+            &[&spec],
+            false,
+            |path| crate::integrity::unixfs_v0_digest_file(path, |_, _| {}),
+            |_, _| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test failure")),
+        )
+        .unwrap();
+
+        assert_eq!(found.get(&model_id), Some(&source.canonicalize().unwrap()));
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn unknown_cid_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let source = root.path().join("unknown.gguf");
+        write_minimal_gguf(&source);
+        let spec = test_spec([0x55; 32], "Expected");
+
+        let found = discover(&resolved_root, &[&spec]);
+
+        assert!(found.is_empty());
+        assert!(source.exists());
+        assert!(!root.path().join("Expected/model.gguf").exists());
+    }
+
+    #[test]
+    fn canonical_ready_model_skips_candidate_hashing() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let canonical = root.path().join("Expected/model.gguf");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        write_minimal_gguf(&canonical);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&canonical, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        let unrelated = root.path().join("unrelated.gguf");
+        write_minimal_gguf(&unrelated);
+
+        let found = discover_model_files_with(
+            &resolved_root,
+            &[&spec],
+            false,
+            |_| panic!("canonical fast path must not hash candidates"),
+            |_, _| panic!("canonical fast path must not rename candidates"),
+        )
+        .unwrap();
+
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn mixed_scan_never_hashes_ready_canonical_model() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let ready = root.path().join("Ready/model.gguf");
+        std::fs::create_dir_all(ready.parent().unwrap()).unwrap();
+        write_minimal_gguf(&ready);
+        let ready_id = crate::integrity::unixfs_v0_digest_file(&ready, |_, _| {}).unwrap();
+        let ready_spec = test_spec(ready_id, "Ready");
+        let missing_id = [0x6b; 32];
+        let missing_spec = test_spec(missing_id, "Missing");
+        let candidate = root.path().join("candidate.gguf");
+        write_minimal_gguf(&candidate);
+        let candidate_before_move = candidate.canonicalize().unwrap();
+        let ready = ready.canonicalize().unwrap();
+        let mut hashed = Vec::new();
+
+        let found = discover_model_files_with(
+            &resolved_root,
+            &[&ready_spec, &missing_spec],
+            false,
+            |path| {
+                assert_ne!(path, ready);
+                hashed.push(path.to_path_buf());
+                Ok(missing_id)
+            },
+            rename_no_replace,
+        )
+        .unwrap();
+
+        assert_eq!(hashed, vec![candidate_before_move]);
+        assert_eq!(found.get(&missing_id), Some(&resolved_root.join("Missing/model.gguf")));
+    }
+
+    #[test]
+    fn wrong_complete_canonical_falls_back_to_matching_source_without_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let canonical = root.path().join("Expected/model.gguf");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        write_minimal_gguf(&canonical);
+        std::fs::OpenOptions::new().append(true).open(&canonical).unwrap().write_all(&[1]).unwrap();
+        let wrong_bytes = std::fs::read(&canonical).unwrap();
+        let source = root.path().join("correct.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        let mut digests = HashMap::new();
+
+        let selected = verify_canonical_or_discover(
+            &spec,
+            &resolved_root,
+            &canonical,
+            &root.path().join("Expected/.ok"),
+            &mut digests,
+            |path, marker| verify_model_file(path, marker, model_id, spec.name),
+        )
+        .unwrap();
+
+        assert_eq!(selected, source.canonicalize().unwrap());
+        assert_eq!(std::fs::read(&canonical).unwrap(), wrong_bytes);
+        assert!(verification_marker(&selected, &canonical, &model_id).exists());
+    }
+
+    #[test]
+    fn wrong_complete_canonical_without_fallback_returns_original_error() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let canonical = root.path().join("Expected/model.gguf");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        write_minimal_gguf(&canonical);
+        let spec = test_spec([0x7c; 32], "Expected");
+
+        let error = verify_canonical_or_discover(
+            &spec,
+            &resolved_root,
+            &canonical,
+            &root.path().join("Expected/.ok"),
+            &mut HashMap::new(),
+            |_, _| Err(anyhow!("original integrity failure")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "original integrity failure");
+    }
+
+    #[test]
+    fn unsafe_destination_directory_uses_verified_source() {
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let source = root.path().join("correct.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        std::fs::write(root.path().join("Expected"), b"occupied").unwrap();
+
+        let found = discover(&resolved_root, &[&spec]);
+
+        assert_eq!(found.get(&model_id), Some(&source.canonicalize().unwrap()));
+        assert_eq!(std::fs::read(root.path().join("Expected")).unwrap(), b"occupied");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn nested_directory_symlink_is_not_followed() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir as symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let resolved_root = prepare_model_root(root.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("model.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        if symlink(outside.path(), root.path().join("linked")).is_err() {
+            return;
+        }
+
+        let found = discover(&resolved_root, &[&spec]);
+
+        assert!(found.is_empty());
+        assert!(source.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn configured_root_symlink_is_resolved_and_supported() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_dir as symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = parent.path().join("models");
+        if symlink(&target, &link).is_err() {
+            return;
+        }
+
+        let resolved = prepare_model_root(&link).unwrap();
+        assert_eq!(resolved, target.canonicalize().unwrap());
+
+        let source = target.join("misnamed.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        let found = discover(&resolved, &[&spec]);
+
+        assert_eq!(found.get(&model_id), Some(&resolved.join("Expected/model.gguf")));
+    }
+
+    #[test]
+    fn gguf_path_reuses_noncanonical_resolved_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("fallback.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec = test_spec(model_id, "Expected");
+        let source = source.canonicalize().unwrap();
+
+        remember_resolved_model_path(model_id, source.clone());
+
+        assert_eq!(gguf_path_for(&spec), source);
+        resolved_model_paths().write().unwrap().remove(&model_id);
     }
 }
