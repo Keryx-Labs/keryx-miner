@@ -1264,10 +1264,10 @@ pub fn pom_level_activation_daa() -> u64 {
 /// lockstep, exactly like `pom_level_activation_daa`. Mainnet H4: 54_766_000 (2026-07-18 ~20:31
 /// UTC). MUST equal the node's MAINNET_PARAMS.coin_age_verification_activation (=
 /// H4_ACTIVATION_DAA).
-/// Testnet: 3_000 — node TESTNET_PARAMS.coin_age_verification_activation = new(3_000).
+/// Testnet: 0 — node TESTNET_PARAMS.coin_age_verification_activation = new(0).
 #[inline(always)]
 pub fn coin_age_verification_activation_daa() -> u64 {
-    gate(54_766_000, 3_000)
+    gate(54_766_000, 0)
 }
 
 /// H5 activation DAA score. At/after this score the possession walk switches from the frozen v1
@@ -1276,33 +1276,33 @@ pub fn coin_age_verification_activation_daa() -> u64 {
 /// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
 /// node↔miner lockstep exactly like `coin_age_verification_activation_daa`. Set to the relaunch tip
 /// DAA — MUST equal node `MAINNET_PARAMS.h5_activation` / `H5_ACTIVATION_DAA` = 59_009_037.
-/// Testnet: 3_000 — node TESTNET_PARAMS.h5_activation = new(3_000) (E2E crossing + hot-swap).
+/// Testnet: 0 — node TESTNET_PARAMS.h5_activation = new(0).
 #[inline(always)]
 pub fn h5_activation_daa() -> u64 {
-    gate(59_009_037, 3_000)
+    gate(59_009_037, 0)
 }
 
 /// H5.1 (emergency relaunch 2026-07-24) activation DAA score. At/after this score the walk seed
 /// derives from the H5.1-salted pph words (`POM_H5_1_PPH_SALT`) — seed fold only, the pow fold
 /// keeps the H3 salt. Gate = virtual daa of the isolated relaunch base. MUST equal the node's
 /// `MAINNET_PARAMS.h5_1_activation` / `H5_1_ACTIVATION_DAA` = 59_027_921.
-/// Testnet: 3_000 — node TESTNET_PARAMS.h5_1_activation = new(3_000) (crosses with H5 in one run).
+/// Testnet: 0 — node TESTNET_PARAMS.h5_1_activation = new(0).
 #[inline(always)]
 pub fn h5_1_activation_daa() -> u64 {
-    gate(59_027_921, 3_000)
+    gate(59_027_921, 0)
 }
 
 /// H5.2 chain-anchoring gate. MUST equal the node's
 /// `MAINNET_PARAMS.h5_2_activation` / `H5_2_ACTIVATION_DAA` = 59_170_000.
 pub fn h5_2_activation_daa() -> u64 {
-    gate(59_170_000, 4_000)
+    gate(59_170_000, 0)
 }
 
 /// H6 matrix-walk gate. At/after this score (the TEMPLATE's daa_score, never wall clock or tip)
 /// the miner grinds the v3 walk and builds `PomProofV3`. MUST equal the node's
-/// `pom_v3_activation`: mainnet never (armed in a later release), testnet 5_000.
+/// `pom_v3_activation`: mainnet never (armed in a later release), testnet 108_000.
 pub fn pom_v3_activation_daa() -> u64 {
-    gate(u64::MAX, 5_000)
+    gate(u64::MAX, 108_000)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
