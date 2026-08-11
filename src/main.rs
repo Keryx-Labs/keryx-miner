@@ -701,6 +701,7 @@ async fn run() -> Result<(), Error> {
                 batch_cap: 0,
                 cap_set_daa: 0,
                 is_inference: false,
+                csv_window: escrow::csv_window_for_daa(a.confirm_daa as u64),
             })
             .collect();
 

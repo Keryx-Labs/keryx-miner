@@ -18,6 +18,8 @@ use crate::proto::{
 };
 
 const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
+/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on.
+const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 504_000;
 const CLAIM_FEE_SOMPI: u64 = 30_000_000;
 const NATIVE_SUBNETWORK: &str = "0000000000000000000000000000000000000000";
 
@@ -76,6 +78,24 @@ pub struct EscrowEntry {
     /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
     #[serde(default)]
     pub is_inference: bool,
+    /// CSV lock of this output, in blocks. Coinbase escrows switch to the service-bond
+    /// window at the H6 gate; inference escrows keep the legacy one. Entries written by
+    /// earlier versions predate the gate and default to legacy.
+    #[serde(default = "default_csv_window")]
+    pub csv_window: u64,
+}
+
+fn default_csv_window() -> u64 {
+    CHALLENGE_WINDOW_BLOCKS
+}
+
+/// CSV lock the node applies to a coinbase escrow output created at `daa`.
+pub fn csv_window_for_daa(daa: u64) -> u64 {
+    if daa >= keryx_miner::pom::pom_v3_activation_daa() {
+        SERVICE_BOND_CSV_WINDOW_BLOCKS
+    } else {
+        CHALLENGE_WINDOW_BLOCKS
+    }
 }
 
 fn default_output_index() -> u32 {
@@ -152,8 +172,9 @@ pub struct EscrowWatcher {
     secp: secp256k1::Secp256k1<secp256k1::All>,
     secret_key: secp256k1::SecretKey,
     pubkey_bytes: [u8; 32],
-    escrow_script: Vec<u8>,
     escrow_script_hex: String,
+    /// Service-bond variant of the escrow script, paid by coinbases from the H6 gate on.
+    escrow_script_bonded_hex: String,
     payout_spk_version: u16,
     payout_spk_script: Vec<u8>,
     payout_spk_script_hex: String,
@@ -215,8 +236,8 @@ impl EscrowWatcher {
         let (xonly, _parity) = keypair.x_only_public_key();
         let pubkey_bytes: [u8; 32] = xonly.serialize();
 
-        let escrow_script = build_escrow_script(&pubkey_bytes);
-        let escrow_script_hex = hex::encode(&escrow_script);
+        let escrow_script_hex = hex::encode(build_escrow_script(&pubkey_bytes, CHALLENGE_WINDOW_BLOCKS));
+        let escrow_script_bonded_hex = hex::encode(build_escrow_script(&pubkey_bytes, SERVICE_BOND_CSV_WINDOW_BLOCKS));
 
         let (payout_spk_version, payout_spk_bytes) = decode_address(mining_address)?;
         let payout_spk_script = build_p2pk_script(&payout_spk_bytes);
@@ -230,8 +251,8 @@ impl EscrowWatcher {
             secp,
             secret_key,
             pubkey_bytes,
-            escrow_script,
             escrow_script_hex,
+            escrow_script_bonded_hex,
             payout_spk_version,
             payout_spk_script,
             payout_spk_script_hex,
@@ -335,7 +356,7 @@ impl EscrowWatcher {
                 .state
                 .entries
                 .iter()
-                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10)
+                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + e.csv_window + 10)
                 .count();
             if mature > 0 || !self.in_flight.is_empty() {
                 debug!(
@@ -405,9 +426,15 @@ impl EscrowWatcher {
         for (out_idx, output) in coinbase.outputs.iter().enumerate() {
             if let Some(spk) = &output.script_public_key {
                 let key = format!("{}:{}", coinbase_txid, out_idx);
-                if spk.script_public_key.to_lowercase() == self.escrow_script_hex
-                    && spk.version == 0
-                    && !self.outpoint_set.contains(&key)
+                let script = spk.script_public_key.to_lowercase();
+                let csv_window = if script == self.escrow_script_hex {
+                    Some(CHALLENGE_WINDOW_BLOCKS)
+                } else if script == self.escrow_script_bonded_hex {
+                    Some(SERVICE_BOND_CSV_WINDOW_BLOCKS)
+                } else {
+                    None
+                };
+                if let Some(csv_window) = csv_window.filter(|_| spk.version == 0 && !self.outpoint_set.contains(&key))
                 {
                     debug!(
                         "EscrowWatcher: tracked escrow coinbase={}…[{}] daa={} amount={}",
@@ -432,6 +459,7 @@ impl EscrowWatcher {
                         batch_cap: 0,
                         cap_set_daa: 0,
                         is_inference: false,
+                        csv_window,
                     });
                     self.outpoint_set.insert(key);
                     if !block_hash.is_empty() {
@@ -637,6 +665,9 @@ impl EscrowWatcher {
         for pass in 0..3u8 {
             batch.clear();
             let mut limit = MAX_CLAIM_BATCH;
+            // A batch never mixes CSV windows: one sequence and one escrow script are
+            // signed for the whole TX. The first selected entry fixes the batch's window.
+            let mut batch_window: Option<u64> = None;
             // Nominal pass: iterate inference entries first so they get batch priority;
             // the sort is stable, so queue order is preserved within each kind.
             let mut indices: Vec<usize> = (0..self.state.entries.len()).collect();
@@ -659,10 +690,13 @@ impl EscrowWatcher {
                 }
                 let eligible = !e.claimed
                     && !e.slashed
-                    && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10
+                    && daa_score >= e.confirm_daa + e.csv_window + 10
                     && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
                     && !self.in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
                 if !eligible {
+                    continue;
+                }
+                if batch_window.map_or(false, |w| w != e.csv_window) {
                     continue;
                 }
                 let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
@@ -670,6 +704,7 @@ impl EscrowWatcher {
                     continue; // joining would violate this entry's cap (or shrink below current size)
                 }
                 limit = limit.min(cap);
+                batch_window = Some(e.csv_window);
                 batch.push(i);
                 if batch.len() >= limit {
                     break; // batch is full for this pass
@@ -866,6 +901,12 @@ impl EscrowWatcher {
         if entries.is_empty() {
             return Err("empty claim batch".into());
         }
+        // Guaranteed single-valued by the batch selection; the whole TX signs one sequence.
+        let csv_window = entries[0].csv_window;
+        if entries.iter().any(|e| e.csv_window != csv_window) {
+            return Err("claim batch mixes CSV windows".into());
+        }
+        let escrow_script = build_escrow_script(&self.pubkey_bytes, csv_window);
         let total_in: u64 = entries.iter().map(|e| e.amount_sompi).sum();
         let amount_out = total_in
             .checked_sub(CLAIM_FEE_SOMPI)
@@ -886,12 +927,13 @@ impl EscrowWatcher {
             amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
+            csv_window,
         );
         let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
 
         let mut inputs: Vec<RpcTransactionInput> = Vec::with_capacity(entries.len());
         for (entry, meta) in entries.iter().zip(&inputs_meta) {
-            let sighash = compute_sighash(meta, &self.escrow_script, &reused);
+            let sighash = compute_sighash(meta, &escrow_script, &reused, csv_window);
             let msg = secp256k1::Message::from_digest_slice(&sighash)
                 .map_err(|e| format!("sighash message error: {}", e))?;
             let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
@@ -908,7 +950,7 @@ impl EscrowWatcher {
                     index: entry.output_index,
                 }),
                 signature_script: hex::encode(&sig_script),
-                sequence: CHALLENGE_WINDOW_BLOCKS,
+                sequence: csv_window,
                 sig_op_count: 1,
                 verbose_data: None,
             });
@@ -919,6 +961,7 @@ impl EscrowWatcher {
             amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
+            csv_window,
         );
 
         Ok((
@@ -975,6 +1018,8 @@ impl EscrowWatcher {
             batch_cap: 0,
             cap_set_daa: 0,
             is_inference: true,
+            // Built by the requester's wallet, which locks the legacy window on both eras.
+            csv_window: CHALLENGE_WINDOW_BLOCKS,
         });
         self.outpoint_set.insert(key);
         self.mark_dirty();
@@ -1092,9 +1137,9 @@ fn load_state(path: &PathBuf) -> EscrowState {
 /// `<CHALLENGE_WINDOW_BLOCKS_LE> OP_CSV OP_DATA_32 <pubkey_32> OP_CHECKSIG`
 ///
 /// Keryx's OP_CSV pops its argument, so no OP_DROP is needed after it.
-fn build_escrow_script(pubkey: &[u8; 32]) -> Vec<u8> {
-    // 36 000 = 0x8CA0 — trim trailing zero bytes for minimal encoding
-    let le = CHALLENGE_WINDOW_BLOCKS.to_le_bytes();
+fn build_escrow_script(pubkey: &[u8; 32], csv_window: u64) -> Vec<u8> {
+    // trim trailing zero bytes for minimal encoding
+    let le = csv_window.to_le_bytes();
     let trimmed_len = 8 - le.iter().rev().position(|&b| b != 0).unwrap_or(8);
     let seq_bytes = &le[..trimmed_len];
 
@@ -1146,6 +1191,7 @@ impl SighashReused {
         payout_amount: u64,
         payout_spk_version: u16,
         payout_spk_script: &[u8],
+        csv_window: u64,
     ) -> Self {
         // previous_outputs_hash: Blake2b(txid_32 | index_u32_LE, per input)
         let mut h = sighash_hasher();
@@ -1158,7 +1204,7 @@ impl SighashReused {
         // sequences_hash: Blake2b(sequence_u64_LE, per input)
         let mut h = sighash_hasher();
         for _ in inputs {
-            h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes());
+            h.update(&csv_window.to_le_bytes());
         }
         let seqs_hash = finalize32(h);
 
@@ -1185,7 +1231,12 @@ impl SighashReused {
 ///
 /// Mirrors `calc_schnorr_signature_hash` in consensus/core/src/hashing/sighash.rs.
 /// Byte-identical to the historical single-input version when the batch has one entry.
-fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &SighashReused) -> [u8; 32] {
+fn compute_sighash(
+    input: &([u8; 32], u32, u64),
+    escrow_script: &[u8],
+    reused: &SighashReused,
+    csv_window: u64,
+) -> [u8; 32] {
     let (txid, index, amount) = input;
     let mut h = sighash_hasher();
     h.update(&0u16.to_le_bytes()); // tx.version
@@ -1199,7 +1250,7 @@ fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &
     h.update(&(escrow_script.len() as u64).to_le_bytes()); // write_var_bytes len
     h.update(escrow_script); // write_var_bytes data
     h.update(&amount.to_le_bytes()); // utxo.amount
-    h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // input.sequence
+    h.update(&csv_window.to_le_bytes()); // input.sequence
     h.update(&[1u8]); // input.sig_op_count
     h.update(&reused.outs_hash);
     h.update(&0u64.to_le_bytes()); // tx.lock_time
@@ -1223,6 +1274,7 @@ fn compute_claim_txid(
     payout_amount: u64,
     payout_spk_version: u16,
     payout_spk_script: &[u8],
+    csv_window: u64,
 ) -> String {
     let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionID").to_state();
     h.update(&0u16.to_le_bytes()); // tx.version
@@ -1231,7 +1283,7 @@ fn compute_claim_txid(
         h.update(txid); // outpoint.transaction_id
         h.update(&index.to_le_bytes()); // outpoint.index
         h.update(&0u64.to_le_bytes()); // write_var_bytes(&[]) — sig script excluded
-        h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // sequence
+        h.update(&csv_window.to_le_bytes()); // sequence
     }
     h.update(&1u64.to_le_bytes()); // write_len(outputs)
     h.update(&payout_amount.to_le_bytes()); // output.value
@@ -1332,5 +1384,41 @@ mod tests {
         hasher.update(&bad);
         let bad_msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
         assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &bad_msg, &pk).is_err());
+    }
+
+    /// Both escrow scripts must match what the node's `ScriptBuilder::add_sequence` emits:
+    /// the sequence little-endian with trailing zero bytes trimmed, pushed by an OpData
+    /// opcode equal to its length. The legacy bytes are pinned so the pre-H6 script — and
+    /// every signature over it — stays unchanged.
+    #[test]
+    fn escrow_scripts_mirror_the_node_for_both_windows() {
+        let pk = [0x11u8; 32];
+        let legacy = build_escrow_script(&pk, CHALLENGE_WINDOW_BLOCKS);
+        let bonded = build_escrow_script(&pk, SERVICE_BOND_CSV_WINDOW_BLOCKS);
+
+        assert_eq!(&legacy[..3], &[0x02, 0xa0, 0x8c]); // 36_000 = 0x8ca0
+        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0xb0, 0x07]); // 504_000 = 0x07b0c0
+
+        assert_eq!(legacy[3], OP_CSV);
+        assert_eq!(bonded[4], OP_CSV);
+        assert_eq!(legacy[4], 0x20);
+        assert_eq!(bonded[5], 0x20);
+        assert_eq!(&legacy[5..37], &pk);
+        assert_eq!(&bonded[6..38], &pk);
+        assert_eq!(*legacy.last().unwrap(), OP_CHECKSIG);
+        assert_eq!(*bonded.last().unwrap(), OP_CHECKSIG);
+        assert_eq!(legacy.len(), 38);
+        assert_eq!(bonded.len(), 39);
+    }
+
+    /// The window is derived from the creating block's DAA, so entries minted on either
+    /// side of the gate keep their own lock.
+    #[test]
+    fn csv_window_follows_the_gate() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        if gate > 0 && gate < u64::MAX {
+            assert_eq!(csv_window_for_daa(gate - 1), CHALLENGE_WINDOW_BLOCKS);
+        }
+        assert_eq!(csv_window_for_daa(gate), SERVICE_BOND_CSV_WINDOW_BLOCKS);
     }
 }
