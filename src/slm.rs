@@ -6,8 +6,9 @@
 /// served-lineup state (`ai:cap`), the model downloads, and the per-model chat templates.
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashSet;
 use std::io::{IsTerminal, Read, Write};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use crate::models::ModelSpec;
 
@@ -407,11 +408,36 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     Ok(())
 }
 
-/// Return the model_ids of supported models that have fully-downloaded files (.ok flag present).
+fn unavailable_models() -> &'static RwLock<HashSet<[u8; 32]>> {
+    static MODELS: OnceLock<RwLock<HashSet<[u8; 32]>>> = OnceLock::new();
+    MODELS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Withdraw a model from `ai:cap`: the files are on disk but this miner cannot serve it right
+/// now. Announcing it anyway earns assigned requests it cannot answer, hence service-bond strikes.
+pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
+    if unavailable_models().write().unwrap().insert(*model_id) {
+        log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({})", hex::encode(model_id), reason);
+    }
+}
+
+/// Re-announce a model after it serves again.
+pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
+    if unavailable_models().write().unwrap().remove(model_id) {
+        log::info!("SlmEngine: model {:.8} back in ai:cap ({})", hex::encode(model_id), reason);
+    }
+}
+
+fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
+    unavailable_models().read().unwrap().contains(model_id)
+}
+
+/// Return the model_ids of supported models that have fully-downloaded files (.ok flag present)
+/// and are not currently withdrawn.
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     specs.iter()
-        .filter(|s| model_dir(s).join(".ok").exists())
+        .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
         .collect()
 }
@@ -428,11 +454,12 @@ pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
         .collect()
 }
 
-/// True only when the model is supported and its files are completely downloaded.
+/// True only when the model is supported, its files are completely downloaded, and it is not
+/// currently withdrawn from `ai:cap`.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
-    model_dir(spec).join(".ok").exists()
+    model_dir(spec).join(".ok").exists() && !model_is_unavailable(model_id)
 }
 
 /// Serve an inference request via the in-process llama.cpp engine, swapping it to the requested
@@ -466,15 +493,54 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                 "SlmEngine: cannot load '{}' — libkeryx-llama.so missing or model load failed; response dropped",
                 spec.name
             );
+            mark_model_unavailable(model_id, "llama_load_failed");
             return None;
         }
     }
 
     match crate::llama_engine::generate(&templated, max_tokens) {
-        Some(text) if !text.trim().is_empty() => Some(text),
+        Some(text) if !text.trim().is_empty() => {
+            mark_model_available(model_id, "generation_success");
+            Some(text)
+        }
         _ => {
             log::warn!("SlmEngine '{}': llama generate failed or empty — response dropped", spec.name);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawn_models_are_hidden_until_they_recover() {
+        let model_id = [0xa7u8; 32];
+        assert!(!model_is_unavailable(&model_id));
+
+        mark_model_unavailable(&model_id, "test_failure");
+        assert!(model_is_unavailable(&model_id));
+        assert!(!is_model_ready(&model_id));
+        assert!(!loaded_model_ids().contains(&model_id));
+
+        mark_model_available(&model_id, "test_recovery");
+        assert!(!model_is_unavailable(&model_id));
+    }
+
+    #[test]
+    fn withdrawal_is_idempotent_per_model() {
+        let model_id = [0xb3u8; 32];
+        mark_model_unavailable(&model_id, "first");
+        mark_model_unavailable(&model_id, "second");
+        assert!(model_is_unavailable(&model_id));
+
+        mark_model_available(&model_id, "recovered");
+        mark_model_available(&model_id, "recovered_again");
+        assert!(!model_is_unavailable(&model_id));
+
+        let other = [0xc1u8; 32];
+        mark_model_unavailable(&model_id, "again");
+        assert!(!model_is_unavailable(&other));
     }
 }
