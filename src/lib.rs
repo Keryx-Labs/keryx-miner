@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 
 pub mod gguf;
 pub mod inference;
+pub mod integrity;
 pub mod llama_engine;
 pub mod models;
 pub mod pom;
