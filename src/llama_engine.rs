@@ -23,6 +23,7 @@ type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
+type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 
 const ABI: c_int = 3;
 
@@ -89,6 +90,7 @@ struct Engine {
     info: InfoFn,
     generate: GenFn,
     free: FreeFn,
+    tensor_device: Option<TensorDeviceFn>,
     gpu: usize,
     gguf: String,
     attempt: u64,
@@ -235,6 +237,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             return Err(failed("abi", format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI), false));
         }
         let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
+        let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
         let cg = match CString::new(gguf) {
             Ok(c) => c,
             Err(_) => return Err(failed("path", "GGUF path contains a NUL byte".to_string(), false)),
@@ -252,7 +255,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             );
             return Err(failed("native_load", detail, true));
         }
-        *g = Some(Engine { model, count, info, generate: gen, free, gpu, gguf: gguf.to_string(), attempt });
+        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string(), attempt });
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
         Ok(attempt)
     }
@@ -323,6 +326,34 @@ pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
         out.push((nm, data as u64, nbytes, is_dev != 0));
     }
     Some(out)
+}
+
+/// First resident tensor whose bytes do NOT live on `expected_gpu`, as (name, owning ordinal).
+///
+/// The possession walk gathers straight over these pointers: launching the kernel on a device
+/// that does not own them dereferences unmapped memory, which raises a sticky
+/// CUDA_ERROR_ILLEGAL_ADDRESS and poisons the whole primary context — inference included.
+pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
+    let g = engine().lock().ok()?;
+    let e = g.as_ref()?;
+    let tensor_device = e.tensor_device?;
+    let n = unsafe { (e.count)(e.model) };
+    for i in 0..n {
+        let mut name: *const c_char = std::ptr::null();
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let mut nbytes: usize = 0;
+        let mut is_dev: c_int = 0;
+        let ok = unsafe { (e.info)(e.model, i, &mut name, &mut data, &mut nbytes, &mut is_dev) };
+        if !ok || name.is_null() || data.is_null() || is_dev == 0 {
+            continue;
+        }
+        let owner = unsafe { tensor_device(e.model, i) };
+        if owner >= 0 && owner as usize != expected_gpu {
+            let nm = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
+            return Some((nm, owner));
+        }
+    }
+    None
 }
 
 /// Generate OPoI text via the in-process engine. None on any failure (caller falls back).

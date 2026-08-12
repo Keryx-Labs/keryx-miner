@@ -168,6 +168,22 @@ KERYX_EXPORT bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** 
 
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
+// CUDA ordinal owning tensor i's bytes, or -1 (host memory, unified memory, unknown, or a
+// context in error). The walk gathers over these pointers, so it must launch on this device.
+KERYX_EXPORT int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
+#ifdef __APPLE__
+    (void)h; (void)i;
+    return -1;
+#else
+    if (!h || i >= h->names.size()) return -1;
+    const ggml_tensor* t = h->model->get_tensor(h->names[i].c_str());
+    if (!t || !t->data) return -1;
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, t->data) != cudaSuccess) return -1;
+    return attr.type == cudaMemoryTypeDevice ? attr.device : -1;
+#endif
+}
+
 KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);
