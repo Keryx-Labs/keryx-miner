@@ -170,7 +170,8 @@ extern "C" {
         // assuming header_len is 72
         int nonceId = threadIdx.x + blockIdx.x*blockDim.x;
         if (nonceId < nonces_len) {
-            if (nonceId == 0) *final_nonce = 0;
+            // final_nonce is cleared by the host before each launch: clearing it here races with
+            // the blocks that already published a winner in this same launch.
             uint64_t nonce;
             switch (random_type) {
                 case RANDOM_LEAN:
