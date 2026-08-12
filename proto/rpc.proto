@@ -691,3 +691,34 @@ message NewBlockTemplateNotificationMessage {
 }
 
 
+
+message ServiceStrikeMessage {
+  string miner = 1;
+  uint32 consecutiveMisses = 2;
+  uint64 lastStrikeDaaScore = 3;
+}
+
+message ServiceSuspensionMessage {
+  string miner = 1;
+  uint64 untilDaaScore = 2;
+}
+
+message ServicePendingBurnMessage {
+  string miner = 1;
+  uint64 missDaaScore = 2;
+  uint32 consecutiveMisses = 3;
+  uint32 burnedClaims = 4;
+  uint64 burnedSompi = 5;
+}
+
+message GetServiceStrikesRequestMessage {
+}
+
+message GetServiceStrikesResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated ServiceStrikeMessage strikes = 2;
+  repeated ServiceSuspensionMessage suspended = 3;
+  repeated ServicePendingBurnMessage pendingBurns = 4;
+
+  RPCError error = 1000;
+}

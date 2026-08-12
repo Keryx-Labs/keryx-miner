@@ -4,8 +4,8 @@ use crate::pow::BlockSeed::{FullBlock, PartialBlock};
 use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
-    GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, KaspadMessage,
-    NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, GetServiceStrikesRequestMessage,
+    KaspadMessage, NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
     NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
@@ -94,6 +94,12 @@ pub struct KeryxdHandler {
 
     /// Auto-claim module: present when an escrow private key is available.
     escrow_watcher: Option<crate::escrow::EscrowWatcher>,
+
+    /// Last service-bond strike poll instant.
+    last_strike_poll: std::time::Instant,
+
+    /// Last rendered service-bond status — logged only on change.
+    strike_status: Option<String>,
 }
 
 #[async_trait(?Send)]
@@ -137,6 +143,10 @@ impl Client for KeryxdHandler {
                     // notifications and the response would otherwise never be sent.
                     } else if self.challenge_inference_rx.is_some() {
                         self.client_get_block_template().await?;
+                    }
+                    if self.escrow_pubkey.is_some() && self.last_strike_poll.elapsed().as_secs() >= 60 {
+                        self.last_strike_poll = std::time::Instant::now();
+                        self.client_send(GetServiceStrikesRequestMessage {}).await?;
                     }
                 }
             }
@@ -217,6 +227,8 @@ impl KeryxdHandler {
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
+            last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
+            strike_status: None,
         }))
     }
 
@@ -571,6 +583,39 @@ impl KeryxdHandler {
         true
     }
 
+    /// Logs this miner's service-bond standing when it changes: strike count, burns awaiting
+    /// finality and production suspensions, matched by escrow pubkey.
+    fn report_service_strikes(&mut self, resp: &crate::proto::GetServiceStrikesResponseMessage) {
+        let Some(me) = self.escrow_pubkey.as_deref() else { return };
+        let strike = resp.strikes.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
+        let suspension = resp.suspended.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
+        let burns: Vec<_> = resp.pending_burns.iter().filter(|b| b.miner.eq_ignore_ascii_case(me)).collect();
+        let status = if strike.is_none() && suspension.is_none() && burns.is_empty() {
+            "clear".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if let Some(s) = strike {
+                parts.push(format!("strike {} (last at daa {})", s.consecutive_misses, s.last_strike_daa_score));
+            }
+            if !burns.is_empty() {
+                let claims: u32 = burns.iter().map(|b| b.burned_claims).sum();
+                let sompi: u64 = burns.iter().map(|b| b.burned_sompi).sum();
+                parts.push(format!("{} escrow claims / {:.2} KRX burning at finality", claims, sompi as f64 / 100_000_000.0));
+            }
+            if let Some(s) = suspension {
+                parts.push(format!("production suspended until daa {}", s.until_daa_score));
+            }
+            parts.join("; ")
+        };
+        if self.strike_status.as_deref() != Some(status.as_str()) {
+            match status.as_str() {
+                "clear" => info!("service-bond: no strikes against this miner"),
+                s => warn!("service-bond: {}", s),
+            }
+            self.strike_status = Some(status);
+        }
+    }
+
     async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager) -> Result<(), Error> {
         match msg {
             // BlockAdded: scan confirmed block for AiRequests and escrow UTXOs.
@@ -608,6 +653,10 @@ impl KeryxdHandler {
                 }
             }
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
+            Payload::GetServiceStrikesResponse(resp) => match resp.error.as_ref() {
+                Some(e) => warn!("service-bond status unavailable: {}", e.message),
+                None => self.report_service_strikes(&resp),
+            },
             Payload::GetBlockTemplateResponse(template) => {
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
