@@ -488,12 +488,9 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         log::info!("SlmEngine: swapping the llama engine to '{}' (gpu{})", spec.name, dev_id);
         crate::pom_gpu::uninstall(dev_id);
         crate::llama_engine::unload();
-        if !crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
-            log::error!(
-                "SlmEngine: cannot load '{}' — libkeryx-llama.so missing or model load failed; response dropped",
-                spec.name
-            );
-            mark_model_unavailable(model_id, "llama_load_failed");
+        if let Err(e) = crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
+            log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
+            mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;
         }
     }

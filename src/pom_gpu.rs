@@ -1083,12 +1083,19 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     let inference_gpu = device_for_model(&model_id).unwrap_or(0);
     let mut use_llama = false;
     if device_id == inference_gpu {
-        use_llama = crate::llama_engine::ensure_loaded(&gguf, device_id as usize);
         // Only this GPU can serve the model: no engine here means no inference anywhere.
-        match use_llama {
-            true => crate::slm::mark_model_available(&model_id, "llama_engine_loaded"),
-            false => crate::slm::mark_model_unavailable(&model_id, "llama_engine_load_failed"),
-        }
+        use_llama = match crate::llama_engine::ensure_loaded(&gguf, device_id as usize) {
+            Ok(_) => {
+                crate::slm::mark_model_available(&model_id, "llama_engine_loaded");
+                true
+            }
+            Err(e) => {
+                warn!("PoM[gpu{}]: llama engine unavailable — {}", device_id, e);
+                let reason = if e.is_oom() { "llama_engine_oom" } else { "llama_engine_load_failed" };
+                crate::slm::mark_model_unavailable(&model_id, reason);
+                false
+            }
+        };
     }
     // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. tied embeddings
     // materialise a separate output.weight), so its resident chunk count differs from the
