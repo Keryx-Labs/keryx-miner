@@ -871,10 +871,11 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
         // crossing it would keep hosting the previous era's model. Unload it when it lives on this
         // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
+        // Drain this device's walk BEFORE freeing the tensors it may be gathering over.
+        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
         if crate::llama_engine::active_gpu() == Some(dev as usize) && !crate::llama_engine::active_for(&gguf, dev as usize) {
             crate::llama_engine::unload();
         }
-        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
     }
     // The served lineup (`SUPPORTED_SPECS`) drives the coinbase `ai:cap` announcement + inference
     // routing — refresh it as the union of era-correct models so the miner stops announcing the
@@ -894,6 +895,35 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     }
 }
 
+/// Per-device lifecycle lock: held for a whole miner (re)build, and by the engine eviction while
+/// it frees the hosted tensors. A build reads llama's resident pointers before any miner is
+/// installed, so the uninstall barrier alone cannot see it — without this lock an inference swap
+/// can free those tensors mid-build and poison the device's primary context.
+fn device_lifecycle(device_id: u32) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<u32, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut g = LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    g.entry(device_id).or_default().clone()
+}
+
+/// Release the llama engine for a model swap, draining every reader of its resident tensors
+/// first: the hosting device's installed walk (uninstall barrier) and any build in flight on it
+/// (lifecycle lock). Then make room on `target_dev` for the incoming model.
+pub fn evict_llama_host_for_swap(target_dev: u32) {
+    let host = crate::llama_engine::active_gpu().map(|g| g as u32);
+    match host {
+        Some(host) => {
+            let lock = device_lifecycle(host);
+            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            uninstall(host);
+            crate::llama_engine::unload();
+        }
+        None => crate::llama_engine::unload(),
+    }
+    if host != Some(target_dev) {
+        uninstall(target_dev);
+    }
+}
+
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
 /// (resident again) and rebuild the zero-dup gather. Heavy (model reload) but only when needed —
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
@@ -904,7 +934,10 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.fetch_add(1, Ordering::Relaxed);
+    let lock = device_lifecycle(device_id);
+    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     let ok = ensure_installed_inner(device_id, daa);
+    drop(guard);
     LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
 }
