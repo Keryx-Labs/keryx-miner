@@ -6,8 +6,9 @@
 /// served-lineup state (`ai:cap`), the model downloads, and the per-model chat templates.
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::models::ModelSpec;
@@ -39,9 +40,13 @@ fn model_dir(spec: &ModelSpec) -> std::path::PathBuf {
     exe_dir.join("models").join(spec.dir_name)
 }
 
-/// Path to a model's GGUF file (`<exe_dir>/models/<dir_name>/model.gguf`). Used by PoM to
-/// build the possession weight index from the resident model.
+/// Path to a model's verified GGUF — normally `<exe_dir>/models/<dir_name>/model.gguf`, but the
+/// discovered source when it could not be relocated there. Used by PoM to build the possession
+/// weight index from the resident model.
 pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
+    if let Some(path) = resolved_model_paths().read().unwrap().get(&spec.model_id) {
+        return path.clone();
+    }
     model_dir(spec).join("model.gguf")
 }
 
@@ -254,11 +259,26 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     // Reuse a complete on-disk GGUF even when `.ok` was lost (HiveOS upgrades, manual copies,
     // interrupted flag write). Never re-download a model that already parses as complete.
     if gguf_ready && tok_ready {
-        if !ok_flag.exists() {
-            let _ = std::fs::write(&ok_flag, b"");
-        }
+        verify_gguf(spec, &gguf, &ok_flag)?;
         log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
+    }
+
+    // Before pulling 16-30 GB over IPFS, look for the content elsewhere under the root: a GGUF
+    // unzipped into the wrong directory or renamed is identified by its digest and relocated.
+    if !gguf_ready {
+        let root = dir.parent().unwrap_or(Path::new(".")).to_path_buf();
+        if let Some(path) = discover_model_files(&root, &[registered_spec(spec)?]).remove(&spec.model_id) {
+            let marker = if path == gguf { ok_flag.clone() } else { path.with_extension("ok") };
+            verify_gguf(spec, &path, &marker)?;
+            if tok_needed && !tok.exists() {
+                std::fs::create_dir_all(&dir)?;
+                download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
+            }
+            resolved_model_paths().write().unwrap().insert(spec.model_id, path.clone());
+            ui_download_info(&format!("[keryx-miner] Model '{}' ready at {}.", spec.name, path.display()));
+            return Ok((tok, path));
+        }
     }
 
     std::fs::create_dir_all(&dir)?;
@@ -291,7 +311,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
         download_file(&ipfs_url(spec.tokenizer_cid), &tok)?;
     }
 
-    std::fs::write(&ok_flag, b"").with_context(|| format!("write .ok flag {}", ok_flag.display()))?;
+    verify_gguf(spec, &gguf, &ok_flag)?;
     ui_download_info(&format!("[keryx-miner] Model '{}' ready.", spec.name));
     Ok((tok, gguf))
 }
@@ -428,8 +448,162 @@ pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
     }
 }
 
+/// The registry entry that owns this model_id — the caller's spec must not decide where a model
+/// lives, only the registered lineup does.
+fn registered_spec(spec: &ModelSpec) -> Result<&'static ModelSpec> {
+    crate::models::REGISTRY
+        .iter()
+        .copied()
+        .find(|known| known.model_id == spec.model_id)
+        .ok_or_else(|| anyhow!("model '{}' is not registered", spec.name))
+}
+
 fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
     unavailable_models().read().unwrap().contains(model_id)
+}
+
+/// GGUFs whose UnixFS digest was checked against the pinned `model_id` in this process.
+fn verified_models() -> &'static RwLock<HashSet<[u8; 32]>> {
+    static MODELS: OnceLock<RwLock<HashSet<[u8; 32]>>> = OnceLock::new();
+    MODELS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Where a model's verified GGUF actually lives, when it is not the canonical path (discovered
+/// elsewhere under the model root and impossible to relocate).
+fn resolved_model_paths() -> &'static RwLock<HashMap<[u8; 32], PathBuf>> {
+    static PATHS: OnceLock<RwLock<HashMap<[u8; 32], PathBuf>>> = OnceLock::new();
+    PATHS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// A marker holds the hex digest of the GGUF it certifies; anything else means "unverified".
+fn marker_certifies(ok_flag: &Path, model_id: &[u8; 32]) -> bool {
+    std::fs::read_to_string(ok_flag).map(|s| s.trim().eq_ignore_ascii_case(&hex::encode(model_id))).unwrap_or(false)
+}
+
+fn verify_model_file(gguf: &Path, ok_flag: &Path, expected: [u8; 32], name: &str) -> Result<()> {
+    // A marker never certifies a model until the complete current file matches its pinned CID.
+    let _ = std::fs::remove_file(ok_flag);
+    let mut next_percent = 10u64;
+    let digest = crate::integrity::unixfs_v0_digest_file(gguf, |done, total| {
+        if total == 0 {
+            return;
+        }
+        let percent = done.saturating_mul(100) / total;
+        if percent >= next_percent {
+            ui_download_info(&format!("[keryx-miner] Verifying '{}': {}%", name, percent.min(100)));
+            next_percent = (percent / 10 + 1) * 10;
+        }
+    })
+    .with_context(|| format!("verify IPFS identity for model '{}' at {}", name, gguf.display()))?;
+
+    if digest != expected {
+        return Err(anyhow!(
+            "model '{}' IPFS CID digest mismatch at {} (expected {}, got {})",
+            name,
+            gguf.display(),
+            hex::encode(expected),
+            hex::encode(digest)
+        ));
+    }
+
+    std::fs::write(ok_flag, hex::encode(expected))
+        .with_context(|| format!("write verified .ok flag {}", ok_flag.display()))?;
+    Ok(())
+}
+
+/// Verify unless the marker already certifies this exact model, and keep the served-lineup
+/// registries in step with the outcome.
+fn verify_gguf(spec: &ModelSpec, gguf: &Path, ok_flag: &Path) -> Result<()> {
+    if marker_certifies(ok_flag, &spec.model_id) {
+        verified_models().write().unwrap().insert(spec.model_id);
+        return Ok(());
+    }
+    verified_models().write().unwrap().remove(&spec.model_id);
+    ui_download_info(&format!("[keryx-miner] Verifying model '{}' integrity before mining...", spec.name));
+    if let Err(error) = verify_model_file(gguf, ok_flag, spec.model_id, spec.name) {
+        mark_model_unavailable(&spec.model_id, "integrity_mismatch");
+        return Err(error);
+    }
+    verified_models().write().unwrap().insert(spec.model_id);
+    mark_model_available(&spec.model_id, "integrity_verified");
+    ui_download_info(&format!("[keryx-miner] Model '{}' integrity verified.", spec.name));
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    nix::fcntl::renameat2(None, source, None, destination, nix::fcntl::RenameFlags::RENAME_NOREPLACE)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination exists"));
+    }
+    std::fs::rename(source, destination)
+}
+
+/// Identify GGUFs sitting anywhere under the model root by their content, so a file that was
+/// unzipped into the wrong directory (or renamed) is used instead of re-downloading 16-30 GB.
+/// Symlinks are never followed; an occupied canonical path is never overwritten.
+fn discover_model_files(root: &Path, wanted: &[&'static ModelSpec]) -> HashMap<[u8; 32], PathBuf> {
+    const MAX_DEPTH: usize = 3;
+    let mut found: HashMap<[u8; 32], PathBuf> = HashMap::new();
+    let mut queue = vec![(root.to_path_buf(), 0usize)];
+
+    while let Some((dir, depth)) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if depth < MAX_DEPTH {
+                    queue.push((path, depth + 1));
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                continue;
+            }
+            // A canonical, already-certified file needs no hashing.
+            if wanted.iter().any(|spec| {
+                path == root.join(spec.dir_name).join("model.gguf")
+                    && marker_certifies(&root.join(spec.dir_name).join(".ok"), &spec.model_id)
+            }) {
+                continue;
+            }
+            if !crate::gguf::is_complete_file(&path) {
+                continue;
+            }
+            let Ok(digest) = crate::integrity::unixfs_v0_digest_file(&path, |_, _| {}) else { continue };
+            let Some(spec) = wanted.iter().find(|spec| spec.model_id == digest) else { continue };
+            if found.contains_key(&digest) {
+                continue;
+            }
+
+            let canonical = root.join(spec.dir_name).join("model.gguf");
+            if path == canonical {
+                found.insert(digest, path);
+                continue;
+            }
+            let _ = std::fs::create_dir_all(root.join(spec.dir_name));
+            match rename_no_replace(&path, &canonical) {
+                Ok(()) => {
+                    log::info!("SlmEngine: found '{}' at {} — moved to {}", spec.name, path.display(), canonical.display());
+                    found.insert(digest, canonical);
+                }
+                Err(e) => {
+                    log::info!("SlmEngine: found '{}' at {} — using it in place ({})", spec.name, path.display(), e);
+                    found.insert(digest, path);
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Return the model_ids of supported models that have fully-downloaded files (.ok flag present)
@@ -510,6 +684,106 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_minimal_gguf(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.resize(32, 0);
+        std::fs::write(path, bytes).unwrap();
+        assert!(crate::gguf::is_complete_file(path));
+    }
+
+    fn test_spec(model_id: [u8; 32], dir_name: &'static str) -> ModelSpec {
+        ModelSpec {
+            name: "test-model",
+            model_id,
+            format: crate::models::ModelFormat::Gguf,
+            tokenizer_cid: "",
+            weight_cids: &["unused"],
+            dir_name,
+            min_vram_mb: 0,
+        }
+    }
+
+    #[test]
+    fn a_marker_certifies_only_its_own_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".ok");
+        let model_id = [0x11u8; 32];
+
+        std::fs::write(&marker, b"").unwrap();
+        assert!(!marker_certifies(&marker, &model_id), "an empty legacy marker must not certify");
+
+        std::fs::write(&marker, hex::encode([0x22u8; 32])).unwrap();
+        assert!(!marker_certifies(&marker, &model_id));
+
+        std::fs::write(&marker, hex::encode(model_id).to_uppercase()).unwrap();
+        assert!(marker_certifies(&marker, &model_id));
+    }
+
+    #[test]
+    fn discovery_relocates_a_misnamed_nested_gguf() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("downloads").join("Qwen-wrong-name");
+        std::fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("weights.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec: &'static ModelSpec = Box::leak(Box::new(test_spec(model_id, "Expected")));
+
+        let found = discover_model_files(root.path(), &[spec]);
+
+        let canonical = root.path().join("Expected").join("model.gguf");
+        assert_eq!(found.get(&model_id), Some(&canonical));
+        assert!(canonical.exists());
+        assert!(!source.exists(), "the source must have been moved, not copied");
+    }
+
+    #[test]
+    fn discovery_never_overwrites_an_occupied_canonical_path() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("stray.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec: &'static ModelSpec = Box::leak(Box::new(test_spec(model_id, "Expected")));
+        let canonical = root.path().join("Expected").join("model.gguf");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        std::fs::write(&canonical, b"keep me").unwrap();
+
+        let found = discover_model_files(root.path(), &[spec]);
+
+        assert_eq!(found.get(&model_id), Some(&source), "the stray file is used in place");
+        assert_eq!(std::fs::read(&canonical).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn discovery_ignores_content_no_spec_claims() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("unknown.gguf");
+        write_minimal_gguf(&source);
+        let spec: &'static ModelSpec = Box::leak(Box::new(test_spec([0x99u8; 32], "Expected")));
+
+        assert!(discover_model_files(root.path(), &[spec]).is_empty());
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn discovery_does_not_follow_symlinked_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("model.gguf");
+        write_minimal_gguf(&source);
+        let model_id = crate::integrity::unixfs_v0_digest_file(&source, |_, _| {}).unwrap();
+        let spec: &'static ModelSpec = Box::leak(Box::new(test_spec(model_id, "Expected")));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+
+        assert!(discover_model_files(root.path(), &[spec]).is_empty());
+        assert!(source.exists());
+    }
 
     #[test]
     fn withdrawn_models_are_hidden_until_they_recover() {
