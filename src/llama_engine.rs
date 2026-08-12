@@ -45,6 +45,12 @@ impl LoadError {
         self.attempt
     }
 
+    /// The engine is simply hosting another model right now — it is swapped on demand when an
+    /// inference request arrives, so this is not an inability to serve.
+    pub fn is_busy(&self) -> bool {
+        self.stage == "busy"
+    }
+
     /// The card could not fit the model — retrying the same tier on this GPU is pointless.
     pub fn is_oom(&self) -> bool {
         let detail = self.detail.to_ascii_lowercase();
@@ -346,6 +352,11 @@ mod tests {
         let broken = LoadError::new(2, "native_load", "model: [cuda: unspecified launch failure]", true);
         assert!(!broken.is_oom());
         assert!(broken.cuda_context_may_be_invalid());
+
+        let busy = LoadError::new(4, "busy", "engine hosts a model on GPU 0 — not stealing it", false);
+        assert!(busy.is_busy());
+        assert!(!busy.is_oom());
+        assert!(!LoadError::new(5, "native_load", "out of memory", true).is_busy());
 
         // Nothing touched the device yet: the context cannot be blamed.
         let missing = LoadError::new(3, "library", "keryx-llama shared library not found", false);

@@ -1089,6 +1089,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 crate::slm::mark_model_available(&model_id, "llama_engine_loaded");
                 true
             }
+            // A busy engine hosts another model and is swapped on demand, so the model stays
+            // announced: withdrawing here would silence every model but the first on a mixed rig.
+            Err(e) if e.is_busy() => false,
             Err(e) => {
                 warn!("PoM[gpu{}]: llama engine unavailable — {}", device_id, e);
                 let reason = if e.is_oom() { "llama_engine_oom" } else { "llama_engine_load_failed" };
