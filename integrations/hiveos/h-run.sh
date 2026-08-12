@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
-cd `dirname $0`
+cd "$(dirname "$0")" || exit 1
 
 [ -t 1 ] && . colors
 
 . h-manifest.conf
+. "$CUSTOM_MINER_DIR/pre-hive-upgrade.sh"
 
 [[ -z $CUSTOM_LOG_BASENAME ]] && echo -e "${RED}No CUSTOM_LOG_BASENAME is set${NOCOLOR}" && exit 1
 [[ -z $CUSTOM_CONFIG_FILENAME ]] && echo -e "${RED}No CUSTOM_CONFIG_FILENAME is set${NOCOLOR}" && exit 1
@@ -63,5 +64,9 @@ cleanup_legacy_models() {
 # One-time migration from old local-per-install cache into the shared cache.
 mkdir -p "$KERYX_MODELS_DIR"
 cleanup_legacy_models
+prepare_keryx_state "$CUSTOM_MINER_DIR" || exit 1
 
-./$CUSTOM_MINERBIN $(< $CUSTOM_CONFIG_FILENAME) --hiveos --stats-bind 127.0.0.1 --stats-port "$WEB_PORT" $@
+config="$(< "$CUSTOM_CONFIG_FILENAME")"
+config="${config//$'\n'/ }"
+read -r -a miner_args <<< "$config"
+"./$CUSTOM_MINERBIN" "${miner_args[@]}" --hiveos --stats-bind 127.0.0.1 --stats-port "$WEB_PORT" "$@"

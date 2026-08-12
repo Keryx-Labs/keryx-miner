@@ -157,6 +157,10 @@ impl Client for KeryxdHandler {
     fn get_block_channel(&self) -> Sender<BlockSeed> {
         self.block_channel.clone()
     }
+
+    fn flush_escrow_state(&mut self) -> Result<(), Error> {
+        self.escrow_watcher.as_mut().map_or(Ok(()), |watcher| watcher.flush_state().map_err(Into::into))
+    }
 }
 
 impl KeryxdHandler {

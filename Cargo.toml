@@ -79,6 +79,7 @@ no-asm = ["keccak"]
 keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 lto = true
