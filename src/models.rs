@@ -281,22 +281,27 @@ pub fn staging_daa() -> u64 {
 /// The single model a hardware `tier` mines AND serves at `daa` — matching the node's per-block
 /// tier table (`pom_tiers`). The H6 branch is what arms `advance_mining_tier_if_due`: the hardware
 /// tier is fixed, the model it must mine flips at the gate.
-pub fn pom_model_for_tier(daa: u64, tier: Tier) -> &'static ModelSpec {
+/// `None` when the tier has no consensus-valid model in that era: it mines nothing there and
+/// idles until its gate, rather than downloading and mining a model the node would reject. The
+/// retirement of a crossed era is expressed by returning `None` for it.
+pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
     if daa >= crate::pom::pom_v3_activation_daa() {
-        return match tier {
+        return Some(match tier {
             Tier::VeryLight => &QWEN3_5_9B_ABLITERATED,
             Tier::Light => &GLM_4_9B_0414,
             Tier::Default => &GEMMA_4_12B_ABLITERATED,
             Tier::High => &QWEN3_6_27B,
             Tier::VeryHigh => &KIMI_LINEAR_48B,
-        };
+        });
     }
     match tier {
-        Tier::VeryLight => &QWEN3_8B_ABLITERATED,
-        Tier::Light => &MISTRAL_7B_V03,
-        Tier::Default => &GLM_4_9B_0414,
-        Tier::High => &QWEN3_6_27B,
-        Tier::VeryHigh => &KIMI_LINEAR_48B,
+        // Tier 0 only exists from H5 on (its pre-H5 model is retired) — mirrors `pom_tier_index`,
+        // which rejects a Qwen3-8B tier-0 block below the gate.
+        Tier::VeryLight => (daa >= crate::pom::h5_activation_daa()).then_some(&QWEN3_8B_ABLITERATED),
+        Tier::Light => Some(&MISTRAL_7B_V03),
+        Tier::Default => Some(&GLM_4_9B_0414),
+        Tier::High => Some(&QWEN3_6_27B),
+        Tier::VeryHigh => Some(&KIMI_LINEAR_48B),
     }
 }
 
@@ -312,7 +317,7 @@ pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static M
         vec![crate::pom::coin_age_verification_activation_daa(), crate::pom::h5_activation_daa(), staging_daa()];
     let mut out: Vec<&'static ModelSpec> = Vec::new();
     for gate in reachable_gates(gates, chain_daa) {
-        let s = pom_model_for_tier(gate, tier);
+        let Some(s) = pom_model_for_tier(gate, tier) else { continue };
         if !out.iter().any(|x| x.model_id == s.model_id) {
             out.push(s);
         }
@@ -337,8 +342,12 @@ fn reachable_gates(mut gates: Vec<u64>, chain_daa: Option<u64>) -> Vec<u64> {
 
 /// The single model a hardware tier mines AND serves at **startup staging** (the latest scheduled
 /// era). A PoM GPU is bound to its tier; the era crossing swaps the resident model in place.
+///
+/// Infallible by construction: the latest scheduled era always carries a model for all five
+/// tiers. Retiring a tier outright would have to shrink the VRAM ladder in the same change, and
+/// this panic is where a half-done retirement would surface.
 pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
-    pom_model_for_tier(staging_daa(), tier)
+    pom_model_for_tier(staging_daa(), tier).expect("the staging era carries every tier")
 }
 
 /// Resolves a model name/id.
@@ -405,13 +414,22 @@ mod tests {
         assert_eq!(pom_tier_index(&MISTRAL_7B_V03.model_id, daa), None);
 
         // The hardware-tier -> model map flips to the same lineup at the gate.
-        assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).model_id, QWEN3_5_9B_ABLITERATED.model_id);
-        assert_eq!(pom_model_for_tier(daa, Tier::Light).model_id, GLM_4_9B_0414.model_id);
-        assert_eq!(pom_model_for_tier(daa, Tier::Default).model_id, GEMMA_4_12B_ABLITERATED.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, QWEN3_5_9B_ABLITERATED.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, GEMMA_4_12B_ABLITERATED.model_id);
 
         // Pre-H6 (mainnet daa today) the H5 lineup is untouched.
         let pre = crate::pom::pom_v3_activation_daa().saturating_sub(1);
         assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, pre), Some(2));
-        assert_eq!(pom_model_for_tier(pre, Tier::VeryLight).model_id, QWEN3_8B_ABLITERATED.model_id);
+        assert_eq!(pom_model_for_tier(pre, Tier::VeryLight).unwrap().model_id, QWEN3_8B_ABLITERATED.model_id);
+
+        // A tier with no valid model in an era yields nothing rather than a model the node would
+        // reject — the shape a retired era relies on. Tier 0 does not exist below the H5 gate.
+        let h5 = crate::pom::h5_activation_daa();
+        if h5 > 0 {
+            assert_eq!(pom_tier_index(&QWEN3_8B_ABLITERATED.model_id, h5 - 1), None);
+            assert!(pom_model_for_tier(h5 - 1, Tier::VeryLight).is_none());
+            assert!(pom_model_for_tier(h5 - 1, Tier::Light).is_some());
+        }
     }
 }

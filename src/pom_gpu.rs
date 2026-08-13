@@ -854,7 +854,9 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     };
     let mut swapped = false;
     for &(dev, tier) in &devices {
-        let spec = crate::models::pom_model_for_tier(daa, tier);
+        // No model for this tier in the era being entered: nothing to swap to, the device simply
+        // has nothing valid to mine until its own gate.
+        let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
         let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
         if current == Some(spec.model_id) {
             continue;
@@ -883,7 +885,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     if swapped {
         let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
         for &(_, tier) in &devices {
-            let spec = crate::models::pom_model_for_tier(daa, tier);
+            let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
