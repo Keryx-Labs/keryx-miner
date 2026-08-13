@@ -128,11 +128,11 @@ pub struct KeryxdHandler {
     /// Status bar sink, so the standing is visible without reading the log.
     stats: Option<Arc<crate::stats::MinerStats>>,
 
-    /// Highest active strike count seen, and how many escalations happened since this miner
-    /// started. The node only reports the *active* count — it resets on a served response or an
-    /// executed suspension — so a lifetime tally has to be kept here.
-    last_active_strikes: u32,
-    strikes_since_start: u32,
+    /// DAA of every miss seen since this miner started, for the lifetime tally. Counting the
+    /// active strike counter would miss the worst ones: the third strike resets it to zero, and a
+    /// served response clears it too. Each miss carries its own daa, so a set of those is exact
+    /// for as long as the process runs.
+    misses_seen: std::collections::HashSet<u64>,
 }
 
 #[async_trait(?Send)]
@@ -282,8 +282,7 @@ impl KeryxdHandler {
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
             strike_status: None,
             stats: None,
-            last_active_strikes: 0,
-            strikes_since_start: 0,
+            misses_seen: std::collections::HashSet::new(),
         }))
     }
 
@@ -683,19 +682,24 @@ impl KeryxdHandler {
             }
             parts.join("; ")
         };
-        // The node reports only the ACTIVE count, which resets on a served response or an executed
-        // suspension. Count every escalation as it appears so the operator keeps a lifetime figure.
         let active = strike.map(|s| s.consecutive_misses).unwrap_or(0);
-        if active > self.last_active_strikes {
-            self.strikes_since_start += active - self.last_active_strikes;
+        for burn in &burns {
+            self.misses_seen.insert(burn.miss_daa_score);
         }
-        self.last_active_strikes = active;
+        let total = self.misses_seen.len();
 
         if let Some(stats) = &self.stats {
+            // `pending` is the only live evidence of sanctions in flight: the third strike resets
+            // the active counter (so a later miss re-escalates from one), and the suspension only
+            // appears in `suspended` once finality flushes it. Without it the bar reads "0 active"
+            // while three penalties are already decided.
+            let pending = burns.len();
             let bar = if suspension.is_some() {
-                format!("SUSPENDED · {} total", self.strikes_since_start)
+                format!("SUSPENDED · {} total", total)
+            } else if pending > 0 {
+                format!("{} active · {} pending · {} total", active, pending, total)
             } else {
-                format!("{} active · {} total", active, self.strikes_since_start)
+                format!("{} active · {} total", active, total)
             };
             stats.set_service_status(Some(bar));
         }

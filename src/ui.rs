@@ -522,7 +522,7 @@ fn draw_frame(
                 palette().dim
             },
         ),
-        ("| Service ".to_string(), palette().muted),
+        ("| Strike ".to_string(), palette().muted),
         (
             service_value.clone(),
             if service_value.starts_with("SUSPENDED") {
