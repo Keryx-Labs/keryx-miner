@@ -330,13 +330,24 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
             "[gMASK]<sop><|user|>\n{}\n\n{}\n<|assistant|>\n",
             SYSTEM_PROMPT_NEXT, prompt
         ),
-        // Qwen3 family (tier-0 Qwen3-8B + tier-3 Qwen3.6-27B) — ChatML + a pre-filled empty think
-        // block so the visible answer starts immediately (an open think block would eat the whole
-        // max_tokens budget).
-        "qwen3.6-27b" | "qwen3-8b-abliterated" => format!(
+        // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
+        // immediately (an open think block would eat the whole max_tokens budget). This is the
+        // `enable_thinking = false` branch of their embedded template, verbatim.
+        "qwen3.6-27b" | "qwen3-8b-abliterated" | "qwen3.5-9b-abliterated" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        // Gemma 4 is NOT the classic <start_of_turn> Gemma: turns are `<|turn>role … <turn|>`,
+        // and its generation prompt carries an empty thought channel when thinking is off — the
+        // same role as Qwen's empty think block. Without it the model opens its own and the
+        // channel markers leak into the answer. BOS is omitted on purpose: this GGUF sets
+        // add_bos_token, so the tokenizer prepends it.
+        "gemma-4-12b-abliterated" => format!(
+            "<|turn>system\n{}<turn|>\n\
+             <|turn>user\n{}<turn|>\n\
+             <|turn>model\n<|channel>thought\n<channel|>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
         "kimi-linear-48b" => format!(
@@ -686,6 +697,38 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model with no arm of its own falls through to generic ChatML, which template-strict
+    /// models answer with leaked control tokens or an unclosed thinking block. The generic tail
+    /// is the tell: every real arm ends on something else.
+    #[test]
+    fn every_registered_model_has_its_own_chat_template() {
+        // Positive control: an unknown model does fall back, so the tail below really is the
+        // fallback's signature and the loop is not asserting a tautology.
+        assert!(format_prompt_by_name("not-a-real-model", "hi").ends_with("<|im_start|>assistant\n"));
+        for spec in crate::models::REGISTRY {
+            let templated = format_prompt_by_name(spec.name, "hi");
+            assert!(
+                !templated.ends_with("<|im_start|>assistant\n"),
+                "{} has no chat template of its own — it falls back to generic ChatML",
+                spec.name
+            );
+        }
+    }
+
+    /// The two H6 models close the reasoning block in the generation prompt, each in its own
+    /// dialect — otherwise the model opens one and spends the whole token budget inside it.
+    #[test]
+    fn h6_models_prefill_a_closed_reasoning_block() {
+        let qwen = format_prompt_by_name("qwen3.5-9b-abliterated", "hi");
+        assert!(qwen.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{qwen}");
+
+        let gemma = format_prompt_by_name("gemma-4-12b-abliterated", "hi");
+        assert!(gemma.ends_with("<|turn>model\n<|channel>thought\n<channel|>"), "{gemma}");
+        assert!(gemma.contains("<|turn>user\nhi<turn|>"), "{gemma}");
+        // The tokenizer prepends BOS (add_bos_token), so the template must not carry one.
+        assert!(!gemma.contains("<bos>"), "{gemma}");
+    }
 
     fn write_minimal_gguf(path: &Path) {
         let mut bytes = Vec::new();
