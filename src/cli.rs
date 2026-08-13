@@ -12,7 +12,7 @@ pub struct Opt {
         long = "very-light",
         help = "Model tier: Qwen3-8B-abliterated — 6GB+ GPU, smallest tier",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["light", "high", "very_high"]
+        conflicts_with_all = &["light", "high", "very-high"]
     )]
     pub very_light: bool,
 
@@ -20,7 +20,7 @@ pub struct Opt {
         long = "light",
         help = "Model tier: Mistral-7B-v0.3 — 8GB+ VRAM",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "high", "very_high"]
+        conflicts_with_all = &["very-light", "high", "very-high"]
     )]
     pub light: bool,
 
@@ -28,7 +28,7 @@ pub struct Opt {
         long = "high",
         help = "Model tier: Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "very_high"]
+        conflicts_with_all = &["very-light", "light", "very-high"]
     )]
     pub high: bool,
 
@@ -36,7 +36,7 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM",
         help_heading = "OPoI / Inference",
-        conflicts_with_all = &["very_light", "light", "high"]
+        conflicts_with_all = &["very-light", "light", "high"]
     )]
     pub very_high: bool,
 
@@ -259,5 +259,17 @@ impl Opt {
         } else {
             LevelFilter::Info
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn model_tier_conflicts_reference_valid_arguments() {
+        Opt::command().debug_assert();
+        assert!(Opt::try_parse_from(["keryx-miner", "--very-light", "--very-high"]).is_err());
     }
 }
