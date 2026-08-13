@@ -305,6 +305,23 @@ fn redirect_stderr_for_tui(_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Last words on a fatal startup error. Under the TUI both usual channels are dead ends: the log
+/// goes to a screen that is wiped on exit, and stderr is redirected to a file. Write to the
+/// controlling terminal so the operator sees WHY the miner refused to run instead of a silent
+/// exit — the failure they cannot diagnose is the one that makes them give up.
+fn report_fatal(message: &str) {
+    use std::io::Write;
+    let banner = format!("\nkeryx-miner cannot start:\n{}\n", message);
+    #[cfg(unix)]
+    if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+        if tty.write_all(banner.as_bytes()).is_ok() {
+            let _ = tty.flush();
+            return;
+        }
+    }
+    let _ = std::io::stderr().write_all(banner.as_bytes());
+}
+
 extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
     if msg_ptr.is_null() || msg_len == 0 {
         return;
@@ -756,7 +773,13 @@ fn main() -> Result<(), Error> {
         builder.max_blocking_threads(n);
     }
     let rt = builder.build()?;
-    rt.block_on(run())
+    // `run` has returned, so the TUI guard is dropped and the terminal restored — only now can a
+    // message survive on screen.
+    let outcome = rt.block_on(run());
+    if let Err(e) = &outcome {
+        report_fatal(&e.to_string());
+    }
+    outcome
 }
 
 async fn run() -> Result<(), Error> {
@@ -976,13 +999,25 @@ async fn run() -> Result<(), Error> {
                 Ok(cert) => Some(cert),
                 Err(e) => {
                     if keryx_miner::models::h6_staged() {
-                        error!("{}", e);
-                        error!("Two ways to fix it, pick one:");
-                        error!("  1. Mine to this miner's own address — nothing else to do: {}", own_address);
-                        error!("  2. Keep your payout address and authorise this miner from the wallet holding it:");
-                        error!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
-                        error!("     then pass the 128-hex output as --escrow-cert, or save it to '{}'.", opt.escrow_cert_file);
-                        return Err(e.into());
+                        // The guidance travels inside the error: the log lines are wiped when the
+                        // TUI restores the terminal, `report_fatal` is what the operator reads.
+                        let guidance = [
+                            e,
+                            String::new(),
+                            "Two ways to fix it, pick one:".to_string(),
+                            "  1. Mine to this miner's own address — nothing else to do:".to_string(),
+                            format!("       {}", own_address),
+                            "  2. Keep your payout address and authorise this miner from the wallet holding it:"
+                                .to_string(),
+                            format!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address),
+                            format!(
+                                "     then pass the 128-hex output as --escrow-cert, or save it to '{}'.",
+                                opt.escrow_cert_file
+                            ),
+                        ]
+                        .join("\n");
+                        error!("{}", guidance);
+                        return Err(guidance.into());
                     }
                     warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
                     warn!("Mining to {} would need no cert at all.", own_address);
