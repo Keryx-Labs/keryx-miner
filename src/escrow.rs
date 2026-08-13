@@ -1526,64 +1526,6 @@ pub fn verify_escrow_cert(payout_address: &str, escrow_pubkey_hex: &str, cert_he
         .map_err(|_| "Cert does not match this payout address and escrow key".to_string())
 }
 
-const ADDRESS_CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-const ADDRESS_GENERATORS: [u64; 5] = [0x98f2_bc8e_61, 0x79b7_6d99_e2, 0xf33e_5fb3_c4, 0xae2e_abe2_a8, 0x1e4f_43e4_70];
-
-fn address_polymod(values: &[u8]) -> u64 {
-    let mut c: u64 = 1;
-    for &d in values {
-        let c0 = c >> 35;
-        c = ((c & 0x07_ffff_ffff) << 5) ^ d as u64;
-        for (i, g) in ADDRESS_GENERATORS.iter().enumerate() {
-            if c0 & (1 << i) != 0 {
-                c ^= g;
-            }
-        }
-    }
-    c ^ 1
-}
-
-/// Encode a schnorr x-only key into its version-0 Keryx address — the inverse of
-/// [`decode_address`]. A wrong checksum here would print an address that swallows rewards, so it
-/// is pinned against known pairs in the tests.
-pub fn encode_address(prefix: &str, pubkey: &[u8; 32]) -> String {
-    let mut data5: Vec<u8> = Vec::with_capacity(53);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for b in std::iter::once(0u8).chain(pubkey.iter().copied()) {
-        acc = (acc << 8) | b as u32;
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            data5.push(((acc >> bits) & 0x1f) as u8);
-        }
-    }
-    if bits > 0 {
-        data5.push(((acc << (5 - bits)) & 0x1f) as u8);
-    }
-
-    let mut values: Vec<u8> = prefix.bytes().map(|c| c & 0x1f).collect();
-    values.push(0);
-    values.extend_from_slice(&data5);
-    values.extend_from_slice(&[0u8; 8]);
-    let checksum = address_polymod(&values);
-
-    let mut out = String::with_capacity(prefix.len() + 1 + data5.len() + 8);
-    out.push_str(prefix);
-    out.push(':');
-    out.extend(data5.iter().map(|&d| ADDRESS_CHARSET[d as usize] as char));
-    out.extend((0..8).map(|i| ADDRESS_CHARSET[((checksum >> (5 * (7 - i))) & 0x1f) as usize] as char));
-    out
-}
-
-/// This escrow key's own payout address — mining to it needs no wallet round-trip, since the
-/// miner then holds the payout key and can sign its own delegation.
-pub fn escrow_key_address(privkey_hex: &str, prefix: &str) -> Result<String, String> {
-    let mut pubkey = [0u8; 32];
-    hex::decode_to_slice(pubkey_hex_from_privkey(privkey_hex)?, &mut pubkey)
-        .map_err(|e| format!("Invalid escrow pubkey hex: {}", e))?;
-    Ok(encode_address(prefix, &pubkey))
-}
-
 /// Signs the delegation cert when the payout address IS this escrow key's own address — the only
 /// case where the payout key is on this machine. `None` otherwise: a cold payout address must be
 /// signed by the wallet that holds it.
@@ -1633,40 +1575,27 @@ mod tests {
         assert!(service_identity_hex("not-an-address").is_err());
     }
 
-    /// The encoder is the inverse of `decode_address` and must agree with the network's own
-    /// encoding — a wrong checksum prints an address that silently swallows rewards. Pinned on
-    /// two independent pairs, including the address of the private key `0x11..11`.
+    /// Cross-implementation vector. This cert was produced by the web wallet (noble schnorr over
+    /// noble blake2b) for escrow key `0x22..22` and the address of private key `0x11..11`. The
+    /// consensus rule must accept it: the two implementations have to agree on the domain string,
+    /// the digest and the curve, and nothing else pins that agreement.
     #[test]
-    fn address_encoding_roundtrips_known_pairs() {
-        let pairs = [
-            (
-                "cc1c720419a4645d2de6f06da860755b7cc665b90016226a7249f6fd69295ca3",
-                "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
-            ),
-            (
-                "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
-                TEST_PAYOUT_ADDRESS,
-            ),
-        ];
-        for (key_hex, address) in pairs {
-            let mut key = [0u8; 32];
-            hex::decode_to_slice(key_hex, &mut key).unwrap();
-            assert_eq!(encode_address("keryx", &key), address);
-            // And back: the decoder must recover exactly what was encoded.
-            assert_eq!(decode_address(address).unwrap(), (0u16, key));
-        }
+    fn web_wallet_cert_verifies_against_the_consensus_rule() {
+        let cert = "f3cf9bfc6a29ba5608ebe777ff9e1f87d5bc3f80ab58e3040995631bfc16ab21\
+                    8b388c9b2d44140fc9448e639dc81c51ba475a780d1eaecc443c613e6d787c9e";
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &"22".repeat(32), cert).is_ok());
+        // Same signature against another escrow key must fail, or the test proves nothing.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &"33".repeat(32), cert).is_err());
     }
 
     /// The miner signs its own delegation only when the payout address is its escrow key's.
     #[test]
     fn self_signing_is_limited_to_the_escrow_key_address() {
         let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
-        let own = escrow_key_address(privkey, "keryx").unwrap();
-        assert_eq!(own, TEST_PAYOUT_ADDRESS);
-
-        let cert = self_sign_cert(privkey, &own).expect("own address must self-sign");
+        let own = TEST_PAYOUT_ADDRESS;
+        let cert = self_sign_cert(privkey, own).expect("own address must self-sign");
         let escrow_pubkey = pubkey_hex_from_privkey(privkey).unwrap();
-        assert!(verify_escrow_cert(&own, &escrow_pubkey, &cert).is_ok());
+        assert!(verify_escrow_cert(own, &escrow_pubkey, &cert).is_ok());
 
         // Any other payout address: the miner does not hold that key, so it must refuse.
         assert!(self_sign_cert(
