@@ -683,10 +683,18 @@ impl KeryxdHandler {
             parts.join("; ")
         };
         let active = strike.map(|s| s.consecutive_misses).unwrap_or(0);
+        // The node keeps the lifetime tally: it survives restarts and covers the time this miner
+        // was down. Fall back to the locally observed misses only when talking to a node that
+        // predates the field (it answers with an empty list).
         for burn in &burns {
             self.misses_seen.insert(burn.miss_daa_score);
         }
-        let total = self.misses_seen.len();
+        let total = resp
+            .lifetime_strikes
+            .iter()
+            .find(|t| t.miner.eq_ignore_ascii_case(me))
+            .map(|t| t.strikes as usize)
+            .unwrap_or(self.misses_seen.len());
 
         if let Some(stats) = &self.stats {
             // `pending` is the only live evidence of sanctions in flight: the third strike resets

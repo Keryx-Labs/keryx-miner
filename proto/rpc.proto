@@ -719,6 +719,13 @@ message ServicePendingBurnMessage {
   uint64 burnedSompi = 5;
 }
 
+// Lifetime strike tally per miner — never reset, unlike consecutiveMisses. Field numbers mirror
+// the node's rpc.proto.
+message ServiceStrikeTotalMessage {
+  string miner = 1;
+  uint32 strikes = 2;
+}
+
 message GetServiceStrikesRequestMessage {
 }
 
@@ -727,6 +734,7 @@ message GetServiceStrikesResponseMessage {
   repeated ServiceStrikeMessage strikes = 2;
   repeated ServiceSuspensionMessage suspended = 3;
   repeated ServicePendingBurnMessage pendingBurns = 4;
+  repeated ServiceStrikeTotalMessage lifetimeStrikes = 5;
 
   RPCError error = 1000;
 }
