@@ -946,22 +946,46 @@ async fn run() -> Result<(), Error> {
     let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
         (Some(privkey), Some(address)) => {
             let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
-            match escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex) {
-                Ok(cert) => {
-                    info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
-                    Some(cert)
+            let prefix = address.split(':').next().unwrap_or("keryx");
+            let own_address = escrow::escrow_key_address(privkey, prefix)?;
+            // Resolution order: an explicitly supplied cert wins; otherwise the miner signs its
+            // own when the payout address is its escrow key's (nothing to set up); otherwise the
+            // file, which is the path for a payout address whose key lives in a wallet.
+            let supplied = opt.escrow_cert.as_deref().map(|c| {
+                let cert = c.trim().to_ascii_lowercase();
+                escrow::verify_escrow_cert(address, &escrow_pubkey_hex, &cert).map(|()| cert)
+            });
+            let resolved = match supplied {
+                Some(Ok(cert)) => {
+                    info!("Escrow delegation cert taken from --escrow-cert.");
+                    Ok(cert)
                 }
+                Some(Err(e)) => Err(e),
+                None => match escrow::self_sign_cert(privkey, address) {
+                    Some(cert) => {
+                        info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
+                        Ok(cert)
+                    }
+                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                        info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
+                        cert
+                    }),
+                },
+            };
+            match resolved {
+                Ok(cert) => Some(cert),
                 Err(e) => {
                     if keryx_miner::models::h6_staged() {
                         error!("{}", e);
-                        error!("Generate it with: keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
-                        error!(
-                            "Save the 128-hex output to '{}' and mine with this exact address.",
-                            opt.escrow_cert_file
-                        );
+                        error!("Two ways to fix it, pick one:");
+                        error!("  1. Mine to this miner's own address — nothing else to do: {}", own_address);
+                        error!("  2. Keep your payout address and authorise this miner from the wallet holding it:");
+                        error!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
+                        error!("     then pass the 128-hex output as --escrow-cert, or save it to '{}'.", opt.escrow_cert_file);
                         return Err(e.into());
                     }
                     warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
+                    warn!("Mining to {} would need no cert at all.", own_address);
                     None
                 }
             }

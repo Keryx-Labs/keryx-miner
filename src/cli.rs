@@ -88,6 +88,13 @@ pub struct Opt {
     pub escrow_key_file: String,
 
     #[clap(
+        long = "escrow-cert",
+        help = "Escrow delegation cert as 128 hex chars, for setups that cannot drop a file (HiveOS). Wins over --escrow-cert-file",
+        help_heading = "OPoI / Inference"
+    )]
+    pub escrow_cert: Option<String>,
+
+    #[clap(
         long = "escrow-cert-file",
         help = "Path to the escrow delegation cert produced by `keryx-cli delegate-escrow` (required from H6)",
         help_heading = "OPoI / Inference",
