@@ -250,6 +250,10 @@ impl MinerManager {
         Arc::clone(&self.opoi_challenge_active)
     }
 
+    pub fn stats_handle(&self) -> Arc<MinerStats> {
+        Arc::clone(&self.stats)
+    }
+
     pub fn record_block_accepted(&self) {
         self.stats.inc_accepted_blocks();
     }

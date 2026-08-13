@@ -55,6 +55,8 @@ pub struct MinerStats {
     last_update_epoch_s: AtomicU64,
     api_port: AtomicU64,
     mining_address: Mutex<Option<String>>,
+    /// Compact service-bond standing for the status bar: "clear", "strike 2", "suspended".
+    service_status: Mutex<Option<String>>,
     device_hashrate_hs: Mutex<HashMap<String, u64>>,
     device_blocks_accepted: Mutex<HashMap<String, u64>>,
     device_blocks_rejected: Mutex<HashMap<String, u64>>,
@@ -91,6 +93,7 @@ pub struct MinerStatsSnapshot {
     pub synced: bool,
     pub opoi_challenge_active: bool,
     pub mining_address: Option<String>,
+    pub service_status: Option<String>,
     pub api_port: Option<u16>,
     pub total_hashrate_hs: u64,
     pub accepted_blocks: u64,
@@ -121,6 +124,7 @@ impl MinerStats {
             last_update_epoch_s: AtomicU64::new(now),
             api_port: AtomicU64::new(0),
             mining_address: Mutex::new(None),
+            service_status: Mutex::new(None),
             device_hashrate_hs: Mutex::new(HashMap::new()),
             device_blocks_accepted: Mutex::new(HashMap::new()),
             device_blocks_rejected: Mutex::new(HashMap::new()),
@@ -132,6 +136,12 @@ impl MinerStats {
 
     pub fn set_api_port(&self, port: u16) {
         self.api_port.store(port as u64, Ordering::Release);
+    }
+
+    pub fn set_service_status(&self, status: Option<String>) {
+        if let Ok(mut slot) = self.service_status.lock() {
+            *slot = status;
+        }
     }
 
     pub fn set_mining_address(&self, address: Option<String>) {
@@ -352,6 +362,7 @@ impl MinerStats {
             .lock()
             .expect("gpu telemetry mutex poisoned")
             .clone();
+        let service_status = self.service_status.lock().ok().and_then(|s| s.clone());
         let mining_address = self
             .mining_address
             .lock()
@@ -397,6 +408,7 @@ impl MinerStats {
             synced: self.synced.load(Ordering::Acquire),
             opoi_challenge_active: self.opoi_challenge_active.load(Ordering::Acquire),
             mining_address,
+            service_status,
             api_port: match self.api_port.load(Ordering::Acquire) {
                 0 => None,
                 p => Some(p as u16),

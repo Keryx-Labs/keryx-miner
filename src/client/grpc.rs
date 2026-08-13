@@ -124,6 +124,15 @@ pub struct KeryxdHandler {
 
     /// Last rendered service-bond status — logged only on change.
     strike_status: Option<String>,
+
+    /// Status bar sink, so the standing is visible without reading the log.
+    stats: Option<Arc<crate::stats::MinerStats>>,
+
+    /// Highest active strike count seen, and how many escalations happened since this miner
+    /// started. The node only reports the *active* count — it resets on a served response or an
+    /// executed suspension — so a lifetime tally has to be kept here.
+    last_active_strikes: u32,
+    strikes_since_start: u32,
 }
 
 #[async_trait(?Send)]
@@ -140,6 +149,7 @@ impl Client for KeryxdHandler {
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         self.opoi_challenge_active = Some(miner.opoi_challenge_flag());
+        self.stats = Some(miner.stats_handle());
         // Harvest in-flight inference on a timer, independently of node notifications.
         // On a sole-producer node, pausing mining for inference stops block production,
         // so the node stops sending NewBlockTemplate notifications — without this timer
@@ -271,6 +281,9 @@ impl KeryxdHandler {
             service_identity,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
             strike_status: None,
+            stats: None,
+            last_active_strikes: 0,
+            strikes_since_start: 0,
         }))
     }
 
@@ -670,6 +683,23 @@ impl KeryxdHandler {
             }
             parts.join("; ")
         };
+        // The node reports only the ACTIVE count, which resets on a served response or an executed
+        // suspension. Count every escalation as it appears so the operator keeps a lifetime figure.
+        let active = strike.map(|s| s.consecutive_misses).unwrap_or(0);
+        if active > self.last_active_strikes {
+            self.strikes_since_start += active - self.last_active_strikes;
+        }
+        self.last_active_strikes = active;
+
+        if let Some(stats) = &self.stats {
+            let bar = if suspension.is_some() {
+                format!("SUSPENDED · {} total", self.strikes_since_start)
+            } else {
+                format!("{} active · {} total", active, self.strikes_since_start)
+            };
+            stats.set_service_status(Some(bar));
+        }
+
         if self.strike_status.as_deref() != Some(status.as_str()) {
             match status.as_str() {
                 "clear" => info!("service-bond: no strikes against this miner"),

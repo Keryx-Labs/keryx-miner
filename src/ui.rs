@@ -499,8 +499,13 @@ fn draw_frame(
         uppercase_first_char("live")
     };
 
+    // Service-bond standing: active strikes and the lifetime tally. "—" until the first poll.
+    let service_value = snapshot.service_status.clone().unwrap_or_else(|| "—".to_string());
+
     let top_left = vec![
-        (" Keryx Miner ".to_string(), palette().accent),
+        // Version in the bar, not only in the boot log: a support question always starts with
+        // "which build are you running", and the boot lines are long scrolled away.
+        (format!(" Keryx Miner {} ", env!("CARGO_PKG_VERSION")), palette().accent),
         ("| ".to_string(), palette().muted),
         (format!("{}  ", hashrate_value), palette().ok),
         ("| Node ".to_string(), palette().muted),
@@ -510,11 +515,22 @@ fn draw_frame(
         ),
         ("| OPoI ".to_string(), palette().muted),
         (
-            format!("{}", opoi_pause_value),
+            format!("{}  ", opoi_pause_value),
             if snapshot.opoi_challenge_active {
                 palette().bright
             } else {
                 palette().dim
+            },
+        ),
+        ("| Service ".to_string(), palette().muted),
+        (
+            service_value.clone(),
+            if service_value.starts_with("SUSPENDED") {
+                palette().warn
+            } else if service_value.starts_with('0') {
+                palette().ok
+            } else {
+                palette().bright
             },
         ),
     ];
