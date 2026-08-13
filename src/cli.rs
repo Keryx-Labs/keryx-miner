@@ -88,6 +88,14 @@ pub struct Opt {
     pub escrow_key_file: String,
 
     #[clap(
+        long = "escrow-cert-file",
+        help = "Path to the escrow delegation cert produced by `keryx-cli delegate-escrow` (required from H6)",
+        help_heading = "OPoI / Inference",
+        default_value = "escrow.cert"
+    )]
+    pub escrow_cert_file: String,
+
+    #[clap(
         long = "escrow-state-file",
         help = "Path to the escrow claim state file",
         help_heading = "OPoI / Inference",

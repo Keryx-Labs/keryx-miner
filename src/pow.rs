@@ -272,7 +272,7 @@ impl State {
                 steps_v2: None,
                 v3: Some(v3),
             };
-            return self.assemble_pom_block(nonce, final_state, proof.to_wire_bytes());
+            return self.assemble_pom_block(nonce, final_state, tier, proof.to_wire_bytes());
         }
 
         let final_state = pom::walk_final(seed, index.n_chunks, pom::POM_WALK_STEPS, |o| index.read_chunk(o), walk_v2);
@@ -301,10 +301,10 @@ impl State {
         };
         // `to_wire_bytes` keeps a pre-H4 proof byte-identical to the 7-field layout the running
         // node still decodes; a v2 proof encodes the full struct (only H4 nodes decode it).
-        self.assemble_pom_block(nonce, final_state, proof.to_wire_bytes())
+        self.assemble_pom_block(nonce, final_state, tier, proof.to_wire_bytes())
     }
 
-    fn assemble_pom_block(&self, nonce: u64, final_state: u64, proof_bytes: Vec<u8>) -> Option<BlockSeed> {
+    fn assemble_pom_block(&self, nonce: u64, final_state: u64, tier: u8, proof_bytes: Vec<u8>) -> Option<BlockSeed> {
         let mut block_seed = (*self.block).clone();
         match &mut block_seed {
             BlockSeed::FullBlock { block, .. } => {
@@ -314,6 +314,11 @@ impl State {
                 // nonce. The node hashes it into the block hash and pins it to the proof.
                 if header.daa_score >= pom::pom_level_activation_daa() {
                     header.pom_final_state = final_state;
+                }
+                // H6: the header commits to the tier this walk proved. The node cross-checks it
+                // against the proof and reads it for the service-bond cohort fold.
+                if header.daa_score >= pom::pom_v3_activation_daa() {
+                    header.pom_tier = tier as u32;
                 }
                 block.pom_proof = proof_bytes; // plain bytes field (empty = none on the wire)
             }
@@ -385,6 +390,17 @@ pub fn serialize_header<H: Hasher>(hasher: &mut H, header: &RpcBlockHeader, for_
     // (the walk seed derives from it). Mirrors the node's `hashing::header::hash`.
     if !for_pre_pow && header.daa_score >= pom::pom_level_activation_daa() {
         hasher.update(header.pom_final_state.to_le_bytes());
+    }
+
+    // H6: the block hash also commits to the node-filled service-state seal and to the proven
+    // tier, in that order. Neither is part of the pre-PoW hash.
+    if !for_pre_pow && header.daa_score >= pom::pom_v3_activation_daa() {
+        let mut seal = [0u8; 32];
+        if !header.service_state_hash.is_empty() {
+            decode_to_slice(&header.service_state_hash, &mut seal).unwrap();
+        }
+        hasher.update(seal);
+        hasher.update([header.pom_tier as u8]);
     }
 }
 
@@ -541,6 +557,8 @@ mod tests {
             pruning_point: "fc44c4f57cf8f7a2ba410a70d0ad49060355b9deb97012345603d9d0d1dcb0de".into(),
             blue_score: 29372123613087746,
             pom_final_state: 0,
+            service_state_hash: String::new(),
+            pom_tier: 0,
         };
         let expected_res = [
             245, 95, 9, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 98, 165, 238, 232, 42, 189, 244, 74, 45, 11, 117,

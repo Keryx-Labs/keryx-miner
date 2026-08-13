@@ -1475,9 +1475,108 @@ fn decode_address(addr: &str) -> Result<(u16, [u8; 32]), String> {
     Ok((version, spk))
 }
 
+// ── Escrow delegation cert ────────────────────────────────────────────────────
+
+/// Mirror of the node's `ESCROW_DELEGATION_DOMAIN`.
+const ESCROW_DELEGATION_DOMAIN: &[u8] = b"KeryxEscrowDelegationV1";
+
+fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut h = Blake2bParams::new().hash_length(32).to_state();
+    h.update(ESCROW_DELEGATION_DOMAIN);
+    h.update(escrow_pubkey);
+    finalize32(h)
+}
+
+/// Service-ledger identity of a payout address — mirror of the node's `miner_key(spk)`:
+/// blake2b-256 keyed "TransactionHash" over `[version_le(2), p2pk_script]`. This is what the
+/// node reports strikes, burns and suspensions against; the escrow key is only the hot key.
+pub fn service_identity_hex(payout_address: &str) -> Result<String, String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} has no service identity (schnorr P2PK only)", version));
+    }
+    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionHash").to_state();
+    h.update(&version.to_le_bytes());
+    h.update(&build_p2pk_script(&payout_key));
+    Ok(hex::encode(finalize32(h)))
+}
+
+/// Verifies a delegation cert exactly the way the node does before accepting a block: schnorr
+/// over the domain-hashed escrow key, by the x-only key of the payout address.
+pub fn verify_escrow_cert(payout_address: &str, escrow_pubkey_hex: &str, cert_hex: &str) -> Result<(), String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} cannot carry a delegation (schnorr P2PK only)", version));
+    }
+    let mut escrow_pubkey = [0u8; 32];
+    hex::decode_to_slice(escrow_pubkey_hex, &mut escrow_pubkey)
+        .map_err(|e| format!("Invalid escrow pubkey hex: {}", e))?;
+    let mut sig_bytes = [0u8; 64];
+    hex::decode_to_slice(cert_hex, &mut sig_bytes).map_err(|e| format!("Invalid cert hex: {}", e))?;
+
+    let payout_key =
+        secp256k1::XOnlyPublicKey::from_slice(&payout_key).map_err(|e| format!("Invalid payout address key: {}", e))?;
+    let sig =
+        secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| format!("Invalid cert signature: {}", e))?;
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+    secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(&sig, &msg, &payout_key)
+        .map_err(|_| "Cert does not match this payout address and escrow key".to_string())
+}
+
+/// Loads the delegation cert and verifies it against the payout address and escrow key before
+/// returning it. Never hands back a cert the node would reject.
+pub fn load_cert(path: &str, payout_address: &str, escrow_pubkey_hex: &str) -> Result<String, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read escrow delegation cert '{}': {}", path, e))?;
+    let cert = raw.trim().to_ascii_lowercase();
+    if cert.len() != 128 {
+        return Err(format!("Escrow delegation cert '{}' must be 128 hex chars, found {}", path, cert.len()));
+    }
+    verify_escrow_cert(payout_address, escrow_pubkey_hex, &cert)?;
+    Ok(cert)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Payout address of the private key `0x11..11`, used as a payout key below.
+    const TEST_PAYOUT_ADDRESS: &str = "keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr";
+
+    /// The service identity must equal the node's `miner_key(spk)`. The expected value is derived
+    /// independently of this code: blake2b-256 keyed "TransactionHash" over
+    /// `[version_le(2), 0x20 || key || 0xac]`.
+    #[test]
+    fn service_identity_matches_the_node_miner_key() {
+        assert_eq!(
+            service_identity_hex("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte").unwrap(),
+            "cb79bef02d429e0fc8bb2335bf43d9d0df4f5bd6a25a39747d700b173e766e20"
+        );
+        assert!(service_identity_hex("not-an-address").is_err());
+    }
+
+    /// A cert only verifies against the exact payout address and escrow key it was signed for.
+    #[test]
+    fn escrow_cert_binds_payout_address_and_escrow_key() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let escrow_pubkey = [0x22u8; 32];
+        let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+        let cert = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref());
+
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), &cert).is_ok());
+        // Another escrow key: the delegation message differs.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode([0x33u8; 32]), &cert).is_err());
+        // Another payout address: not the signer.
+        assert!(verify_escrow_cert(
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            &hex::encode(escrow_pubkey),
+            &cert
+        )
+        .is_err());
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), "dead").is_err());
+    }
 
     /// The responder signature must verify exactly the way the node's `verified_responder`
     /// does: schnorr over blake2b-256("KeryxServiceResponderV1" || v1 payload bytes) with the

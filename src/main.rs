@@ -563,6 +563,7 @@ async fn get_client(
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
+    escrow_cert: Option<String>,
     ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
@@ -583,6 +584,7 @@ async fn get_client(
             Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
+            escrow_cert,
             ipfs_url,
         )
         .await?)
@@ -662,6 +664,7 @@ async fn client_main(
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
+    escrow_cert: Option<String>,
     stats: Arc<MinerStats>,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
@@ -675,6 +678,7 @@ async fn client_main(
         block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
+        escrow_cert,
         opt.ipfs_url.clone(),
     )
     .await?;
@@ -931,6 +935,35 @@ async fn run() -> Result<(), Error> {
         }
     };
 
+    // Escrow delegation cert: binds the escrow key to the payout address. From H6 a coinbase
+    // without a valid pair is an invalid block, so a bad cert fails here instead of producing
+    // rejected blocks.
+    let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
+        (Some(privkey), Some(address)) => {
+            let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
+            match escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex) {
+                Ok(cert) => {
+                    info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
+                    Some(cert)
+                }
+                Err(e) => {
+                    if keryx_miner::models::h6_staged() {
+                        error!("{}", e);
+                        error!("Generate it with: keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address);
+                        error!(
+                            "Save the 128-hex output to '{}' and mine with this exact address.",
+                            opt.escrow_cert_file
+                        );
+                        return Err(e.into());
+                    }
+                    warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
@@ -1101,6 +1134,7 @@ async fn run() -> Result<(), Error> {
             block_template_ctr.clone(),
             &plugin_manager,
             escrow_privkey.clone(),
+            escrow_cert.clone(),
             Arc::clone(&stats),
             Arc::clone(&shutdown_requested),
         )

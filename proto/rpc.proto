@@ -47,6 +47,14 @@ message RpcBlockHeader {
   // into the block hash by the node. Filled on submit_block exactly like the nonce.
   // 0 (absent on the wire) below the activation. Field number mirrors the node's rpc.proto.
   uint64 pomFinalState = 16;
+  // H6: sealed service-state commitment, filled by the node at template build. The miner never
+  // writes it, but MUST carry it back on submit_block — prost drops unknown fields, so omitting
+  // it here strips the node's own commitment from the submitted header. Field number mirrors the
+  // node's rpc.proto. Hex string; empty below the gate.
+  string serviceStateHash = 17;
+  // H6: the winning walk's proven PoM tier, committed into the block hash. Filled on
+  // submit_block from the GPU that solved the block, exactly like pomFinalState.
+  uint32 pomTier = 18;
 }
 
 message RpcBlockLevelParents {
