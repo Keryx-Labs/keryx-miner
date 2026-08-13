@@ -951,6 +951,29 @@ async fn run() -> Result<(), Error> {
         return Ok(());
     }
 
+    // Where the chain actually is. Two decisions need it before anything heavy happens: whether
+    // the escrow delegation is already required, and which model eras are still reachable.
+    // Bounded and fail-open — an unreachable node must not stop a miner from starting.
+    let chain_daa = if opt.keryxd_address.starts_with("grpc://") {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::client::grpc::query_virtual_daa(opt.keryxd_address.clone()),
+        )
+        .await
+        {
+            Ok(Some(daa)) => {
+                info!("Node at DAA {}.", daa);
+                Some(daa)
+            }
+            _ => {
+                warn!("Could not read the node's DAA — assuming pre-H6 and prefetching every scheduled era.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Resolve OPoI escrow private key (once, before the reconnect loop).
     let escrow_privkey: Option<String> = match escrow::load_or_generate_key(&opt.escrow_key_file) {
         Ok(k) => {
@@ -969,8 +992,10 @@ async fn run() -> Result<(), Error> {
     let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
         (Some(privkey), Some(address)) => {
             let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
-            let prefix = address.split(':').next().unwrap_or("keryx");
-            let own_address = escrow::escrow_key_address(privkey, prefix)?;
+            // Printed on every start, not only on failure: this is the value the operator pastes
+            // into their wallet to authorise this miner, and it must be findable without first
+            // provoking an error. It is a public key — safe in a log, a screenshot or a paste.
+            info!("Escrow key to authorise in your wallet: {}", escrow_pubkey_hex);
             // Resolution order: an explicitly supplied cert wins; otherwise the miner signs its
             // own when the payout address is its escrow key's (nothing to set up); otherwise the
             // file, which is the path for a payout address whose key lives in a wallet.
@@ -998,29 +1023,31 @@ async fn run() -> Result<(), Error> {
             match resolved {
                 Ok(cert) => Some(cert),
                 Err(e) => {
+                    // Refuse as soon as H6 is scheduled, not only once crossed. The operator is at
+                    // the keyboard when they upgrade; at the gate they are asleep and the whole
+                    // network trips at once. A release that arms H6 must therefore ship after the
+                    // wallet can issue the cert, or miners are stopped with no way to comply.
                     if keryx_miner::models::h6_staged() {
                         // The guidance travels inside the error: the log lines are wiped when the
                         // TUI restores the terminal, `report_fatal` is what the operator reads.
                         let guidance = [
                             e,
                             String::new(),
-                            "Two ways to fix it, pick one:".to_string(),
-                            "  1. Mine to this miner's own address — nothing else to do:".to_string(),
-                            format!("       {}", own_address),
-                            "  2. Keep your payout address and authorise this miner from the wallet holding it:"
-                                .to_string(),
-                            format!("       keryx-cli delegate-escrow {} {}", escrow_pubkey_hex, address),
-                            format!(
-                                "     then pass the 128-hex output as --escrow-cert, or save it to '{}'.",
-                                opt.escrow_cert_file
-                            ),
+                            "This miner works for your payout address, and your wallet has to say so once.".to_string(),
+                            String::new(),
+                            "  1. Open your wallet, card \"Authorise a miner\", and paste this escrow key:".to_string(),
+                            format!("       {}", escrow_pubkey_hex),
+                            "  2. Copy the line it returns and add it to this miner:".to_string(),
+                            "       --escrow-cert <the 128 hex characters>".to_string(),
+                            String::new(),
+                            format!("Signed once, valid for as long as you keep this address and '{}'.", opt.escrow_key_file),
+                            format!("Mine with this exact address: {}", address),
                         ]
                         .join("\n");
                         error!("{}", guidance);
                         return Err(guidance.into());
                     }
-                    warn!("No usable escrow delegation cert ({}) — it becomes mandatory at H6.", e);
-                    warn!("Mining to {} would need no cert at all.", own_address);
+                    warn!("No escrow delegation cert ({}) — required once H6 is scheduled.", e);
                     None
                 }
             }
@@ -1083,25 +1110,6 @@ async fn run() -> Result<(), Error> {
     log::debug!("OPoI Phase-3 active — {} model(s) staged.", specs.len());
     // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
     // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
-    let chain_daa = if opt.keryxd_address.starts_with("grpc://") {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            crate::client::grpc::query_virtual_daa(opt.keryxd_address.clone()),
-        )
-        .await
-        {
-            Ok(Some(daa)) => {
-                info!("Node at DAA {} — skipping the models of eras already behind it.", daa);
-                Some(daa)
-            }
-            _ => {
-                warn!("Could not read the node's DAA — prefetching every scheduled era.");
-                None
-            }
-        }
-    } else {
-        None
-    };
     // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a
     // mid-run download stall. Block until every such model is downloaded before mining: never start
     // hashing while a model is still downloading.
