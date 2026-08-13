@@ -121,13 +121,21 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
         return nullptr;
     }
 
-    // User-facing sampling (repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
+    // User-facing sampling (DRY -> repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
     // text is not consensus-relevant, but keep the flavor consistent.
-    // The repetition penalty is essential: without it the small quantized models
-    // (9B Q4 especially) degenerate into verbatim sentence loops. 256-token window
-    // because the observed loops are whole sentences (~25 tokens each), far beyond
-    // the classic 64-token window; 1.10 is the battle-tested llama.cpp default.
+    //
+    // The flat repeat penalty alone does not stop these models: it charges a token once for
+    // having appeared, no matter how many times, so a repeated *sentence* pays almost nothing
+    // per token and the loop survives (observed on-chain with GLM-4-9B at 1.10 / 256). DRY
+    // penalises the continuation of an already-seen sequence, growing with its length, which is
+    // the failure mode we actually have. Standard settings: multiplier 0.8, base 1.75, loops
+    // allowed up to 2 tokens, scanning the whole context (-1). The break tokens keep normal
+    // structure (newlines, list markers, quotes) from counting as repetition.
+    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
+        llama_model_get_vocab(model), llama_model_n_ctx_train(model),
+        0.8f, 1.75f, 2, -1, dry_breakers, sizeof(dry_breakers) / sizeof(dry_breakers[0])));
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
