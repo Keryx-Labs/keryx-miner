@@ -300,18 +300,39 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> &'static ModelSpec {
     }
 }
 
-/// Every PoM model a `tier` may mine across the currently-scheduled eras — the current-era model
-/// and, once a later era is scheduled, its model too. Prefetched together at startup so the era
-/// crossing hot-swaps the resident mining model without stalling on a mid-run download.
-pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
+/// Every PoM model a `tier` may still mine — the current-era model and, once a later era is
+/// scheduled, its model too. Prefetched together at startup so the era crossing hot-swaps the
+/// resident mining model without stalling on a mid-run download.
+///
+/// `chain_daa` is the network's virtual DAA score. An era spans `[gate, next_gate)`, and nothing
+/// below the tip can still be mined, so an era the chain has already left needs no model. `None`
+/// (node unreachable, or pool mining) keeps every scheduled era.
+pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
+    let gates =
+        vec![crate::pom::coin_age_verification_activation_daa(), crate::pom::h5_activation_daa(), staging_daa()];
     let mut out: Vec<&'static ModelSpec> = Vec::new();
-    for daa in [crate::pom::coin_age_verification_activation_daa(), crate::pom::h5_activation_daa(), staging_daa()] {
-        let s = pom_model_for_tier(daa, tier);
+    for gate in reachable_gates(gates, chain_daa) {
+        let s = pom_model_for_tier(gate, tier);
         if !out.iter().any(|x| x.model_id == s.model_id) {
             out.push(s);
         }
     }
     out
+}
+
+/// The era gates whose models can still be mined, sorted. An era spans `[gate, next_gate)`, so it
+/// is dropped once the chain has passed `next_gate`. The last era is open-ended and always kept.
+fn reachable_gates(mut gates: Vec<u64>, chain_daa: Option<u64>) -> Vec<u64> {
+    gates.sort_unstable();
+    gates.dedup();
+    let Some(daa) = chain_daa else { return gates };
+    let last = gates.len().saturating_sub(1);
+    gates
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == last || gates[i + 1] > daa)
+        .map(|(_, gate)| *gate)
+        .collect()
 }
 
 /// The single model a hardware tier mines AND serves at **startup staging** (the latest scheduled
@@ -342,6 +363,31 @@ pub fn available_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the eras the chain can still reach are kept. Synthetic gates keep this independent of
+    /// the network switch.
+    #[test]
+    fn eras_already_left_are_dropped() {
+        // Testnet shape: H4/H5 born with the chain, H6 scheduled later.
+        let testnet = vec![0, 0, 108_000];
+        // Chain past the H6 gate: the pre-H6 era can never be mined again.
+        assert_eq!(reachable_gates(testnet.clone(), Some(200_000)), vec![108_000]);
+        // Chain still below it: both eras are live, the crossing must not stall on a download.
+        assert_eq!(reachable_gates(testnet.clone(), Some(50_000)), vec![0, 108_000]);
+        // Unknown tip (node unreachable, pool mining): keep everything.
+        assert_eq!(reachable_gates(testnet, None), vec![0, 108_000]);
+
+        // Mainnet shape, H6 armed ahead of the tip: the H4 era is gone, H5 and H6 are kept.
+        let mainnet = vec![54_766_000, 59_009_037, 70_000_000];
+        assert_eq!(reachable_gates(mainnet.clone(), Some(66_000_000)), vec![59_009_037, 70_000_000]);
+        // Once the tip passes the H6 gate the H5 model retires on its own — no code change needed.
+        assert_eq!(reachable_gates(mainnet, Some(70_000_001)), vec![70_000_000]);
+
+        // Exactly at a gate: that era has just begun, the previous one is over.
+        assert_eq!(reachable_gates(vec![0, 108_000], Some(108_000)), vec![108_000]);
+        // H6 unscheduled: staging collapses onto the H5 gate, leaving a single live era.
+        assert_eq!(reachable_gates(vec![54_766_000, 59_009_037, 59_009_037], Some(66_000_000)), vec![59_009_037]);
+    }
 
     /// The H6 per-block tier table — mirror of the node's `POM_TIERS_H6` order. `u64::MAX` sits
     /// at/after every gate on any network, so this exercises the H6 branch without touching the

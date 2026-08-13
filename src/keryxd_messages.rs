@@ -1,6 +1,7 @@
 use crate::proto::{
-    kaspad_message::Payload, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
-    GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    kaspad_message::Payload, GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage,
+    GetInfoRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    NotifyNewBlockTemplateRequestMessage,
     NotifyVirtualSelectedParentChainChangedRequestMessage, RpcBlock, RpcTransaction,
     SubmitBlockRequestMessage, SubmitTransactionRequestMessage,
 };
@@ -43,6 +44,11 @@ impl KaspadMessage {
 impl From<GetInfoRequestMessage> for KaspadMessage {
     fn from(a: GetInfoRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::GetInfoRequest(a)) }
+    }
+}
+impl From<GetBlockDagInfoRequestMessage> for KaspadMessage {
+    fn from(a: GetBlockDagInfoRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetBlockDagInfoRequest(a)) }
     }
 }
 impl From<NotifyBlockAddedRequestMessage> for KaspadMessage {

@@ -537,17 +537,18 @@ fn lineup_from_assignments(
 fn prefetch_lineup_from_assignments(
     assignments: &[(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)],
     ceiling: keryx_miner::models::Tier,
+    chain_daa: Option<u64>,
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     let mut union: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
     for (_, gpu_tier, _) in assignments {
-        for spec in keryx_miner::models::pom_models_all_eras(*gpu_tier) {
+        for spec in keryx_miner::models::pom_models_all_eras(*gpu_tier, chain_daa) {
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
         }
     }
     if union.is_empty() {
-        for spec in keryx_miner::models::pom_models_all_eras(ceiling) {
+        for spec in keryx_miner::models::pom_models_all_eras(ceiling, chain_daa) {
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
@@ -1017,10 +1018,31 @@ async fn run() -> Result<(), Error> {
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::slm::init_supported(specs);
     log::debug!("OPoI Phase-3 active — {} model(s) staged.", specs.len());
-    // Prefetch BOTH scheduled eras so the H5 crossing hot-swaps without a mid-run download stall
-    // (equals `specs` while H5 is unscheduled). Block until every such model is downloaded before
-    // mining: never start hashing while a model is still downloading.
-    let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier);
+    // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
+    // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
+    let chain_daa = if opt.keryxd_address.starts_with("grpc://") {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::client::grpc::query_virtual_daa(opt.keryxd_address.clone()),
+        )
+        .await
+        {
+            Ok(Some(daa)) => {
+                info!("Node at DAA {} — skipping the models of eras already behind it.", daa);
+                Some(daa)
+            }
+            _ => {
+                warn!("Could not read the node's DAA — prefetching every scheduled era.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a
+    // mid-run download stall. Block until every such model is downloaded before mining: never start
+    // hashing while a model is still downloading.
+    let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier, chain_daa);
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(prefetch_specs)).await {
         Ok(Ok(())) => info!("Model files ready ({}) — starting mining.", prefetch_specs.len()),
         Ok(Err(e)) => {

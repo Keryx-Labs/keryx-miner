@@ -4,11 +4,27 @@ use crate::pow::BlockSeed::{FullBlock, PartialBlock};
 use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
-    GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, GetServiceStrikesRequestMessage,
-    KaspadMessage, NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
-    NotifyVirtualSelectedParentChainChangedRequestMessage,
+    GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
+    GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    NotifyNewBlockTemplateRequestMessage, NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
+
+/// Asks the node for its virtual DAA score, before the mining client exists. Used to skip
+/// downloading the models of eras the chain has already left. `None` on any failure — the caller
+/// then keeps every scheduled era, which only costs bandwidth.
+pub async fn query_virtual_daa(address: String) -> Option<u64> {
+    let mut client = RpcClient::connect(address).await.ok()?;
+    let (send, recv) = mpsc::channel(2);
+    send.send(GetBlockDagInfoRequestMessage {}.into()).await.ok()?;
+    let mut stream = client.message_stream(ReceiverStream::new(recv)).await.ok()?.into_inner();
+    while let Ok(Some(msg)) = stream.message().await {
+        if let Some(Payload::GetBlockDagInfoResponse(resp)) = msg.payload {
+            return resp.error.is_none().then_some(resp.virtual_daa_score);
+        }
+    }
+    None
+}
 
 /// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
 const MAX_AI_QUEUE_SIZE: usize = 64;
@@ -920,5 +936,18 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Round-trip against a live node. Ignored by default — run with
+    /// `cargo test --bin keryx-miner -- --ignored query_virtual_daa` and a node on 22110.
+    #[tokio::test]
+    #[ignore]
+    async fn query_virtual_daa_reads_the_live_node() {
+        let daa = super::query_virtual_daa("grpc://127.0.0.1:22110".to_string()).await;
+        assert!(daa.is_some_and(|d| d > 0), "no DAA read from the node: {:?}", daa);
+        println!("node virtual daa = {}", daa.unwrap());
     }
 }
