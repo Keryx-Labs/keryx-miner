@@ -287,10 +287,12 @@ impl MinerManager {
                     return Ok(());
                 }
                 self.is_synced = false;
-                self.stats.set_synced(false);
+                // A pause we chose says nothing about the node: leave its status alone, or the
+                // header reports it out of sync for the length of every inference.
                 if self.opoi_challenge_active.load(Ordering::Relaxed) {
-                    info!("OPoI challenge in progress — PoW template suspended, stand by");
+                    info!("OPoI work in progress — PoW template suspended, stand by");
                 } else {
+                    self.stats.set_synced(false);
                     warn!("Keryxd is not synced, skipping current template");
                 }
                 None

@@ -537,6 +537,15 @@ impl KeryxdHandler {
 
     /// Starts SLM inference for the next queued AiRequest, if no inference is
     /// already in flight and a response slot is free.
+    /// Marks whether mining is paused by OPoI work (inference in flight, or model files not
+    /// ready) rather than by the node. Set at every pause decision, so no exit path can leave it
+    /// stale. Also suppresses the GPU stall warnings, which a deliberate pause would trip.
+    fn set_opoi_pause(&self, paused: bool) {
+        if let Some(flag) = &self.opoi_challenge_active {
+            flag.store(paused, Ordering::Relaxed);
+        }
+    }
+
     fn try_start_inference(&mut self) {
         if self.inference_rx.is_some() {
             return;
@@ -767,6 +776,7 @@ impl KeryxdHandler {
                     if self.last_known_daa % 200 == 0 {
                         log::warn!("OPoI: no models ready — mining suspended until model files are available");
                     }
+                    self.set_opoi_pause(true);
                     miner.process_block(None).await?;
                     return Ok(());
                 }
@@ -777,9 +787,12 @@ impl KeryxdHandler {
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
                 // This covers both regular AiRequest inference and node-issued challenge inference.
                 if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
+                    self.set_opoi_pause(true);
                     miner.process_block(None).await?;
                     return Ok(());
                 }
+                // Past this point any pause comes from the node, not from us.
+                self.set_opoi_pause(false);
                 match (template.block, template.is_synced, template.error) {
                     (Some(b), true, None) => miner.process_block(Some(FullBlock {
                         block: Box::new(b),
