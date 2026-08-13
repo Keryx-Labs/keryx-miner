@@ -565,6 +565,7 @@ async fn get_client(
     escrow_privkey: Option<String>,
     escrow_state_file: String,
     escrow_cert: Option<String>,
+    chain_daa: Option<u64>,
     ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
@@ -586,6 +587,7 @@ async fn get_client(
             escrow_privkey,
             escrow_state_file,
             escrow_cert,
+            chain_daa,
             ipfs_url,
         )
         .await?)
@@ -666,6 +668,7 @@ async fn client_main(
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
     escrow_cert: Option<String>,
+    chain_daa: Option<u64>,
     stats: Arc<MinerStats>,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
@@ -680,6 +683,7 @@ async fn client_main(
         escrow_privkey,
         opt.escrow_state_file.clone(),
         escrow_cert,
+        chain_daa,
         opt.ipfs_url.clone(),
     )
     .await?;
@@ -1157,6 +1161,7 @@ async fn run() -> Result<(), Error> {
             &plugin_manager,
             escrow_privkey.clone(),
             escrow_cert.clone(),
+            chain_daa,
             Arc::clone(&stats),
             Arc::clone(&shutdown_requested),
         )

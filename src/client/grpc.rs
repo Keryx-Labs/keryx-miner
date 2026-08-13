@@ -196,6 +196,7 @@ impl KeryxdHandler {
         escrow_privkey: Option<String>,
         escrow_state_file: String,
         escrow_cert: Option<String>,
+        chain_daa: Option<u64>,
         ipfs_url: String,
     ) -> Result<Box<Self>, Error>
     where
@@ -260,7 +261,9 @@ impl KeryxdHandler {
             challenge_inference_rx: None,
             opoi_challenge_active: None,
             pending_block_submissions,
-            last_known_daa: 0,
+            // Seeded from the node so era-gated decisions (devfund payout) are right on the very
+            // first template request, not only once one has been received.
+            last_known_daa: chain_daa.unwrap_or(0),
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
@@ -302,8 +305,13 @@ impl KeryxdHandler {
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
+        // From H6 the delegation cert is verified against the block's own pay address, and this
+        // miner can only hold one for its own. A devfund block would be refused at the template.
+        let devfund_payable = self.last_known_daa < keryx_miner::pom::pom_v3_activation_daa();
         let pay_address = match &self.devfund_address {
-            Some(devfund_address) if self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent => {
+            Some(devfund_address)
+                if devfund_payable && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent =>
+            {
                 devfund_address.clone()
             }
             _ => self.miner_address.clone(),
