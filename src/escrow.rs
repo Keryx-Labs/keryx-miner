@@ -18,8 +18,10 @@ use tempfile::NamedTempFile;
 use crate::proto::{RpcOutpoint, RpcScriptPublicKey, RpcTransaction, RpcTransactionInput, RpcTransactionOutput};
 
 const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
-/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on.
-const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 504_000;
+/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on. MUST equal the
+/// node's `SERVICE_BOND_CSV_WINDOW_BLOCKS` — the script, and so the output this miner recognizes
+/// and can spend, is derived from it.
+const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 792_000;
 const CLAIM_FEE_SOMPI: u64 = 30_000_000;
 const NATIVE_SUBNETWORK: &str = "0000000000000000000000000000000000000000";
 
@@ -1627,7 +1629,7 @@ mod tests {
         let bonded = build_escrow_script(&pk, SERVICE_BOND_CSV_WINDOW_BLOCKS);
 
         assert_eq!(&legacy[..3], &[0x02, 0xa0, 0x8c]); // 36_000 = 0x8ca0
-        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0xb0, 0x07]); // 504_000 = 0x07b0c0
+        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0x15, 0x0c]); // 792_000 = 0x0c15c0
 
         assert_eq!(legacy[3], OP_CSV);
         assert_eq!(bonded[4], OP_CSV);
