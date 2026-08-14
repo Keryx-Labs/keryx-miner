@@ -1006,6 +1006,15 @@ async fn run() -> Result<(), Error> {
             let resolved = match supplied {
                 Some(Ok(cert)) => {
                     info!("Escrow delegation cert taken from --escrow-cert.");
+                    // Persist it so the operator does not re-pass the flag every start (signed once).
+                    match escrow::save_cert(&opt.escrow_cert_file, &cert) {
+                        Ok(true) => info!(
+                            "Escrow delegation cert saved to '{}' — future starts need no --escrow-cert.",
+                            opt.escrow_cert_file
+                        ),
+                        Ok(false) => {}
+                        Err(e) => warn!("Could not persist escrow cert to '{}': {} (running this session anyway).", opt.escrow_cert_file, e),
+                    }
                     Ok(cert)
                 }
                 Some(Err(e)) => Err(e),

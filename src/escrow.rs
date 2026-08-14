@@ -802,6 +802,22 @@ impl EscrowWatcher {
                 // situations where the source block is off the selected chain.
                 let is_orphan = msg.contains("orphan");
                 let is_seq_lock = msg.contains("sequence lock");
+                // SpendOfBurnedEscrow (node `TxRuleError`): the outpoint is unspendable forever.
+                let is_burned = msg.contains("burned escrow outpoint");
+                // The node names every burned outpoint in the batch ("...outpoints: txid:idx txid:idx").
+                // Parsing it lets us slash exactly those and re-batch the rest — no bisection. An older
+                // node sends no list; `burned_set` stays empty and we fall back to bisection below.
+                let burned_set: std::collections::HashSet<(String, u32)> = msg
+                    .rsplit_once("burned escrow outpoints: ")
+                    .map(|(_, list)| {
+                        list.split_whitespace()
+                            .filter_map(|tok| {
+                                let (tx, idx) = tok.split_once(':')?;
+                                Some((tx.to_ascii_lowercase(), idx.parse().ok()?))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let batch_rejected = n_outputs > 1;
                 let last_daa = self.last_daa_score;
                 // Bisection step: one dead input orphans the whole batch, but most members
@@ -841,6 +857,23 @@ impl EscrowWatcher {
                     } else if is_seq_lock {
                         // The OP_CSV blue-score check may lag DAA score by a few blocks.
                         e.orphan_retry_after_daa = Some(last_daa + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
+                    } else if is_burned {
+                        // Burn is permanent by consensus. When the node named the burned outpoints,
+                        // slash exactly the ones it listed and leave the rest untouched — they
+                        // re-batch next round, no bisection. Fall back to bisection only when no list
+                        // was parsed (older node): batch → halve to isolate, solo → slash. The exact
+                        // node message keeps this off the "irreversible state from an error string"
+                        // trap that applies to every OTHER rejection.
+                        if !burned_set.is_empty() {
+                            if burned_set.contains(&(t.to_ascii_lowercase(), *i)) {
+                                e.slashed = true;
+                            }
+                        } else if batch_rejected {
+                            e.batch_cap = halved_cap;
+                            e.cap_set_daa = last_daa;
+                        } else {
+                            e.slashed = true;
+                        }
                     } else {
                         // Unrecognized rejection: bisect too (a size-related rejection heals
                         // that way) with exponential backoff, never a permanent slash — an
@@ -857,15 +890,27 @@ impl EscrowWatcher {
                         e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
                 }
-                // Debug level: with boot-time state validation in place, rejections are
-                // rare and transient (bisection repair) — not worth operator noise.
-                debug!(
-                    "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
-                    claim_txid,
-                    n_outputs,
-                    if batch_rejected { ", batch cap halved" } else { "" },
-                    msg
-                );
+                // Burns are terminal and operator-relevant (the miner is being penalised) — surface
+                // them once at WARN. Everything else is transient bisection repair, kept at DEBUG.
+                if is_burned && !burned_set.is_empty() {
+                    warn!(
+                        "EscrowWatcher: {} escrow outpoint(s) burned by service-bond — slashed permanently, re-batching the rest.",
+                        burned_set.len()
+                    );
+                } else if is_burned && !batch_rejected {
+                    warn!(
+                        "EscrowWatcher: escrow outpoint burned by service-bond — abandoning claim {} permanently: {}",
+                        claim_txid, msg
+                    );
+                } else {
+                    debug!(
+                        "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
+                        claim_txid,
+                        n_outputs,
+                        if batch_rejected { ", batch cap halved" } else { "" },
+                        msg
+                    );
+                }
             }
         }
         self.mark_dirty();
@@ -1554,6 +1599,19 @@ pub fn load_cert(path: &str, payout_address: &str, escrow_pubkey_hex: &str) -> R
     }
     verify_escrow_cert(payout_address, escrow_pubkey_hex, &cert)?;
     Ok(cert)
+}
+
+/// Persist a verified delegation cert to `path` so later starts load it without `--escrow-cert`.
+/// Idempotent: writes only when the file is missing or holds a different value. Returns whether it
+/// wrote. The cert is public (a signature over pubkey↔address), so the file needs no special mode.
+pub fn save_cert(path: &str, cert_hex: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing.trim().eq_ignore_ascii_case(cert_hex) {
+            return Ok(false);
+        }
+    }
+    fs::write(path, cert_hex)?;
+    Ok(true)
 }
 
 #[cfg(test)]
