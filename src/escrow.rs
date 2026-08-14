@@ -9,15 +9,19 @@ use blake2b_simd::Params as Blake2bParams;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
+use tempfile::NamedTempFile;
 
-use crate::proto::{
-    RpcOutpoint, RpcScriptPublicKey, RpcTransaction, RpcTransactionInput, RpcTransactionOutput,
-};
+use crate::proto::{RpcOutpoint, RpcScriptPublicKey, RpcTransaction, RpcTransactionInput, RpcTransactionOutput};
 
 const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
+/// CSV lock the node applies to coinbase escrow outputs from the H6 gate on. MUST equal the
+/// node's `SERVICE_BOND_CSV_WINDOW_BLOCKS` — the script, and so the output this miner recognizes
+/// and can spend, is derived from it.
+const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 792_000;
 const CLAIM_FEE_SOMPI: u64 = 30_000_000;
 const NATIVE_SUBNETWORK: &str = "0000000000000000000000000000000000000000";
 
@@ -76,6 +80,24 @@ pub struct EscrowEntry {
     /// Red-set slashing is skipped for these since non-coinbase TXs can be re-included.
     #[serde(default)]
     pub is_inference: bool,
+    /// CSV lock of this output, in blocks. Coinbase escrows switch to the service-bond
+    /// window at the H6 gate; inference escrows keep the legacy one. Entries written by
+    /// earlier versions predate the gate and default to legacy.
+    #[serde(default = "default_csv_window")]
+    pub csv_window: u64,
+}
+
+fn default_csv_window() -> u64 {
+    CHALLENGE_WINDOW_BLOCKS
+}
+
+/// CSV lock the node applies to a coinbase escrow output created at `daa`.
+pub fn csv_window_for_daa(daa: u64) -> u64 {
+    if daa >= keryx_miner::pom::pom_v3_activation_daa() {
+        SERVICE_BOND_CSV_WINDOW_BLOCKS
+    } else {
+        CHALLENGE_WINDOW_BLOCKS
+    }
 }
 
 fn default_output_index() -> u32 {
@@ -152,8 +174,9 @@ pub struct EscrowWatcher {
     secp: secp256k1::Secp256k1<secp256k1::All>,
     secret_key: secp256k1::SecretKey,
     pubkey_bytes: [u8; 32],
-    escrow_script: Vec<u8>,
     escrow_script_hex: String,
+    /// Service-bond variant of the escrow script, paid by coinbases from the H6 gate on.
+    escrow_script_bonded_hex: String,
     payout_spk_version: u16,
     payout_spk_script: Vec<u8>,
     payout_spk_script_hex: String,
@@ -202,27 +225,26 @@ struct InFlightClaim {
 
 impl EscrowWatcher {
     pub fn new(privkey_hex: &str, mining_address: &str, state_path: PathBuf) -> Result<Self, String> {
-        let privkey_bytes = hex::decode(privkey_hex)
-            .map_err(|e| format!("Invalid --mining-privkey hex: {}", e))?;
+        let privkey_bytes = hex::decode(privkey_hex).map_err(|e| format!("Invalid --mining-privkey hex: {}", e))?;
         if privkey_bytes.len() != 32 {
             return Err(format!("--mining-privkey must be 32 bytes (64 hex chars), got {}", privkey_bytes.len()));
         }
 
         let secp = secp256k1::Secp256k1::new();
-        let secret_key = secp256k1::SecretKey::from_slice(&privkey_bytes)
-            .map_err(|e| format!("Invalid private key: {}", e))?;
+        let secret_key =
+            secp256k1::SecretKey::from_slice(&privkey_bytes).map_err(|e| format!("Invalid private key: {}", e))?;
         let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret_key);
         let (xonly, _parity) = keypair.x_only_public_key();
         let pubkey_bytes: [u8; 32] = xonly.serialize();
 
-        let escrow_script = build_escrow_script(&pubkey_bytes);
-        let escrow_script_hex = hex::encode(&escrow_script);
+        let escrow_script_hex = hex::encode(build_escrow_script(&pubkey_bytes, CHALLENGE_WINDOW_BLOCKS));
+        let escrow_script_bonded_hex = hex::encode(build_escrow_script(&pubkey_bytes, SERVICE_BOND_CSV_WINDOW_BLOCKS));
 
         let (payout_spk_version, payout_spk_bytes) = decode_address(mining_address)?;
         let payout_spk_script = build_p2pk_script(&payout_spk_bytes);
         let payout_spk_script_hex = hex::encode(&payout_spk_script);
 
-        let state = load_state(&state_path);
+        let state = load_state(&state_path)?;
 
         info!("EscrowWatcher ready: pubkey={}", hex::encode(pubkey_bytes));
 
@@ -230,8 +252,8 @@ impl EscrowWatcher {
             secp,
             secret_key,
             pubkey_bytes,
-            escrow_script,
             escrow_script_hex,
+            escrow_script_bonded_hex,
             payout_spk_version,
             payout_spk_script,
             payout_spk_script_hex,
@@ -286,8 +308,11 @@ impl EscrowWatcher {
     /// which is re-derived from the chain on the next blocks.
     fn maybe_flush(&mut self) {
         if self.dirty && self.last_save.elapsed() >= STATE_SAVE_INTERVAL {
-            self.save_state();
-            self.dirty = false;
+            if let Err(e) = self.save_state() {
+                warn!("EscrowWatcher: failed to save state: {}", e);
+            } else {
+                self.dirty = false;
+            }
             self.last_save = Instant::now();
         }
     }
@@ -295,6 +320,19 @@ impl EscrowWatcher {
     /// Return the 64-char hex x-only public key of the mining key.
     pub fn pubkey_hex(&self) -> String {
         hex::encode(self.pubkey_bytes)
+    }
+
+    /// V2 responder identity for an AiResponse: schnorr signature with the escrow key over the
+    /// domain-hashed v1 payload bytes — MUST match the node's `verified_responder`
+    /// (blake2b-256("KeryxServiceResponderV1" || signed_bytes)).
+    pub fn sign_responder(&self, signed_bytes: &[u8]) -> keryx_inference::AiResponder {
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(signed_bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        keryx_inference::AiResponder { escrow_pubkey: self.pubkey_bytes, signature: *sig.as_ref() }
     }
 
     /// Scan a confirmed block for the miner's escrow output and check for mature claims.
@@ -322,7 +360,7 @@ impl EscrowWatcher {
                 .state
                 .entries
                 .iter()
-                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10)
+                .filter(|e| !e.claimed && !e.slashed && daa_score >= e.confirm_daa + e.csv_window + 10)
                 .count();
             if mature > 0 || !self.in_flight.is_empty() {
                 debug!(
@@ -392,9 +430,15 @@ impl EscrowWatcher {
         for (out_idx, output) in coinbase.outputs.iter().enumerate() {
             if let Some(spk) = &output.script_public_key {
                 let key = format!("{}:{}", coinbase_txid, out_idx);
-                if spk.script_public_key.to_lowercase() == self.escrow_script_hex
-                    && spk.version == 0
-                    && !self.outpoint_set.contains(&key)
+                let script = spk.script_public_key.to_lowercase();
+                let csv_window = if script == self.escrow_script_hex {
+                    Some(CHALLENGE_WINDOW_BLOCKS)
+                } else if script == self.escrow_script_bonded_hex {
+                    Some(SERVICE_BOND_CSV_WINDOW_BLOCKS)
+                } else {
+                    None
+                };
+                if let Some(csv_window) = csv_window.filter(|_| spk.version == 0 && !self.outpoint_set.contains(&key))
                 {
                     debug!(
                         "EscrowWatcher: tracked escrow coinbase={}…[{}] daa={} amount={}",
@@ -419,6 +463,7 @@ impl EscrowWatcher {
                         batch_cap: 0,
                         cap_set_daa: 0,
                         is_inference: false,
+                        csv_window,
                     });
                     self.outpoint_set.insert(key);
                     if !block_hash.is_empty() {
@@ -624,6 +669,9 @@ impl EscrowWatcher {
         for pass in 0..3u8 {
             batch.clear();
             let mut limit = MAX_CLAIM_BATCH;
+            // A batch never mixes CSV windows: one sequence and one escrow script are
+            // signed for the whole TX. The first selected entry fixes the batch's window.
+            let mut batch_window: Option<u64> = None;
             // Nominal pass: iterate inference entries first so they get batch priority;
             // the sort is stable, so queue order is preserved within each kind.
             let mut indices: Vec<usize> = (0..self.state.entries.len()).collect();
@@ -646,10 +694,13 @@ impl EscrowWatcher {
                 }
                 let eligible = !e.claimed
                     && !e.slashed
-                    && daa_score >= e.confirm_daa + CHALLENGE_WINDOW_BLOCKS + 10
+                    && daa_score >= e.confirm_daa + e.csv_window + 10
                     && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
                     && !self.in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
                 if !eligible {
+                    continue;
+                }
+                if batch_window.map_or(false, |w| w != e.csv_window) {
                     continue;
                 }
                 let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
@@ -657,6 +708,7 @@ impl EscrowWatcher {
                     continue; // joining would violate this entry's cap (or shrink below current size)
                 }
                 limit = limit.min(cap);
+                batch_window = Some(e.csv_window);
                 batch.push(i);
                 if batch.len() >= limit {
                     break; // batch is full for this pass
@@ -750,6 +802,22 @@ impl EscrowWatcher {
                 // situations where the source block is off the selected chain.
                 let is_orphan = msg.contains("orphan");
                 let is_seq_lock = msg.contains("sequence lock");
+                // SpendOfBurnedEscrow (node `TxRuleError`): the outpoint is unspendable forever.
+                let is_burned = msg.contains("burned escrow outpoint");
+                // The node names every burned outpoint in the batch ("...outpoints: txid:idx txid:idx").
+                // Parsing it lets us slash exactly those and re-batch the rest — no bisection. An older
+                // node sends no list; `burned_set` stays empty and we fall back to bisection below.
+                let burned_set: std::collections::HashSet<(String, u32)> = msg
+                    .rsplit_once("burned escrow outpoints: ")
+                    .map(|(_, list)| {
+                        list.split_whitespace()
+                            .filter_map(|tok| {
+                                let (tx, idx) = tok.split_once(':')?;
+                                Some((tx.to_ascii_lowercase(), idx.parse().ok()?))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let batch_rejected = n_outputs > 1;
                 let last_daa = self.last_daa_score;
                 // Bisection step: one dead input orphans the whole batch, but most members
@@ -758,11 +826,7 @@ impl EscrowWatcher {
                 // dead ones converge to solo claims and get slashed there.
                 let halved_cap = ((n_outputs / 2).max(1)).min(u8::MAX as usize) as u8;
                 for (t, i) in &claim.outpoints {
-                    let e = match self
-                        .state
-                        .entries
-                        .iter_mut()
-                        .find(|e| e.coinbase_txid == *t && e.output_index == *i)
+                    let e = match self.state.entries.iter_mut().find(|e| e.coinbase_txid == *t && e.output_index == *i)
                     {
                         Some(e) => e,
                         None => continue,
@@ -793,6 +857,23 @@ impl EscrowWatcher {
                     } else if is_seq_lock {
                         // The OP_CSV blue-score check may lag DAA score by a few blocks.
                         e.orphan_retry_after_daa = Some(last_daa + SEQ_LOCK_RETRY_COOLDOWN_BLOCKS);
+                    } else if is_burned {
+                        // Burn is permanent by consensus. When the node named the burned outpoints,
+                        // slash exactly the ones it listed and leave the rest untouched — they
+                        // re-batch next round, no bisection. Fall back to bisection only when no list
+                        // was parsed (older node): batch → halve to isolate, solo → slash. The exact
+                        // node message keeps this off the "irreversible state from an error string"
+                        // trap that applies to every OTHER rejection.
+                        if !burned_set.is_empty() {
+                            if burned_set.contains(&(t.to_ascii_lowercase(), *i)) {
+                                e.slashed = true;
+                            }
+                        } else if batch_rejected {
+                            e.batch_cap = halved_cap;
+                            e.cap_set_daa = last_daa;
+                        } else {
+                            e.slashed = true;
+                        }
                     } else {
                         // Unrecognized rejection: bisect too (a size-related rejection heals
                         // that way) with exponential backoff, never a permanent slash — an
@@ -809,15 +890,27 @@ impl EscrowWatcher {
                         e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
                 }
-                // Debug level: with boot-time state validation in place, rejections are
-                // rare and transient (bisection repair) — not worth operator noise.
-                debug!(
-                    "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
-                    claim_txid,
-                    n_outputs,
-                    if batch_rejected { ", batch cap halved" } else { "" },
-                    msg
-                );
+                // Burns are terminal and operator-relevant (the miner is being penalised) — surface
+                // them once at WARN. Everything else is transient bisection repair, kept at DEBUG.
+                if is_burned && !burned_set.is_empty() {
+                    warn!(
+                        "EscrowWatcher: {} escrow outpoint(s) burned by service-bond — slashed permanently, re-batching the rest.",
+                        burned_set.len()
+                    );
+                } else if is_burned && !batch_rejected {
+                    warn!(
+                        "EscrowWatcher: escrow outpoint burned by service-bond — abandoning claim {} permanently: {}",
+                        claim_txid, msg
+                    );
+                } else {
+                    debug!(
+                        "EscrowWatcher: claim {} rejected ({} output(s) released{}): {}",
+                        claim_txid,
+                        n_outputs,
+                        if batch_rejected { ", batch cap halved" } else { "" },
+                        msg
+                    );
+                }
             }
         }
         self.mark_dirty();
@@ -830,12 +923,7 @@ impl EscrowWatcher {
     fn mark_entries_claimed(&mut self, outpoints: &[(String, u32)]) -> u64 {
         let mut total_sompi = 0u64;
         for (t, i) in outpoints {
-            if let Some(e) = self
-                .state
-                .entries
-                .iter_mut()
-                .find(|e| e.coinbase_txid == *t && e.output_index == *i)
-            {
+            if let Some(e) = self.state.entries.iter_mut().find(|e| e.coinbase_txid == *t && e.output_index == *i) {
                 if !e.claimed {
                     total_sompi += e.amount_sompi;
                 }
@@ -853,6 +941,12 @@ impl EscrowWatcher {
         if entries.is_empty() {
             return Err("empty claim batch".into());
         }
+        // Guaranteed single-valued by the batch selection; the whole TX signs one sequence.
+        let csv_window = entries[0].csv_window;
+        if entries.iter().any(|e| e.csv_window != csv_window) {
+            return Err("claim batch mixes CSV windows".into());
+        }
+        let escrow_script = build_escrow_script(&self.pubkey_bytes, csv_window);
         let total_in: u64 = entries.iter().map(|e| e.amount_sompi).sum();
         let amount_out = total_in
             .checked_sub(CLAIM_FEE_SOMPI)
@@ -873,12 +967,13 @@ impl EscrowWatcher {
             amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
+            csv_window,
         );
         let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
 
         let mut inputs: Vec<RpcTransactionInput> = Vec::with_capacity(entries.len());
         for (entry, meta) in entries.iter().zip(&inputs_meta) {
-            let sighash = compute_sighash(meta, &self.escrow_script, &reused);
+            let sighash = compute_sighash(meta, &escrow_script, &reused, csv_window);
             let msg = secp256k1::Message::from_digest_slice(&sighash)
                 .map_err(|e| format!("sighash message error: {}", e))?;
             let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
@@ -895,7 +990,7 @@ impl EscrowWatcher {
                     index: entry.output_index,
                 }),
                 signature_script: hex::encode(&sig_script),
-                sequence: CHALLENGE_WINDOW_BLOCKS,
+                sequence: csv_window,
                 sig_op_count: 1,
                 verbose_data: None,
             });
@@ -906,6 +1001,7 @@ impl EscrowWatcher {
             amount_out,
             self.payout_spk_version,
             &self.payout_spk_script,
+            csv_window,
         );
 
         Ok((
@@ -962,22 +1058,164 @@ impl EscrowWatcher {
             batch_cap: 0,
             cap_set_daa: 0,
             is_inference: true,
+            // Built by the requester's wallet, which locks the legacy window on both eras.
+            csv_window: CHALLENGE_WINDOW_BLOCKS,
         });
         self.outpoint_set.insert(key);
         self.mark_dirty();
         self.maybe_flush();
     }
 
-    fn save_state(&self) {
-        match serde_json::to_string_pretty(&self.state) {
-            Ok(json) => {
-                if let Err(e) = fs::write(&self.state_path, &json) {
-                    warn!("EscrowWatcher: failed to save state: {}", e);
-                }
-            }
-            Err(e) => warn!("EscrowWatcher: failed to serialize state: {}", e),
+    fn save_state(&self) -> Result<(), String> {
+        save_state_atomic(&self.state_path, &self.state)
+    }
+
+    pub fn flush_state(&mut self) -> Result<(), String> {
+        if self.dirty {
+            self.save_state()?;
+            self.dirty = false;
+            self.last_save = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EscrowWatcher {
+    fn drop(&mut self) {
+        if let Err(e) = self.flush_state() {
+            warn!("EscrowWatcher: final state flush failed: {}", e);
         }
     }
+}
+
+fn ensure_parent(path: &Path) -> io::Result<&Path> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    create_parent_dirs(parent)?;
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn create_parent_dirs(parent: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    }
+    if !cursor.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotADirectory, format!("'{}' is not a directory", cursor.display())));
+    }
+    for directory in missing.into_iter().rev() {
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+        sync_parent(directory.parent().unwrap_or_else(|| Path::new(".")))?;
+        sync_parent(&directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_parent_dirs(parent: &Path) -> io::Result<()> {
+    fs::create_dir_all(parent)
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_key_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    if permissions.mode() & 0o077 != 0 {
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_key_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_REPLACE_FAILURE_STAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn inject_atomic_replace_failure(stage: u8) -> io::Result<()> {
+    ATOMIC_REPLACE_FAILURE_STAGE.with(|configured| {
+        if configured.get() == stage {
+            Err(io::Error::new(io::ErrorKind::Other, format!("injected atomic replacement failure at stage {stage}")))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(windows)]
+fn move_file_write_through(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let flags = MOVEFILE_WRITE_THROUGH | if replace { MOVEFILE_REPLACE_EXISTING } else { 0 };
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn install_temp_noclobber(temporary: NamedTempFile, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        move_file_write_through(temporary.path(), path, false)
+    }
+    #[cfg(not(windows))]
+    {
+        temporary.persist_noclobber(path).map(|_| ()).map_err(|e| e.error)
+    }
+}
+
+fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = ensure_parent(path)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(1)?;
+    temporary.write_all(contents)?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(2)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(3)?;
+    #[cfg(windows)]
+    move_file_write_through(temporary.path(), path, true)?;
+    #[cfg(not(windows))]
+    temporary.persist(path).map_err(|e| e.error)?;
+    #[cfg(test)]
+    inject_atomic_replace_failure(4)?;
+    sync_parent(parent)
+}
+
+/// Persist escrow state without exposing a partially-written JSON file.
+pub fn save_state_atomic(path: &Path, state: &EscrowState) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(state).map_err(|e| format!("Failed to serialize escrow state: {}", e))?;
+    atomic_replace(path, &json)
+        .map_err(|e| format!("Failed to atomically write escrow state '{}': {}", path.display(), e))
 }
 
 /// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
@@ -990,14 +1228,15 @@ pub fn load_key(path: &str) -> Result<String, String> {
             path
         ));
     }
-    let s = fs::read_to_string(p)
-        .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
+    // Best effort: a filesystem without Unix permissions (removable media, some network mounts)
+    // must not stop a miner whose key is perfectly readable.
+    if let Err(e) = harden_key_permissions(p) {
+        warn!("Could not restrict permissions on escrow key file '{}': {}", path, e);
+    }
+    let s = fs::read_to_string(p).map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
     let privkey = s.trim().to_string();
     if privkey.len() != 64 || !privkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!(
-            "Escrow key file '{}' must contain exactly 64 hex chars",
-            path
-        ));
+        return Err(format!("Escrow key file '{}' must contain exactly 64 hex chars", path));
     }
     Ok(privkey)
 }
@@ -1008,16 +1247,8 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     use rand::RngCore;
     let p = std::path::Path::new(path);
     if p.exists() {
-        let s = fs::read_to_string(p)
-            .map_err(|e| format!("Failed to read escrow key file '{}': {}", path, e))?;
-        let privkey = s.trim().to_string();
-        if privkey.len() != 64 || !privkey.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "Escrow key file '{}' must contain exactly 64 hex chars — delete it to regenerate",
-                path
-            ));
-        }
-        return Ok(privkey);
+        return load_key(path)
+            .map_err(|e| format!("{}. Restore the correct key; do not delete a key that may control rewards.", e));
     }
 
     let mut privkey_bytes = [0u8; 32];
@@ -1035,8 +1266,21 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     let (xonly, _) = kp.x_only_public_key();
     let pubkey_hex = hex::encode(xonly.serialize());
 
-    fs::write(p, &privkey_hex)
+    let parent =
+        ensure_parent(p).map_err(|e| format!("Failed to create escrow key directory for '{}': {}", path, e))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Failed to create temporary escrow key file for '{}': {}", path, e))?;
+    temporary
+        .write_all(privkey_hex.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
         .map_err(|e| format!("Failed to write escrow key file '{}': {}", path, e))?;
+
+    match install_temp_noclobber(temporary, p) {
+        Ok(()) => sync_parent(parent)
+            .map_err(|e| format!("Failed to sync escrow key directory '{}': {}", parent.display(), e))?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return load_key(path),
+        Err(e) => return Err(format!("Failed to install escrow key file '{}': {}", path, e)),
+    }
 
     info!("OPoI escrow keypair generated — saved to '{}'", path);
     info!("  Escrow pubkey : {}", pubkey_hex);
@@ -1046,30 +1290,22 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
 
 /// Derive the x-only public key hex (64 hex chars) from a hex-encoded private key.
 pub fn pubkey_hex_from_privkey(privkey_hex: &str) -> Result<String, String> {
-    let privkey_bytes = hex::decode(privkey_hex)
-        .map_err(|e| format!("Invalid privkey hex: {}", e))?;
+    let privkey_bytes = hex::decode(privkey_hex).map_err(|e| format!("Invalid privkey hex: {}", e))?;
     let secp = secp256k1::Secp256k1::new();
-    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes)
-        .map_err(|e| format!("Invalid private key: {}", e))?;
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes).map_err(|e| format!("Invalid private key: {}", e))?;
     let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
     let (xonly, _) = kp.x_only_public_key();
     Ok(hex::encode(xonly.serialize()))
 }
 
-fn load_state(path: &PathBuf) -> EscrowState {
-    let state = match fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
-            warn!("EscrowWatcher: could not parse {}: {} — starting fresh", path.display(), e);
-            EscrowState::default()
+fn load_state(path: &Path) -> Result<EscrowState, String> {
+    match fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).map_err(|e| {
+            format!("Escrow state '{}' is corrupt: {}. Restore it or run --recover-escrow.", path.display(), e)
         }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => EscrowState::default(),
-        Err(e) => {
-            warn!("EscrowWatcher: could not read {}: {} — starting fresh", path.display(), e);
-            EscrowState::default()
-        }
-    };
-
-    state
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(EscrowState::default()),
+        Err(e) => Err(format!("Failed to read escrow state '{}': {}", path.display(), e)),
+    }
 }
 
 // ── Script builders ───────────────────────────────────────────────────────────
@@ -1079,9 +1315,9 @@ fn load_state(path: &PathBuf) -> EscrowState {
 /// `<CHALLENGE_WINDOW_BLOCKS_LE> OP_CSV OP_DATA_32 <pubkey_32> OP_CHECKSIG`
 ///
 /// Keryx's OP_CSV pops its argument, so no OP_DROP is needed after it.
-fn build_escrow_script(pubkey: &[u8; 32]) -> Vec<u8> {
-    // 36 000 = 0x8CA0 — trim trailing zero bytes for minimal encoding
-    let le = CHALLENGE_WINDOW_BLOCKS.to_le_bytes();
+fn build_escrow_script(pubkey: &[u8; 32], csv_window: u64) -> Vec<u8> {
+    // trim trailing zero bytes for minimal encoding
+    let le = csv_window.to_le_bytes();
     let trimmed_len = 8 - le.iter().rev().position(|&b| b != 0).unwrap_or(8);
     let seq_bytes = &le[..trimmed_len];
 
@@ -1133,6 +1369,7 @@ impl SighashReused {
         payout_amount: u64,
         payout_spk_version: u16,
         payout_spk_script: &[u8],
+        csv_window: u64,
     ) -> Self {
         // previous_outputs_hash: Blake2b(txid_32 | index_u32_LE, per input)
         let mut h = sighash_hasher();
@@ -1145,7 +1382,7 @@ impl SighashReused {
         // sequences_hash: Blake2b(sequence_u64_LE, per input)
         let mut h = sighash_hasher();
         for _ in inputs {
-            h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes());
+            h.update(&csv_window.to_le_bytes());
         }
         let seqs_hash = finalize32(h);
 
@@ -1172,7 +1409,12 @@ impl SighashReused {
 ///
 /// Mirrors `calc_schnorr_signature_hash` in consensus/core/src/hashing/sighash.rs.
 /// Byte-identical to the historical single-input version when the batch has one entry.
-fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &SighashReused) -> [u8; 32] {
+fn compute_sighash(
+    input: &([u8; 32], u32, u64),
+    escrow_script: &[u8],
+    reused: &SighashReused,
+    csv_window: u64,
+) -> [u8; 32] {
     let (txid, index, amount) = input;
     let mut h = sighash_hasher();
     h.update(&0u16.to_le_bytes()); // tx.version
@@ -1186,7 +1428,7 @@ fn compute_sighash(input: &([u8; 32], u32, u64), escrow_script: &[u8], reused: &
     h.update(&(escrow_script.len() as u64).to_le_bytes()); // write_var_bytes len
     h.update(escrow_script); // write_var_bytes data
     h.update(&amount.to_le_bytes()); // utxo.amount
-    h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // input.sequence
+    h.update(&csv_window.to_le_bytes()); // input.sequence
     h.update(&[1u8]); // input.sig_op_count
     h.update(&reused.outs_hash);
     h.update(&0u64.to_le_bytes()); // tx.lock_time
@@ -1210,6 +1452,7 @@ fn compute_claim_txid(
     payout_amount: u64,
     payout_spk_version: u16,
     payout_spk_script: &[u8],
+    csv_window: u64,
 ) -> String {
     let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionID").to_state();
     h.update(&0u16.to_le_bytes()); // tx.version
@@ -1218,7 +1461,7 @@ fn compute_claim_txid(
         h.update(txid); // outpoint.transaction_id
         h.update(&index.to_le_bytes()); // outpoint.index
         h.update(&0u64.to_le_bytes()); // write_var_bytes(&[]) — sig script excluded
-        h.update(&CHALLENGE_WINDOW_BLOCKS.to_le_bytes()); // sequence
+        h.update(&csv_window.to_le_bytes()); // sequence
     }
     h.update(&1u64.to_le_bytes()); // write_len(outputs)
     h.update(&payout_amount.to_le_bytes()); // output.value
@@ -1277,4 +1520,410 @@ fn decode_address(addr: &str) -> Result<(u16, [u8; 32]), String> {
     let mut spk = [0u8; 32];
     spk.copy_from_slice(&bytes[1..33]);
     Ok((version, spk))
+}
+
+// ── Escrow delegation cert ────────────────────────────────────────────────────
+
+/// Mirror of the node's `ESCROW_DELEGATION_DOMAIN`.
+const ESCROW_DELEGATION_DOMAIN: &[u8] = b"KeryxEscrowDelegationV1";
+
+fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut h = Blake2bParams::new().hash_length(32).to_state();
+    h.update(ESCROW_DELEGATION_DOMAIN);
+    h.update(escrow_pubkey);
+    finalize32(h)
+}
+
+/// Service-ledger identity of a payout address — mirror of the node's `miner_key(spk)`:
+/// blake2b-256 keyed "TransactionHash" over `[version_le(2), p2pk_script]`. This is what the
+/// node reports strikes, burns and suspensions against; the escrow key is only the hot key.
+pub fn service_identity_hex(payout_address: &str) -> Result<String, String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} has no service identity (schnorr P2PK only)", version));
+    }
+    let mut h = Blake2bParams::new().hash_length(32).key(b"TransactionHash").to_state();
+    h.update(&version.to_le_bytes());
+    h.update(&build_p2pk_script(&payout_key));
+    Ok(hex::encode(finalize32(h)))
+}
+
+/// Verifies a delegation cert exactly the way the node does before accepting a block: schnorr
+/// over the domain-hashed escrow key, by the x-only key of the payout address.
+pub fn verify_escrow_cert(payout_address: &str, escrow_pubkey_hex: &str, cert_hex: &str) -> Result<(), String> {
+    let (version, payout_key) = decode_address(payout_address)?;
+    if version != 0 {
+        return Err(format!("Payout address version {} cannot carry a delegation (schnorr P2PK only)", version));
+    }
+    let mut escrow_pubkey = [0u8; 32];
+    hex::decode_to_slice(escrow_pubkey_hex, &mut escrow_pubkey)
+        .map_err(|e| format!("Invalid escrow pubkey hex: {}", e))?;
+    let mut sig_bytes = [0u8; 64];
+    hex::decode_to_slice(cert_hex, &mut sig_bytes).map_err(|e| format!("Invalid cert hex: {}", e))?;
+
+    let payout_key =
+        secp256k1::XOnlyPublicKey::from_slice(&payout_key).map_err(|e| format!("Invalid payout address key: {}", e))?;
+    let sig =
+        secp256k1::schnorr::Signature::from_slice(&sig_bytes).map_err(|e| format!("Invalid cert signature: {}", e))?;
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+    secp256k1::Secp256k1::verification_only()
+        .verify_schnorr(&sig, &msg, &payout_key)
+        .map_err(|_| "Cert does not match this payout address and escrow key".to_string())
+}
+
+/// Signs the delegation cert when the payout address IS this escrow key's own address — the only
+/// case where the payout key is on this machine. `None` otherwise: a cold payout address must be
+/// signed by the wallet that holds it.
+pub fn self_sign_cert(privkey_hex: &str, payout_address: &str) -> Option<String> {
+    let (version, payout_key) = decode_address(payout_address).ok()?;
+    let privkey_bytes = hex::decode(privkey_hex).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes).ok()?;
+    let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (xonly, _) = kp.x_only_public_key();
+    let pubkey: [u8; 32] = xonly.serialize();
+    if version != 0 || payout_key != pubkey {
+        return None;
+    }
+    let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&pubkey)).ok()?;
+    Some(hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref()))
+}
+
+/// Loads the delegation cert and verifies it against the payout address and escrow key before
+/// returning it. Never hands back a cert the node would reject.
+pub fn load_cert(path: &str, payout_address: &str, escrow_pubkey_hex: &str) -> Result<String, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("Cannot read escrow delegation cert '{}': {}", path, e))?;
+    let cert = raw.trim().to_ascii_lowercase();
+    if cert.len() != 128 {
+        return Err(format!("Escrow delegation cert '{}' must be 128 hex chars, found {}", path, cert.len()));
+    }
+    verify_escrow_cert(payout_address, escrow_pubkey_hex, &cert)?;
+    Ok(cert)
+}
+
+/// Persist a verified delegation cert to `path` so later starts load it without `--escrow-cert`.
+/// Idempotent: writes only when the file is missing or holds a different value. Returns whether it
+/// wrote. The cert is public (a signature over pubkey↔address), so the file needs no special mode.
+pub fn save_cert(path: &str, cert_hex: &str) -> std::io::Result<bool> {
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing.trim().eq_ignore_ascii_case(cert_hex) {
+            return Ok(false);
+        }
+    }
+    fs::write(path, cert_hex)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Payout address of the private key `0x11..11`, used as a payout key below.
+    const TEST_PAYOUT_ADDRESS: &str = "keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr";
+
+    /// The service identity must equal the node's `miner_key(spk)`. The expected value is derived
+    /// independently of this code: blake2b-256 keyed "TransactionHash" over
+    /// `[version_le(2), 0x20 || key || 0xac]`.
+    #[test]
+    fn service_identity_matches_the_node_miner_key() {
+        assert_eq!(
+            service_identity_hex("keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte").unwrap(),
+            "cb79bef02d429e0fc8bb2335bf43d9d0df4f5bd6a25a39747d700b173e766e20"
+        );
+        assert!(service_identity_hex("not-an-address").is_err());
+    }
+
+    /// Cross-implementation vector. This cert was produced by the web wallet (noble schnorr over
+    /// noble blake2b) for escrow key `0x22..22` and the address of private key `0x11..11`. The
+    /// consensus rule must accept it: the two implementations have to agree on the domain string,
+    /// the digest and the curve, and nothing else pins that agreement.
+    #[test]
+    fn web_wallet_cert_verifies_against_the_consensus_rule() {
+        let cert = "f3cf9bfc6a29ba5608ebe777ff9e1f87d5bc3f80ab58e3040995631bfc16ab21\
+                    8b388c9b2d44140fc9448e639dc81c51ba475a780d1eaecc443c613e6d787c9e";
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &"22".repeat(32), cert).is_ok());
+        // Same signature against another escrow key must fail, or the test proves nothing.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &"33".repeat(32), cert).is_err());
+    }
+
+    /// The miner signs its own delegation only when the payout address is its escrow key's.
+    #[test]
+    fn self_signing_is_limited_to_the_escrow_key_address() {
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let own = TEST_PAYOUT_ADDRESS;
+        let cert = self_sign_cert(privkey, own).expect("own address must self-sign");
+        let escrow_pubkey = pubkey_hex_from_privkey(privkey).unwrap();
+        assert!(verify_escrow_cert(own, &escrow_pubkey, &cert).is_ok());
+
+        // Any other payout address: the miner does not hold that key, so it must refuse.
+        assert!(self_sign_cert(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte"
+        )
+        .is_none());
+    }
+
+    /// A cert only verifies against the exact payout address and escrow key it was signed for.
+    #[test]
+    fn escrow_cert_binds_payout_address_and_escrow_key() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let escrow_pubkey = [0x22u8; 32];
+        let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&escrow_pubkey)).unwrap();
+        let cert = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref());
+
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), &cert).is_ok());
+        // Another escrow key: the delegation message differs.
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode([0x33u8; 32]), &cert).is_err());
+        // Another payout address: not the signer.
+        assert!(verify_escrow_cert(
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            &hex::encode(escrow_pubkey),
+            &cert
+        )
+        .is_err());
+        assert!(verify_escrow_cert(TEST_PAYOUT_ADDRESS, &hex::encode(escrow_pubkey), "dead").is_err());
+    }
+
+    /// The responder signature must verify exactly the way the node's `verified_responder`
+    /// does: schnorr over blake2b-256("KeryxServiceResponderV1" || v1 payload bytes) with the
+    /// x-only escrow pubkey.
+    #[test]
+    fn responder_signature_verifies_like_the_node() {
+        let dir = std::env::temp_dir().join(format!("keryx-escrow-test-{}", std::process::id()));
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let w = EscrowWatcher::new(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            dir,
+        )
+        .unwrap();
+
+        let resp = keryx_inference::AiResponsePayload::new([9u8; 32], 123, [7u8; 34], 5);
+        let signed_bytes = resp.signed_bytes();
+        let r = w.sign_responder(&signed_bytes);
+        assert_eq!(r.escrow_pubkey, w.pubkey_bytes);
+
+        // Node-side verification, replicated bit-for-bit.
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(&signed_bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).unwrap();
+        let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok());
+
+        // A tampered payload byte must fail verification.
+        let mut bad = signed_bytes.clone();
+        bad[0] ^= 1;
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceResponderV1");
+        hasher.update(&bad);
+        let bad_msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &bad_msg, &pk).is_err());
+    }
+
+    /// Both escrow scripts must match what the node's `ScriptBuilder::add_sequence` emits:
+    /// the sequence little-endian with trailing zero bytes trimmed, pushed by an OpData
+    /// opcode equal to its length. The legacy bytes are pinned so the pre-H6 script — and
+    /// every signature over it — stays unchanged.
+    #[test]
+    fn escrow_scripts_mirror_the_node_for_both_windows() {
+        let pk = [0x11u8; 32];
+        let legacy = build_escrow_script(&pk, CHALLENGE_WINDOW_BLOCKS);
+        let bonded = build_escrow_script(&pk, SERVICE_BOND_CSV_WINDOW_BLOCKS);
+
+        assert_eq!(&legacy[..3], &[0x02, 0xa0, 0x8c]); // 36_000 = 0x8ca0
+        assert_eq!(&bonded[..4], &[0x03, 0xc0, 0x15, 0x0c]); // 792_000 = 0x0c15c0
+
+        assert_eq!(legacy[3], OP_CSV);
+        assert_eq!(bonded[4], OP_CSV);
+        assert_eq!(legacy[4], 0x20);
+        assert_eq!(bonded[5], 0x20);
+        assert_eq!(&legacy[5..37], &pk);
+        assert_eq!(&bonded[6..38], &pk);
+        assert_eq!(*legacy.last().unwrap(), OP_CHECKSIG);
+        assert_eq!(*bonded.last().unwrap(), OP_CHECKSIG);
+        assert_eq!(legacy.len(), 38);
+        assert_eq!(bonded.len(), 39);
+    }
+
+    /// The window is derived from the creating block's DAA, so entries minted on either
+    /// side of the gate keep their own lock.
+    #[test]
+    fn csv_window_follows_the_gate() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        if gate > 0 && gate < u64::MAX {
+            assert_eq!(csv_window_for_daa(gate - 1), CHALLENGE_WINDOW_BLOCKS);
+        }
+        assert_eq!(csv_window_for_daa(gate), SERVICE_BOND_CSV_WINDOW_BLOCKS);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn state(confirm_daa: u64) -> EscrowState {
+        EscrowState {
+            entries: vec![EscrowEntry {
+                coinbase_txid: "01".repeat(32),
+                block_hash: "02".repeat(32),
+                confirm_daa,
+                amount_sompi: 100,
+                output_index: 1,
+                claimed: false,
+                slashed: false,
+                orphan_slashed: false,
+                orphan_retries: 0,
+                orphan_retry_after_daa: None,
+                submit_retries: 0,
+                batch_cap: 0,
+                cap_set_daa: 0,
+                is_inference: false,
+                csv_window: csv_window_for_daa(confirm_daa),
+            }],
+        }
+    }
+
+    fn fail_at(stage: u8) {
+        ATOMIC_REPLACE_FAILURE_STAGE.with(|configured| configured.set(stage));
+    }
+
+    #[test]
+    fn state_replacement_is_complete_and_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        save_state_atomic(&path, &EscrowState::default()).unwrap();
+        save_state_atomic(&path, &state(42)).unwrap();
+
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].confirm_daa, 42);
+    }
+
+    #[test]
+    fn failures_before_replace_preserve_previous_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        save_state_atomic(&path, &state(1)).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        for stage in 1..=3 {
+            fail_at(stage);
+            assert!(save_state_atomic(&path, &state(2)).is_err());
+            fail_at(0);
+            assert_eq!(fs::read(&path).unwrap(), original, "failure stage {stage}");
+        }
+    }
+
+    #[test]
+    fn failure_after_replace_leaves_complete_state_and_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        save_state_atomic(&path, &state(1)).unwrap();
+
+        fail_at(4);
+        assert!(save_state_atomic(&path, &state(2)).is_err());
+        fail_at(0);
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded.entries[0].confirm_daa, 2);
+
+        save_state_atomic(&path, &state(3)).unwrap();
+        let retried: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(retried.entries[0].confirm_daa, 3);
+    }
+
+    #[test]
+    fn concurrent_key_creation_returns_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("escrow.key"));
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    load_or_generate_key(path.to_str().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let keys: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+
+        assert!(keys.iter().all(|key| key == &keys[0]));
+        assert_eq!(fs::read_to_string(path.as_ref()).unwrap(), keys[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        load_or_generate_key(path.to_str().unwrap()).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_key_permissions_are_hardened() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        fs::write(&path, "11".repeat(32)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        load_or_generate_key(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn invalid_key_fails_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow.key");
+        let invalid = b"not-a-private-key";
+        fs::write(&path, invalid).unwrap();
+
+        assert!(load_or_generate_key(path.to_str().unwrap()).is_err());
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn corrupt_state_fails_closed_without_changing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let invalid = b"{not-json";
+        fs::write(&path, invalid).unwrap();
+
+        let error = load_state(&path).unwrap_err();
+        assert!(error.contains("corrupt"));
+        assert!(error.contains("--recover-escrow"));
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn explicit_flush_keeps_dirty_state_until_retry_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("state").join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path.clone()).unwrap();
+        watcher.state = state(77);
+        watcher.dirty = true;
+
+        fail_at(1);
+        assert!(watcher.flush_state().is_err());
+        assert!(watcher.dirty);
+        fail_at(0);
+        watcher.flush_state().unwrap();
+
+        assert!(!watcher.dirty);
+        let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(loaded.entries[0].confirm_daa, 77);
+    }
 }

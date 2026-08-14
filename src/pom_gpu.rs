@@ -31,6 +31,10 @@ const FATBIN_LEGACY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_
 const FATBIN_NEXTGEN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pom_mine_nextgen.fatbin"));
 const CHUNK_BYTES: usize = 32;
 const POM_KERNEL_NAME: &str = "pom_mine";
+const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
+const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
+/// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
+const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
 
 const POM_PTX_CANDIDATES: [(&str, &str, &str); 7] = [
     ("pom_mine_mod_sm90", "sm_90", PTX_SM90),
@@ -87,6 +91,10 @@ pub fn list_gpu_kernel_info() -> Vec<GpuKernelInfo> {
 struct LoadedPomKernel {
     module: sys::CUmodule,
     function: sys::CUfunction,
+    /// v3 (H6) entries — `None` when the loaded image predates the v3 kernel (stale fatbin)
+    /// or the card cannot take the 64 KB opt-in shared attribute. Legacy mining is unaffected.
+    function_v3: Option<sys::CUfunction>,
+    function_v3_dump: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -111,14 +119,16 @@ impl LoadedPomKernel {
         }
         let module = unsafe { result::module::load_data(fatbin.as_ptr() as *const c_void) }?;
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
-        Ok(Self { module, function })
+        let (function_v3, function_v3_dump) = load_v3_functions(module);
+        Ok(Self { module, function, function_v3, function_v3_dump })
     }
 
     fn from_ptx(_label: &'static str, ptx: &'static str) -> Result<Self> {
         let c_src = CString::new(ptx)?;
         let module = unsafe { result::module::load_data(c_src.as_ptr() as *const c_void) }?;
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
-        Ok(Self { module, function })
+        let (function_v3, function_v3_dump) = load_v3_functions(module);
+        Ok(Self { module, function, function_v3, function_v3_dump })
     }
 
     fn launch(
@@ -180,6 +190,142 @@ impl LoadedPomKernel {
         let w = stream.clone_dtoh(&winner)?[0];
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
+
+    /// v3 (H6) grind: one CUDA block per nonce over `[start, start + batch)`.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v3(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_tiles: u64,
+        p_words: &[u64; 4],
+        s_words: &[u64; 4],
+        timestamp: u64,
+        target_le: &[u8; 32],
+        start: u64,
+        batch: u64,
+    ) -> Result<Option<u64>> {
+        let function = self.function_v3.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no v3 entry"))?;
+        let t = words4(target_le);
+        let k = crate::pom_v3::POM_V3_K as u32;
+        let winner = stream.clone_htod(&[u64::MAX])?;
+        let cfg = LaunchConfig {
+            grid_dim: (batch as u32, 1, 1),
+            block_dim: (crate::pom_v3::POM_V3_D as u32, 1, 1),
+            shared_mem_bytes: POM_V3_SHARED_BYTES,
+        };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (winner_ptr, _winner_guard) = winner.device_ptr(stream);
+
+        let mut params: [*mut c_void; 21] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void),
+            (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void),
+            (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void),
+            (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void),
+            (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void),
+            (&batch as *const _ as *mut c_void),
+            (&winner_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
+
+        let w = stream.clone_dtoh(&winner)?[0];
+        Ok(if w == u64::MAX { None } else { Some(w) })
+    }
+
+    /// v3 (H6) dump: re-walk ONE (winning) nonce and return (states S_0..=S_K concatenated,
+    /// snippets, fold64(root_K)) for the host proof-build.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_v3_dump(
+        &self,
+        stream: &Arc<CudaStream>,
+        bases_dev: &CudaSlice<u64>,
+        prefix_dev: &CudaSlice<u64>,
+        t_count: u32,
+        n_tiles: u64,
+        s_words: &[u64; 4],
+        timestamp: u64,
+        nonce: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+        let function =
+            self.function_v3_dump.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no v3 dump entry"))?;
+        let k = crate::pom_v3::POM_V3_K;
+        let d = crate::pom_v3::POM_V3_D;
+        let states = stream.clone_htod(vec![0u8; (k + 1) * d * d].as_slice())?;
+        let snippets = stream.clone_htod(vec![0u8; k * crate::pom_v3::POM_V3_SNIPPET_BYTES].as_slice())?;
+        let final_state = stream.clone_htod(&[0u64])?;
+        let k32 = k as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (d as u32, 1, 1),
+            shared_mem_bytes: POM_V3_SHARED_BYTES,
+        };
+
+        let (bases_ptr, _bases_guard) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _prefix_guard) = prefix_dev.device_ptr(stream);
+        let (states_ptr, _states_guard) = states.device_ptr(stream);
+        let (snippets_ptr, _snippets_guard) = snippets.device_ptr(stream);
+        let (final_ptr, _final_guard) = final_state.device_ptr(stream);
+
+        let mut params: [*mut c_void; 14] = [
+            (&bases_ptr as *const _ as *mut c_void),
+            (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void),
+            (&n_tiles as *const _ as *mut c_void),
+            (&k32 as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void),
+            (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void),
+            (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&nonce as *const _ as *mut c_void),
+            (&states_ptr as *const _ as *mut c_void),
+            (&snippets_ptr as *const _ as *mut c_void),
+            (&final_ptr as *const _ as *mut c_void),
+        ];
+
+        unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        stream.synchronize()?;
+
+        Ok((stream.clone_dtoh(&states)?, stream.clone_dtoh(&snippets)?, stream.clone_dtoh(&final_state)?[0]))
+    }
+}
+
+/// Best-effort v3 entry lookup + opt-in shared attribute. `None` entries mean the image
+/// predates the v3 kernel or the card cannot honor 64 KB of dynamic shared.
+fn load_v3_functions(module: sys::CUmodule) -> (Option<sys::CUfunction>, Option<sys::CUfunction>) {
+    let get = |name: &str| unsafe { result::module::get_function(module, CString::new(name).unwrap()) }.ok();
+    let arm = |f: sys::CUfunction| {
+        unsafe {
+            result::function::set_function_attribute(
+                f,
+                sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                POM_V3_SHARED_BYTES as i32,
+            )
+        }
+        .is_ok()
+        .then_some(f)
+    };
+    (get(POM_V3_KERNEL_NAME).and_then(arm), get(POM_V3_DUMP_KERNEL_NAME).and_then(arm))
 }
 
 fn is_nextgen_device(device_id: usize) -> bool {
@@ -418,8 +564,8 @@ impl PomGpuMiner {
     /// engine's resident device tensors in canonical name-sorted order (the wrapper pre-sorts;
     /// byte-identity to the on-disk GGUF proven by `tools/llama_zerodup_spike`). Host-resident
     /// tensors (e.g. `token_embd` on the CPU buffer) get a small device upload of our own.
-    /// `tier` selects the host possession index for the consensus byte-gate.
-    pub fn load_llama(device_id: usize, tier: u8) -> Result<Self> {
+    /// `model_id` selects the host possession index for the consensus byte-gate.
+    pub fn load_llama(device_id: usize, model_id: &[u8; 32]) -> Result<Self> {
         let ctx = CudaContext::new(device_id)?;
         ctx.bind_to_thread()?;
         let stream = ctx.default_stream();
@@ -462,7 +608,7 @@ impl PomGpuMiner {
         // device memory and compare them byte-for-byte against the host index (GGUF pread) — any
         // mismatch refuses to mine. Full-model byte-identity for this llama build was proven once
         // by `tools/llama_zerodup_spike`; this guards every startup against regressions.
-        if let Some(idx) = crate::pom::active_index_for_tier(tier) {
+        if let Some(idx) = crate::pom::active_index_for_model(model_id) {
             if idx.n_chunks == n_total_chunks {
                 let samples = 128u64;
                 for kk in 0..=samples {
@@ -507,11 +653,30 @@ impl PomGpuMiner {
     /// `h3` salts the pph words host-side (POM_H3_PPH_SALT); `h5_1` swaps the SEED words to the
     /// v2 salt (POM_H5_1_PPH_SALT) while the pow words stay H3 — the kernel is era-agnostic,
     /// it folds whatever word sets it receives.
-    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Result<Option<u64>> {
+    pub fn mine(&self, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Result<Option<u64>> {
         // Worker threads rotate; make sure this device's context is current before raw launches.
         self.ctx.bind_to_thread()?;
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        if v3 {
+            let n_tiles = self.n_total_chunks / crate::pom_v3::POM_V3_TILE_CHUNKS;
+            if n_tiles == 0 {
+                return Err(anyhow!("PoM GPU: blob too small for the v3 walk"));
+            }
+            return self.kernel.launch_v3(
+                &self.stream,
+                &self.bases_dev,
+                &self.prefix_dev,
+                self.t_count,
+                n_tiles,
+                &p_words,
+                &s_words,
+                timestamp,
+                target_le,
+                start,
+                batch,
+            );
+        }
         self.kernel.launch(
             &self.stream,
             &self.bases_dev,
@@ -526,6 +691,17 @@ impl PomGpuMiner {
             batch,
             walk_v2 as u32,
         )
+    }
+
+    /// v3 dump for the winning nonce: (states S_0..=S_K, snippets, fold64(root_K)).
+    pub fn dump_v3(&self, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+        self.ctx.bind_to_thread()?;
+        let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);
+        let n_tiles = self.n_total_chunks / crate::pom_v3::POM_V3_TILE_CHUNKS;
+        if n_tiles == 0 {
+            return Err(anyhow!("PoM GPU: blob too small for the v3 walk"));
+        }
+        self.kernel.launch_v3_dump(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &s_words, timestamp, nonce)
     }
 }
 
@@ -554,8 +730,21 @@ pub fn install(device_id: u32, m: PomGpuMiner) {
 /// entry untouched. Pulled out as a tiny generic helper (over the map's value type) purely so
 /// this scoping behavior is unit-testable without a real, CUDA-backed `PomGpuMiner` — production
 /// always calls it through `uninstall` against `HashMap<u32, Arc<PomGpuMiner>>`.
-fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
-    map.remove(&device_id);
+fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) -> Option<T> {
+    map.remove(&device_id)
+}
+
+/// Block until `item` is the only remaining handle, or the deadline passes. Returns whether the
+/// wait succeeded.
+fn wait_for_sole_owner<T>(item: &Arc<T>, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while Arc::strong_count(item) > 1 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    true
 }
 
 /// Drop the GPU miner for `device_id` only, releasing its hold on that device's mining-model VRAM
@@ -572,8 +761,19 @@ fn remove_device_entry<T>(map: &mut HashMap<u32, T>, device_id: u32) {
 /// the gather index (`ensure_installed_inner`'s own doc comment calls this reload "Heavy") even
 /// though nothing about them changed.
 pub fn uninstall(device_id: u32) {
-    if let Ok(mut g) = miners().lock() {
-        remove_device_entry(&mut g, device_id);
+    let removed = match miners().lock() {
+        Ok(mut g) => remove_device_entry(&mut g, device_id),
+        Err(_) => None,
+    };
+    // BARRIER before the caller frees any VRAM this miner walks over: a mining thread clones the
+    // handle and launches outside the map lock, so removing the entry does not stop an in-flight
+    // walk. Its launch synchronizes before it drops its handle, so waiting for the last handle is
+    // enough. Freeing under a live walk raises a sticky CUDA_ERROR_ILLEGAL_ADDRESS that poisons
+    // the device's context for every user of it, inference included.
+    if let Some(miner) = removed {
+        if !wait_for_sole_owner(&miner, std::time::Duration::from_secs(30)) {
+            log::error!("PoM[gpu{}]: a walk still holds the miner after 30s — releasing anyway", device_id);
+        }
     }
 }
 
@@ -592,12 +792,22 @@ pub fn is_loading() -> bool {
 }
 
 /// Convenience: search a nonce batch via the installed miner for a specific device.
-pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool) -> Option<u64> {
+#[allow(clippy::too_many_arguments)]
+pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Option<u64> {
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2).ok().flatten()
+    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3).ok().flatten()
+}
+
+/// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
+pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    let miner = {
+        let g = miners().lock().ok()?;
+        g.get(&device_id)?.clone()
+    };
+    miner.dump_v3(pre_pow_hash, timestamp, nonce, h3, h5_1, h5_2).ok()
 }
 
 /// Per-GPU mining-tier identity for rebuilds: `device_id -> (model_id, gguf_path)`. A heterogeneous
@@ -644,7 +854,9 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     };
     let mut swapped = false;
     for &(dev, tier) in &devices {
-        let spec = crate::models::pom_model_for_tier(daa, tier);
+        // No model for this tier in the era being entered: nothing to swap to, the device simply
+        // has nothing valid to mine until its own gate.
+        let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
         let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
         if current == Some(spec.model_id) {
             continue;
@@ -653,20 +865,19 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
         set_mining_tier(dev, spec.model_id, gguf.clone());
-        // The host possession index is keyed by tier POSITION and a crossing swaps which model
-        // occupies that position, so the pre-crossing index must be dropped — otherwise
-        // `ensure_installed` keeps it (key present) and the gather/index N-guard refuses to mine
-        // forever.
-        if let Some(t) = crate::models::pom_tier_index(&spec.model_id, daa) {
-            crate::pom::clear_index(t);
+        // Free the retired model's possession index (indices are keyed by MODEL, so the new
+        // model's index simply builds under its own key at the next ensure_installed).
+        if let Some(old_id) = current {
+            crate::pom::clear_index(&old_id);
         }
         // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
         // crossing it would keep hosting the previous era's model. Unload it when it lives on this
         // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
+        // Drain this device's walk BEFORE freeing the tensors it may be gathering over.
+        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
         if crate::llama_engine::active_gpu() == Some(dev as usize) && !crate::llama_engine::active_for(&gguf, dev as usize) {
             crate::llama_engine::unload();
         }
-        uninstall(dev); // force a resident reload of the new model on the next ensure_installed
     }
     // The served lineup (`SUPPORTED_SPECS`) drives the coinbase `ai:cap` announcement + inference
     // routing — refresh it as the union of era-correct models so the miner stops announcing the
@@ -674,7 +885,7 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     if swapped {
         let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
         for &(_, tier) in &devices {
-            let spec = crate::models::pom_model_for_tier(daa, tier);
+            let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
@@ -683,6 +894,35 @@ pub fn advance_mining_tier_if_due(daa: u64) {
             // Leaked to satisfy the &'static lineup API — at most once per era crossing.
             crate::slm::init_supported(Box::leak(union.into_boxed_slice()));
         }
+    }
+}
+
+/// Per-device lifecycle lock: held for a whole miner (re)build, and by the engine eviction while
+/// it frees the hosted tensors. A build reads llama's resident pointers before any miner is
+/// installed, so the uninstall barrier alone cannot see it — without this lock an inference swap
+/// can free those tensors mid-build and poison the device's primary context.
+fn device_lifecycle(device_id: u32) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<u32, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut g = LOCKS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    g.entry(device_id).or_default().clone()
+}
+
+/// Release the llama engine for a model swap, draining every reader of its resident tensors
+/// first: the hosting device's installed walk (uninstall barrier) and any build in flight on it
+/// (lifecycle lock). Then make room on `target_dev` for the incoming model.
+pub fn evict_llama_host_for_swap(target_dev: u32) {
+    let host = crate::llama_engine::active_gpu().map(|g| g as u32);
+    match host {
+        Some(host) => {
+            let lock = device_lifecycle(host);
+            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            uninstall(host);
+            crate::llama_engine::unload();
+        }
+        None => crate::llama_engine::unload(),
+    }
+    if host != Some(target_dev) {
+        uninstall(target_dev);
     }
 }
 
@@ -696,7 +936,10 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.fetch_add(1, Ordering::Relaxed);
+    let lock = device_lifecycle(device_id);
+    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     let ok = ensure_installed_inner(device_id, daa);
+    drop(guard);
     LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
 }
@@ -707,6 +950,11 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
 pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
     let model_id = mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)?;
     crate::models::pom_tier_index(&model_id, daa)
+}
+
+/// The model a CUDA device currently mines, if assigned.
+pub fn mining_model_id(device_id: u32) -> Option<[u8; 32]> {
+    mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)
 }
 
 /// The CUDA device that mines `model_id` (from the per-GPU tier assignment), if any. Inference for a
@@ -824,10 +1072,12 @@ fn is_transient_gpu_runtime_fault(err: &str) -> bool {
 }
 
 fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
+    // Order matters: the miner walks llama's resident tensors, so it must be released — and any
+    // in-flight walk drained — before those tensors are freed.
+    uninstall(device_id);
     if use_llama {
         crate::llama_engine::unload_for_gpu(device_id as usize);
     }
-    uninstall(device_id);
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
@@ -843,17 +1093,17 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     if is_oom_banlisted(device_id, &model_id) {
         return false; // this model OOM'd on this GPU before — don't retry (avoids a hot reload spin).
     }
-    // Build THIS tier's possession index once (host, heavy) — deferred from boot so the pre-PoM
-    // legacy phase starts immediately, and keyed by tier so a mixed rig builds one index per
-    // distinct tier it mines (shared across every GPU on that tier).
-    if crate::pom::active_index_for_tier(tier).is_none() {
+    // Build THIS model's possession index once (host, heavy) — deferred from boot so the pre-PoM
+    // legacy phase starts immediately, and keyed by model so a mixed rig builds one index per
+    // distinct model it mines (shared across every GPU on it).
+    if crate::pom::active_index_for_model(&model_id).is_none() {
         let _guard = match index_build_lock().lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if crate::pom::active_index_for_tier(tier).is_none() {
+        if crate::pom::active_index_for_model(&model_id).is_none() {
             info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", tier, device_id);
-            match crate::pom::WeightIndex::build_from_gguf(&gguf) {
+            match crate::pom::WeightIndex::build_from_gguf(&gguf, model_id) {
                 Ok(mut idx) => {
                     // Opt-in: hold the full Merkle tree in RAM for lookup-time proof build.
                     if std::env::var("KERYX_RESIDENT_TREE").is_ok_and(|v| v == "1") {
@@ -871,7 +1121,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         }
                     }
                     info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
-                    crate::pom::set_index(tier, idx);
+                    crate::pom::set_index(model_id, idx);
                 }
                 Err(e) => {
                     log::error!("PoM: host index build failed for tier {} on gpu{}: {}", tier, device_id, e);
@@ -892,15 +1142,47 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // handler can banlist + downgrade instead of crashing the mining thread or hot-spinning on a
     // model that doesn't fit this GPU.
     let inference_gpu = device_for_model(&model_id).unwrap_or(0);
-    let mut use_llama =
-        device_id == inference_gpu && crate::llama_engine::ensure_loaded(&gguf, device_id as usize);
+    let mut use_llama = false;
+    if device_id == inference_gpu {
+        // Only this GPU can serve the model: no engine here means no inference anywhere.
+        use_llama = match crate::llama_engine::ensure_loaded(&gguf, device_id as usize) {
+            Ok(_) => {
+                crate::slm::mark_model_available(&model_id, "llama_engine_loaded");
+                true
+            }
+            // A busy engine hosts another model and is swapped on demand, so the model stays
+            // announced: withdrawing here would silence every model but the first on a mixed rig.
+            Err(e) if e.is_busy() => false,
+            Err(e) => {
+                warn!("PoM[gpu{}]: llama engine unavailable — {}", device_id, e);
+                let reason = if e.is_oom() { "llama_engine_oom" } else { "llama_engine_load_failed" };
+                crate::slm::mark_model_unavailable(&model_id, reason);
+                false
+            }
+        };
+    }
     // BYTE-COMPAT GATE: llama.cpp repacks some architectures on load (e.g. tied embeddings
     // materialise a separate output.weight), so its resident chunk count differs from the
     // canonical GGUF the walk MUST gather and R_T pins. When that happens the zero-dup walk is
     // impossible — free llama's VRAM and walk a raw canonical upload instead. (Inference for
     // such a model is unavailable without the engine; every current-lineup model is untied.)
+    // OWNERSHIP GATE: the walk dereferences llama's tensor pointers on THIS device. If llama
+    // placed them on another card, the launch hits unmapped memory and raises a sticky
+    // CUDA_ERROR_ILLEGAL_ADDRESS that poisons the primary context for every user of the device,
+    // llama included — the card then loops on rebuilds until the process restarts.
     if use_llama {
-        let host_n = crate::pom::active_index_for_tier(tier).map(|i| i.n_chunks);
+        if let Some((name, owner)) = crate::llama_engine::foreign_device_tensor(device_id as usize) {
+            warn!(
+                "PoM[gpu{}]: llama placed '{}' on device {} — walking a raw canonical copy; inference for this model is unavailable.",
+                device_id, name, owner
+            );
+            crate::llama_engine::unload();
+            use_llama = false;
+            crate::slm::mark_model_unavailable(&model_id, "llama_wrong_device");
+        }
+    }
+    if use_llama {
+        let host_n = crate::pom::active_index_for_model(&model_id).map(|i| i.n_chunks);
         let llama_n = crate::llama_engine::tensors().map(|ts| {
             ts.iter().map(|(_, _, nbytes, _)| (*nbytes / CHUNK_BYTES) as u64).sum::<u64>()
         });
@@ -912,13 +1194,14 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 );
                 crate::llama_engine::unload();
                 use_llama = false;
+                crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
             }
         }
     }
     let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights", device_id);
-            PomGpuMiner::load_llama(device_id as usize, tier)
+            PomGpuMiner::load_llama(device_id as usize, &model_id)
         } else {
             PomGpuMiner::load_raw(&gguf, device_id as usize)
         }
@@ -973,7 +1256,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     };
     let n = gm.n_chunks();
     // N-guard: the gather must match the host index, else blocks would be rejected.
-    if let Some(idx) = crate::pom::active_index_for_tier(tier) {
+    if let Some(idx) = crate::pom::active_index_for_model(&model_id) {
         if n != idx.n_chunks {
             log::error!("PoM[gpu{}]: gather N={} != tier {} index N={} — refusing to mine", device_id, n, tier, idx.n_chunks);
             return false;
@@ -994,6 +1277,45 @@ mod tests {
     // CI/unit-test environments. `remove_device_entry` holds the entire scoping logic that
     // `uninstall` delegates to, so this still covers the behavior that matters: only the targeted
     // device's entry is removed, every other device's entry survives untouched.
+
+    #[test]
+    fn barrier_waits_for_the_last_walk_to_release_the_miner() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let miner = Arc::new("gpu0-miner");
+        let held = Arc::clone(&miner);
+        let (tx, rx) = mpsc::channel();
+        let walker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(held);
+            let _ = tx.send(());
+        });
+
+        assert!(wait_for_sole_owner(&miner, Duration::from_secs(5)), "must wait, not give up");
+        assert_eq!(Arc::strong_count(&miner), 1);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        walker.join().unwrap();
+    }
+
+    #[test]
+    fn barrier_gives_up_after_the_deadline_rather_than_hanging() {
+        use std::time::Duration;
+
+        let miner = Arc::new("gpu0-miner");
+        let _stuck = Arc::clone(&miner);
+
+        assert!(!wait_for_sole_owner(&miner, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn remove_device_entry_hands_back_the_removed_miner() {
+        let mut map: HashMap<u32, &str> = HashMap::new();
+        map.insert(0, "gpu0-miner");
+
+        assert_eq!(remove_device_entry(&mut map, 0), Some("gpu0-miner"));
+        assert_eq!(remove_device_entry(&mut map, 0), None);
+    }
 
     #[test]
     fn remove_device_entry_only_clears_target_device() {
@@ -1026,5 +1348,101 @@ mod tests {
         assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
         assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
         assert!(!is_transient_gpu_runtime_fault("out of memory"));
+    }
+}
+
+#[cfg(test)]
+impl PomGpuMiner {
+    /// Test-only walk source: upload arbitrary chunk-aligned segments (no GGUF, no llama).
+    pub(crate) fn load_test_segments(device_id: usize, segments: Vec<Vec<u8>>) -> Result<Self> {
+        let ctx = CudaContext::new(device_id)?;
+        ctx.bind_to_thread()?;
+        let stream = ctx.default_stream();
+        let mut uploads: Vec<CudaSlice<u8>> = Vec::new();
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        for seg in &segments {
+            let chunks = (seg.len() / CHUNK_BYTES) as u64;
+            if chunks == 0 {
+                continue;
+            }
+            let dev = stream.clone_htod(seg.as_slice())?;
+            bases.push(dev.device_ptr(&stream).0 as u64);
+            uploads.push(dev);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        let bases_dev = stream.clone_htod(bases.as_slice())?;
+        let prefix_dev = stream.clone_htod(prefix.as_slice())?;
+        let kernel = select_pom_kernel(device_id)?;
+        Ok(Self {
+            ctx,
+            stream,
+            kernel,
+            bases_dev,
+            prefix_dev,
+            t_count: bases.len() as u32,
+            n_total_chunks,
+            _uploads: uploads,
+        })
+    }
+}
+
+/// GPU lockstep tests — need a CUDA card: `cargo test --release -- --ignored v3_kernel`.
+#[cfg(test)]
+mod v3_kernel_tests {
+    use super::*;
+    use crate::pom_v3;
+
+    const PPH: [u8; 32] = [7u8; 32];
+    const TIMESTAMP: u64 = 0x11_2233_4455;
+
+    /// Chunk-aligned but NOT tile-aligned segment cuts — tiles straddle segment boundaries,
+    /// exercising the per-chunk gather.
+    fn split_blob(blob: &[u8]) -> Vec<Vec<u8>> {
+        let cuts = [999 * 32, 5000 * 32, blob.len()];
+        let mut segs = Vec::new();
+        let mut start = 0;
+        for &c in &cuts {
+            segs.push(blob[start..c].to_vec());
+            start = c;
+        }
+        segs
+    }
+
+    #[test]
+    #[ignore]
+    fn v3_kernel_matches_host_reference() {
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        let nonce = 42u64;
+        let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, nonce, true, true, true).unwrap();
+
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, nonce, true, true, true);
+        let (ref_states, ref_snippets, _) = pom_v3::ref_walk(seed, &blob);
+        assert_eq!(snippets, ref_snippets, "GPU snippets differ from the host reference");
+        assert_eq!(states, ref_states, "GPU states differ from the host reference");
+
+        let d2 = pom_v3::POM_V3_D * pom_v3::POM_V3_D;
+        let root = pom_v3::v3_state_root(&ref_states[pom_v3::POM_V3_K * d2..]);
+        assert_eq!(final_state, pom_v3::fold64(&root), "GPU blake3 tree differs from the host");
+    }
+
+    #[test]
+    #[ignore]
+    fn v3_grind_end_to_end() {
+        let blob = pom_v3::lockstep_blob();
+        let miner = PomGpuMiner::load_test_segments(0, split_blob(&blob)).unwrap();
+        // Trivial target: every nonce wins, atomicMin returns the batch base.
+        let target = [0xFFu8; 32];
+        let found = miner.mine(&PPH, TIMESTAMP, &target, 1000, 8, true, true, true, true, true).unwrap().unwrap();
+        assert_eq!(found, 1000);
+
+        let (states, snippets, final_state) = miner.dump_v3(&PPH, TIMESTAMP, found, true, true, true).unwrap();
+        let seed = crate::pom::pom_block_seed(&PPH, TIMESTAMP, found, true, true, true);
+        let index = crate::pom::index_from_ram(blob);
+        let proof = pom_v3::build_proof_v3(0, &PPH, found, seed, &states, &snippets, &index).unwrap();
+        assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
+        assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
     }
 }

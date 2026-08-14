@@ -4,11 +4,27 @@ use crate::pow::BlockSeed::{FullBlock, PartialBlock};
 use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
-    GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage, KaspadMessage,
-    NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
-    NotifyVirtualSelectedParentChainChangedRequestMessage,
+    GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
+    GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    NotifyNewBlockTemplateRequestMessage, NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
+
+/// Asks the node for its virtual DAA score, before the mining client exists. Used to skip
+/// downloading the models of eras the chain has already left. `None` on any failure — the caller
+/// then keeps every scheduled era, which only costs bandwidth.
+pub async fn query_virtual_daa(address: String) -> Option<u64> {
+    let mut client = RpcClient::connect(address).await.ok()?;
+    let (send, recv) = mpsc::channel(2);
+    send.send(GetBlockDagInfoRequestMessage {}.into()).await.ok()?;
+    let mut stream = client.message_stream(ReceiverStream::new(recv)).await.ok()?.into_inner();
+    while let Ok(Some(msg)) = stream.message().await {
+        if let Some(Payload::GetBlockDagInfoResponse(resp)) = msg.payload {
+            return resp.error.is_none().then_some(resp.virtual_daa_score);
+        }
+    }
+    None
+}
 
 /// Max AiRequest queue size — drop oldest when full to prevent unbounded memory growth.
 const MAX_AI_QUEUE_SIZE: usize = 64;
@@ -94,6 +110,29 @@ pub struct KeryxdHandler {
 
     /// Auto-claim module: present when an escrow private key is available.
     escrow_watcher: Option<crate::escrow::EscrowWatcher>,
+
+    /// 128-char hex delegation cert embedded as `/esig:<cert>`, binding the escrow key above to
+    /// the payout address. Mandatory from H6 — a block without it is invalid.
+    escrow_cert: Option<String>,
+
+    /// Service-ledger identity of the payout address (the node's `miner_key`), the key strikes,
+    /// burns and suspensions are reported against.
+    service_identity: Option<String>,
+
+    /// Last service-bond strike poll instant.
+    last_strike_poll: std::time::Instant,
+
+    /// Last rendered service-bond status — logged only on change.
+    strike_status: Option<String>,
+
+    /// Status bar sink, so the standing is visible without reading the log.
+    stats: Option<Arc<crate::stats::MinerStats>>,
+
+    /// DAA of every miss seen since this miner started, for the lifetime tally. Counting the
+    /// active strike counter would miss the worst ones: the third strike resets it to zero, and a
+    /// served response clears it too. Each miss carries its own daa, so a set of those is exact
+    /// for as long as the process runs.
+    misses_seen: std::collections::HashSet<u64>,
 }
 
 #[async_trait(?Send)]
@@ -110,6 +149,7 @@ impl Client for KeryxdHandler {
 
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         self.opoi_challenge_active = Some(miner.opoi_challenge_flag());
+        self.stats = Some(miner.stats_handle());
         // Harvest in-flight inference on a timer, independently of node notifications.
         // On a sole-producer node, pausing mining for inference stops block production,
         // so the node stops sending NewBlockTemplate notifications — without this timer
@@ -138,6 +178,10 @@ impl Client for KeryxdHandler {
                     } else if self.challenge_inference_rx.is_some() {
                         self.client_get_block_template().await?;
                     }
+                    if self.escrow_pubkey.is_some() && self.last_strike_poll.elapsed().as_secs() >= 60 {
+                        self.last_strike_poll = std::time::Instant::now();
+                        self.client_send(GetServiceStrikesRequestMessage {}).await?;
+                    }
                 }
             }
         }
@@ -146,6 +190,10 @@ impl Client for KeryxdHandler {
 
     fn get_block_channel(&self) -> Sender<BlockSeed> {
         self.block_channel.clone()
+    }
+
+    fn flush_escrow_state(&mut self) -> Result<(), Error> {
+        self.escrow_watcher.as_mut().map_or(Ok(()), |watcher| watcher.flush_state().map_err(Into::into))
     }
 }
 
@@ -157,6 +205,8 @@ impl KeryxdHandler {
         block_template_ctr: Option<Arc<AtomicU16>>,
         escrow_privkey: Option<String>,
         escrow_state_file: String,
+        escrow_cert: Option<String>,
+        chain_daa: Option<u64>,
         ipfs_url: String,
     ) -> Result<Box<Self>, Error>
     where
@@ -180,6 +230,14 @@ impl KeryxdHandler {
                 }
             }
             None => (None, None),
+        };
+
+        let service_identity = match crate::escrow::service_identity_hex(&miner_address) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                log::warn!("Cannot derive the service identity of the payout address: {}", e);
+                None
+            }
         };
 
         let mut client = RpcClient::connect(address).await?;
@@ -213,10 +271,18 @@ impl KeryxdHandler {
             challenge_inference_rx: None,
             opoi_challenge_active: None,
             pending_block_submissions,
-            last_known_daa: 0,
+            // Seeded from the node so era-gated decisions (devfund payout) are right on the very
+            // first template request, not only once one has been received.
+            last_known_daa: chain_daa.unwrap_or(0),
             ipfs_url,
             escrow_pubkey,
             escrow_watcher,
+            escrow_cert,
+            service_identity,
+            last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
+            strike_status: None,
+            stats: None,
+            misses_seen: std::collections::HashSet::new(),
         }))
     }
 
@@ -251,8 +317,13 @@ impl KeryxdHandler {
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
+        // From H6 the delegation cert is verified against the block's own pay address, and this
+        // miner can only hold one for its own. A devfund block would be refused at the template.
+        let devfund_payable = self.last_known_daa < keryx_miner::pom::pom_v3_activation_daa();
         let pay_address = match &self.devfund_address {
-            Some(devfund_address) if self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent => {
+            Some(devfund_address)
+                if devfund_payable && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent =>
+            {
                 devfund_address.clone()
             }
             _ => self.miner_address.clone(),
@@ -268,6 +339,12 @@ impl KeryxdHandler {
             .as_deref()
             .map(|pk| format!("/escrow:{}", pk))
             .unwrap_or_default();
+        // Delegation cert binding that escrow key to the payout address. From H6 the node rejects
+        // a block whose coinbase carries no valid pair.
+        let esig_part = self.escrow_cert
+            .as_deref()
+            .map(|cert| format!("/esig:{}", cert))
+            .unwrap_or_default();
         // Announce loaded model capabilities so the node can enforce model_id matching.
         let cap_part = {
             let ids = keryx_miner::slm::loaded_model_ids();
@@ -278,7 +355,8 @@ impl KeryxdHandler {
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
-        let extra_data = format!("{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, nonce_hex, opoi_tag, cap_part);
+        let extra_data =
+            format!("{}{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, esig_part, nonce_hex, opoi_tag, cap_part);
         // Harvest a pending challenge response if the inference task just finished.
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
@@ -471,6 +549,15 @@ impl KeryxdHandler {
 
     /// Starts SLM inference for the next queued AiRequest, if no inference is
     /// already in flight and a response slot is free.
+    /// Marks whether mining is paused by OPoI work (inference in flight, or model files not
+    /// ready) rather than by the node. Set at every pause decision, so no exit path can leave it
+    /// stale. Also suppresses the GPU stall warnings, which a deliberate pause would trip.
+    fn set_opoi_pause(&self, paused: bool) {
+        if let Some(flag) = &self.opoi_challenge_active {
+            flag.store(paused, Ordering::Relaxed);
+        }
+    }
+
     fn try_start_inference(&mut self) {
         if self.inference_rx.is_some() {
             return;
@@ -526,8 +613,24 @@ impl KeryxdHandler {
 
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
-        let resp = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
-        info!("OPoI: uploading response CID={}, challenge_window_end={}", resp.cid_v0(), challenge_window_end);
+        // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
+        // as served for the tier cohort — an unsigned response no longer cancels a strike. The
+        // era rule mirrors the node's: V2 is rejected before the gate, so v1 is kept below it.
+        let v2 = self.last_known_daa >= keryx_miner::pom::pom_v3_activation_daa();
+        let resp = match (&self.escrow_watcher, v2) {
+            (Some(w), true) => {
+                let unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+                let responder = w.sign_responder(&unsigned.signed_bytes());
+                keryx_inference::AiResponsePayload::new_v2(request_hash, challenge_window_end, cid, response_length, responder)
+            }
+            (None, true) => {
+                warn!("OPoI: no escrow key configured — submitting an unsigned (v1) response; it will NOT count for the service bond");
+                keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length)
+            }
+            (_, false) => keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length),
+        };
+        info!("OPoI: uploading response CID={}, challenge_window_end={}{}", resp.cid_v0(), challenge_window_end,
+            if resp.responder.is_some() { " (signed, V2)" } else { "" });
 
         let rpc_tx = crate::proto::RpcTransaction {
             version: 0,
@@ -553,6 +656,69 @@ impl KeryxdHandler {
         }
 
         true
+    }
+
+    /// Logs this miner's service-bond standing when it changes: strike count, burns awaiting
+    /// finality and production suspensions, matched by payout-address identity.
+    fn report_service_strikes(&mut self, resp: &crate::proto::GetServiceStrikesResponseMessage) {
+        let Some(me) = self.service_identity.as_deref() else { return };
+        let strike = resp.strikes.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
+        let suspension = resp.suspended.iter().find(|s| s.miner.eq_ignore_ascii_case(me));
+        let burns: Vec<_> = resp.pending_burns.iter().filter(|b| b.miner.eq_ignore_ascii_case(me)).collect();
+        let status = if strike.is_none() && suspension.is_none() && burns.is_empty() {
+            "clear".to_string()
+        } else {
+            let mut parts = Vec::new();
+            if let Some(s) = strike {
+                parts.push(format!("strike {} (last at daa {})", s.consecutive_misses, s.last_strike_daa_score));
+            }
+            if !burns.is_empty() {
+                let claims: u32 = burns.iter().map(|b| b.burned_claims).sum();
+                let sompi: u64 = burns.iter().map(|b| b.burned_sompi).sum();
+                parts.push(format!("{} escrow claims / {:.2} KRX burning at finality", claims, sompi as f64 / 100_000_000.0));
+            }
+            if let Some(s) = suspension {
+                parts.push(format!("production suspended until daa {}", s.until_daa_score));
+            }
+            parts.join("; ")
+        };
+        let active = strike.map(|s| s.consecutive_misses).unwrap_or(0);
+        // The node keeps the lifetime tally: it survives restarts and covers the time this miner
+        // was down. Fall back to the locally observed misses only when talking to a node that
+        // predates the field (it answers with an empty list).
+        for burn in &burns {
+            self.misses_seen.insert(burn.miss_daa_score);
+        }
+        let total = resp
+            .lifetime_strikes
+            .iter()
+            .find(|t| t.miner.eq_ignore_ascii_case(me))
+            .map(|t| t.strikes as usize)
+            .unwrap_or(self.misses_seen.len());
+
+        if let Some(stats) = &self.stats {
+            // `pending` is the only live evidence of sanctions in flight: the third strike resets
+            // the active counter (so a later miss re-escalates from one), and the suspension only
+            // appears in `suspended` once finality flushes it. Without it the bar reads "0 active"
+            // while three penalties are already decided.
+            let pending = burns.len();
+            let bar = if suspension.is_some() {
+                format!("SUSPENDED · {} total", total)
+            } else if pending > 0 {
+                format!("{} active · {} pending · {} total", active, pending, total)
+            } else {
+                format!("{} active · {} total", active, total)
+            };
+            stats.set_service_status(Some(bar));
+        }
+
+        if self.strike_status.as_deref() != Some(status.as_str()) {
+            match status.as_str() {
+                "clear" => info!("service-bond: no strikes against this miner"),
+                s => warn!("service-bond: {}", s),
+            }
+            self.strike_status = Some(status);
+        }
     }
 
     async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager) -> Result<(), Error> {
@@ -592,6 +758,10 @@ impl KeryxdHandler {
                 }
             }
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
+            Payload::GetServiceStrikesResponse(resp) => match resp.error.as_ref() {
+                Some(e) => warn!("service-bond status unavailable: {}", e.message),
+                None => self.report_service_strikes(&resp),
+            },
             Payload::GetBlockTemplateResponse(template) => {
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
@@ -648,6 +818,7 @@ impl KeryxdHandler {
                     if self.last_known_daa % 200 == 0 {
                         log::warn!("OPoI: no models ready — mining suspended until model files are available");
                     }
+                    self.set_opoi_pause(true);
                     miner.process_block(None).await?;
                     return Ok(());
                 }
@@ -658,9 +829,12 @@ impl KeryxdHandler {
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
                 // This covers both regular AiRequest inference and node-issued challenge inference.
                 if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
+                    self.set_opoi_pause(true);
                     miner.process_block(None).await?;
                     return Ok(());
                 }
+                // Past this point any pause comes from the node, not from us.
+                self.set_opoi_pause(false);
                 match (template.block, template.is_synced, template.error) {
                     (Some(b), true, None) => miner.process_block(Some(FullBlock {
                         block: Box::new(b),
@@ -825,5 +999,18 @@ impl KeryxdHandler {
 impl Drop for KeryxdHandler {
     fn drop(&mut self) {
         self.block_handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Round-trip against a live node. Ignored by default — run with
+    /// `cargo test --bin keryx-miner -- --ignored query_virtual_daa` and a node on 22110.
+    #[tokio::test]
+    #[ignore]
+    async fn query_virtual_daa_reads_the_live_node() {
+        let daa = super::query_virtual_daa("grpc://127.0.0.1:22110".to_string()).await;
+        assert!(daa.is_some_and(|d| d > 0), "no DAA read from the node: {:?}", daa);
+        println!("node virtual daa = {}", daa.unwrap());
     }
 }

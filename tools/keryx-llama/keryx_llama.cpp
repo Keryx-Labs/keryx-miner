@@ -37,6 +37,32 @@
 #define KERYX_EXPORT
 #endif
 
+// Load failures are reported by a null return, which tells the miner nothing. Keep the reason
+// (and the VRAM figures behind an OOM) for `keryx_llama_last_error`.
+static thread_local std::string keryx_last_error;
+
+static std::string keryx_cuda_diagnostics() {
+#ifdef __APPLE__
+    return std::string();
+#else
+    std::string out;
+    const cudaError_t pending = cudaPeekAtLastError();
+    if (pending != cudaSuccess) {
+        out += std::string(" [cuda: ") + cudaGetErrorString(pending) + "]";
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        out += " [vram: " + std::to_string(free_bytes / (1024 * 1024)) + " MiB free / "
+             + std::to_string(total_bytes / (1024 * 1024)) + " MiB total]";
+    }
+    return out;
+#endif
+}
+
+static void keryx_set_error(const char* stage, const std::string& detail) {
+    keryx_last_error = std::string(stage) + ": " + detail + keryx_cuda_diagnostics();
+}
+
 struct KeryxLlama {
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
@@ -66,9 +92,13 @@ static void keryx_install_log_filter() {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 2; }
+KERYX_EXPORT int keryx_llama_abi() { return 3; }
+
+// Reason for the last failed call on this thread; empty when none. Valid until the next call.
+KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
 
 KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    keryx_last_error.clear();
     keryx_install_log_filter();
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -77,20 +107,35 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     mp.main_gpu     = gpu;
     mp.use_mmap     = true;
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
-    if (!model) return nullptr;
+    if (!model) {
+        keryx_set_error("model", std::string("llama_model_load_from_file failed for ") + gguf_path);
+        return nullptr;
+    }
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     llama_context* ctx = llama_init_from_model(model, cp);
-    if (!ctx) { llama_model_free(model); return nullptr; }
+    if (!ctx) {
+        keryx_set_error("context", "llama_init_from_model failed");
+        llama_model_free(model);
+        return nullptr;
+    }
 
-    // User-facing sampling (repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
+    // User-facing sampling (DRY -> repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
     // text is not consensus-relevant, but keep the flavor consistent.
-    // The repetition penalty is essential: without it the small quantized models
-    // (9B Q4 especially) degenerate into verbatim sentence loops. 256-token window
-    // because the observed loops are whole sentences (~25 tokens each), far beyond
-    // the classic 64-token window; 1.10 is the battle-tested llama.cpp default.
+    //
+    // The flat repeat penalty alone does not stop these models: it charges a token once for
+    // having appeared, no matter how many times, so a repeated *sentence* pays almost nothing
+    // per token and the loop survives (observed on-chain with GLM-4-9B at 1.10 / 256). DRY
+    // penalises the continuation of an already-seen sequence, growing with its length, which is
+    // the failure mode we actually have. Standard settings: multiplier 0.8, base 1.75, loops
+    // allowed up to 2 tokens, scanning the whole context (-1). The break tokens keep normal
+    // structure (newlines, list markers, quotes) from counting as repetition.
+    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
+        llama_model_get_vocab(model), llama_model_n_ctx_train(model),
+        0.8f, 1.75f, 2, -1, dry_breakers, sizeof(dry_breakers) / sizeof(dry_breakers[0])));
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
     llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
@@ -131,6 +176,22 @@ KERYX_EXPORT bool keryx_llama_tensor_info(KeryxLlama* h, size_t i, const char** 
 
 // Generate up to max_tokens; writes UTF-8 into out (cap bytes, NUL-terminated). Returns written
 // length, or -1 on error. Serialized — one generation at a time (OPoI challenges are rare).
+// CUDA ordinal owning tensor i's bytes, or -1 (host memory, unified memory, unknown, or a
+// context in error). The walk gathers over these pointers, so it must launch on this device.
+KERYX_EXPORT int keryx_llama_tensor_device(KeryxLlama* h, size_t i) {
+#ifdef __APPLE__
+    (void)h; (void)i;
+    return -1;
+#else
+    if (!h || i >= h->names.size()) return -1;
+    const ggml_tensor* t = h->model->get_tensor(h->names[i].c_str());
+    if (!t || !t->data) return -1;
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, t->data) != cudaSuccess) return -1;
+    return attr.type == cudaMemoryTypeDevice ? attr.device : -1;
+#endif
+}
+
 KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max_tokens, char* out, int cap) {
     if (!h || !prompt || !out || cap < 2) return -1;
     std::lock_guard<std::mutex> g(h->gen_lock);

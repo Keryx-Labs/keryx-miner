@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/keryx-labs/keryx-miner"
@@ -22,6 +22,9 @@ include = [
 
 [dependencies]
 memmap2 = "0.9"
+tempfile = "3"
+sha2 = "0.10"
+ipfs-unixfs = "0.2"
 tonic = "0.8"
 tokio = { version = "1.17", features = ["macros", "rt-multi-thread", "signal"] }
 prost = "0.11"
@@ -76,6 +79,7 @@ no-asm = ["keccak"]
 keccak = "0.1"
 kernel32-sys = "0.2"
 win32console = "0.1"
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [profile.release]
 lto = true

@@ -250,6 +250,10 @@ impl MinerManager {
         Arc::clone(&self.opoi_challenge_active)
     }
 
+    pub fn stats_handle(&self) -> Arc<MinerStats> {
+        Arc::clone(&self.stats)
+    }
+
     pub fn record_block_accepted(&self) {
         self.stats.inc_accepted_blocks();
     }
@@ -287,10 +291,12 @@ impl MinerManager {
                     return Ok(());
                 }
                 self.is_synced = false;
-                self.stats.set_synced(false);
+                // A pause we chose says nothing about the node: leave its status alone, or the
+                // header reports it out of sync for the length of every inference.
                 if self.opoi_challenge_active.load(Ordering::Relaxed) {
-                    info!("OPoI challenge in progress — PoW template suspended, stand by");
+                    info!("OPoI work in progress — PoW template suspended, stand by");
                 } else {
+                    self.stats.set_synced(false);
                     warn!("Keryxd is not synced, skipping current template");
                 }
                 None
@@ -331,6 +337,7 @@ impl MinerManager {
                 // above kernel-launch overhead (batch ≈ 43 ms at 24 MH/s).
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
+                const POM_V3_BATCH: u64 = 512;
 
                 loop {
                     nonces[0] = 0;
@@ -358,6 +365,11 @@ impl MinerManager {
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
                             (pph, time, s.target.to_le_bytes(), s.daa_score)
                         };
+                        // Era-crossing hook, every template: swap a GPU's resident model in place
+                        // at its gate so an already-running (installed) miner crosses over without
+                        // a restart — the swap uninstalls the device, and the reload below brings
+                        // up the era-correct model. No-op until a gate actually flips a model.
+                        keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
                         if !keryx_miner::pom_gpu::is_installed(worker_device_id) {
@@ -372,25 +384,26 @@ impl MinerManager {
                                     None => { state = None; continue; }
                                 }
                             }
-                            // Era-crossing hook: swap a GPU's resident model in place at its gate
-                            // before (re)installing, so an already-running miner crosses over
-                            // without a restart. No-op with the current fixed post-H5 lineup.
-                            keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
                             keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
                         let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, POM_BATCH, h3, walk_v2, h5_1, h5_2);
-                        pom_nonce = pom_nonce.wrapping_add(POM_BATCH);
-                        hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
-                        worker_hashes_tried.fetch_add(POM_BATCH, Ordering::AcqRel);
+                        let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
+                        // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
+                        // walk: small batches keep template latency low at 10 BPS.
+                        let batch = if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3);
+                        pom_nonce = pom_nonce.wrapping_add(batch);
+                        hashes_tried.fetch_add(batch, Ordering::AcqRel);
+                        worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {
                             let built = state.as_ref().and_then(|s| {
                                 let tier = keryx_miner::pom_gpu::current_tier(worker_device_id, s.daa_score)?;
-                                let idx = keryx_miner::pom::active_index_for_tier(tier)?;
-                                s.generate_block_if_pom(nonce, idx.as_ref(), tier)
+                                let model_id = keryx_miner::pom_gpu::mining_model_id(worker_device_id)?;
+                                let idx = keryx_miner::pom::active_index_for_model(&model_id)?;
+                                s.generate_block_if_pom(nonce, idx.as_ref(), tier, worker_device_id)
                             });
                             if let Some(mut block_seed) = built {
                                 block_seed.set_device_id(&device_id);
@@ -544,12 +557,16 @@ impl MinerManager {
                     };
                     nonce = (nonce & mask) | fixed;
 
-                    // PoM possession path (CPU) once active; else legacy kHeavyHash.
-                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
-                        // The CPU/fallback walk has no per-device tier assignment — mine whichever
-                        // tier's index is built (lowest present).
-                        keryx_miner::pom::any_active_index().and_then(|(tier, idx)| {
-                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier)
+                    // PoM possession path once active; else legacy kHeavyHash. The v3 (H6)
+                    // matrix walk only grinds on the GPU kernel — this fallback loop idles there.
+                    let found = if state_ref.daa_score >= keryx_miner::pom::pom_v3_activation_daa() {
+                        None
+                    } else if state_ref.daa_score >= keryx_miner::pom::pom_activation_daa() {
+                        // The fallback walk has no per-device tier assignment — mine whichever
+                        // model's index is built; its tier index is per-block.
+                        keryx_miner::pom::any_active_index().and_then(|(model_id, idx)| {
+                            let tier = keryx_miner::models::pom_tier_index(&model_id, state_ref.daa_score)?;
+                            state_ref.generate_block_if_pom(nonce.0, idx.as_ref(), tier, 0)
                         })
                     } else {
                         state_ref.generate_block_if_pow(nonce.0)

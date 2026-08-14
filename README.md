@@ -151,6 +151,12 @@ models/
 
 If the miner still downloads a model although the folder is there, check your tier flag before anything else: the flag decides **which** model is requested, `--models-dir` only says **where** to look.
 
+### Escrow state durability
+
+Escrow keys and claim state are written through a same-directory temporary file, synced, and atomically installed. An unreadable key or malformed state file stops escrow initialization without replacing the existing bytes. Recovery output uses the same atomic write path.
+
+On HiveOS, the durable files live outside the replaceable miner package at `/hive/miners/custom/keryx-miner-state/escrow.key` and `/hive/miners/custom/keryx-miner-state/escrow_state.json`, with directory mode `0700` and file mode `0600`. Back up both files together before an upgrade or manual recovery. Never delete an invalid key to generate another one: restore the original backup because it controls existing rewards. See [`integrations/hiveos/HIVEOS_README.md`](integrations/hiveos/HIVEOS_README.md) for verified migration and rollback steps.
+
 ### All options
 
 ```bash

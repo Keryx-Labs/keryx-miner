@@ -12,9 +12,11 @@
 
 use anyhow::{anyhow, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(target_family = "unix")]
@@ -50,6 +52,9 @@ pub const POM_OPENINGS: usize = 32;
 /// Merkle tree checkpoint interval: store every K-th level on disk (level 0 never stored —
 /// recomputed from the GGUF on demand; root always stored).
 const CHECKPOINT_INTERVAL: u32 = 6;
+const CACHE_FORMAT_VERSION: u32 = 1;
+const CANONICAL_LAYOUT_VERSION: u32 = 1;
+const CACHE_METADATA_FILE: &str = "pom-tree.json";
 
 // --- wire structs (field order == node's PomOpening/PomProof) ---
 
@@ -82,6 +87,11 @@ pub struct PomProof {
     /// H4 recompute-from-chunks walk record. `None` on every pre-H4 proof. MUST keep the exact
     /// field order/types of the node's `PomProof::steps_v2` (borsh wire format).
     pub steps_v2: Option<Vec<PomStep>>,
+    /// H6 matrix-walk witness. When present the legacy fields above are canonical placeholders
+    /// (`trace_root` zeroed, empty paths/openings, `steps_v2 = None`) except `tier` (mirrored),
+    /// `final_state` (= `pom_v3::fold64(roots[K])`) and `pow_value` (era pow fold of it).
+    /// Trailing field, same era-exact wire mechanism as `steps_v2` — mirror of the node's.
+    pub v3: Option<crate::pom_v3::PomProofV3>,
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
@@ -98,13 +108,74 @@ pub struct PomProofPreH4 {
     pub openings: Vec<PomOpening>,
 }
 
+/// Exact pre-H6 layout of `PomProof` (no `v3`) — mirror of the node's `PomProofPreV3`. A proof
+/// without the v3 extension MUST serialize through this so pre-H6 nodes keep accepting it
+/// byte-for-byte. See `PomProof::to_wire_bytes`.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreV3 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+impl From<PomProofPreV3> for PomProof {
+    fn from(p: PomProofPreV3) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: None,
+        }
+    }
+}
+
+impl From<PomProofPreH4> for PomProof {
+    fn from(p: PomProofPreH4) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: None,
+            v3: None,
+        }
+    }
+}
+
 impl PomProof {
-    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`. A proof
-    /// without the v2 extension encodes byte-identically to the pre-H4 layout, so a not-yet-H4 node
-    /// (7-field decode) still accepts it. The submit path MUST use this, never `borsh::to_vec`.
+    /// Canonical wire (borsh) encoding, era-exact — mirror of the node's `to_wire_bytes`: a proof
+    /// without the v3 extension encodes byte-identically to the pre-H6 layout, and without the v2
+    /// extension to the pre-H4 layout. The submit path MUST use this, never `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        match &self.steps_v2 {
-            None => borsh::to_vec(&PomProofPreH4 {
+        if self.v3.is_some() {
+            borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.steps_v2.is_some() {
+            borsh::to_vec(&PomProofPreV3 {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+                steps_v2: self.steps_v2.clone(),
+            })
+            .expect("PomProof borsh serialize")
+        } else {
+            borsh::to_vec(&PomProofPreH4 {
                 tier: self.tier,
                 trace_root: self.trace_root,
                 pow_value: self.pow_value,
@@ -113,9 +184,15 @@ impl PomProof {
                 final_trace_path: self.final_trace_path.clone(),
                 openings: self.openings.clone(),
             })
-            .expect("PomProof borsh serialize"),
-            Some(_) => borsh::to_vec(self).expect("PomProof borsh serialize"),
+            .expect("PomProof borsh serialize")
         }
+    }
+
+    /// Decode the canonical wire encoding, any era — mirror of the node's `from_wire_bytes`.
+    pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
+            .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 }
 
@@ -349,7 +426,7 @@ pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<[u8; 32]> {
     path
 }
 
-fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
+pub(crate) fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
     let mut acc = leaf;
     let mut idx = index;
     for sib in path {
@@ -482,6 +559,7 @@ where
         final_trace_path: merkle_proof(&trace_leaves, k as usize),
         openings,
         steps_v2: None,
+        v3: None,
     }
 }
 
@@ -526,6 +604,7 @@ where
         final_trace_path: vec![],
         openings: vec![],
         steps_v2: Some(steps),
+        v3: None,
     }
 }
 
@@ -618,6 +697,68 @@ struct StoredLevel {
     count: u64,  // node count at this level
 }
 
+/// Sidecar written next to `pom-tree.bin`: identifies the model the tree was built from and
+/// authenticates the tree bytes, so a stale or truncated cache is rebuilt instead of trusted.
+#[derive(Debug, Deserialize, Serialize)]
+struct CacheMetadata {
+    format_version: u32,
+    layout_version: u32,
+    model_id: [u8; 32],
+    n_chunks: u64,
+    chunk_size: u32,
+    checkpoint_interval: u32,
+    gguf_size: u64,
+    tree_size: u64,
+    tree_sha256: [u8; 32],
+    root: [u8; 32],
+}
+
+fn cache_metadata_path(tree_path: &Path) -> PathBuf {
+    tree_path.with_file_name(CACHE_METADATA_FILE)
+}
+
+fn validate_cache_metadata(
+    metadata: &CacheMetadata,
+    tree_path: &Path,
+    expected_model_id: [u8; 32],
+    n_chunks: u64,
+    gguf_size: u64,
+    root: [u8; 32],
+) -> Result<()> {
+    if metadata.format_version != CACHE_FORMAT_VERSION
+        || metadata.layout_version != CANONICAL_LAYOUT_VERSION
+        || metadata.model_id != expected_model_id
+        || metadata.n_chunks != n_chunks
+        || metadata.chunk_size != 32
+        || metadata.checkpoint_interval != CHECKPOINT_INTERVAL
+        || metadata.gguf_size != gguf_size
+        || metadata.root != root
+    {
+        return Err(anyhow!("PoM: cached tree metadata does not match the verified model or cache format"));
+    }
+
+    let tree_size = std::fs::metadata(tree_path)?.len();
+    if metadata.tree_size != tree_size {
+        return Err(anyhow!("PoM: cached tree length does not match its metadata"));
+    }
+    let digest = crate::integrity::sha256_file(tree_path, |_, _| {})?;
+    if metadata.tree_sha256 != digest {
+        return Err(anyhow!("PoM: cached tree SHA-256 mismatch"));
+    }
+    Ok(())
+}
+
+fn write_cache_metadata(tree_path: &Path, metadata: &CacheMetadata) -> Result<()> {
+    let path = cache_metadata_path(tree_path);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = NamedTempFile::new_in(dir)?;
+    serde_json::to_writer_pretty(temp.as_file_mut(), metadata)?;
+    temp.as_file_mut().write_all(b"\n")?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(&path).map_err(|e| anyhow!("persist {}: {}", path.display(), e.error))?;
+    Ok(())
+}
+
 /// Canonical weight index built once at startup from the resident model: the per-chunk
 /// blake3 leaves (for Merkle paths), the recomputed tier root `R_T` (sanity-checked against
 /// the consensus-pinned value), and a chunk reader. Canonical layout = name-sorted GGUF
@@ -681,7 +822,7 @@ fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
 
 /// Open an existing checkpoint tree file and reconstruct the WeightIndex.
 /// Detects legacy full-tree files (size mismatch) and returns an error so the caller can rebuild.
-fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<WeightIndex> {
+fn open_existing_tree(tree_path: &Path, gguf_path: &str, expected_model_id: [u8; 32]) -> Result<WeightIndex> {
     let mut file = File::open(gguf_path)?;
     let meta = crate::gguf::GgufMeta::read(&mut file)?;
     let names = meta.sorted_names();
@@ -734,6 +875,18 @@ fn open_existing_tree(tree_path: &std::path::Path, gguf_path: &str) -> Result<We
     let mut r_t = [0u8; 32];
     read_exact_at(&tree_file, &mut r_t, root_cp.offset)?;
 
+    let metadata_path = cache_metadata_path(tree_path);
+    let metadata: CacheMetadata = serde_json::from_reader(File::open(&metadata_path)?)
+        .map_err(|e| anyhow!("PoM: invalid cache metadata {}: {}", metadata_path.display(), e))?;
+    validate_cache_metadata(
+        &metadata,
+        tree_path,
+        expected_model_id,
+        n_chunks,
+        std::fs::metadata(gguf_path)?.len(),
+        r_t,
+    )?;
+
     let mmap = unsafe { memmap2::Mmap::map(&File::open(gguf_path)?)? };
     Ok(WeightIndex {
         n_chunks,
@@ -764,7 +917,7 @@ impl WeightIndex {
     /// in `R_T`. The sparse checkpoint Merkle tree is persisted to `pom-tree.bin` next to the
     /// GGUF: only every K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On
     /// subsequent restarts the existing tree is reused (GGUF is immutable), avoiding a rebuild.
-    pub fn build_from_gguf(path: &str) -> Result<Self> {
+    pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
         let tree_path = dir.join("pom-tree.bin");
 
@@ -782,7 +935,7 @@ impl WeightIndex {
 
         // Reuse existing checkpoint tree if valid.
         if tree_path.exists() {
-            match open_existing_tree(&tree_path, path) {
+            match open_existing_tree(&tree_path, path, model_id) {
                 Ok(idx) => {
                     log::info!("PoM: reusing cached weight index — {} chunks", idx.n_chunks);
                     return Ok(idx);
@@ -790,6 +943,7 @@ impl WeightIndex {
                 Err(e) => {
                     log::warn!("PoM: cached tree invalid ({}), rebuilding…", e);
                     let _ = std::fs::remove_file(&tree_path);
+                    let _ = std::fs::remove_file(cache_metadata_path(&tree_path));
                 }
             }
         }
@@ -861,6 +1015,24 @@ impl WeightIndex {
         writer.flush()?;
         drop(writer);
         let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n_chunks)?;
+
+        let tree_size = std::fs::metadata(&tree_path)?.len();
+        let tree_sha256 = crate::integrity::sha256_file(&tree_path, |_, _| {})?;
+        write_cache_metadata(
+            &tree_path,
+            &CacheMetadata {
+                format_version: CACHE_FORMAT_VERSION,
+                layout_version: CANONICAL_LAYOUT_VERSION,
+                model_id,
+                n_chunks,
+                chunk_size: 32,
+                checkpoint_interval: CHECKPOINT_INTERVAL,
+                gguf_size: std::fs::metadata(path)?.len(),
+                tree_size,
+                tree_sha256,
+                root: r_t,
+            },
+        )?;
 
         let mmap = unsafe { memmap2::Mmap::map(&File::open(path)?)? };
         let tree_file = File::open(&tree_path)?;
@@ -1190,10 +1362,10 @@ pub fn pom_level_activation_daa() -> u64 {
 /// lockstep, exactly like `pom_level_activation_daa`. Mainnet H4: 54_766_000 (2026-07-18 ~20:31
 /// UTC). MUST equal the node's MAINNET_PARAMS.coin_age_verification_activation (=
 /// H4_ACTIVATION_DAA).
-/// Testnet: 3_000 — node TESTNET_PARAMS.coin_age_verification_activation = new(3_000).
+/// Testnet: 0 — node TESTNET_PARAMS.coin_age_verification_activation = new(0).
 #[inline(always)]
 pub fn coin_age_verification_activation_daa() -> u64 {
-    gate(54_766_000, 3_000)
+    gate(54_766_000, 0)
 }
 
 /// H5 activation DAA score. At/after this score the possession walk switches from the frozen v1
@@ -1202,63 +1374,117 @@ pub fn coin_age_verification_activation_daa() -> u64 {
 /// shortcut. MUST equal the node's `MAINNET_PARAMS.h5_activation` (= node `H5_ACTIVATION_DAA`),
 /// node↔miner lockstep exactly like `coin_age_verification_activation_daa`. Set to the relaunch tip
 /// DAA — MUST equal node `MAINNET_PARAMS.h5_activation` / `H5_ACTIVATION_DAA` = 59_009_037.
-/// Testnet: 3_000 — node TESTNET_PARAMS.h5_activation = new(3_000) (E2E crossing + hot-swap).
+/// Testnet: 0 — node TESTNET_PARAMS.h5_activation = new(0).
 #[inline(always)]
 pub fn h5_activation_daa() -> u64 {
-    gate(59_009_037, 3_000)
+    gate(59_009_037, 0)
 }
 
 /// H5.1 (emergency relaunch 2026-07-24) activation DAA score. At/after this score the walk seed
 /// derives from the H5.1-salted pph words (`POM_H5_1_PPH_SALT`) — seed fold only, the pow fold
 /// keeps the H3 salt. Gate = virtual daa of the isolated relaunch base. MUST equal the node's
 /// `MAINNET_PARAMS.h5_1_activation` / `H5_1_ACTIVATION_DAA` = 59_027_921.
-/// Testnet: 3_000 — node TESTNET_PARAMS.h5_1_activation = new(3_000) (crosses with H5 in one run).
+/// Testnet: 0 — node TESTNET_PARAMS.h5_1_activation = new(0).
 #[inline(always)]
 pub fn h5_1_activation_daa() -> u64 {
-    gate(59_027_921, 3_000)
+    gate(59_027_921, 0)
 }
 
 /// H5.2 chain-anchoring gate. MUST equal the node's
 /// `MAINNET_PARAMS.h5_2_activation` / `H5_2_ACTIVATION_DAA` = 59_170_000.
 pub fn h5_2_activation_daa() -> u64 {
-    gate(59_170_000, 4_000)
+    gate(59_170_000, 0)
 }
 
-/// Per-tier resident possession indices, built lazily when PoM activates. A heterogeneous rig can
-/// mine several tiers at once (one per GPU), so the index is keyed by tier rather than a single
-/// process-wide slot. Each tier's index is built once and shared (`Arc`) across every GPU on it.
-static POM_INDICES: OnceLock<Mutex<HashMap<u8, Arc<WeightIndex>>>> = OnceLock::new();
+/// H6 matrix-walk gate. At/after this score (the TEMPLATE's daa_score, never wall clock or tip)
+/// the miner grinds the v3 walk and builds `PomProofV3`. MUST equal the node's
+/// `pom_v3_activation`: mainnet 77_203_262, testnet 1000.
+pub fn pom_v3_activation_daa() -> u64 {
+    gate(77_203_262, 1000)
+}
 
-fn pom_indices() -> &'static Mutex<HashMap<u8, Arc<WeightIndex>>> {
+/// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
+/// A tier POSITION shifts across eras (a lineup insertion renumbers the models below it) while
+/// the model's index bytes are identical — keying by position would strand a built index at a
+/// crossing. A heterogeneous rig mines several models at once (one per GPU); each model's index
+/// is built once and shared (`Arc`) across every GPU on it.
+static POM_INDICES: OnceLock<Mutex<HashMap<[u8; 32], Arc<WeightIndex>>>> = OnceLock::new();
+
+fn pom_indices() -> &'static Mutex<HashMap<[u8; 32], Arc<WeightIndex>>> {
     POM_INDICES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Install a tier's possession index (built from that tier's resident model). Idempotent per tier.
-pub fn set_index(tier: u8, index: WeightIndex) {
+/// Install a model's possession index (built from that resident model). Idempotent per model.
+pub fn set_index(model_id: [u8; 32], index: WeightIndex) {
     if let Ok(mut g) = pom_indices().lock() {
-        g.insert(tier, Arc::new(index));
+        g.insert(model_id, Arc::new(index));
     }
 }
 
-/// Drop a tier's possession index so the next `ensure_installed` rebuilds it from the CURRENT
-/// model. Needed at an era crossing: the map is keyed by tier POSITION, and the crossing swaps
-/// which model occupies that position, so the built index no longer matches the resident model
-/// (the gather/index N-guard would refuse to mine forever otherwise).
-pub fn clear_index(tier: u8) {
+/// Drop a model's possession index (era crossing retires the model — frees the RAM).
+pub fn clear_index(model_id: &[u8; 32]) {
     if let Ok(mut g) = pom_indices().lock() {
-        g.remove(&tier);
+        g.remove(model_id);
     }
 }
 
-/// The possession index for a specific tier, if built.
-pub fn active_index_for_tier(tier: u8) -> Option<Arc<WeightIndex>> {
-    pom_indices().lock().ok().and_then(|g| g.get(&tier).cloned())
+/// The possession index for a specific model, if built.
+pub fn active_index_for_model(model_id: &[u8; 32]) -> Option<Arc<WeightIndex>> {
+    pom_indices().lock().ok().and_then(|g| g.get(model_id).cloned())
 }
 
-/// Any built index — the lowest tier present. Used by the CPU/fallback walk, which has no per-device
-/// tier assignment, and by "is any index ready" checks.
-pub fn any_active_index() -> Option<(u8, Arc<WeightIndex>)> {
-    pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(t, _)| **t).map(|(t, i)| (*t, i.clone())))
+/// Any built index (lowest model_id for determinism). Used by the fallback walk, which has no
+/// per-device tier assignment, and by "is any index ready" checks.
+pub fn any_active_index() -> Option<([u8; 32], Arc<WeightIndex>)> {
+    pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(m, _)| **m).map(|(m, i)| (*m, i.clone())))
+}
+
+/// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) —
+/// real checkpoint tree + merkle paths, no GGUF.
+#[cfg(test)]
+pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    static UNIQ: AtomicU64 = AtomicU64::new(0);
+    let uid = UNIQ.fetch_add(1, O::Relaxed);
+    let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
+    let _ = std::fs::remove_file(&tree_path);
+
+    let n = (data.len() / 32) as u64;
+    let k = CHECKPOINT_INTERVAL;
+    let batch_size = 1u64 << k; // 64 for K=6
+
+    // Write level-K nodes from batches of chunk leaves.
+    let mut writer = BufWriter::new(
+        OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
+    );
+    let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
+    for o in 0..n as usize {
+        batch.push(blake(&data[o * 32..o * 32 + 32]));
+        if batch.len() == batch_size as usize {
+            let level_k_node = fold_levels(&batch, k);
+            writer.write_all(&level_k_node).unwrap();
+            batch.clear();
+        }
+    }
+    // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
+    if !batch.is_empty() {
+        writer.write_all(&fold_levels(&batch, k)).unwrap();
+    }
+    writer.flush().unwrap();
+    drop(writer);
+
+    let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
+    let tree_file = File::open(&tree_path).unwrap();
+    WeightIndex {
+        n_chunks: n,
+        r_t,
+        chunks: ChunkSource::Ram(data),
+        tree_file,
+        tree_path,
+        checkpoints,
+        total_levels,
+        dense: None,
+    }
 }
 
 #[cfg(test)]
@@ -1276,54 +1502,11 @@ mod tests {
     // Synthetic WeightIndex (no GGUF) — exercises the real read_chunk + O(log N) merkle_path
     // with the sparse checkpoint tree (same structure as production).
     fn synth_index(n: u64) -> WeightIndex {
-        use std::sync::atomic::{AtomicU64, Ordering as O};
-        static UNIQ: AtomicU64 = AtomicU64::new(0);
-        let uid = UNIQ.fetch_add(1, O::Relaxed);
-        let tree_path = std::env::temp_dir().join(format!("keryx-pom-synth-{}-{}.bin", std::process::id(), uid));
-        let _ = std::fs::remove_file(&tree_path);
-
-        let k = CHECKPOINT_INTERVAL;
-        let batch_size = 1u64 << k; // 64 for K=6
-
-        // Write level-K nodes from batches of synth chunks.
-        let mut writer = BufWriter::new(
-            OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tree_path).unwrap(),
-        );
-        let mut data = Vec::new();
-        let mut batch: Vec<[u8; 32]> = Vec::with_capacity(batch_size as usize);
-
+        let mut data = Vec::with_capacity(n as usize * 32);
         for o in 0..n {
-            let b = words_to_bytes(&synth_chunk(o));
-            data.extend_from_slice(&b);
-            batch.push(blake(&b));
-            if batch.len() == batch_size as usize {
-                let level_k_node = fold_levels(&batch, k);
-                writer.write_all(&level_k_node).unwrap();
-                batch.clear();
-            }
+            data.extend_from_slice(&words_to_bytes(&synth_chunk(o)));
         }
-        // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
-        if !batch.is_empty() {
-            writer.write_all(&fold_levels(&batch, k)).unwrap();
-        }
-
-        writer.flush().unwrap();
-        drop(writer);
-
-        // Build higher checkpoints
-        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n).unwrap();
-
-        let tree_file = File::open(&tree_path).unwrap();
-        WeightIndex {
-            n_chunks: n,
-            r_t,
-            chunks: ChunkSource::Ram(data),
-            tree_file,
-            tree_path,
-            checkpoints,
-            total_levels,
-            dense: None,
-        }
+        index_from_ram(data)
     }
 
     /// Regression for the sparse-checkpoint R_T bug (commit e1811a0): the checkpoint-built root MUST
@@ -1373,7 +1556,8 @@ mod tests {
         // Force a fresh build (don't reuse a possibly-stale cached tree from an older binary).
         let dir = std::path::Path::new(&path).parent().unwrap();
         let _ = std::fs::remove_file(dir.join("pom-tree.bin"));
-        let idx = WeightIndex::build_from_gguf(&path).unwrap();
+        let _ = std::fs::remove_file(dir.join(CACHE_METADATA_FILE));
+        let idx = WeightIndex::build_from_gguf(&path, [0u8; 32]).unwrap();
         let got: String = idx.r_t.iter().map(|b| format!("{:02x}", b)).collect();
         assert_eq!(got, expected, "R_T mismatch vs pinned root for {path}");
     }
@@ -1471,7 +1655,7 @@ mod tests {
             eprintln!("skip: GGUF not found at {path}");
             return;
         }
-        let idx = WeightIndex::build_from_gguf(path).expect("build index from real GGUF");
+        let idx = WeightIndex::build_from_gguf(path, [0u8; 32]).expect("build index from real GGUF");
         eprintln!("real model index: N={} chunks", idx.n_chunks);
         let (k, t) = (POM_WALK_STEPS, POM_OPENINGS);
         let pph = [3u8; 32];
@@ -1491,6 +1675,62 @@ mod tests {
         let idx = synth_index(n);
         let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
         assert_eq!(idx.r_t, merkle_root(&leaves));
+    }
+
+    #[test]
+    fn cache_metadata_rejects_corruption_and_wrong_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("pom-tree.bin");
+        std::fs::write(&tree, b"authenticated sparse tree").unwrap();
+        let model_id = [0x42; 32];
+        let root = [0x24; 32];
+        let digest = crate::integrity::sha256_file(&tree, |_, _| {}).unwrap();
+        let metadata = CacheMetadata {
+            format_version: CACHE_FORMAT_VERSION,
+            layout_version: CANONICAL_LAYOUT_VERSION,
+            model_id,
+            n_chunks: 123,
+            chunk_size: 32,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+            gguf_size: 456,
+            tree_size: std::fs::metadata(&tree).unwrap().len(),
+            tree_sha256: digest,
+            root,
+        };
+
+        validate_cache_metadata(&metadata, &tree, model_id, 123, 456, root).unwrap();
+        assert!(validate_cache_metadata(&metadata, &tree, [0x43; 32], 123, 456, root).is_err());
+        assert!(validate_cache_metadata(&metadata, &tree, model_id, 124, 456, root).is_err());
+
+        let mut bytes = std::fs::read(&tree).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&tree, bytes).unwrap();
+        assert!(validate_cache_metadata(&metadata, &tree, model_id, 123, 456, root).is_err());
+    }
+
+    #[test]
+    fn cache_metadata_round_trips_through_the_sidecar_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("pom-tree.bin");
+        std::fs::write(&tree, b"authenticated sparse tree").unwrap();
+        let metadata = CacheMetadata {
+            format_version: CACHE_FORMAT_VERSION,
+            layout_version: CANONICAL_LAYOUT_VERSION,
+            model_id: [0x42; 32],
+            n_chunks: 123,
+            chunk_size: 32,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+            gguf_size: 456,
+            tree_size: std::fs::metadata(&tree).unwrap().len(),
+            tree_sha256: crate::integrity::sha256_file(&tree, |_, _| {}).unwrap(),
+            root: [0x24; 32],
+        };
+        write_cache_metadata(&tree, &metadata).unwrap();
+
+        let path = cache_metadata_path(&tree);
+        assert_eq!(path.file_name().unwrap(), CACHE_METADATA_FILE);
+        let reloaded: CacheMetadata = serde_json::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+        validate_cache_metadata(&reloaded, &tree, [0x42; 32], 123, 456, [0x24; 32]).unwrap();
     }
 
     #[test]
@@ -1571,9 +1811,10 @@ mod tests {
         assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &blake(b"wrong"), &[0xff; 32], true, false));
         assert!(!verify_proof_v2(&proof, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0u8; 32], true, false));
 
-        // borsh wire round-trips through to_wire_bytes (full struct for a v2 proof).
+        // Wire round-trip: a v2 proof encodes through the pre-H6 layout (era-exact) and
+        // decodes back through the fallback chain.
         let bytes = proof.to_wire_bytes();
-        let back: PomProof = borsh::from_slice(&bytes).unwrap();
+        let back = PomProof::from_wire_bytes(&bytes).unwrap();
         assert!(verify_proof_v2(&back, &pph, seed, idx.n_chunks, k, &idx.r_t, &[0xff; 32], true, false));
     }
 

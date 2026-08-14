@@ -25,6 +25,8 @@ pub enum ModelFormat {
     GgufQwen35,
     /// GGUF quantized — Kimi-Linear MoE architecture (H4 tier 4). llama-served.
     GgufKimiLinear,
+    /// GGUF quantized — Gemma 4 architecture (H6 tier 2). llama-served.
+    GgufGemma4,
 }
 
 #[derive(Clone)]
@@ -146,6 +148,48 @@ pub const QWEN3_8B_ABLITERATED: ModelSpec = ModelSpec {
     min_vram_mb: 6_000,
 };
 
+// ── H6 lineup additions ─────────────────────────────────────────
+// Active at `crate::pom::pom_v3_activation_daa()` (the H6 hardfork, matrix-walk era). Five tiers,
+// mirror of the node's `POM_TIERS_H6`: tier 0 = Qwen3.5-9B (replaces BOTH Qwen3-8B and
+// Mistral-7B), tier 1 = GLM-9B (slides from position 2), tier 2 = Gemma-4-12B (NEW, 16 GB
+// cards), tiers 3-4 unchanged.
+
+/// H6 tier-0 model — Qwen3.5-9B-abliterated Q5_K_M (huihui-ai abliteration, mradermacher GGUF).
+/// `model_id` MUST equal the node's `QWEN3_5_9B_ABLITERATED_MODEL_ID`.
+pub const QWEN3_5_9B_ABLITERATED: ModelSpec = ModelSpec {
+    name: "qwen3.5-9b-abliterated",
+    model_id: [
+        0xbd, 0x34, 0x56, 0x8c, 0xd8, 0x9f, 0x5f, 0x19,
+        0xc6, 0xc3, 0xa6, 0xe1, 0xa6, 0x1b, 0x92, 0x9b,
+        0xc8, 0x68, 0x70, 0x94, 0x09, 0xea, 0xad, 0x8e,
+        0x67, 0x2d, 0x85, 0xf3, 0xc1, 0xeb, 0x57, 0x10,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["Qmb5E3zospd78SfiRHB9iZWNz29xuwRJufieZbWzEFBuGB"],
+    dir_name: "Qwen3.5-9B-abliterated",
+    // ~6.5 GB Q5_K_M weights + ~1.3 GB KV/workspace → 8 GB card.
+    min_vram_mb: 8_000,
+};
+
+/// H6 tier-2 model — gemma-4-12B-it-abliterated Q6_K (huihui-ai abliteration, mradermacher
+/// GGUF). `model_id` MUST equal the node's `GEMMA_4_12B_ABLITERATED_MODEL_ID`.
+pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
+    name: "gemma-4-12b-abliterated",
+    model_id: [
+        0x39, 0x99, 0x84, 0x04, 0x56, 0x00, 0xf7, 0xd5,
+        0x8d, 0x1b, 0x2c, 0xf0, 0x1e, 0x6a, 0x4b, 0xf4,
+        0x66, 0xfa, 0x15, 0xc7, 0xac, 0x31, 0xbd, 0x0d,
+        0xd1, 0xa7, 0x1e, 0x00, 0x3b, 0x61, 0x7c, 0xc6,
+    ],
+    format: ModelFormat::GgufGemma4,
+    tokenizer_cid: "",
+    weight_cids: &["QmSDVicqRDwitecBaPitHsAePLUEamgL4KfrBWYHVWQyx9"],
+    dir_name: "Gemma-4-12B-abliterated",
+    // ~9.8 GB Q6_K weights + ~2 GB KV/workspace → 16 GB card (fills the 12→24 GB gap).
+    min_vram_mb: 16_000,
+};
+
 /// Whether `model_id` is one of the Proof-of-Model tier models (any era). DAA-independent —
 /// used at startup to pick a mineable PoM model before any block DAA is known (the tier *index*
 /// is then computed per block via `pom_tier_index`).
@@ -155,6 +199,8 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
         || *model_id == GLM_4_9B_0414.model_id
         || *model_id == QWEN3_6_27B.model_id
         || *model_id == KIMI_LINEAR_48B.model_id
+        || *model_id == QWEN3_5_9B_ABLITERATED.model_id
+        || *model_id == GEMMA_4_12B_ABLITERATED.model_id
 }
 
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
@@ -162,6 +208,23 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     // pre-H4-era block. MUST mirror the node's per-block tier table, recomputed from the block DAA.
     if daa < crate::pom::coin_age_verification_activation_daa() {
         return None;
+    }
+    // H6 table (node `POM_TIERS_H6`): tier 0 = Qwen3.5-9B, tier 1 = GLM (slides 2 -> 1),
+    // tier 2 = Gemma-4-12B, tiers 3-4 unchanged. Qwen3-8B and Mistral are retired.
+    if daa >= crate::pom::pom_v3_activation_daa() {
+        return if *model_id == QWEN3_5_9B_ABLITERATED.model_id {
+            Some(0)
+        } else if *model_id == GLM_4_9B_0414.model_id {
+            Some(1)
+        } else if *model_id == GEMMA_4_12B_ABLITERATED.model_id {
+            Some(2)
+        } else if *model_id == QWEN3_6_27B.model_id {
+            Some(3)
+        } else if *model_id == KIMI_LINEAR_48B.model_id {
+            Some(4)
+        } else {
+            None
+        };
     }
     // Tier 0 is Qwen3-8B at/after H5. A Qwen3-8B tier-0 block below the gate is not a valid tier
     // (its R_T won't match the node's `POM_TIERS_H5`); the pre-H5 tier-0 model is retired.
@@ -195,38 +258,66 @@ pub fn h5_staged() -> bool {
     crate::pom::h5_activation_daa() != u64::MAX
 }
 
+/// True once the H6 hardfork has a scheduled DAA — startup staging (lineup + VRAM ladder) then
+/// targets the H6 lineup.
+pub fn h6_staged() -> bool {
+    crate::pom::pom_v3_activation_daa() != u64::MAX
+}
+
 /// DAA marking the latest scheduled era for startup staging (VRAM ladder + initial mining model).
-/// While H5 is unscheduled this is the H4 gate, so behaviour is unchanged; once H5 is scheduled it
-/// is the H5 gate. The miner does NOT idle until the crossing — it stages the pre-crossing (H4)
-/// model, prefetches both eras (`pom_models_all_eras`), and hot-swaps the resident model at the
-/// crossing (`pom_gpu::advance_mining_tier_if_due`).
+/// The miner does NOT idle until the crossing — it stages against the latest scheduled lineup,
+/// prefetches every scheduled era (`pom_models_all_eras`), and hot-swaps the resident model at
+/// the crossing (`pom_gpu::advance_mining_tier_if_due`).
 pub fn staging_daa() -> u64 {
-    if h5_staged() {
+    if h6_staged() {
+        crate::pom::pom_v3_activation_daa()
+    } else if h5_staged() {
         crate::pom::h5_activation_daa()
     } else {
         crate::pom::coin_age_verification_activation_daa()
     }
 }
 
-/// The single model a hardware `tier` mines AND serves — matching the node's per-block tier table.
-/// Post-H5 the lineup is fixed (tier 0 = Qwen3-8B); `_daa` is kept for call-site symmetry.
-pub fn pom_model_for_tier(_daa: u64, tier: Tier) -> &'static ModelSpec {
+/// The single model a hardware `tier` mines AND serves at `daa` — matching the node's per-block
+/// tier table (`pom_tiers`). The H6 branch is what arms `advance_mining_tier_if_due`: the hardware
+/// tier is fixed, the model it must mine flips at the gate.
+/// `None` when the tier has no consensus-valid model in that era: it mines nothing there and
+/// idles until its gate, rather than downloading and mining a model the node would reject. The
+/// retirement of a crossed era is expressed by returning `None` for it.
+pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
+    if daa >= crate::pom::pom_v3_activation_daa() {
+        return Some(match tier {
+            Tier::VeryLight => &QWEN3_5_9B_ABLITERATED,
+            Tier::Light => &GLM_4_9B_0414,
+            Tier::Default => &GEMMA_4_12B_ABLITERATED,
+            Tier::High => &QWEN3_6_27B,
+            Tier::VeryHigh => &KIMI_LINEAR_48B,
+        });
+    }
     match tier {
-        Tier::VeryLight => &QWEN3_8B_ABLITERATED,
-        Tier::Light => &MISTRAL_7B_V03,
-        Tier::Default => &GLM_4_9B_0414,
-        Tier::High => &QWEN3_6_27B,
-        Tier::VeryHigh => &KIMI_LINEAR_48B,
+        // Tier 0 only exists from H5 on (its pre-H5 model is retired) — mirrors `pom_tier_index`,
+        // which rejects a Qwen3-8B tier-0 block below the gate.
+        Tier::VeryLight => (daa >= crate::pom::h5_activation_daa()).then_some(&QWEN3_8B_ABLITERATED),
+        Tier::Light => Some(&MISTRAL_7B_V03),
+        Tier::Default => Some(&GLM_4_9B_0414),
+        Tier::High => Some(&QWEN3_6_27B),
+        Tier::VeryHigh => Some(&KIMI_LINEAR_48B),
     }
 }
 
-/// Every PoM model a `tier` may mine across the currently-scheduled eras — the pre-crossing (H4)
-/// model and, once H5 is scheduled, the H5 model. Prefetched together at startup so the era
-/// crossing hot-swaps the resident mining model without stalling on a mid-run download.
-pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
+/// Every PoM model a `tier` may still mine — the current-era model and, once a later era is
+/// scheduled, its model too. Prefetched together at startup so the era crossing hot-swaps the
+/// resident mining model without stalling on a mid-run download.
+///
+/// `chain_daa` is the network's virtual DAA score. An era spans `[gate, next_gate)`, and nothing
+/// below the tip can still be mined, so an era the chain has already left needs no model. `None`
+/// (node unreachable, or pool mining) keeps every scheduled era.
+pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
+    let gates =
+        vec![crate::pom::coin_age_verification_activation_daa(), crate::pom::h5_activation_daa(), staging_daa()];
     let mut out: Vec<&'static ModelSpec> = Vec::new();
-    for daa in [crate::pom::coin_age_verification_activation_daa(), staging_daa()] {
-        let s = pom_model_for_tier(daa, tier);
+    for gate in reachable_gates(gates, chain_daa) {
+        let Some(s) = pom_model_for_tier(gate, tier) else { continue };
         if !out.iter().any(|x| x.model_id == s.model_id) {
             out.push(s);
         }
@@ -234,10 +325,29 @@ pub fn pom_models_all_eras(tier: Tier) -> Vec<&'static ModelSpec> {
     out
 }
 
+/// The era gates whose models can still be mined, sorted. An era spans `[gate, next_gate)`, so it
+/// is dropped once the chain has passed `next_gate`. The last era is open-ended and always kept.
+fn reachable_gates(mut gates: Vec<u64>, chain_daa: Option<u64>) -> Vec<u64> {
+    gates.sort_unstable();
+    gates.dedup();
+    let Some(daa) = chain_daa else { return gates };
+    let last = gates.len().saturating_sub(1);
+    gates
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == last || gates[i + 1] > daa)
+        .map(|(_, gate)| *gate)
+        .collect()
+}
+
 /// The single model a hardware tier mines AND serves at **startup staging** (the latest scheduled
 /// era). A PoM GPU is bound to its tier; the era crossing swaps the resident model in place.
+///
+/// Infallible by construction: the latest scheduled era always carries a model for all five
+/// tiers. Retiring a tier outright would have to shrink the VRAM ladder in the same change, and
+/// this panic is where a half-done retirement would surface.
 pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
-    pom_model_for_tier(staging_daa(), tier)
+    pom_model_for_tier(staging_daa(), tier).expect("the staging era carries every tier")
 }
 
 /// Resolves a model name/id.
@@ -247,6 +357,8 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &GLM_4_9B_0414,
     &QWEN3_6_27B,
     &KIMI_LINEAR_48B,
+    &QWEN3_5_9B_ABLITERATED,
+    &GEMMA_4_12B_ABLITERATED,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -255,4 +367,69 @@ pub fn find(name: &str) -> Option<&'static ModelSpec> {
 
 pub fn available_names() -> Vec<&'static str> {
     REGISTRY.iter().map(|m| m.name).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only the eras the chain can still reach are kept. Synthetic gates keep this independent of
+    /// the network switch.
+    #[test]
+    fn eras_already_left_are_dropped() {
+        // Testnet shape: H4/H5 born with the chain, H6 scheduled later.
+        let testnet = vec![0, 0, 108_000];
+        // Chain past the H6 gate: the pre-H6 era can never be mined again.
+        assert_eq!(reachable_gates(testnet.clone(), Some(200_000)), vec![108_000]);
+        // Chain still below it: both eras are live, the crossing must not stall on a download.
+        assert_eq!(reachable_gates(testnet.clone(), Some(50_000)), vec![0, 108_000]);
+        // Unknown tip (node unreachable, pool mining): keep everything.
+        assert_eq!(reachable_gates(testnet, None), vec![0, 108_000]);
+
+        // Mainnet shape, H6 armed ahead of the tip: the H4 era is gone, H5 and H6 are kept.
+        let mainnet = vec![54_766_000, 59_009_037, 70_000_000];
+        assert_eq!(reachable_gates(mainnet.clone(), Some(66_000_000)), vec![59_009_037, 70_000_000]);
+        // Once the tip passes the H6 gate the H5 model retires on its own — no code change needed.
+        assert_eq!(reachable_gates(mainnet, Some(70_000_001)), vec![70_000_000]);
+
+        // Exactly at a gate: that era has just begun, the previous one is over.
+        assert_eq!(reachable_gates(vec![0, 108_000], Some(108_000)), vec![108_000]);
+        // H6 unscheduled: staging collapses onto the H5 gate, leaving a single live era.
+        assert_eq!(reachable_gates(vec![54_766_000, 59_009_037, 59_009_037], Some(66_000_000)), vec![59_009_037]);
+    }
+
+    /// The H6 per-block tier table — mirror of the node's `POM_TIERS_H6` order. `u64::MAX` sits
+    /// at/after every gate on any network, so this exercises the H6 branch without touching the
+    /// global testnet switch.
+    #[test]
+    fn h6_tier_table_mirrors_node() {
+        let daa = u64::MAX;
+        assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), Some(0));
+        assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, daa), Some(1));
+        assert_eq!(pom_tier_index(&GEMMA_4_12B_ABLITERATED.model_id, daa), Some(2));
+        assert_eq!(pom_tier_index(&QWEN3_6_27B.model_id, daa), Some(3));
+        assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), Some(4));
+        // Retired at H6.
+        assert_eq!(pom_tier_index(&QWEN3_8B_ABLITERATED.model_id, daa), None);
+        assert_eq!(pom_tier_index(&MISTRAL_7B_V03.model_id, daa), None);
+
+        // The hardware-tier -> model map flips to the same lineup at the gate.
+        assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, QWEN3_5_9B_ABLITERATED.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, GEMMA_4_12B_ABLITERATED.model_id);
+
+        // Pre-H6 (mainnet daa today) the H5 lineup is untouched.
+        let pre = crate::pom::pom_v3_activation_daa().saturating_sub(1);
+        assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, pre), Some(2));
+        assert_eq!(pom_model_for_tier(pre, Tier::VeryLight).unwrap().model_id, QWEN3_8B_ABLITERATED.model_id);
+
+        // A tier with no valid model in an era yields nothing rather than a model the node would
+        // reject — the shape a retired era relies on. Tier 0 does not exist below the H5 gate.
+        let h5 = crate::pom::h5_activation_daa();
+        if h5 > 0 {
+            assert_eq!(pom_tier_index(&QWEN3_8B_ABLITERATED.model_id, h5 - 1), None);
+            assert!(pom_model_for_tier(h5 - 1, Tier::VeryLight).is_none());
+            assert!(pom_model_for_tier(h5 - 1, Tier::Light).is_some());
+        }
+    }
 }

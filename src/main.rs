@@ -57,6 +57,69 @@ pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
 type Hash = Uint256;
 
+const CUDA_INSTALL_SCRIPT: &str = r#"set -euo pipefail
+umask 077
+tmp_dir=$(mktemp -d /tmp/keryx-cuda.XXXXXX)
+cleanup() { rm -rf -- "$tmp_dir"; }
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+keyring="$tmp_dir/cuda-keyring.deb"
+curl --fail --silent --show-error --location \
+  --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  --connect-timeout 15 --max-time 300 \
+  'https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb' \
+  --output "$keyring"
+printf '%s  %s\n' 'd93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df' "$keyring" | sha256sum -c -
+
+test "$(dpkg-deb -f "$keyring" Package)" = 'cuda-keyring'
+test "$(dpkg-deb -f "$keyring" Version)" = '1.1-1'
+test "$(dpkg-deb -f "$keyring" Architecture)" = 'all'
+dpkg -i "$keyring"
+apt-get update -qq
+apt-get install -y -qq libcublas-12-2 libcurand-12-2 cuda-cudart-12-2
+
+library_path() {
+  package=$1
+  soname=$2
+  path=$(dpkg -L "$package" | awk -v soname="$soname" '
+    { count = split($0, parts, "/") }
+    parts[count] == soname { matched_path = $0 }
+    END { if (matched_path) print matched_path }
+  ')
+  test -n "$path"
+  test -e "$path"
+  readlink -f "$path"
+}
+
+cublas_path=$(library_path libcublas-12-2 libcublas.so.12)
+curand_path=$(library_path libcurand-12-2 libcurand.so.10)
+cudart_path=$(library_path cuda-cudart-12-2 libcudart.so.12)
+cublas_dir=$(dirname "$cublas_path")
+curand_dir=$(dirname "$curand_path")
+cudart_dir=$(dirname "$cudart_path")
+printf '%s\n' "$cublas_dir" "$curand_dir" "$cudart_dir" | sort -u > "$tmp_dir/keryx-cuda.conf"
+install -m 0644 "$tmp_dir/keryx-cuda.conf" /etc/ld.so.conf.d/keryx-cuda.conf
+ldconfig
+
+loader_has() {
+  soname=$1
+  expected_path=$2
+  while IFS= read -r path; do
+    if [ "$(readlink -f "$path")" = "$expected_path" ]; then
+      return 0
+    fi
+  done < <(ldconfig -p | awk -v soname="$soname" '$1 == soname { print $NF }')
+  return 1
+}
+
+loader_has libcublas.so.12 "$cublas_path"
+loader_has libcurand.so.10 "$curand_path"
+loader_has libcudart.so.12 "$cudart_path"
+"#;
+
 /// Attempt to install the CUDA runtime libraries inference needs, on a Debian/Ubuntu host (HiveOS).
 ///
 /// OPoI GPU inference (the in-process llama engine) needs cuBLAS/cuBLASLt; cuRAND is kept for
@@ -73,34 +136,13 @@ type Hash = Uint256;
 fn install_cuda_libs() -> bool {
     use std::process::Command;
     // Only meaningful where apt-get exists (Debian/Ubuntu, incl. HiveOS).
-    let has_apt = Command::new("sh")
-        .args(["-c", "command -v apt-get"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let has_apt = Command::new("sh").args(["-c", "command -v apt-get"]).status().map(|s| s.success()).unwrap_or(false);
     if !has_apt {
         error!("CUDA lib auto-install needs apt-get (Debian/Ubuntu) — not found on this system.");
         return false;
     }
-    // The CUDA libs install into /usr/local/cuda-*/targets/x86_64-linux/lib, which is NOT in
-    // the default loader search path. Installing alone is not enough: we must register that
-    // directory with ldconfig so dlopen("libcublas.so.12" / "libcurand.so.10") resolves it.
-    let script = r#"set -e
-cd /tmp
-wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O cuda-keyring.deb
-dpkg -i cuda-keyring.deb
-apt-get update -qq
-apt-get install -y -qq libcublas-12-2 libcurand-12-2 cuda-cudart-12-2
-CUBLAS_PATH=$(find /usr/local /usr/lib -name 'libcublas.so.12' 2>/dev/null | head -1)
-if [ -z "$CUBLAS_PATH" ]; then echo "libcublas.so.12 not found after install"; exit 1; fi
-echo "$(dirname "$CUBLAS_PATH")" > /etc/ld.so.conf.d/keryx-cuda.conf
-ldconfig
-ldconfig -p | grep -q libcublas.so.12 || { echo "libcublas still not in loader cache"; exit 1; }
-ldconfig -p | grep -q libcurand.so   || { echo "libcurand still not in loader cache"; exit 1; }
-ldconfig -p | grep -q libcudart.so.12 || { echo "libcudart still not in loader cache"; exit 1; }
-rm -f cuda-keyring.deb"#;
     let output = match Command::new("bash")
-        .args(["-c", script])
+        .args(["-c", CUDA_INSTALL_SCRIPT])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -131,6 +173,52 @@ rm -f cuda-keyring.deb"#;
     }
 }
 
+#[cfg(test)]
+mod installer_tests {
+    use super::CUDA_INSTALL_SCRIPT;
+
+    #[test]
+    fn cuda_installer_security_invariants() {
+        let checksum = CUDA_INSTALL_SCRIPT.find("sha256sum -c").unwrap();
+        let metadata = CUDA_INSTALL_SCRIPT.find("dpkg-deb -f").unwrap();
+        let install = CUDA_INSTALL_SCRIPT.find("dpkg -i").unwrap();
+
+        assert!(CUDA_INSTALL_SCRIPT.contains("mktemp -d /tmp/keryx-cuda.XXXXXX"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("umask 077"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap cleanup EXIT"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap 'exit 129' HUP"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap 'exit 130' INT"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("trap 'exit 143' TERM"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--proto '=https'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--proto-redir '=https'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--tlsv1.2"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("--connect-timeout 15 --max-time 300"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("d93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df"));
+        assert!(checksum < metadata && metadata < install);
+        assert!(CUDA_INSTALL_SCRIPT.contains("Package)\" = 'cuda-keyring'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("Version)\" = '1.1-1'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("Architecture)\" = 'all'"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("dpkg -L \"$package\""));
+        assert!(CUDA_INSTALL_SCRIPT.contains("readlink -f \"$path\""));
+        assert!(CUDA_INSTALL_SCRIPT.contains("$(readlink -f \"$path\")"));
+        assert!(CUDA_INSTALL_SCRIPT.contains("$1 == soname { print $NF }"));
+        assert!(!CUDA_INSTALL_SCRIPT.contains("print; exit"));
+        assert!(!CUDA_INSTALL_SCRIPT.contains("find /usr"));
+        assert!(!CUDA_INSTALL_SCRIPT.contains("/tmp/cuda-keyring.deb"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cuda_installer_is_valid_bash() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("bash").args(["-n"]).stdin(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(CUDA_INSTALL_SCRIPT.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn adjust_console() -> Result<(), Error> {
     let console = win32console::console::WinConsole::input();
@@ -139,6 +227,46 @@ fn adjust_console() -> Result<(), Error> {
         | win32console::console::ConsoleMode::ENABLE_EXTENDED_FLAGS;
     console.set_mode(mode)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn api_entry() -> ApiEscrowEntry {
+        ApiEscrowEntry {
+            coinbase_txid: "AB".repeat(32),
+            block_hash: "CD".repeat(32),
+            confirm_daa: 10,
+            amount_sompi: 20,
+            output_index: 1,
+        }
+    }
+
+    #[test]
+    fn recovery_validates_and_normalizes_entries() {
+        let (state, total) = recovered_escrow_state(vec![api_entry()]).unwrap();
+        assert_eq!(total, 20);
+        assert_eq!(state.entries[0].coinbase_txid, "ab".repeat(32));
+        assert_eq!(state.entries[0].block_hash, "cd".repeat(32));
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_network_values() {
+        let mut entry = api_entry();
+        entry.confirm_daa = -1;
+        assert!(recovered_escrow_state(vec![entry]).is_err());
+
+        let mut entry = api_entry();
+        entry.output_index = i64::from(u32::MAX) + 1;
+        assert!(recovered_escrow_state(vec![entry]).is_err());
+
+        let mut entry = api_entry();
+        entry.coinbase_txid = "not-a-hash".into();
+        assert!(recovered_escrow_state(vec![entry]).is_err());
+
+        assert!(recovered_escrow_state(vec![api_entry(), api_entry()]).is_err());
+    }
 }
 
 fn filter_plugins(dirname: &str) -> Vec<String> {
@@ -168,14 +296,30 @@ fn redirect_stderr_for_tui(path: &str) -> Result<(), String> {
         .open(path)
         .map_err(|e| format!("open stderr log '{}': {}", path, e))?;
 
-    dup2(file.as_raw_fd(), STDERR_FILENO)
-        .map_err(|e| format!("dup2(stderr -> '{}') failed: {}", path, e))?;
+    dup2(file.as_raw_fd(), STDERR_FILENO).map_err(|e| format!("dup2(stderr -> '{}') failed: {}", path, e))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn redirect_stderr_for_tui(_path: &str) -> Result<(), String> {
     Ok(())
+}
+
+/// Last words on a fatal startup error. Under the TUI both usual channels are dead ends: the log
+/// goes to a screen that is wiped on exit, and stderr is redirected to a file. Write to the
+/// controlling terminal so the operator sees WHY the miner refused to run instead of a silent
+/// exit — the failure they cannot diagnose is the one that makes them give up.
+fn report_fatal(message: &str) {
+    use std::io::Write;
+    let banner = format!("\nkeryx-miner cannot start:\n{}\n", message);
+    #[cfg(unix)]
+    if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+        if tty.write_all(banner.as_bytes()).is_ok() {
+            let _ = tty.flush();
+            return;
+        }
+    }
+    let _ = std::io::stderr().write_all(banner.as_bytes());
 }
 
 extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
@@ -207,10 +351,7 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     let output = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=power.limit,power.max_limit,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
+        .args(["--query-gpu=power.limit,power.max_limit,memory.total", "--format=csv,noheader,nounits"])
         .output();
 
     // nvidia-smi prints one line per GPU; the power + VRAM check applies to GPU 0
@@ -264,17 +405,31 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// Per-tier VRAM floor (MB) for **auto-assignment** — the practical minimum to load that tier's
 /// model (weights + KV cache + CUDA workspace). Distinct from `ModelSpec.min_vram_mb`, which is 0
 /// for the smallest tiers (never gated out of `ai:cap`) and so can't rank tier 0 vs 1 by VRAM.
-/// Largest tier first, so a device picks the biggest tier it can hold.
-const POM_TIER_LADDER: &[(keryx_miner::models::Tier, u64)] = &[
-    (keryx_miner::models::Tier::VeryHigh, 28_000),
-    (keryx_miner::models::Tier::High, 22_000),
-    (keryx_miner::models::Tier::Default, 11_000),
-    (keryx_miner::models::Tier::Light, 7_000),
-    // Qwen3-8B tier 0 loads in ~5,409 MiB @ ctx 4096; floor sits ~300 MiB below its 6 GB min_vram so
-    // a 6 GB card reporting slightly under 6000 (total_mem) keeps tier 0, and ~300 MiB above the load
-    // need for OOM margin. Its need is close to min_vram, so it can't take the full −1000 headroom.
-    (keryx_miner::models::Tier::VeryLight, 5_700),
-];
+/// Largest tier first, so a device picks the biggest tier it can hold. Era-aware: staging targets
+/// the latest scheduled lineup (`spec_for_tier`), so the floors MUST rank against that lineup's
+/// models — with H6 staged the tier-0 model is 8 GB-class and tier 2 is 16 GB-class.
+fn pom_tier_ladder() -> &'static [(keryx_miner::models::Tier, u64)] {
+    if keryx_miner::models::h6_staged() {
+        &[
+            (keryx_miner::models::Tier::VeryHigh, 28_000),
+            (keryx_miner::models::Tier::High, 22_000),
+            (keryx_miner::models::Tier::Default, 15_000),
+            (keryx_miner::models::Tier::Light, 11_000),
+            (keryx_miner::models::Tier::VeryLight, 7_000),
+        ]
+    } else {
+        &[
+            (keryx_miner::models::Tier::VeryHigh, 28_000),
+            (keryx_miner::models::Tier::High, 22_000),
+            (keryx_miner::models::Tier::Default, 11_000),
+            (keryx_miner::models::Tier::Light, 7_000),
+            // Qwen3-8B tier 0 loads in ~5,409 MiB @ ctx 4096; floor sits ~300 MiB below its 6 GB
+            // min_vram so a 6 GB card reporting slightly under 6000 (total_mem) keeps tier 0, and
+            // ~300 MiB above the load need for OOM margin.
+            (keryx_miner::models::Tier::VeryLight, 5_700),
+        ]
+    }
+}
 
 /// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
 fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
@@ -321,7 +476,7 @@ fn assign_pom_tiers(
     }
     let ceiling_rank = tier_rank(ceiling);
     // Assignment floor + tier + model for each tier ≤ ceiling, largest first.
-    let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = POM_TIER_LADDER
+    let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = pom_tier_ladder()
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
         .map(|(t, floor)| (*floor, *t, keryx_miner::models::spec_for_tier(*t)))
@@ -335,10 +490,14 @@ fn assign_pom_tiers(
     if devices.is_empty() {
         // No enumeration: a forced first entry still wins for the fallback device-0 tier.
         if let Some(t) = forced.first().copied().flatten() {
-            log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the forced tier to device 0 (fallback).");
+            log::warn!(
+                "No CUDA device enumerated for PoM tier assignment — assigning the forced tier to device 0 (fallback)."
+            );
             return vec![(0u32, t, keryx_miner::models::spec_for_tier(t))];
         }
-        log::warn!("No CUDA device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback).");
+        log::warn!(
+            "No CUDA device enumerated for PoM tier assignment — assigning the ceiling tier to device 0 (fallback)."
+        );
         return candidates.first().map(|(_, t, s)| vec![(0u32, *t, *s)]).unwrap_or_default();
     }
     let mut out = Vec::with_capacity(devices.len());
@@ -361,7 +520,9 @@ fn assign_pom_tiers(
         }
         match pick(vram_mb) {
             Some((t, spec)) => out.push((id as u32, t, spec)),
-            None => log::warn!("PoM: GPU {} ({} MB VRAM) fits no tier ≤ the ceiling — it will not mine PoM.", id, vram_mb),
+            None => {
+                log::warn!("PoM: GPU {} ({} MB VRAM) fits no tier ≤ the ceiling — it will not mine PoM.", id, vram_mb)
+            }
         }
     }
     out
@@ -393,17 +554,18 @@ fn lineup_from_assignments(
 fn prefetch_lineup_from_assignments(
     assignments: &[(u32, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)],
     ceiling: keryx_miner::models::Tier,
+    chain_daa: Option<u64>,
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
     let mut union: Vec<&'static keryx_miner::models::ModelSpec> = Vec::new();
     for (_, gpu_tier, _) in assignments {
-        for spec in keryx_miner::models::pom_models_all_eras(*gpu_tier) {
+        for spec in keryx_miner::models::pom_models_all_eras(*gpu_tier, chain_daa) {
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
         }
     }
     if union.is_empty() {
-        for spec in keryx_miner::models::pom_models_all_eras(ceiling) {
+        for spec in keryx_miner::models::pom_models_all_eras(ceiling, chain_daa) {
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
             }
@@ -419,6 +581,8 @@ async fn get_client(
     block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
+    escrow_cert: Option<String>,
+    chain_daa: Option<u64>,
     ipfs_url: String,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
@@ -439,6 +603,8 @@ async fn get_client(
             Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
+            escrow_cert,
+            chain_daa,
             ipfs_url,
         )
         .await?)
@@ -447,11 +613,79 @@ async fn get_client(
     }
 }
 
+#[derive(Debug)]
+struct EscrowFlushError(String);
+
+impl std::fmt::Display for EscrowFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for EscrowFlushError {}
+
+#[derive(serde::Deserialize)]
+struct ApiEscrowEntry {
+    coinbase_txid: String,
+    block_hash: String,
+    confirm_daa: i64,
+    amount_sompi: i64,
+    output_index: i64,
+}
+
+fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::EscrowState, u64), String> {
+    let mut entries = Vec::with_capacity(api_entries.len());
+    let mut outpoints = std::collections::HashSet::with_capacity(api_entries.len());
+    let mut total_sompi = 0u64;
+    for api_entry in api_entries {
+        if api_entry.coinbase_txid.len() != 64 || !api_entry.coinbase_txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Recovery API returned an invalid coinbase transaction ID".into());
+        }
+        if api_entry.block_hash.len() != 64 || !api_entry.block_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Recovery API returned an invalid block hash".into());
+        }
+        let confirm_daa = u64::try_from(api_entry.confirm_daa)
+            .map_err(|_| "Recovery API returned a negative confirmation DAA score")?;
+        let amount_sompi =
+            u64::try_from(api_entry.amount_sompi).map_err(|_| "Recovery API returned a negative escrow amount")?;
+        if amount_sompi == 0 {
+            return Err("Recovery API returned a zero escrow amount".into());
+        }
+        let output_index =
+            u32::try_from(api_entry.output_index).map_err(|_| "Recovery API returned an invalid output index")?;
+        let coinbase_txid = api_entry.coinbase_txid.to_ascii_lowercase();
+        if !outpoints.insert((coinbase_txid.clone(), output_index)) {
+            return Err("Recovery API returned a duplicate escrow outpoint".into());
+        }
+        total_sompi = total_sompi.checked_add(amount_sompi).ok_or("Recovered escrow amount overflow")?;
+        entries.push(escrow::EscrowEntry {
+            coinbase_txid,
+            block_hash: api_entry.block_hash.to_ascii_lowercase(),
+            confirm_daa,
+            amount_sompi,
+            output_index,
+            claimed: false,
+            slashed: false,
+            orphan_slashed: false,
+            orphan_retries: 0,
+            orphan_retry_after_daa: None,
+            submit_retries: 0,
+            batch_cap: 0,
+            cap_set_daa: 0,
+            is_inference: false,
+            csv_window: escrow::csv_window_for_daa(confirm_daa),
+        });
+    }
+    Ok((escrow::EscrowState { entries }, total_sompi))
+}
+
 async fn client_main(
     opt: &Opt,
     block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
+    escrow_cert: Option<String>,
+    chain_daa: Option<u64>,
     stats: Arc<MinerStats>,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
@@ -465,6 +699,8 @@ async fn client_main(
         block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
+        escrow_cert,
+        chain_daa,
         opt.ipfs_url.clone(),
     )
     .await?;
@@ -474,16 +710,38 @@ async fn client_main(
     }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager, stats);
-    tokio::select! {
+    let listen_result = tokio::select! {
         listen_res = client.listen(&mut miner_manager) => {
-            listen_res?;
+            listen_res
         }
         _ = wait_for_shutdown(shutdown_requested) => {
             info!("Shutdown requested, stopping client listen loop");
+            Ok(())
+        }
+    };
+    // Flush funds-critical client state before potentially blocking on worker shutdown.
+    let mut flush_error = None;
+    for attempt in 1..=3 {
+        match client.flush_escrow_state() {
+            Ok(()) => {
+                flush_error = None;
+                break;
+            }
+            Err(e) => {
+                flush_error = Some(e.to_string());
+                warn!("Escrow final flush attempt {}/3 failed: {}", attempt, e);
+                if attempt < 3 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
     }
+    drop(client);
     drop(miner_manager);
-    Ok(())
+    if let Some(error) = flush_error {
+        return Err(Box::new(EscrowFlushError(error)));
+    }
+    listen_result
 }
 
 async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
@@ -497,11 +755,7 @@ async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
 /// idle executor threads on a many-core rig are pure scheduler overhead. Override with
 /// KERYX_ASYNC_WORKERS.
 fn tokio_worker_threads() -> usize {
-    std::env::var("KERYX_ASYNC_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(2)
-        .clamp(1, 8)
+    std::env::var("KERYX_ASYNC_WORKERS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2).clamp(1, 8)
 }
 
 /// Optional cap for the `spawn_blocking` pool (SLM inference, IPFS upload, model prefetch). Only
@@ -509,10 +763,7 @@ fn tokio_worker_threads() -> usize {
 /// tokio's default costs nothing at rest and capping it low would bottleneck parallel multi-model
 /// prefetch on multi-GPU rigs.
 fn tokio_blocking_threads() -> Option<usize> {
-    std::env::var("KERYX_BLOCKING_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(2, 64))
+    std::env::var("KERYX_BLOCKING_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).map(|n| n.clamp(2, 64))
 }
 
 fn main() -> Result<(), Error> {
@@ -522,7 +773,13 @@ fn main() -> Result<(), Error> {
         builder.max_blocking_threads(n);
     }
     let rt = builder.build()?;
-    rt.block_on(run())
+    // `run` has returned, so the TUI guard is dropped and the terminal restored — only now can a
+    // message survive on screen.
+    let outcome = rt.block_on(run());
+    if let Err(e) = &outcome {
+        report_fatal(&e.to_string());
+    }
+    outcome
 }
 
 async fn run() -> Result<(), Error> {
@@ -557,23 +814,50 @@ async fn run() -> Result<(), Error> {
     {
         let shutdown_requested = Arc::clone(&shutdown_requested);
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            shutdown_requested.store(true, Ordering::Release);
+            #[cfg(unix)]
+            {
+                let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+                loop {
+                    match terminate.as_mut() {
+                        Ok(terminate) => {
+                            tokio::select! {
+                                _ = tokio::signal::ctrl_c() => {}
+                                _ = terminate.recv() => {}
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to register SIGTERM handler: {}", e);
+                            if tokio::signal::ctrl_c().await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if shutdown_requested.swap(true, Ordering::AcqRel) {
+                        eprintln!("Second shutdown signal received; forcing exit");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                if shutdown_requested.swap(true, Ordering::AcqRel) {
+                    eprintln!("Second shutdown signal received; forcing exit");
+                    std::process::exit(1);
+                }
+            }
         });
     }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
-    let plain_log_path = opt
-        .plain_log_file
-        .clone()
-        .or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok());
-    let plain_log_file = plain_log_path
-        .and_then(|path| {
-            match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => Some(file),
-                Err(e) => {
-                    eprintln!("Failed to open plain log file '{}': {}", path, e);
-                    None
-                }
+    let plain_log_path = opt.plain_log_file.clone().or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok());
+    let plain_log_file =
+        plain_log_path.and_then(|path| match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                eprintln!("Failed to open plain log file '{}': {}", path, e);
+                None
             }
         });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
@@ -608,19 +892,15 @@ async fn run() -> Result<(), Error> {
     let stats = Arc::new(MinerStats::new(opt.hiveos));
     stats.set_mining_address(opt.mining_address.clone());
     stats.set_api_port(opt.stats_port);
-    let _ui_guard = ui_state
-        .as_ref()
-        .map(|ui| spawn_ui(Arc::clone(&stats), Arc::clone(ui), Arc::clone(&shutdown_requested)));
+    let _ui_guard =
+        ui_state.as_ref().map(|ui| spawn_ui(Arc::clone(&stats), Arc::clone(ui), Arc::clone(&shutdown_requested)));
 
     match spawn_stats_server(Arc::clone(&stats), opt.stats_bind.clone(), opt.stats_port) {
         Ok(_handle) => {
             info!("Stats API listening on {}:{}", opt.stats_bind, opt.stats_port);
         }
         Err(e) => {
-            warn!(
-                "Failed to start stats API on {}:{} ({})",
-                opt.stats_bind, opt.stats_port, e
-            );
+            warn!("Failed to start stats API on {}:{} ({})", opt.stats_bind, opt.stats_port, e);
         }
     }
 
@@ -650,60 +930,49 @@ async fn run() -> Result<(), Error> {
         let url = format!("{}/api/v1/escrow/{}", opt.recover_escrow_api.trim_end_matches('/'), pubkey_hex);
         info!("Querying escrow UTXOs from {}", url);
 
-        #[derive(serde::Deserialize)]
-        struct ApiEscrowEntry {
-            coinbase_txid: String,
-            block_hash: String,
-            confirm_daa: i64,
-            amount_sompi: i64,
-            output_index: i64,
-        }
-
         let url_clone = url.clone();
         let api_entries: Vec<ApiEscrowEntry> = tokio::task::spawn_blocking(move || {
-            let response = ureq::get(&url_clone)
-                .call()
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            let response = ureq::get(&url_clone).call().map_err(|e| format!("HTTP request failed: {}", e))?;
             serde_json::from_reader::<_, Vec<ApiEscrowEntry>>(response.into_reader())
                 .map_err(|e| format!("JSON parse error: {}", e))
         })
         .await
         .map_err(|e| format!("spawn_blocking failed: {}", e))??;
 
-        let entries: Vec<escrow::EscrowEntry> = api_entries
-            .into_iter()
-            .map(|a| escrow::EscrowEntry {
-                coinbase_txid: a.coinbase_txid,
-                block_hash: a.block_hash,
-                confirm_daa: a.confirm_daa as u64,
-                amount_sompi: a.amount_sompi as u64,
-                output_index: a.output_index as u32,
-                claimed: false,
-                slashed: false,
-                orphan_slashed: false,
-                orphan_retries: 0,
-                orphan_retry_after_daa: None,
-                submit_retries: 0,
-                batch_cap: 0,
-                cap_set_daa: 0,
-                is_inference: false,
-            })
-            .collect();
+        let (state, total_sompi) = recovered_escrow_state(api_entries)?;
+        let count = state.entries.len();
+        if shutdown_requested.load(Ordering::Acquire) {
+            return Err("Shutdown requested before recovered escrow state was saved".into());
+        }
+        escrow::save_state_atomic(std::path::Path::new(&opt.escrow_state_file), &state)?;
 
-        let total_sompi: u64 = entries.iter().map(|e| e.amount_sompi).sum();
-        let count = entries.len();
-        let state = escrow::EscrowState { entries };
-        let json = serde_json::to_string_pretty(&state)?;
-        fs::write(&opt.escrow_state_file, &json)?;
-
-        info!(
-            "Recovered {} escrow entries — claimable: {:.4} KRX",
-            count,
-            total_sompi as f64 / 1e8
-        );
+        info!("Recovered {} escrow entries — claimable: {:.4} KRX", count, total_sompi as f64 / 1e8);
         info!("State saved to '{}'.", opt.escrow_state_file);
         return Ok(());
     }
+
+    // Where the chain actually is. Two decisions need it before anything heavy happens: whether
+    // the escrow delegation is already required, and which model eras are still reachable.
+    // Bounded and fail-open — an unreachable node must not stop a miner from starting.
+    let chain_daa = if opt.keryxd_address.starts_with("grpc://") {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::client::grpc::query_virtual_daa(opt.keryxd_address.clone()),
+        )
+        .await
+        {
+            Ok(Some(daa)) => {
+                info!("Node at DAA {}.", daa);
+                Some(daa)
+            }
+            _ => {
+                warn!("Could not read the node's DAA — assuming pre-H6 and prefetching every scheduled era.");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Resolve OPoI escrow private key (once, before the reconnect loop).
     let escrow_privkey: Option<String> = match escrow::load_or_generate_key(&opt.escrow_key_file) {
@@ -717,6 +986,84 @@ async fn run() -> Result<(), Error> {
         }
     };
 
+    // Escrow delegation cert: binds the escrow key to the payout address. From H6 a coinbase
+    // without a valid pair is an invalid block, so a bad cert fails here instead of producing
+    // rejected blocks.
+    let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
+        (Some(privkey), Some(address)) => {
+            let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
+            // Printed on every start, not only on failure: this is the value the operator pastes
+            // into their wallet to authorise this miner, and it must be findable without first
+            // provoking an error. It is a public key — safe in a log, a screenshot or a paste.
+            info!("Escrow key to authorise in your wallet: {}", escrow_pubkey_hex);
+            // Resolution order: an explicitly supplied cert wins; otherwise the miner signs its
+            // own when the payout address is its escrow key's (nothing to set up); otherwise the
+            // file, which is the path for a payout address whose key lives in a wallet.
+            let supplied = opt.escrow_cert.as_deref().map(|c| {
+                let cert = c.trim().to_ascii_lowercase();
+                escrow::verify_escrow_cert(address, &escrow_pubkey_hex, &cert).map(|()| cert)
+            });
+            let resolved = match supplied {
+                Some(Ok(cert)) => {
+                    info!("Escrow delegation cert taken from --escrow-cert.");
+                    // Persist it so the operator does not re-pass the flag every start (signed once).
+                    match escrow::save_cert(&opt.escrow_cert_file, &cert) {
+                        Ok(true) => info!(
+                            "Escrow delegation cert saved to '{}' — future starts need no --escrow-cert.",
+                            opt.escrow_cert_file
+                        ),
+                        Ok(false) => {}
+                        Err(e) => warn!("Could not persist escrow cert to '{}': {} (running this session anyway).", opt.escrow_cert_file, e),
+                    }
+                    Ok(cert)
+                }
+                Some(Err(e)) => Err(e),
+                None => match escrow::self_sign_cert(privkey, address) {
+                    Some(cert) => {
+                        info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
+                        Ok(cert)
+                    }
+                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                        info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
+                        cert
+                    }),
+                },
+            };
+            match resolved {
+                Ok(cert) => Some(cert),
+                Err(e) => {
+                    // Refuse as soon as H6 is scheduled, not only once crossed. The operator is at
+                    // the keyboard when they upgrade; at the gate they are asleep and the whole
+                    // network trips at once. A release that arms H6 must therefore ship after the
+                    // wallet can issue the cert, or miners are stopped with no way to comply.
+                    if keryx_miner::models::h6_staged() {
+                        // The guidance travels inside the error: the log lines are wiped when the
+                        // TUI restores the terminal, `report_fatal` is what the operator reads.
+                        let guidance = [
+                            e,
+                            String::new(),
+                            "This miner works for your payout address, and your wallet has to say so once.".to_string(),
+                            String::new(),
+                            "  1. Open your wallet, card \"Authorise a miner\", and paste this escrow key:".to_string(),
+                            format!("       {}", escrow_pubkey_hex),
+                            "  2. Copy the line it returns and add it to this miner:".to_string(),
+                            "       --escrow-cert <the 128 hex characters>".to_string(),
+                            String::new(),
+                            format!("Signed once, valid for as long as you keep this address and '{}'.", opt.escrow_key_file),
+                            format!("Mine with this exact address: {}", address),
+                        ]
+                        .join("\n");
+                        error!("{}", guidance);
+                        return Err(guidance.into());
+                    }
+                    warn!("No escrow delegation cert ({}) — required once H6 is scheduled.", e);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
@@ -728,13 +1075,13 @@ async fn run() -> Result<(), Error> {
 
     // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
     // warning below and the per-GPU assignment both need them.
-    let forced_tiers: Vec<Option<keryx_miner::models::Tier>> = opt
-        .force_model
-        .as_deref()
-        .map(|s| s.split(',').map(parse_tier_name).collect())
-        .unwrap_or_default();
+    let forced_tiers: Vec<Option<keryx_miner::models::Tier>> =
+        opt.force_model.as_deref().map(|s| s.split(',').map(parse_tier_name).collect()).unwrap_or_default();
     if let Some(raw) = opt.force_model.as_deref() {
-        info!("--force-model: {} — per-card tier override (VRAM floor bypassed; unlisted/extra cards use auto).", raw.trim());
+        info!(
+            "--force-model: {} — per-card tier override (VRAM floor bypassed; unlisted/extra cards use auto).",
+            raw.trim()
+        );
     }
     let forced_max_rank = forced_tiers.iter().flatten().map(|t| tier_rank(*t)).max();
 
@@ -770,10 +1117,12 @@ async fn run() -> Result<(), Error> {
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::slm::init_supported(specs);
     log::debug!("OPoI Phase-3 active — {} model(s) staged.", specs.len());
-    // Prefetch BOTH scheduled eras so the H5 crossing hot-swaps without a mid-run download stall
-    // (equals `specs` while H5 is unscheduled). Block until every such model is downloaded before
-    // mining: never start hashing while a model is still downloading.
-    let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier);
+    // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
+    // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
+    // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a
+    // mid-run download stall. Block until every such model is downloaded before mining: never start
+    // hashing while a model is still downloading.
+    let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier, chain_daa);
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(prefetch_specs)).await {
         Ok(Ok(())) => info!("Model files ready ({}) — starting mining.", prefetch_specs.len()),
         Ok(Err(e)) => {
@@ -796,8 +1145,10 @@ async fn run() -> Result<(), Error> {
             let gpath = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
             keryx_miner::pom_gpu::set_mining_tier(*device_id, spec.model_id, gpath);
             keryx_miner::pom_gpu::set_device_tier(*device_id, *gpu_tier);
-            info!("PoM: GPU {} → {} (index + GPU walk load lazily once the lineup is active).",
-                device_id, spec.dir_name);
+            info!(
+                "PoM: GPU {} → {} (index + GPU walk load lazily once the lineup is active).",
+                device_id, spec.dir_name
+            );
         }
     }
 
@@ -805,7 +1156,9 @@ async fn run() -> Result<(), Error> {
     // that cannot run inference must fail fast with a clear message rather than spam panics.
     info!("Probing GPU inference (cuBLAS + llama engine) before mining…");
     match tokio::task::spawn_blocking(keryx_miner::slm::probe_gpu_inference).await {
-        Ok(keryx_miner::slm::GpuProbe::Ok) => info!("GPU inference verified — cuBLAS and the llama engine loaded successfully."),
+        Ok(keryx_miner::slm::GpuProbe::Ok) => {
+            info!("GPU inference verified — cuBLAS and the llama engine loaded successfully.")
+        }
         Ok(keryx_miner::slm::GpuProbe::NoCuda) => {
             error!("No CUDA device detected — OPoI inference is GPU-only and is mandatory, cannot mine.");
             return Err("No CUDA device — cannot start OPoI mining".into());
@@ -883,12 +1236,18 @@ async fn run() -> Result<(), Error> {
             block_template_ctr.clone(),
             &plugin_manager,
             escrow_privkey.clone(),
+            escrow_cert.clone(),
+            chain_daa,
             Arc::clone(&stats),
             Arc::clone(&shutdown_requested),
         )
         .await
         {
             Ok(_) => info!("Client closed gracefully"),
+            Err(e) if e.downcast_ref::<EscrowFlushError>().is_some() => {
+                error!("Funds-critical escrow state could not be persisted: {}", e);
+                return Err(e);
+            }
             Err(e) => error!("Client closed with error {:?}", e),
         }
         if shutdown_requested.load(Ordering::Acquire) {

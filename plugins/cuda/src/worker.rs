@@ -108,6 +108,9 @@ impl<'gpu> Worker for CudaGPUWorker<'gpu> {
             NonceGenEnum::Xoshiro => 1,
         };
 
+        // Clear the winner slot host-side: the kernel must not clear it while its own blocks
+        // are already publishing into it.
+        self.final_nonce_buff.copy_from(&[0]).unwrap();
         self.start_event.record(stream).unwrap();
         unsafe {
             launch!(

@@ -1,6 +1,7 @@
 use crate::proto::{
-    kaspad_message::Payload, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
-    KaspadMessage, NotifyBlockAddedRequestMessage, NotifyNewBlockTemplateRequestMessage,
+    kaspad_message::Payload, GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage,
+    GetInfoRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    NotifyNewBlockTemplateRequestMessage,
     NotifyVirtualSelectedParentChainChangedRequestMessage, RpcBlock, RpcTransaction,
     SubmitBlockRequestMessage, SubmitTransactionRequestMessage,
 };
@@ -45,6 +46,11 @@ impl From<GetInfoRequestMessage> for KaspadMessage {
         KaspadMessage { payload: Some(Payload::GetInfoRequest(a)) }
     }
 }
+impl From<GetBlockDagInfoRequestMessage> for KaspadMessage {
+    fn from(a: GetBlockDagInfoRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetBlockDagInfoRequest(a)) }
+    }
+}
 impl From<NotifyBlockAddedRequestMessage> for KaspadMessage {
     fn from(a: NotifyBlockAddedRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::NotifyBlockAddedRequest(a)) }
@@ -54,6 +60,12 @@ impl From<NotifyBlockAddedRequestMessage> for KaspadMessage {
 impl From<GetBlockTemplateRequestMessage> for KaspadMessage {
     fn from(a: GetBlockTemplateRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::GetBlockTemplateRequest(a)) }
+    }
+}
+
+impl From<GetServiceStrikesRequestMessage> for KaspadMessage {
+    fn from(a: GetServiceStrikesRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetServiceStrikesRequest(a)) }
     }
 }
 

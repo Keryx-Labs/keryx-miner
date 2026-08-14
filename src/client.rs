@@ -13,4 +13,7 @@ pub trait Client {
     async fn register(&mut self) -> Result<(), Error>;
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error>;
     fn get_block_channel(&self) -> Sender<BlockSeed>;
+    fn flush_escrow_state(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
