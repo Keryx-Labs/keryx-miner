@@ -186,6 +186,17 @@ pub fn probe_library() -> Result<std::path::PathBuf, String> {
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns the
 /// attempt id of the resident load, or why it failed. Safe to call from multiple threads.
 pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
+    load(gguf, gpu, false)
+}
+
+/// Atomically replace the resident model, including across GPUs. The caller must first drain the
+/// hosting GPU's tensor readers. The engine mutex prevents another GPU from claiming the singleton
+/// between freeing the old model and loading the replacement.
+pub fn replace_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
+    load(gguf, gpu, true)
+}
+
+fn load(gguf: &str, gpu: usize, allow_gpu_change: bool) -> Result<u64, LoadError> {
     let attempt = next_attempt();
     let failed = |stage: &'static str, detail: String, cuda_touched: bool| {
         LoadError::new(attempt, stage, detail, cuda_touched)
@@ -203,7 +214,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         // steal the engine — the hosting GPU's zero-dup walk still gathers over these
         // resident tensors, so freeing them here would be a device use-after-free (and the
         // two GPUs would thrash full model loads stealing the singleton back and forth).
-        if e.gpu != gpu {
+        if e.gpu != gpu && !allow_gpu_change {
             return Err(failed("busy", format!("engine hosts a model on GPU {} — not stealing it", e.gpu), false));
         }
         if let Some(e) = g.take() {
@@ -243,17 +254,30 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             Err(_) => return Err(failed("path", "GGUF path contains a NUL byte".to_string(), false)),
         };
         log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
-        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let model = load(cg.as_ptr(), gpu as c_int, n_ctx);
+        let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
+        let n_ctx: c_int = configured_ctx.unwrap_or(4096);
+        let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
         if model.is_null() {
-            let detail = last_error.map_or_else(
+            let mut detail = last_error.map_or_else(
                 || "model load failed (VRAM? arch?)".to_string(),
                 |f| {
                     let msg = CStr::from_ptr(f()).to_string_lossy().into_owned();
                     if msg.is_empty() { "model load failed (VRAM? arch?)".to_string() } else { msg }
                 },
             );
-            return Err(failed("native_load", detail, true));
+            if context_retry_size(n_ctx, configured_ctx.is_some(), &detail).is_some() {
+                log::warn!("llama engine: 4096-token context did not fit; retrying with 1024 tokens");
+                model = load(cg.as_ptr(), gpu as c_int, 1024);
+                if model.is_null() {
+                    detail = last_error.map_or_else(
+                        || "model load failed (VRAM? arch?)".to_string(),
+                        |f| CStr::from_ptr(f()).to_string_lossy().into_owned(),
+                    );
+                }
+            }
+            if model.is_null() {
+                return Err(failed("native_load", detail, true));
+            }
         }
         *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string(), attempt });
         log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
@@ -395,4 +419,58 @@ mod tests {
         assert!(!missing.cuda_context_may_be_invalid());
         assert_eq!(missing.to_string(), "library: keryx-llama shared library not found");
     }
+
+    #[test]
+    fn retries_default_context_only_after_context_allocation_failure() {
+        let context_oom = "context: llama_init_from_model failed [vram: 0 MiB free / 16302 MiB total]";
+        assert_eq!(context_retry_size(4096, false, context_oom), Some(1024));
+        assert_eq!(context_retry_size(4096, true, context_oom), None);
+        assert_eq!(context_retry_size(1024, false, context_oom), None);
+        assert_eq!(context_retry_size(4096, false, "model: unsupported architecture"), None);
+        assert_eq!(
+            context_retry_size(
+                4096,
+                false,
+                "context: llama_init_from_model failed [vram: unavailable (cudaMemGetInfo failed: CUDA_ERROR_INVALID_CONTEXT)]",
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA GPUs, libkeryx-llama, and KERYX_TEST_MODEL_GPU0/GPU1 GGUF paths"]
+    fn cross_gpu_replace_moves_the_singleton_without_busy() {
+        let gpu0 = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
+        let gpu1 = std::env::var("KERYX_TEST_MODEL_GPU1").expect("set KERYX_TEST_MODEL_GPU1");
+
+        ensure_loaded(&gpu1, 1).unwrap();
+        assert!(active_for(&gpu1, 1));
+        assert!(generate("Reply with only OK.", 16).is_some());
+        replace_loaded(&gpu0, 0).unwrap();
+        assert!(active_for(&gpu0, 0));
+        assert!(generate("Reply with only OK.", 16).is_some());
+        replace_loaded(&gpu1, 1).unwrap();
+        assert!(active_for(&gpu1, 1));
+        assert!(generate("Reply with only OK.", 16).is_some());
+        unload();
+    }
+
+    #[test]
+    #[ignore = "requires one CUDA GPU, libkeryx-llama, and KERYX_TEST_MODEL_GPU0 GGUF path"]
+    fn single_gpu_load_and_generate() {
+        let model = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
+
+        ensure_loaded(&model, 0).unwrap();
+        assert!(active_for(&model, 0));
+        assert!(generate("Reply with only OK.", 16).is_some());
+        unload();
+    }
+}
+
+fn context_retry_size(n_ctx: c_int, explicitly_configured: bool, detail: &str) -> Option<c_int> {
+    (!explicitly_configured
+        && n_ctx > 1024
+        && detail.contains("context: llama_init_from_model failed")
+        && detail.contains(" MiB free / "))
+    .then_some(1024)
 }

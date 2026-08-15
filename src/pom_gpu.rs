@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -782,6 +782,19 @@ pub fn is_installed(device_id: u32) -> bool {
     miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
 }
 
+/// Raised before an OPoI inference is spawned, lowered once no inference is in flight. While
+/// raised, no PoM operation may start or reload a model — including a worker that acquired the
+/// lifecycle lock before the pause.
+static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_inference_paused(paused: bool) {
+    INFERENCE_PAUSED.store(paused, Ordering::Release);
+}
+
+pub fn inference_paused() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire)
+}
+
 /// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
 /// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
 static LOADING: AtomicUsize = AtomicUsize::new(0);
@@ -794,6 +807,9 @@ pub fn is_loading() -> bool {
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Option<u64> {
+    if inference_paused() {
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
@@ -803,6 +819,9 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
 pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    if inference_paused() {
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
@@ -848,6 +867,9 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
 /// device's era-correct model actually changes — and inert entirely with the current fixed post-H5
 /// lineup. Called each tick from the loop, so a miner upgraded before a gate crosses over on its own.
 pub fn advance_mining_tier_if_due(daa: u64) {
+    if inference_paused() {
+        return;
+    }
     let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
         Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
         Err(_) => return,
@@ -907,23 +929,34 @@ fn device_lifecycle(device_id: u32) -> Arc<Mutex<()>> {
     g.entry(device_id).or_default().clone()
 }
 
-/// Release the llama engine for a model swap, draining every reader of its resident tensors
-/// first: the hosting device's installed walk (uninstall barrier) and any build in flight on it
-/// (lifecycle lock). Then make room on `target_dev` for the incoming model.
-pub fn evict_llama_host_for_swap(target_dev: u32) {
+static LLAMA_MODEL_SWAP: Mutex<()> = Mutex::new(());
+
+fn with_swap_lifecycle_locks<T>(host: Option<u32>, target_dev: u32, swap: impl FnOnce() -> T) -> T {
+    let mut devices = vec![target_dev];
+    if let Some(host) = host.filter(|host| *host != target_dev) {
+        devices.push(host);
+        devices.sort_unstable();
+    }
+    let locks: Vec<_> = devices.into_iter().map(device_lifecycle).collect();
+    let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner())).collect();
+    swap()
+}
+
+/// Replace the llama engine's resident model while the old and target GPU miners are unable to
+/// rebuild. Keeping both lifecycle locks through the new load closes the gap where the old miner
+/// could reload its model first and make `ensure_loaded` report a cross-GPU busy error.
+pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crate::llama_engine::LoadError> {
+    let _swap_guard = LLAMA_MODEL_SWAP.lock().unwrap_or_else(|p| p.into_inner());
     let host = crate::llama_engine::active_gpu().map(|g| g as u32);
-    match host {
-        Some(host) => {
-            let lock = device_lifecycle(host);
-            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    with_swap_lifecycle_locks(host, target_dev, || {
+        if let Some(host) = host {
             uninstall(host);
-            crate::llama_engine::unload();
         }
-        None => crate::llama_engine::unload(),
-    }
-    if host != Some(target_dev) {
-        uninstall(target_dev);
-    }
+        if host != Some(target_dev) {
+            uninstall(target_dev);
+        }
+        crate::llama_engine::replace_loaded(gguf, target_dev as usize)
+    })
 }
 
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
@@ -931,6 +964,9 @@ pub fn evict_llama_host_for_swap(target_dev: u32) {
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
+    if inference_paused() {
+        return false;
+    }
     if is_installed(device_id) {
         return true;
     }
@@ -1081,6 +1117,11 @@ fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
+    // Re-check under the per-device lifecycle lock: a worker that queued on the lock before the
+    // pause was raised must not reload the mining model while inference is still generating.
+    if inference_paused() {
+        return false;
+    }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
         None => return false,
@@ -1348,6 +1389,46 @@ mod tests {
         assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
         assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
         assert!(!is_transient_gpu_runtime_fault("out of memory"));
+    }
+
+    #[test]
+    fn model_swap_holds_both_gpu_lifecycles_until_replacement_load_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const HOST: u32 = 10_000;
+        const TARGET: u32 = 10_001;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let swap = std::thread::spawn(move || {
+            with_swap_lifecycle_locks(Some(HOST), TARGET, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut waiters = Vec::new();
+        for device in [HOST, TARGET] {
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let lock = device_lifecycle(device);
+                let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                acquired_tx.send(()).unwrap();
+            });
+            assert!(
+                acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "gpu{device} lifecycle escaped before the replacement model finished loading"
+            );
+            waiters.push((acquired_rx, waiter));
+        }
+
+        release_tx.send(()).unwrap();
+        swap.join().unwrap();
+        for (acquired_rx, waiter) in waiters {
+            acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            waiter.join().unwrap();
+        }
     }
 }
 
