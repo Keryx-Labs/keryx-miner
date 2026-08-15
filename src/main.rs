@@ -342,11 +342,11 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
 /// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   Qwen3-8B-abliterated →  ~4.6 GB
-///   Mistral-7B-v0.3 →  ~5.9 GB
-///   GLM-4-9B        →  ~8.3 GB
-///   Qwen3.6-27B     → ~16.5 GB  (requires ≥24 GB card)
-///   Kimi-Linear-48B → ~29.7 GB  (requires ≥32 GB card)
+///   Qwen3.5-9B-abliterated  →  ~6.5 GB  (requires ≥8 GB card)
+///   GLM-4-9B                →  ~8.3 GB  (requires ≥12 GB card)
+///   Gemma-4-12B-abliterated →  ~9.8 GB  (requires ≥16 GB card)
+///   Qwen3.6-27B             → ~16.5 GB  (requires ≥24 GB card)
+///   Kimi-Linear-48B         → ~29.7 GB  (requires ≥32 GB card)
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
@@ -385,14 +385,14 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     } else if needs_high {
         ("Qwen3.6-27B (--high)", 20_000)
     } else {
-        ("GLM-4-9B (default)", 10_000)
+        ("Gemma-4-12B-abliterated (default)", 15_000)
     };
 
     if vram_mb < min_vram_mb {
         log::warn!(
             "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
-             will OOM. Use a smaller tier (--high Qwen3.6-27B / --light Mistral-7B-v0.3) or let \
-             the per-GPU assignment downgrade it.",
+             will OOM. Use a smaller tier (--high Qwen3.6-27B / --light GLM-4-9B / --very-light \
+             Qwen3.5-9B) or let the per-GPU assignment downgrade it.",
             model_label,
             min_vram_mb / 1024,
             vram_mb / 1024,
@@ -405,30 +405,16 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// Per-tier VRAM floor (MB) for **auto-assignment** — the practical minimum to load that tier's
 /// model (weights + KV cache + CUDA workspace). Distinct from `ModelSpec.min_vram_mb`, which is 0
 /// for the smallest tiers (never gated out of `ai:cap`) and so can't rank tier 0 vs 1 by VRAM.
-/// Largest tier first, so a device picks the biggest tier it can hold. Era-aware: staging targets
-/// the latest scheduled lineup (`spec_for_tier`), so the floors MUST rank against that lineup's
-/// models — with H6 staged the tier-0 model is 8 GB-class and tier 2 is 16 GB-class.
+/// Largest tier first, so a device picks the biggest tier it can hold. The floors MUST rank
+/// against the staged lineup's models (`spec_for_tier`).
 fn pom_tier_ladder() -> &'static [(keryx_miner::models::Tier, u64)] {
-    if keryx_miner::models::h6_staged() {
-        &[
-            (keryx_miner::models::Tier::VeryHigh, 28_000),
-            (keryx_miner::models::Tier::High, 22_000),
-            (keryx_miner::models::Tier::Default, 15_000),
-            (keryx_miner::models::Tier::Light, 11_000),
-            (keryx_miner::models::Tier::VeryLight, 7_000),
-        ]
-    } else {
-        &[
-            (keryx_miner::models::Tier::VeryHigh, 28_000),
-            (keryx_miner::models::Tier::High, 22_000),
-            (keryx_miner::models::Tier::Default, 11_000),
-            (keryx_miner::models::Tier::Light, 7_000),
-            // Qwen3-8B tier 0 loads in ~5,409 MiB @ ctx 4096; floor sits ~300 MiB below its 6 GB
-            // min_vram so a 6 GB card reporting slightly under 6000 (total_mem) keeps tier 0, and
-            // ~300 MiB above the load need for OOM margin.
-            (keryx_miner::models::Tier::VeryLight, 5_700),
-        ]
-    }
+    &[
+        (keryx_miner::models::Tier::VeryHigh, 28_000),
+        (keryx_miner::models::Tier::High, 22_000),
+        (keryx_miner::models::Tier::Default, 15_000),
+        (keryx_miner::models::Tier::Light, 11_000),
+        (keryx_miner::models::Tier::VeryLight, 7_000),
+    ]
 }
 
 /// Ordinal rank of a tier (VeryLight=0 … VeryHigh=4), for the "≤ ceiling" comparison.
@@ -1067,9 +1053,9 @@ async fn run() -> Result<(), Error> {
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
-    //   --very-light → Qwen3-8B-abliterated
-    //   --light      → Mistral-7B-v0.3
-    //   (no flag)    → GLM-4-9B      [default]
+    //   --very-light → Qwen3.5-9B-abliterated
+    //   --light      → GLM-4-9B
+    //   (no flag)    → Gemma-4-12B-abliterated   [default]
     //   --high       → Qwen3.6-27B
     //   --very-high  → Kimi-Linear-48B
 
@@ -1099,13 +1085,13 @@ async fn run() -> Result<(), Error> {
         info!("--high mode: high tier — mines Qwen3.6-27B under PoM.");
         keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: light tier — mines Mistral-7B-v0.3 under PoM.");
+        info!("--light mode: light tier — mines GLM-4-9B under PoM.");
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: smallest tier — mines Qwen3-8B-abliterated under PoM.");
+        info!("--very-light mode: smallest tier — mines Qwen3.5-9B-abliterated under PoM.");
         keryx_miner::models::Tier::VeryLight
     } else {
-        info!("default mode: mines GLM-4-9B under PoM.");
+        info!("default mode: mines Gemma-4-12B-abliterated under PoM.");
         keryx_miner::models::Tier::Default
     };
     // Per-GPU PoM assignment: each CUDA device mines the highest tier ≤ the flag ceiling that its

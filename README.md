@@ -96,9 +96,9 @@ One tier, one model. The flag you pick decides which model your GPU must hold, a
 
 | Flag | Model | Quant | Min VRAM |
 |------|-------|-------|----------|
-| `--very-light` | Qwen3-8B-abliterated | Q4_K_S | 6 GB+ |
-| `--light` | Mistral-7B-v0.3 | Q6_K | 8 GB+ |
-| *(none, default)* | GLM-4-9B-0414 | Q6_K | 12 GB+ |
+| `--very-light` | Qwen3.5-9B-abliterated | Q5_K_M | 8 GB+ |
+| `--light` | GLM-4-9B-0414 | Q6_K | 12 GB+ |
+| *(none, default)* | Gemma-4-12B-abliterated | Q6_K | 16 GB+ |
 | `--high` | Qwen3.6-27B | Q4_K_M | 24 GB+ |
 | `--very-high` | Kimi-Linear-48B | Q4_K_M | 32 GB+ |
 
@@ -114,7 +114,7 @@ The model is loaded **on demand** when a request arrives and cached between requ
 
 ### Faster proof build (optional)
 
-`--resident-tree` holds the full Merkle tree in RAM, so building a block's proof is a lookup instead of an on-the-fly recompute. It needs roughly **2× the model size in system RAM** (not VRAM) — about 10 GB for the smallest tier, ~40 GB for the largest. If the machine doesn't have the RAM, the miner logs a warning and keeps the default disk-backed path, so enabling it is always safe.
+`--resident-tree` holds the full Merkle tree in RAM, so building a block's proof is a lookup instead of an on-the-fly recompute. It needs roughly **2× the model size in system RAM** (not VRAM) — about 13 GB for the smallest tier, ~40 GB for the largest. If the machine doesn't have the RAM, the miner logs a warning and keeps the default disk-backed path, so enabling it is always safe.
 
 ```bash
 ./keryx-miner --mining-address keryx:YOUR_ADDRESS --resident-tree
@@ -134,9 +134,9 @@ If IPFS is slow or blocked on your network, download the archive and unzip it in
 
 | Model | Hugging Face | Direct | Torrent |
 |-------|--------------|--------|---------|
-| Qwen3-8B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3-8B-abliterated.zip) | [zip](https://keryx-labs.com/Qwen3-8B-abliterated.zip) | [torrent](https://keryx-labs.com/Qwen3-8B-abliterated.zip.torrent) |
-| Mistral-7B-v0.3 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Mistral-7B-v0.3.zip) | [zip](https://keryx-labs.com/Mistral-7B-v0.3.zip) | [torrent](https://keryx-labs.com/Mistral-7B-v0.3.zip.torrent) |
+| Qwen3.5-9B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3.5-9B-abliterated.zip) | [zip](https://keryx-labs.com/Qwen3.5-9B-abliterated.zip) | [torrent](https://keryx-labs.com/Qwen3.5-9B-abliterated.zip.torrent) |
 | GLM-4-9B-0414 | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/GLM-4-9B-0414.zip) | [zip](https://keryx-labs.com/GLM-4-9B-0414.zip) | [torrent](https://keryx-labs.com/GLM-4-9B-0414.zip.torrent) |
+| Gemma-4-12B-abliterated | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Gemma-4-12B-abliterated.zip) | [zip](https://keryx-labs.com/Gemma-4-12B-abliterated.zip) | [torrent](https://keryx-labs.com/Gemma-4-12B-abliterated.zip.torrent) |
 | Qwen3.6-27B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Qwen3.6-27B.zip) | [zip](https://keryx-labs.com/Qwen3.6-27B.zip) | [torrent](https://keryx-labs.com/Qwen3.6-27B.zip.torrent) |
 | Kimi-Linear-48B | [zip](https://huggingface.co/datasets/Keryx-Labs/models/resolve/main/Kimi-Linear-48B.zip) | [zip](https://keryx-labs.com/Kimi-Linear-48B.zip) | [torrent](https://keryx-labs.com/Kimi-Linear-48B.zip.torrent) |
 

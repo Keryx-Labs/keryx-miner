@@ -323,7 +323,6 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
 /// e.g. Qwen3). Each template was validated against the GGUF's embedded chat template.
 fn format_prompt_by_name(name: &str, prompt: &str) -> String {
     match name {
-        "mistral-7b-v0.3" => format!("[INST] {}\n\n{}[/INST]", SYSTEM_PROMPT_NEXT, prompt),
         // GLM-4-0414 ignores the <|system|> role identity (keeps claiming a foreign vendor) —
         // fold the system prompt into the user turn instead.
         "glm-4-9b-0414" => format!(
@@ -333,7 +332,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.6-27b" | "qwen3-8b-abliterated" | "qwen3.5-9b-abliterated" => format!(
+        "qwen3.6-27b" | "qwen3.5-9b-abliterated" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",

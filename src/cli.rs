@@ -4,13 +4,13 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers — one model per tier (default: GLM-4-9B):\n  --very-light Qwen3-8B-abliterated (Q4_K_S) — 6GB+ VRAM, smallest tier\n  --light      Mistral-7B-v0.3 (Q6_K) — 8GB+ VRAM\n  (default)    GLM-4-9B (Q6_K) — 12GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers — one model per tier (default: Gemma-4-12B):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B (Q6_K) — 12GB+ VRAM\n  (default)    Gemma-4-12B-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
 pub struct Opt {
     // ── OPoI / Inference ─────────────────────────────────────────────────────
 
     #[clap(
         long = "very-light",
-        help = "Model tier: Qwen3-8B-abliterated — 6GB+ GPU, smallest tier",
+        help = "Model tier: Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ GPU, smallest tier",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "very-high"]
     )]
@@ -18,7 +18,7 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Model tier: Mistral-7B-v0.3 — 8GB+ VRAM",
+        help = "Model tier: GLM-4-9B (Q6_K) — 12GB+ VRAM",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["very-light", "high", "very-high"]
     )]
