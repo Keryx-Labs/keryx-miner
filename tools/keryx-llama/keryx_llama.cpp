@@ -114,6 +114,8 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
+    cp.n_batch = std::min(cp.n_batch, cp.n_ctx);
+    cp.n_ubatch = std::min(cp.n_ubatch, std::max(1u, cp.n_ctx / 4));
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         keryx_set_error("context", "llama_init_from_model failed");
