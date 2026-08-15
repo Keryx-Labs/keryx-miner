@@ -907,23 +907,34 @@ fn device_lifecycle(device_id: u32) -> Arc<Mutex<()>> {
     g.entry(device_id).or_default().clone()
 }
 
-/// Release the llama engine for a model swap, draining every reader of its resident tensors
-/// first: the hosting device's installed walk (uninstall barrier) and any build in flight on it
-/// (lifecycle lock). Then make room on `target_dev` for the incoming model.
-pub fn evict_llama_host_for_swap(target_dev: u32) {
+static LLAMA_MODEL_SWAP: Mutex<()> = Mutex::new(());
+
+fn with_swap_lifecycle_locks<T>(host: Option<u32>, target_dev: u32, swap: impl FnOnce() -> T) -> T {
+    let mut devices = vec![target_dev];
+    if let Some(host) = host.filter(|host| *host != target_dev) {
+        devices.push(host);
+        devices.sort_unstable();
+    }
+    let locks: Vec<_> = devices.into_iter().map(device_lifecycle).collect();
+    let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner())).collect();
+    swap()
+}
+
+/// Replace the llama engine's resident model while the old and target GPU miners are unable to
+/// rebuild. Keeping both lifecycle locks through the new load closes the gap where the old miner
+/// could reload its model first and make `ensure_loaded` report a cross-GPU busy error.
+pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crate::llama_engine::LoadError> {
+    let _swap_guard = LLAMA_MODEL_SWAP.lock().unwrap_or_else(|p| p.into_inner());
     let host = crate::llama_engine::active_gpu().map(|g| g as u32);
-    match host {
-        Some(host) => {
-            let lock = device_lifecycle(host);
-            let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    with_swap_lifecycle_locks(host, target_dev, || {
+        if let Some(host) = host {
             uninstall(host);
-            crate::llama_engine::unload();
         }
-        None => crate::llama_engine::unload(),
-    }
-    if host != Some(target_dev) {
-        uninstall(target_dev);
-    }
+        if host != Some(target_dev) {
+            uninstall(target_dev);
+        }
+        crate::llama_engine::replace_loaded(gguf, target_dev as usize)
+    })
 }
 
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
@@ -1348,6 +1359,46 @@ mod tests {
         assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
         assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
         assert!(!is_transient_gpu_runtime_fault("out of memory"));
+    }
+
+    #[test]
+    fn model_swap_holds_both_gpu_lifecycles_until_replacement_load_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        const HOST: u32 = 10_000;
+        const TARGET: u32 = 10_001;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let swap = std::thread::spawn(move || {
+            with_swap_lifecycle_locks(Some(HOST), TARGET, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let mut waiters = Vec::new();
+        for device in [HOST, TARGET] {
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let lock = device_lifecycle(device);
+                let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+                acquired_tx.send(()).unwrap();
+            });
+            assert!(
+                acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "gpu{device} lifecycle escaped before the replacement model finished loading"
+            );
+            waiters.push((acquired_rx, waiter));
+        }
+
+        release_tx.send(()).unwrap();
+        swap.join().unwrap();
+        for (acquired_rx, waiter) in waiters {
+            acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            waiter.join().unwrap();
+        }
     }
 }
 

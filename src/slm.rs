@@ -674,8 +674,7 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         // The hosted model may live on ANOTHER device whose walk reads its tensors zero-dup:
         // evict drains that device (installed walk AND in-flight build) before freeing anything.
         // Draining only `dev_id` here poisoned the hosting GPU on every two-model rig.
-        crate::pom_gpu::evict_llama_host_for_swap(dev_id);
-        if let Err(e) = crate::llama_engine::ensure_loaded(&gguf, dev_id as usize) {
+        if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
             log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;
