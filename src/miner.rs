@@ -358,6 +358,19 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::pom_activation_daa()) {
+                        // The OPoI gate is raised before inference is spawned. A worker that has
+                        // not consumed the watch::None pause yet must not start another PoM op.
+                        if keryx_miner::pom_gpu::inference_paused() {
+                            if let Some(cmd) = block_channel.get_changed()? {
+                                state = match cmd {
+                                    Some(WorkerCommand::Job(ns)) => Some(ns),
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    None => None,
+                                };
+                            }
+                            std::thread::yield_now();
+                            continue;
+                        }
                         let (pph, time, target_le, daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
@@ -419,7 +432,7 @@ impl MinerManager {
                             state = match cmd {
                                 Some(WorkerCommand::Job(ns)) => Some(ns),
                                 Some(WorkerCommand::Close) => return Ok(()),
-                                None => state,
+                                None => None,
                             };
                         }
                         continue;

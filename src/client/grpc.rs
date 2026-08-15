@@ -553,13 +553,14 @@ impl KeryxdHandler {
     /// ready) rather than by the node. Set at every pause decision, so no exit path can leave it
     /// stale. Also suppresses the GPU stall warnings, which a deliberate pause would trip.
     fn set_opoi_pause(&self, paused: bool) {
+        keryx_miner::pom_gpu::set_inference_paused(paused);
         if let Some(flag) = &self.opoi_challenge_active {
             flag.store(paused, Ordering::Relaxed);
         }
     }
 
     fn try_start_inference(&mut self) {
-        if self.inference_rx.is_some() {
+        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
             return;
         }
         if let Some((stable_id, raw, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
@@ -730,7 +731,16 @@ impl KeryxdHandler {
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
                         self.scan_txs_for_ai_requests(&block.transactions);
-                        self.try_start_inference();
+                        // Pause and drain mining BEFORE spawning inference, so no PoM op can
+                        // race the model swap: PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME.
+                        if self.inference_rx.is_none()
+                            && self.challenge_inference_rx.is_none()
+                            && !self.ai_request_queue.is_empty()
+                        {
+                            self.set_opoi_pause(true);
+                            miner.process_block(None).await?;
+                            self.try_start_inference();
+                        }
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         if let Some(w) = self.escrow_watcher.as_ref() {
@@ -778,6 +788,7 @@ impl KeryxdHandler {
                 // (defensive: holds even against a node that still issues them post-hardfork).
                 if !template.inference_challenge.is_empty()
                     && self.challenge_inference_rx.is_none()
+                    && self.inference_rx.is_none()
                     && self.last_known_daa < keryx_miner::pom::pom_activation_daa()
                 {
                     let challenge = template.inference_challenge.clone();
@@ -789,10 +800,9 @@ impl KeryxdHandler {
                             let mut model_id = [0u8; 32];
                             model_id.copy_from_slice(&model_id_bytes);
                             if keryx_miner::slm::is_model_ready(&model_id) {
+                                self.set_opoi_pause(true);
+                                miner.process_block(None).await?;
                                 info!("OPoI: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);
-                                if let Some(flag) = &self.opoi_challenge_active {
-                                    flag.store(true, Ordering::Relaxed);
-                                }
                                 let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
                                 let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
                                 tokio::task::spawn_blocking(move || {
@@ -825,7 +835,14 @@ impl KeryxdHandler {
                 if let Some(ref block) = template.block {
                     self.scan_txs_for_ai_requests(&block.transactions);
                 }
-                self.try_start_inference();
+                if self.inference_rx.is_none()
+                    && self.challenge_inference_rx.is_none()
+                    && !self.ai_request_queue.is_empty()
+                {
+                    self.set_opoi_pause(true);
+                    miner.process_block(None).await?;
+                    self.try_start_inference();
+                }
                 // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
                 // This covers both regular AiRequest inference and node-issued challenge inference.
                 if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
@@ -880,7 +897,14 @@ impl KeryxdHandler {
                         .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
                         self.scan_txs_for_ai_requests(&block.transactions);
-                        self.try_start_inference();
+                        if self.inference_rx.is_none()
+                            && self.challenge_inference_rx.is_none()
+                            && !self.ai_request_queue.is_empty()
+                        {
+                            self.set_opoi_pause(true);
+                            miner.process_block(None).await?;
+                            self.try_start_inference();
+                        }
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         if let Some(w) = self.escrow_watcher.as_ref() {
                             let (outputs, sompi) = w.pending_escrow();

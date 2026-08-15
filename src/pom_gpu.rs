@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -782,6 +782,19 @@ pub fn is_installed(device_id: u32) -> bool {
     miners().lock().map(|g| g.contains_key(&device_id)).unwrap_or(false)
 }
 
+/// Raised before an OPoI inference is spawned, lowered once no inference is in flight. While
+/// raised, no PoM operation may start or reload a model — including a worker that acquired the
+/// lifecycle lock before the pause.
+static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_inference_paused(paused: bool) {
+    INFERENCE_PAUSED.store(paused, Ordering::Release);
+}
+
+pub fn inference_paused() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire)
+}
+
 /// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
 /// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
 static LOADING: AtomicUsize = AtomicUsize::new(0);
@@ -794,6 +807,9 @@ pub fn is_loading() -> bool {
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool) -> Option<u64> {
+    if inference_paused() {
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
@@ -803,6 +819,9 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
 pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
+    if inference_paused() {
+        return None;
+    }
     let miner = {
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
@@ -848,6 +867,9 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
 /// device's era-correct model actually changes — and inert entirely with the current fixed post-H5
 /// lineup. Called each tick from the loop, so a miner upgraded before a gate crosses over on its own.
 pub fn advance_mining_tier_if_due(daa: u64) {
+    if inference_paused() {
+        return;
+    }
     let devices: Vec<(u32, crate::models::Tier)> = match device_tiers().lock() {
         Ok(g) => g.iter().map(|(d, t)| (*d, *t)).collect(),
         Err(_) => return,
@@ -942,6 +964,9 @@ pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crat
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
+    if inference_paused() {
+        return false;
+    }
     if is_installed(device_id) {
         return true;
     }
@@ -1092,6 +1117,11 @@ fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
+    // Re-check under the per-device lifecycle lock: a worker that queued on the lock before the
+    // pause was raised must not reload the mining model while inference is still generating.
+    if inference_paused() {
+        return false;
+    }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
         None => return false,
