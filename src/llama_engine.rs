@@ -11,6 +11,7 @@
 //! user-facing OPoI text. The walk kernel, the host possession index, proofs and `tag_fixed` are
 //! untouched; `ensure_installed_inner`'s N-guard cross-checks the gather against the host index.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,7 @@ type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut 
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
+type TensorInfo = (String, u64, usize, bool);
 
 const ABI: c_int = 3;
 
@@ -331,12 +333,42 @@ pub fn unload_for_gpu(gpu: usize) {
     }
 }
 
-/// Resident tensors in CANONICAL (name-sorted) order: (name, data_ptr, nbytes, is_device).
-pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
+/// Restrict llama.cpp's runtime tensor list to tensors that actually exist in the source GGUF,
+/// preserving the canonical GGUF name order used by PoM. Runtime-only aliases (for example a
+/// materialised `output.weight` for tied embeddings) are valid for inference, but they are not
+/// part of the on-disk model committed by R_T and must never enter the possession walk.
+fn canonical_tensor_view(resident: &[TensorInfo], canonical: &[(String, usize)]) -> Option<(Vec<TensorInfo>, usize)> {
+    let mut by_name: HashMap<&str, &TensorInfo> = HashMap::with_capacity(resident.len());
+    for tensor in resident {
+        if by_name.insert(tensor.0.as_str(), tensor).is_some() {
+            return None;
+        }
+    }
+
+    let mut out = Vec::with_capacity(canonical.len());
+    for (name, expected_nbytes) in canonical {
+        let tensor = *by_name.get(name.as_str())?;
+        if tensor.2 != *expected_nbytes {
+            return None;
+        }
+        out.push(tensor.clone());
+    }
+
+    let ignored = resident.len().saturating_sub(out.len());
+    Some((out, ignored))
+}
+
+/// Resident tensors in CANONICAL GGUF (name-sorted) order: (name, data_ptr, nbytes, is_device).
+///
+/// llama.cpp can expose additional runtime-materialised tensors that are not present in the GGUF.
+/// We only filter those extras after proving that every canonical GGUF tensor is present with the
+/// exact expected byte length. If that proof fails, return the raw runtime list unchanged so the
+/// existing PoM N/byte safety gates fail closed rather than silently accepting a changed layout.
+pub fn tensors() -> Option<Vec<TensorInfo>> {
     let g = engine().lock().ok()?;
     let e = g.as_ref()?;
     let n = unsafe { (e.count)(e.model) };
-    let mut out = Vec::with_capacity(n);
+    let mut resident = Vec::with_capacity(n);
     for i in 0..n {
         let mut name: *const c_char = std::ptr::null();
         let mut data: *mut c_void = std::ptr::null_mut();
@@ -347,9 +379,45 @@ pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
             return None;
         }
         let nm = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
-        out.push((nm, data as u64, nbytes, is_dev != 0));
+        resident.push((nm, data as u64, nbytes, is_dev != 0));
     }
-    Some(out)
+
+    let canonical = (|| -> Option<Vec<(String, usize)>> {
+        let mut file = std::fs::File::open(&e.gguf).ok()?;
+        let meta = crate::gguf::GgufMeta::read(&mut file).ok()?;
+        meta.sorted_names()
+            .into_iter()
+            .map(|name| {
+                let nbytes = usize::try_from(meta.tensors[&name].nbytes).ok()?;
+                Some((name, nbytes))
+            })
+            .collect()
+    })();
+
+    let Some(canonical) = canonical else {
+        log::warn!(
+            "llama engine: could not reconstruct the canonical GGUF tensor list; leaving the runtime tensor view unfiltered for PoM safety gates"
+        );
+        return Some(resident);
+    };
+
+    match canonical_tensor_view(&resident, &canonical) {
+        Some((view, ignored)) => {
+            if ignored > 0 {
+                log::info!(
+                    "llama engine: PoM canonical tensor view ignored {} runtime-only tensor(s) materialised by llama.cpp",
+                    ignored
+                );
+            }
+            Some(view)
+        }
+        None => {
+            log::warn!(
+                "llama engine: runtime tensor view does not exactly cover the GGUF canonical tensors; leaving it unfiltered for PoM safety gates"
+            );
+            Some(resident)
+        }
+    }
 }
 
 /// First resident tensor whose bytes do NOT live on `expected_gpu`, as (name, owning ordinal).
@@ -435,6 +503,42 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn canonical_tensor_view_ignores_runtime_only_tied_embedding_alias() {
+        let resident = vec![
+            ("output.weight".to_string(), 30, 32, true),
+            ("token_embd.weight".to_string(), 10, 64, true),
+            ("blk.0.attn_q.weight".to_string(), 20, 96, true),
+        ];
+        let canonical = vec![
+            ("blk.0.attn_q.weight".to_string(), 96),
+            ("token_embd.weight".to_string(), 64),
+        ];
+
+        let (view, ignored) = canonical_tensor_view(&resident, &canonical).expect("canonical view");
+        assert_eq!(ignored, 1);
+        assert_eq!(view.len(), 2);
+        assert_eq!(view[0].0, "blk.0.attn_q.weight");
+        assert_eq!(view[1].0, "token_embd.weight");
+    }
+
+    #[test]
+    fn canonical_tensor_view_rejects_missing_canonical_tensor() {
+        let resident = vec![("token_embd.weight".to_string(), 10, 64, true)];
+        let canonical = vec![
+            ("blk.0.attn_q.weight".to_string(), 96),
+            ("token_embd.weight".to_string(), 64),
+        ];
+        assert!(canonical_tensor_view(&resident, &canonical).is_none());
+    }
+
+    #[test]
+    fn canonical_tensor_view_rejects_size_mismatch() {
+        let resident = vec![("token_embd.weight".to_string(), 10, 96, true)];
+        let canonical = vec![("token_embd.weight".to_string(), 64)];
+        assert!(canonical_tensor_view(&resident, &canonical).is_none());
     }
 
     #[test]
