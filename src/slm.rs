@@ -386,7 +386,6 @@ pub enum GpuProbe {
 }
 
 /// Verify that GPU inference can actually work *before* mining starts.
-///
 /// The in-process llama engine and its cuBLAS dependency are both dlopened lazily on the first
 /// load; discovering either of them missing mid-challenge would silently drop responses while
 /// mining kept running — the possession walk has no dependency on them. Probe all three
@@ -445,7 +444,17 @@ fn unavailable_models() -> &'static RwLock<HashSet<[u8; 32]>> {
 
 /// Withdraw a model from `ai:cap`: the files are on disk but this miner cannot serve it right
 /// now. Announcing it anyway earns assigned requests it cannot answer, hence service-bond strikes.
+/// A PoM-only zero-copy layout mismatch is explicitly not such a failure: llama can still serve
+/// inference, while the possession walk falls back to the canonical GGUF layout.
 pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
+    if reason == "llama_layout_incompatible" {
+        log::warn!(
+            "SlmEngine: model {:.8} remains in ai:cap ({}) — inference is serviceable; PoM will use the canonical GGUF walk",
+            hex::encode(model_id),
+            reason
+        );
+        return;
+    }
     if unavailable_models().write().unwrap().insert(*model_id) {
         log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({})", hex::encode(model_id), reason);
     }
@@ -840,6 +849,19 @@ mod tests {
 
         mark_model_available(&model_id, "test_recovery");
         assert!(!model_is_unavailable(&model_id));
+    }
+
+    #[test]
+    fn layout_incompatibility_keeps_inference_capability_advertised() {
+        let model_id = [0xd4u8; 32];
+        mark_model_available(&model_id, "test_cleanup");
+
+        mark_model_unavailable(&model_id, "llama_layout_incompatible");
+
+        assert!(
+            !model_is_unavailable(&model_id),
+            "a zero-copy PoM layout mismatch must not withdraw a model that llama can still serve"
+        );
     }
 
     #[test]
