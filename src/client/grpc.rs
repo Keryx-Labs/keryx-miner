@@ -35,6 +35,13 @@ const VALIDATION_WINDOW: usize = 64;
 /// Max unique stable-ids tracked for deduplication — evict when full.
 const MAX_AI_SEEN_IDS: usize = 10_000;
 
+/// DAA lookback of the startup backfill scan: deep enough to cover any service window still
+/// open when the miner process comes up.
+const AI_BACKFILL_WINDOW_DAA: u64 = 6_000;
+
+/// Backfill GetBlock requests kept in flight.
+const AI_BACKFILL_INFLIGHT: usize = 32;
+
 /// Seconds between AiResponse resubmissions while the mempool has not accepted it.
 const AI_RESPONSE_RETRY_SECS: u64 = 3;
 
@@ -92,6 +99,14 @@ pub struct KeryxdHandler {
     /// Value: (tx, submit attempts, last submit time). Resubmitted until accepted or expired —
     /// a transiently rejected response must keep trying while the service window is open.
     ai_response_inflight: std::collections::HashMap<String, (crate::proto::RpcTransaction, u32, std::time::Instant)>,
+
+    /// Startup backfill: recent ancestors are walked parent-by-parent and scanned, so an
+    /// AiRequest accepted before this process started is still served while its window is
+    /// open. `None` cutoff = not seeded yet.
+    backfill_cutoff_daa: Option<u64>,
+    backfill_queue: VecDeque<String>,
+    backfill_pending: std::collections::HashSet<String>,
+    backfill_visited: std::collections::HashSet<String>,
 
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
@@ -280,6 +295,10 @@ impl KeryxdHandler {
             ai_seen_prefixes: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
             ai_response_inflight: std::collections::HashMap::new(),
+            backfill_cutoff_daa: None,
+            backfill_queue: VecDeque::new(),
+            backfill_pending: std::collections::HashSet::new(),
+            backfill_visited: std::collections::HashSet::new(),
             inference_rx: None,
             challenge_inference_rx: None,
             opoi_challenge_active: None,
@@ -595,6 +614,68 @@ impl KeryxdHandler {
         }
     }
 
+    /// Seeds the startup backfill from the first block notification.
+    fn backfill_seed(&mut self, header: Option<&crate::proto::RpcBlockHeader>) {
+        if self.backfill_cutoff_daa.is_some() {
+            return;
+        }
+        let Some(header) = header else { return };
+        let cutoff = header.daa_score.saturating_sub(AI_BACKFILL_WINDOW_DAA);
+        self.backfill_cutoff_daa = Some(cutoff);
+        if let Some(level0) = header.parents.first() {
+            for hash in &level0.parent_hashes {
+                if self.backfill_visited.insert(hash.clone()) {
+                    self.backfill_queue.push_back(hash.clone());
+                }
+            }
+        }
+        info!("OPoI: backfilling recent blocks for in-window AiRequests (cutoff daa {})", cutoff);
+    }
+
+    /// Keeps up to AI_BACKFILL_INFLIGHT backfill block requests in flight.
+    async fn backfill_pump(&mut self) -> Result<(), Error> {
+        if self.backfill_cutoff_daa.is_none() {
+            return Ok(());
+        }
+        while self.backfill_pending.len() < AI_BACKFILL_INFLIGHT {
+            let Some(hash) = self.backfill_queue.pop_front() else { break };
+            self.backfill_pending.insert(hash.clone());
+            self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
+        }
+        Ok(())
+    }
+
+    /// Notes a fetched backfill block: walks its parents while above the cutoff.
+    fn backfill_note_block(&mut self, hash: &str, header: Option<&crate::proto::RpcBlockHeader>) {
+        if !self.backfill_pending.remove(hash) {
+            return;
+        }
+        let Some(cutoff) = self.backfill_cutoff_daa else { return };
+        if let Some(header) = header {
+            if header.daa_score > cutoff {
+                if let Some(level0) = header.parents.first() {
+                    for parent in &level0.parent_hashes {
+                        if self.backfill_visited.insert(parent.clone()) {
+                            self.backfill_queue.push_back(parent.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if self.backfill_queue.is_empty() && self.backfill_pending.is_empty() {
+            info!("OPoI: startup backfill complete ({} blocks scanned)", self.backfill_visited.len());
+            self.backfill_visited.clear();
+            self.backfill_visited.shrink_to_fit();
+        }
+    }
+
+    /// Clears a backfill entry whose GetBlock failed (pruned or unknown block).
+    fn backfill_note_error(&mut self, message: &str) {
+        if let Some(hash) = self.backfill_pending.iter().find(|h| message.contains(h.as_str())).cloned() {
+            self.backfill_pending.remove(&hash);
+        }
+    }
+
     /// Resubmits in-flight AiResponses the mempool has not accepted yet.
     async fn retry_pending_ai_responses(&mut self) -> Result<(), Error> {
         if self.ai_response_inflight.is_empty() {
@@ -770,6 +851,8 @@ impl KeryxdHandler {
             // Do NOT trigger a new block template here — NewBlockTemplate handles that.
             Payload::BlockAddedNotification(notif) => {
                 if let Some(block) = notif.block {
+                    self.backfill_seed(block.header.as_ref());
+                    self.backfill_pump().await?;
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
                         self.scan_txs_for_ai_requests(&block.transactions);
@@ -926,7 +1009,12 @@ impl KeryxdHandler {
                         .as_mut()
                         .map_or(false, |w| w.on_block_validation_error(&e.message));
                     if !was_validation {
-                        warn!("GetBlockResponse error: {}", e.message);
+                        if self.backfill_pending.iter().any(|h| e.message.contains(h.as_str())) {
+                            self.backfill_note_error(&e.message);
+                            self.backfill_pump().await?;
+                        } else {
+                            warn!("GetBlockResponse error: {}", e.message);
+                        }
                     }
                 } else if let Some(block) = msg.block {
                     let hash = block.verbose_data.as_ref().map(|v| v.hash.clone()).unwrap_or_default();
@@ -939,6 +1027,8 @@ impl KeryxdHandler {
                         .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
                         self.scan_txs_for_ai_requests(&block.transactions);
+                        self.backfill_note_block(&hash, block.header.as_ref());
+                        self.backfill_pump().await?;
                         if self.inference_rx.is_none()
                             && self.challenge_inference_rx.is_none()
                             && !self.ai_request_queue.is_empty()
