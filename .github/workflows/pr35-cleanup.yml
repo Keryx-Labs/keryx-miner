@@ -1,0 +1,75 @@
+name: PR35 Gemma cleanup
+
+on:
+  push:
+    branches:
+      - fix/gemma4-llama-layout
+    paths:
+      - .github/workflows/pr35-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gemma4-llama-layout
+          fetch-depth: 0
+
+      - name: Finalize fallback semantics and format
+        shell: powershell
+        run: |
+          $pom = 'src/pom_gpu.rs'
+          $s = Get-Content $pom -Raw
+          $s = $s.Replace(
+            '// impossible — free llama''s VRAM and walk a raw canonical upload instead. (Inference for`r`n    // such a model is unavailable without the engine; every current-lineup model is untied.)',
+            '// impossible — free llama''s VRAM and walk a raw canonical upload instead. OPoI can`r`n    // reload the same model into llama on demand, so this is not an inference-capability failure.'
+          )
+          $s = $s.Replace(
+            '"PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch) — walking a raw canonical copy; inference for this model is unavailable."',
+            '"PoM[gpu{}]: llama-resident layout N={} != canonical N={} (llama repacks this model arch) — walking a raw canonical copy; zero-copy PoM sharing is disabled for this model."'
+          )
+          $s = $s.Replace(
+            '                crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");`r`n',
+            ''
+          )
+          Set-Content $pom $s -Encoding utf8
+
+          $llama = 'src/llama_engine.rs'
+          $l = Get-Content $llama -Raw
+          $pattern = '(?s)    #\[test\]\r?\n    #\[ignore = "requires one CUDA GPU, keryx-llama shared library, and KERYX_TEST_GEMMA4 GGUF path"\]\r?\n    fn gemma4_live_layout_and_inference\(\) \{.*?\r?\n    \}\r?\n\r?\n    #\[test\]\r?\n    #\[ignore = "requires two CUDA GPUs'
+          $replacement = @'
+    #[test]
+    #[ignore = "requires one CUDA GPU, keryx-llama shared library, and KERYX_TEST_GEMMA4 GGUF path"]
+    fn gemma4_live_llama_inference() {
+        let model = std::env::var("KERYX_TEST_GEMMA4")
+            .expect("set KERYX_TEST_GEMMA4 to Gemma-4-12B-abliterated/model.gguf");
+
+        ensure_loaded(&model, 0).expect("Gemma-4 must load in llama.cpp");
+        assert!(active_for(&model, 0));
+        assert!(!tensors().expect("Gemma-4 resident tensors").is_empty());
+        let text = generate("Reply with only OK.", 16).expect("Gemma-4 OPoI generation");
+        assert!(!text.trim().is_empty(), "Gemma-4 generated an empty OPoI response");
+        unload();
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA GPUs
+'@
+          $l2 = [regex]::Replace($l, $pattern, $replacement)
+          if ($l2 -eq $l) { throw 'Failed to replace obsolete Gemma zero-copy live test' }
+          Set-Content $llama $l2 -Encoding utf8
+
+          cargo fmt --all
+
+          Remove-Item '.github/workflows/pr35-cleanup.yml'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'fix(gemma4): preserve OPoI across raw PoM fallback'
+          git push origin HEAD:fix/gemma4-llama-layout
