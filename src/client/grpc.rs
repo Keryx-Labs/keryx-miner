@@ -35,6 +35,12 @@ const VALIDATION_WINDOW: usize = 64;
 /// Max unique stable-ids tracked for deduplication — evict when full.
 const MAX_AI_SEEN_IDS: usize = 10_000;
 
+/// Seconds between AiResponse resubmissions while the mempool has not accepted it.
+const AI_RESPONSE_RETRY_SECS: u64 = 3;
+
+/// Submission attempts before giving up on an AiResponse.
+const AI_RESPONSE_MAX_ATTEMPTS: u32 = 100;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use log::{error, info, warn};
@@ -81,6 +87,11 @@ pub struct KeryxdHandler {
     /// Maps stable_id → (txid, inference_reward_sompi) for confirmed AiRequest TXs.
     /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
     ai_request_txids: std::collections::HashMap<String, (String, u64)>,
+
+    /// In-flight AiResponse submissions not yet accepted by the mempool, keyed by txid.
+    /// Value: (tx, submit attempts, last submit time). Resubmitted until accepted or expired —
+    /// a transiently rejected response must keep trying while the service window is open.
+    ai_response_inflight: std::collections::HashMap<String, (crate::proto::RpcTransaction, u32, std::time::Instant)>,
 
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
@@ -182,6 +193,7 @@ impl Client for KeryxdHandler {
                         self.last_strike_poll = std::time::Instant::now();
                         self.client_send(GetServiceStrikesRequestMessage {}).await?;
                     }
+                    self.retry_pending_ai_responses().await?;
                 }
             }
         }
@@ -267,6 +279,7 @@ impl KeryxdHandler {
             validation_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
+            ai_response_inflight: std::collections::HashMap::new(),
             inference_rx: None,
             challenge_inference_rx: None,
             opoi_challenge_active: None,
@@ -582,6 +595,32 @@ impl KeryxdHandler {
         }
     }
 
+    /// Resubmits in-flight AiResponses the mempool has not accepted yet.
+    async fn retry_pending_ai_responses(&mut self) -> Result<(), Error> {
+        if self.ai_response_inflight.is_empty() {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        let mut resend: Vec<crate::proto::RpcTransaction> = Vec::new();
+        self.ai_response_inflight.retain(|txid, (tx, attempts, last)| {
+            if now.duration_since(*last).as_secs() < AI_RESPONSE_RETRY_SECS {
+                return true;
+            }
+            if *attempts >= AI_RESPONSE_MAX_ATTEMPTS {
+                warn!("OPoI: giving up on AiResponse {} after {} submit attempts", txid, attempts);
+                return false;
+            }
+            *attempts += 1;
+            *last = now;
+            resend.push(tx.clone());
+            true
+        });
+        for tx in resend {
+            self.client_send(KaspadMessage::submit_transaction(tx)).await?;
+        }
+        Ok(())
+    }
+
     /// Polls the in-flight inference task. When complete, uploads the result to
     /// IPFS and submits a zero-input/zero-output AiResponse transaction.
     /// Returns `true` if inference just finished (regardless of tx success).
@@ -644,6 +683,9 @@ impl KeryxdHandler {
             mass: 0,
             verbose_data: None,
         };
+        if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
+            self.ai_response_inflight.insert(txid, (rpc_tx.clone(), 1, std::time::Instant::now()));
+        }
         if let Err(e) = self.client_send(KaspadMessage::submit_transaction(rpc_tx)).await {
             warn!("OPoI: failed to send AiResponse tx: {}", e);
         }
@@ -962,8 +1004,31 @@ impl KeryxdHandler {
                     }
                     SubmitResponseOutcome::Handled => {}
                     SubmitResponseOutcome::NotOurs => {
-                        if let Some(e) = err {
-                            log::debug!("OPoI: submit_transaction error: {}", e);
+                        let inflight_txid = if self.ai_response_inflight.contains_key(&res.transaction_id) {
+                            Some(res.transaction_id.clone())
+                        } else {
+                            // Rejections may carry the txid in the message text instead.
+                            err.as_ref().and_then(|e| self.ai_response_inflight.keys().find(|k| e.contains(k.as_str())).cloned())
+                        };
+                        match (inflight_txid, err) {
+                            (Some(txid), None) => {
+                                self.ai_response_inflight.remove(&txid);
+                                info!("OPoI: AiResponse accepted by the mempool");
+                            }
+                            (Some(txid), Some(e)) if (e.contains(&txid) && e.contains("already")) || e.contains("same responder") => {
+                                self.ai_response_inflight.remove(&txid);
+                                info!("OPoI: AiResponse already known to the node — done");
+                            }
+                            (Some(txid), Some(e)) => {
+                                let attempts = self.ai_response_inflight.get(&txid).map(|(_, a, _)| *a).unwrap_or(1);
+                                if attempts <= 1 {
+                                    warn!("OPoI: AiResponse rejected: {} — retrying until accepted or expired", e);
+                                } else {
+                                    log::debug!("OPoI: AiResponse rejected (attempt {}): {}", attempts, e);
+                                }
+                            }
+                            (None, Some(e)) => log::debug!("OPoI: submit_transaction error: {}", e),
+                            (None, None) => {}
                         }
                     }
                 }
