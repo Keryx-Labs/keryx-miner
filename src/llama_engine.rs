@@ -542,6 +542,55 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_observed_runtime_layout_reduces_to_canonical_pom_chunks() {
+        const CHUNK_BYTES: usize = 32;
+        const CANONICAL_N: usize = 305_318_656;
+        const RESIDENT_N: usize = 331_123_456;
+
+        let canonical_bytes = CANONICAL_N * CHUNK_BYTES;
+        let runtime_only_bytes = (RESIDENT_N - CANONICAL_N) * CHUNK_BYTES;
+        let resident = vec![
+            ("token_embd.weight".to_string(), 0x1000, canonical_bytes, true),
+            ("output.weight".to_string(), 0x2000, runtime_only_bytes, true),
+        ];
+        let canonical = vec![("token_embd.weight".to_string(), canonical_bytes)];
+
+        let resident_n = resident.iter().map(|(_, _, nbytes, _)| nbytes / CHUNK_BYTES).sum::<usize>();
+        assert_eq!(resident_n, RESIDENT_N, "fixture must reproduce the Gemma-4 llama-resident N");
+
+        let (view, ignored) = canonical_tensor_view(&resident, &canonical).expect("Gemma-4 canonical view");
+        let canonical_n = view.iter().map(|(_, _, nbytes, _)| nbytes / CHUNK_BYTES).sum::<usize>();
+        assert_eq!(ignored, 1);
+        assert_eq!(canonical_n, CANONICAL_N, "runtime-only Gemma tensor must not alter PoM N");
+    }
+
+    #[test]
+    #[ignore = "requires one CUDA GPU, keryx-llama shared library, and KERYX_TEST_GEMMA4 GGUF path"]
+    fn gemma4_live_layout_and_inference() {
+        const CHUNK_BYTES: usize = 32;
+        let model = std::env::var("KERYX_TEST_GEMMA4").expect("set KERYX_TEST_GEMMA4 to Gemma-4-12B-abliterated/model.gguf");
+
+        ensure_loaded(&model, 0).expect("Gemma-4 must load in llama.cpp");
+        assert!(active_for(&model, 0));
+
+        let pom_view = tensors().expect("Gemma-4 resident tensors");
+        let pom_n = pom_view.iter().map(|(_, _, nbytes, _)| nbytes / CHUNK_BYTES).sum::<usize>();
+
+        let mut file = std::fs::File::open(&model).expect("open Gemma-4 GGUF");
+        let meta = crate::gguf::GgufMeta::read(&mut file).expect("parse Gemma-4 GGUF");
+        let canonical_n = meta
+            .sorted_names()
+            .into_iter()
+            .map(|name| usize::try_from(meta.tensors[&name].nbytes).expect("tensor size") / CHUNK_BYTES)
+            .sum::<usize>();
+
+        assert_eq!(pom_n, canonical_n, "Gemma-4 PoM view must match the canonical GGUF layout");
+        let text = generate("Reply with only OK.", 16).expect("Gemma-4 OPoI generation");
+        assert!(!text.trim().is_empty(), "Gemma-4 generated an empty OPoI response");
+        unload();
+    }
+
+    #[test]
     #[ignore = "requires two CUDA GPUs, libkeryx-llama, and KERYX_TEST_MODEL_GPU0/GPU1 GGUF paths"]
     fn cross_gpu_replace_moves_the_singleton_without_busy() {
         let gpu0 = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
