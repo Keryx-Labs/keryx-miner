@@ -57,6 +57,7 @@ pub type Error = Box<dyn StdError + Send + Sync + 'static>;
 
 type Hash = Uint256;
 
+#[cfg(any(target_os = "linux", test))]
 const CUDA_INSTALL_SCRIPT: &str = r#"set -euo pipefail
 umask 077
 tmp_dir=$(mktemp -d /tmp/keryx-cuda.XXXXXX)
