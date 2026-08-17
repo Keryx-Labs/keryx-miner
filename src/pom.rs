@@ -1398,9 +1398,10 @@ pub fn h5_2_activation_daa() -> u64 {
 
 /// H6 matrix-walk gate. At/after this score (the TEMPLATE's daa_score, never wall clock or tip)
 /// the miner grinds the v3 walk and builds `PomProofV3`. MUST equal the node's
-/// `pom_v3_activation`: mainnet 76_316_623, testnet 1000.
+/// `pom_v3_activation`: mainnet 76_316_623, testnet 0 — the lineup carries no pre-H6 models, so
+/// anything above 0 leaves the miner with no model to walk on a chain starting at genesis.
 pub fn pom_v3_activation_daa() -> u64 {
-    gate(76_316_623, 1000)
+    gate(76_316_623, 0)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
