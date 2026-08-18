@@ -104,6 +104,102 @@ fn default_output_index() -> u32 {
     1
 }
 
+/// Pick the next claim batch, returned as indices into `entries` (empty = nothing to ship).
+///
+/// +10 margin on maturity: OP_CSV validation can lag the virtual-state DAA score by several
+/// blocks in the BlockDAG. A single +1 margin is often not enough, causing seq-lock
+/// rejections that get retried every block. Per-entry cooldowns are checked individually so
+/// they don't block other claims.
+///
+/// Selection runs in priority passes; each candidate builds its own batch and the first
+/// RELEASABLE one wins, so a held-back pass never starves the ones below:
+///   0 — nominal: uncapped live entries, inference first within the batch (they carry
+///       user fees and must not be starved by the coinbase queue). A batch never mixes
+///       CSV windows — one sequence and one escrow script are signed for the whole TX —
+///       so each window present gets its own candidate, current-era first. Releasable
+///       ONLY as a full MAX_CLAIM_BATCH batch — the flat claim fee is amortized across
+///       the whole TX and partial batches never ship. Nominal goes FIRST so full batches
+///       are never delayed behind repair grinding;
+///   1 — repair: live entries carrying a bisection cap (survivors of a rejected batch).
+///       They regroup among themselves — never with uncapped entries, which would bleed
+///       fresh outputs into small immediate batches — and flow at any size (in the gaps
+///       between full batches) so dead inputs get isolated;
+///   2 — drain: live entries whose CSV window no longer matches the one coinbases mint.
+///       Their pool can no longer grow to a full nominal batch, so they flow at any size;
+///   3 — the known-dead pool (solo-orphaned at least once), ground down whenever nothing
+///       fresher is claimable.
+/// A batch never mixes passes: batching live entries with known-dead ones would let one
+/// dead input orphan the whole TX and stall the live entries.
+fn select_claim_batch(entries: &[EscrowEntry], daa_score: u64, in_flight_outpoints: &HashSet<String>) -> Vec<usize> {
+    let current_window = csv_window_for_daa(daa_score);
+    let mut windows: Vec<u64> = entries.iter().map(|e| e.csv_window).collect();
+    windows.sort_unstable_by_key(|&w| (w != current_window, w));
+    windows.dedup();
+
+    let mut candidates: Vec<(u8, Option<u64>)> = windows.into_iter().map(|w| (0u8, Some(w))).collect();
+    candidates.extend([(1, None), (2, None), (3, None)]);
+
+    let mut batch: Vec<usize> = Vec::new();
+    for (pass, forced_window) in candidates {
+        batch.clear();
+        let mut limit = MAX_CLAIM_BATCH;
+        let mut batch_window: Option<u64> = forced_window;
+        // Nominal pass: iterate inference entries first so they get batch priority;
+        // the sort is stable, so queue order is preserved within each kind.
+        let mut indices: Vec<usize> = (0..entries.len()).collect();
+        if pass == 0 {
+            indices.sort_by_key(|&i| !entries[i].is_inference);
+        }
+        for &i in &indices {
+            let e = &entries[i];
+            // Only the (transient, forgivable) flag decides the dead pool; the
+            // orphan_retries counter is the cumulative memory driving the permanent
+            // slash and must not keep an entry in the dead pool forever on its own.
+            let proven_dead = e.orphan_slashed;
+            let in_pass = match pass {
+                0 => e.batch_cap == 0 && !proven_dead,
+                1 => e.batch_cap != 0 && !proven_dead,
+                2 => e.batch_cap == 0 && !proven_dead && e.csv_window != current_window,
+                _ => proven_dead,
+            };
+            if !in_pass {
+                continue;
+            }
+            let eligible = !e.claimed
+                && !e.slashed
+                && daa_score >= e.confirm_daa + e.csv_window + 10
+                && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
+                && !in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
+            if !eligible {
+                continue;
+            }
+            if batch_window.map_or(false, |w| w != e.csv_window) {
+                continue;
+            }
+            let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
+            if cap.min(limit) < batch.len() + 1 {
+                continue; // joining would violate this entry's cap (or shrink below current size)
+            }
+            limit = limit.min(cap);
+            batch_window = Some(e.csv_window);
+            batch.push(i);
+            if batch.len() >= limit {
+                break; // batch is full for this candidate
+            }
+        }
+        let releasable = match pass {
+            // Nominal batches ship full or not at all (fee amortization).
+            0 => batch.len() >= MIN_CLAIM_BATCH,
+            // Repair, drain and dead-pool batches flow at any size.
+            _ => !batch.is_empty(),
+        };
+        if releasable {
+            return batch;
+        }
+    }
+    Vec::new()
+}
+
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct EscrowState {
     pub entries: Vec<EscrowEntry>,
@@ -644,88 +740,8 @@ impl EscrowWatcher {
             self.mark_dirty();
         }
 
-        // +10 margin: OP_CSV validation uses the selected-chain blue score, which can lag the
-        // virtual-state DAA score by several blocks in the BlockDAG.  A single +1 margin is
-        // often not enough, causing seq-lock rejections that get retried every block.
-        // Per-entry cooldowns are checked individually so they don't block other claims.
-        //
-        // Selection runs in priority passes; each pass builds its own candidate batch and
-        // the first RELEASABLE one wins, so a held-back pass never starves the ones below:
-        //   0 — nominal: uncapped live entries, inference first within the batch (they
-        //       carry user fees and must not be starved by the coinbase queue). Releasable
-        //       ONLY as a full MAX_CLAIM_BATCH batch — the flat claim fee is amortized
-        //       across the whole TX and partial batches never ship. Nominal goes FIRST so
-        //       full batches are never delayed behind repair grinding;
-        //   1 — repair: live entries carrying a bisection cap (survivors of a rejected
-        //       batch). They regroup among themselves — never with uncapped entries, which
-        //       would bleed fresh outputs into small immediate batches — and flow at any
-        //       size (in the gaps between full batches) so dead inputs get isolated;
-        //   2 — the known-dead pool (solo-orphaned at least once), ground down whenever
-        //       nothing fresher is claimable.
-        // A batch never mixes passes: batching live entries with known-dead ones would let
-        // one dead input orphan the whole TX and stall the live entries.
-        let mut batch: Vec<usize> = Vec::new();
-        let mut selected = false;
-        for pass in 0..3u8 {
-            batch.clear();
-            let mut limit = MAX_CLAIM_BATCH;
-            // A batch never mixes CSV windows: one sequence and one escrow script are
-            // signed for the whole TX. The first selected entry fixes the batch's window.
-            let mut batch_window: Option<u64> = None;
-            // Nominal pass: iterate inference entries first so they get batch priority;
-            // the sort is stable, so queue order is preserved within each kind.
-            let mut indices: Vec<usize> = (0..self.state.entries.len()).collect();
-            if pass == 0 {
-                indices.sort_by_key(|&i| !self.state.entries[i].is_inference);
-            }
-            for &i in &indices {
-                let e = &self.state.entries[i];
-                // Only the (transient, forgivable) flag decides the dead pool; the
-                // orphan_retries counter is the cumulative memory driving the permanent
-                // slash and must not keep an entry in the dead pool forever on its own.
-                let proven_dead = e.orphan_slashed;
-                let in_pass = match pass {
-                    0 => e.batch_cap == 0 && !proven_dead,
-                    1 => e.batch_cap != 0 && !proven_dead,
-                    _ => proven_dead,
-                };
-                if !in_pass {
-                    continue;
-                }
-                let eligible = !e.claimed
-                    && !e.slashed
-                    && daa_score >= e.confirm_daa + e.csv_window + 10
-                    && e.orphan_retry_after_daa.map_or(true, |retry_daa| daa_score >= retry_daa)
-                    && !self.in_flight_outpoints.contains(&format!("{}:{}", e.coinbase_txid, e.output_index));
-                if !eligible {
-                    continue;
-                }
-                if batch_window.map_or(false, |w| w != e.csv_window) {
-                    continue;
-                }
-                let cap = if e.batch_cap == 0 { MAX_CLAIM_BATCH } else { (e.batch_cap as usize).min(MAX_CLAIM_BATCH) };
-                if cap.min(limit) < batch.len() + 1 {
-                    continue; // joining would violate this entry's cap (or shrink below current size)
-                }
-                limit = limit.min(cap);
-                batch_window = Some(e.csv_window);
-                batch.push(i);
-                if batch.len() >= limit {
-                    break; // batch is full for this pass
-                }
-            }
-            let releasable = match pass {
-                // Nominal batches ship full or not at all (fee amortization).
-                0 => batch.len() >= MIN_CLAIM_BATCH,
-                // Repair and dead-pool batches flow at any size.
-                _ => !batch.is_empty(),
-            };
-            if releasable {
-                selected = true;
-                break;
-            }
-        }
-        if !selected {
+        let batch = select_claim_batch(&self.state.entries, daa_score, &self.in_flight_outpoints);
+        if batch.is_empty() {
             return None;
         }
         let entries: Vec<EscrowEntry> = batch.iter().map(|&i| self.state.entries[i].clone()).collect();
@@ -1790,6 +1806,60 @@ mod persistence_tests {
 
     fn fail_at(stage: u8) {
         ATOMIC_REPLACE_FAILURE_STAGE.with(|configured| configured.set(stage));
+    }
+
+    fn entry(idx: usize, confirm_daa: u64, csv_window: u64) -> EscrowEntry {
+        EscrowEntry {
+            coinbase_txid: format!("{idx:064x}"),
+            block_hash: "02".repeat(32),
+            confirm_daa,
+            amount_sompi: 100,
+            output_index: 1,
+            claimed: false,
+            slashed: false,
+            orphan_slashed: false,
+            orphan_retries: 0,
+            orphan_retry_after_daa: None,
+            submit_retries: 0,
+            batch_cap: 0,
+            cap_set_daa: 0,
+            is_inference: false,
+            csv_window,
+        }
+    }
+
+    /// A sub-full remainder of legacy-window entries at the head of the queue must not
+    /// keep a full current-window batch from shipping.
+    #[test]
+    fn full_current_window_batch_ships_past_legacy_remainder() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        let daa = gate + SERVICE_BOND_CSV_WINDOW_BLOCKS + 100_000;
+        let mut entries: Vec<EscrowEntry> =
+            (0..40).map(|i| entry(i, gate.saturating_sub(50_000), CHALLENGE_WINDOW_BLOCKS)).collect();
+        entries.extend((40..40 + MAX_CLAIM_BATCH).map(|i| entry(i, gate + 10, SERVICE_BOND_CSV_WINDOW_BLOCKS)));
+
+        let batch = select_claim_batch(&entries, daa, &HashSet::new());
+        assert_eq!(batch.len(), MAX_CLAIM_BATCH);
+        assert!(batch.iter().all(|&i| entries[i].csv_window == SERVICE_BOND_CSV_WINDOW_BLOCKS));
+    }
+
+    /// Legacy-window entries can no longer grow to a full batch once coinbases mint the
+    /// bonded window: they must drain at any size instead of waiting forever.
+    #[test]
+    fn stranded_legacy_window_drains_at_any_size() {
+        let gate = keryx_miner::pom::pom_v3_activation_daa();
+        if gate == 0 {
+            return; // testnet build: no legacy era exists
+        }
+        let daa = gate + SERVICE_BOND_CSV_WINDOW_BLOCKS + 100_000;
+        let mut entries: Vec<EscrowEntry> =
+            (0..40).map(|i| entry(i, gate.saturating_sub(50_000), CHALLENGE_WINDOW_BLOCKS)).collect();
+        // Current-window entries below a full batch: nominal must hold them back.
+        entries.extend((40..90).map(|i| entry(i, gate + 10, SERVICE_BOND_CSV_WINDOW_BLOCKS)));
+
+        let batch = select_claim_batch(&entries, daa, &HashSet::new());
+        assert_eq!(batch.len(), 40);
+        assert!(batch.iter().all(|&i| entries[i].csv_window == CHALLENGE_WINDOW_BLOCKS));
     }
 
     #[test]
