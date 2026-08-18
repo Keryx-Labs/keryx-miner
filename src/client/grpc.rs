@@ -81,7 +81,7 @@ pub struct KeryxdHandler {
     /// Queue of AiRequests waiting for inference.
     /// Each entry: (stable_id_hex16, raw_payload_bytes, model_id, prompt, max_tokens).
     /// Fed by both BlockAdded scans and block template scans.
-    ai_request_queue: VecDeque<(String, Vec<u8>, [u8; 32], String, usize)>,
+    ai_request_queue: VecDeque<(String, [u8; 32], [u8; 32], String, usize)>,
 
     /// Block hashes queued for boot-time escrow-state validation, drained in slices of
     /// VALIDATION_WINDOW so thousands of GetBlock requests never saturate the HTTP/2
@@ -110,7 +110,7 @@ pub struct KeryxdHandler {
 
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
-    inference_rx: Option<(Vec<u8>, oneshot::Receiver<Option<String>>)>,
+    inference_rx: Option<([u8; 32], oneshot::Receiver<Option<String>>)>,
 
     /// In-flight inference for a node-issued challenge.
     /// Tuple: (challenge_string, result_receiver) where challenge_string = "model_id_hex:nonce_hex".
@@ -434,7 +434,11 @@ impl KeryxdHandler {
     /// Handles two formats:
     ///   - Subnetwork 0x03 + binary `AiRequestPayload` (future on-chain format)
     ///   - Any non-coinbase TX + `KRX:AI:1:` JSON prefix (web wallet format)
-    fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction]) {
+    fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction], block_daa: u64) {
+        // Identity of a request follows the same gate as the node: transaction id past it, payload
+        // digest before. Decided from the daa of the block the request is observed in, so both
+        // sides classify a request the same way across the activation.
+        let txid_identity = block_daa >= keryx_miner::pom::reward_routing_activation_daa();
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
         let ready_ids = keryx_miner::slm::loaded_model_ids();
@@ -478,12 +482,28 @@ impl KeryxdHandler {
                     log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
                     continue;
                 }
-                let hash = blake2b_simd::blake2b(&raw);
-                let stable_id = hex::encode(&hash.as_bytes()[..8]);
+                let txid_hex = tx
+                    .verbose_data
+                    .as_ref()
+                    .map(|v| v.transaction_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| Self::compute_rpc_txid(tx));
+                let request_hash: [u8; 32] = if txid_identity {
+                    match txid_hex.as_deref().and_then(|h| hex::decode(h).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+                        Some(id) => id,
+                        None => {
+                            log::warn!("OPoI: cannot resolve the AiRequest transaction id — request skipped");
+                            continue;
+                        }
+                    }
+                } else {
+                    blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
+                };
+                let stable_id = hex::encode(&request_hash[..8]);
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
-                    self.ai_request_queue.push_back((stable_id.clone(), raw, model_id, prompt, max_tokens));
+                    self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, max_tokens));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
                         self.ai_request_queue.pop_front();
                     }
@@ -501,11 +521,7 @@ impl KeryxdHandler {
                 // template or block notifications, so without this fallback the escrow
                 // outpoint is never tracked and the inference_reward is never claimed.
                 if inference_reward > 0 {
-                    let txid_opt = tx.verbose_data.as_ref()
-                        .map(|v| v.transaction_id.clone())
-                        .filter(|id| !id.is_empty())
-                        .or_else(|| Self::compute_rpc_txid(tx));
-                    if let Some(txid) = txid_opt {
+                    if let Some(txid) = txid_hex {
                         self.ai_request_txids.insert(stable_id, (txid, inference_reward));
                     }
                 }
@@ -595,7 +611,7 @@ impl KeryxdHandler {
         if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
             return;
         }
-        if let Some((stable_id, raw, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+        if let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::is_model_ready(&model_id) {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
@@ -610,7 +626,7 @@ impl KeryxdHandler {
                 }
                 let _ = tx_done.send(result);
             });
-            self.inference_rx = Some((raw, rx_done));
+            self.inference_rx = Some((request_hash, rx_done));
         }
     }
 
@@ -706,11 +722,11 @@ impl KeryxdHandler {
     /// IPFS and submits a zero-input/zero-output AiResponse transaction.
     /// Returns `true` if inference just finished (regardless of tx success).
     async fn poll_inference(&mut self) -> bool {
-        let Some((raw, mut rx)) = self.inference_rx.take() else {
+        let Some((request_hash, mut rx)) = self.inference_rx.take() else {
             return false;
         };
         let Ok(result_opt) = rx.try_recv() else {
-            self.inference_rx = Some((raw, rx));
+            self.inference_rx = Some((request_hash, rx));
             return false;
         };
         let Some(result) = result_opt else {
@@ -720,8 +736,6 @@ impl KeryxdHandler {
             return true;
         };
 
-        let full_hash = blake2b_simd::blake2b(&raw);
-        let request_hash: [u8; 32] = full_hash.as_bytes()[..32].try_into().unwrap();
         info!("OPoI: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
 
         let ipfs_url = self.ipfs_url.clone();
@@ -772,7 +786,7 @@ impl KeryxdHandler {
         }
 
         // Register inference escrow outpoint for auto-claim after the challenge window.
-        let stable_id = hex::encode(&full_hash.as_bytes()[..8]);
+        let stable_id = hex::encode(&request_hash[..8]);
         if let Some((txid, inference_reward)) = self.ai_request_txids.remove(&stable_id) {
             if let Some(w) = self.escrow_watcher.as_mut() {
                 w.track_inference_escrow(txid, self.last_known_daa, inference_reward);
@@ -855,7 +869,7 @@ impl KeryxdHandler {
                     self.backfill_pump().await?;
                     if !block.transactions.is_empty() {
                         // Full block — scan directly.
-                        self.scan_txs_for_ai_requests(&block.transactions);
+                        self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         // Pause and drain mining BEFORE spawning inference, so no PoM op can
                         // race the model swap: PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME.
                         if self.inference_rx.is_none()
@@ -958,7 +972,7 @@ impl KeryxdHandler {
                     return Ok(());
                 }
                 if let Some(ref block) = template.block {
-                    self.scan_txs_for_ai_requests(&block.transactions);
+                    self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                 }
                 if self.inference_rx.is_none()
                     && self.challenge_inference_rx.is_none()
@@ -1026,7 +1040,7 @@ impl KeryxdHandler {
                         .as_mut()
                         .map_or(false, |w| w.consume_validation_ok(&hash, is_chain));
                     if !was_validation {
-                        self.scan_txs_for_ai_requests(&block.transactions);
+                        self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         self.backfill_note_block(&hash, block.header.as_ref());
                         self.backfill_pump().await?;
                         if self.inference_rx.is_none()

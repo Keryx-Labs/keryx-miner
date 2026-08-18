@@ -1404,6 +1404,14 @@ pub fn pom_v3_activation_daa() -> u64 {
     gate(76_316_623, 0)
 }
 
+/// H8 request-identity gate. At/after this score a request is identified by the transaction id of
+/// the AiRequest, not by the digest of its payload. MUST equal the node's
+/// `reward_routing_activation`: a miner deriving the other identity signs responses the node
+/// cannot credit, and is struck for work it actually did.
+pub fn reward_routing_activation_daa() -> u64 {
+    gate(79_251_000, 500)
+}
+
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
 /// A tier POSITION shifts across eras (a lineup insertion renumbers the models below it) while
 /// the model's index bytes are identical — keying by position would strand a built index at a
