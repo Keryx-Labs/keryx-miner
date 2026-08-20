@@ -92,6 +92,8 @@ pub struct PomProof {
     /// `final_state` (= `pom_v3::fold64(roots[K])`) and `pow_value` (era pow fold of it).
     /// Trailing field, same era-exact wire mechanism as `steps_v2` — mirror of the node's.
     pub v3: Option<crate::pom_v3::PomProofV3>,
+    /// v4 re-walk witness. Trailing field, same era-exact wire mechanism as `v3`.
+    pub v4: Option<crate::pom_v4::PomProofV4>,
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`) — mirror of the node's `PomProofPreH4`.
@@ -123,6 +125,38 @@ pub struct PomProofPreV3 {
     pub steps_v2: Option<Vec<PomStep>>,
 }
 
+/// Exact pre-v4 layout of `PomProof` (through `v3`, no `v4`) — mirror of the node's
+/// `PomProofPreV4`. Encode/decode fallback for proofs without the v4 extension.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct PomProofPreV4 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+    pub v3: Option<crate::pom_v3::PomProofV3>,
+}
+
+impl From<PomProofPreV4> for PomProof {
+    fn from(p: PomProofPreV4) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: p.v3,
+            v4: None,
+        }
+    }
+}
+
 impl From<PomProofPreV3> for PomProof {
     fn from(p: PomProofPreV3) -> Self {
         Self {
@@ -135,6 +169,7 @@ impl From<PomProofPreV3> for PomProof {
             openings: p.openings,
             steps_v2: p.steps_v2,
             v3: None,
+            v4: None,
         }
     }
 }
@@ -151,6 +186,7 @@ impl From<PomProofPreH4> for PomProof {
             openings: p.openings,
             steps_v2: None,
             v3: None,
+            v4: None,
         }
     }
 }
@@ -160,8 +196,21 @@ impl PomProof {
     /// without the v3 extension encodes byte-identically to the pre-H6 layout, and without the v2
     /// extension to the pre-H4 layout. The submit path MUST use this, never `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.v3.is_some() {
+        if self.v4.is_some() {
             borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.v3.is_some() {
+            borsh::to_vec(&PomProofPreV4 {
+                tier: self.tier,
+                trace_root: self.trace_root,
+                pow_value: self.pow_value,
+                final_state: self.final_state,
+                initial_trace_path: self.initial_trace_path.clone(),
+                final_trace_path: self.final_trace_path.clone(),
+                openings: self.openings.clone(),
+                steps_v2: self.steps_v2.clone(),
+                v3: self.v3.clone(),
+            })
+            .expect("PomProof borsh serialize")
         } else if self.steps_v2.is_some() {
             borsh::to_vec(&PomProofPreV3 {
                 tier: self.tier,
@@ -191,6 +240,7 @@ impl PomProof {
     /// Decode the canonical wire encoding, any era — mirror of the node's `from_wire_bytes`.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreV4>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
@@ -389,6 +439,42 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32], h3: bool) -> [u8
     out
 }
 
+/// v4 seed/pow salts. MUST equal the node's `POM_V4_PPH_SALT` / `POM_V4_POW_NONCE_SALT`.
+pub const POM_V4_PPH_SALT: [u64; 4] =
+    [0x7D7BC84C8D18DE80, 0xDE48EE16AE3F1541, 0x3305F1952B30384A, 0xF78C133968D388B7];
+pub const POM_V4_POW_NONCE_SALT: u64 = 0xD1507C9337DBF7D8;
+
+#[inline]
+pub fn pph_words_v4(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_V4_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
+/// v4 block seed. BYTE-IDENTICAL to the node's `pom_block_seed_v4`.
+pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_v4(pre_pow_hash), timestamp, nonce)
+}
+
+/// v4 pow value: folds the nonce into `final_state` first. BYTE-IDENTICAL to the node's
+/// `pom_pow_value_v4` and `pom_mine.cu::pom_mine_v4`.
+pub fn pom_pow_value_v4(final_state: u64, pre_pow_hash: &[u8; 32], nonce: u64) -> [u8; 32] {
+    let fs = mix64(final_state ^ mix64(nonce ^ POM_V4_POW_NONCE_SALT));
+    let p = pph_words_v4(pre_pow_hash);
+    let o0 = mix64(fs ^ p[0] ^ 0x9E3779B97F4A7C15);
+    let o1 = mix64(o0 ^ p[1] ^ 0xC2B2AE3D27D4EB4F);
+    let o2 = mix64(o1 ^ p[2] ^ 0x165667B19E3779F9);
+    let o3 = mix64(o2 ^ p[3] ^ 0xD6E8FEB86659FD93);
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&o0.to_le_bytes());
+    out[8..16].copy_from_slice(&o1.to_le_bytes());
+    out[16..24].copy_from_slice(&o2.to_le_bytes());
+    out[24..32].copy_from_slice(&o3.to_le_bytes());
+    out
+}
+
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty(), "merkle_root: empty leaves");
     let mut level = leaves.to_vec();
@@ -560,6 +646,7 @@ where
         openings,
         steps_v2: None,
         v3: None,
+        v4: None,
     }
 }
 
@@ -605,6 +692,7 @@ where
         openings: vec![],
         steps_v2: Some(steps),
         v3: None,
+        v4: None,
     }
 }
 
@@ -1404,12 +1492,17 @@ pub fn pom_v3_activation_daa() -> u64 {
     gate(76_316_623, 0)
 }
 
+/// PoM v4 (re-walk) gate. MUST equal the node's `pom_v4_activation`.
+pub fn pom_v4_activation_daa() -> u64 {
+    gate(79_210_000, 500)
+}
+
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of
 /// the AiRequest, not by the digest of its payload. MUST equal the node's
 /// `reward_routing_activation`: a miner deriving the other identity signs responses the node
 /// cannot credit, and is struck for work it actually did.
 pub fn reward_routing_activation_daa() -> u64 {
-    gate(79_251_000, 500)
+    gate(79_210_000, 500)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).

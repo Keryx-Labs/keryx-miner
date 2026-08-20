@@ -15,6 +15,7 @@ use crate::{
 };
 use keryx_miner::pom::{self, WeightIndex};
 use keryx_miner::pom_v3;
+use keryx_miner::pom_v4;
 use keryx_miner::Worker;
 
 mod hasher;
@@ -241,6 +242,40 @@ impl State {
         let h5_2 = self.daa_score >= pom::h5_2_activation_daa();
         let seed = pom::pom_block_seed(&pph, timestamp, nonce, h3, h5_1, h5_2);
 
+        // v4: re-walk era — the winning nonce is re-walked on the host (reading tiles from the
+        // canonical index) and the proof carries those tiles + Merkle range proofs.
+        if self.daa_score >= pom::pom_v4_activation_daa() {
+            let seed_v4 = pom::pom_block_seed_v4(&pph, timestamp, nonce);
+            let (v4, final_state) = pom_v4::build_proof_v4(tier, seed_v4, index)
+                .map_err(|e| info!("PoM v4 proof build failed: {e}"))
+                .ok()?;
+            let pow_value = pom::pom_pow_value_v4(final_state, &pph, nonce);
+            if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
+                info!("PoM v4 candidate rejected: canonical host walk does not meet target");
+                return None;
+            }
+            let checked = pom_v4::verify_proof_v4(seed_v4, &v4, &index.r_t, index.n_chunks)
+                .map_err(|e| info!("PoM v4 self-check failed: {e}"))
+                .ok()?;
+            if checked != final_state {
+                info!("PoM v4 proof discarded: self-check final_state mismatch");
+                return None;
+            }
+            let proof = pom::PomProof {
+                tier,
+                trace_root: [0u8; 32],
+                pow_value,
+                final_state,
+                initial_trace_path: vec![],
+                final_trace_path: vec![],
+                openings: vec![],
+                steps_v2: None,
+                v3: None,
+                v4: Some(v4),
+            };
+            return self.assemble_pom_block(nonce, final_state, tier, proof.to_wire_bytes());
+        }
+
         // H6: matrix-walk era — the winning nonce is re-walked on the GPU (state dump) and the
         // witness is built host-side from the dump. The seed/pow folds are era-stable.
         if self.daa_score >= pom::pom_v3_activation_daa() {
@@ -271,6 +306,7 @@ impl State {
                 openings: vec![],
                 steps_v2: None,
                 v3: Some(v3),
+                v4: None,
             };
             return self.assemble_pom_block(nonce, final_state, tier, proof.to_wire_bytes());
         }

@@ -382,3 +382,133 @@ extern "C" __global__ void pom_mine_v3_dump(
 
     if (threadIdx.x == 0) *final_state_out = fin;
 }
+
+// ============================================================================
+// PoM v4 (D=32 re-walk). Byte-exact mirror of consensus/core/src/pom_v4.rs.
+// One block of 32 threads per nonce; the moat is the K dependent 1 KB tile reads.
+// ============================================================================
+#define V4_D 32
+#define V4_D4 (V4_D / 4)          // 8 uints per row/column
+#define V4_TILE_BYTES 1024
+#define V4_TILE_CHUNKS 32
+static_assert(V4_D == 32, "PoM v4 requires D=32");
+
+#define V4_S0_ROW_SALT       0x03421325594C3C51ULL
+#define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9ULL
+#define V4_OFFSET_STEP_SALT  0x89050E78D34609EFULL
+#define V4_POW_NONCE_SALT    0xD1507C9337DBF7D8ULL
+
+// One 1 KB tile (32 canonical chunks) into shared, one chunk per lane.
+__device__ __forceinline__ void v4_load_tile(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long tile_index, unsigned int* s_tile, unsigned int lane) {
+    const unsigned long long idx = tile_index * (unsigned long long)V4_TILE_CHUNKS + lane;
+    unsigned int lo = 0, hi = T;
+    while (lo + 1 < hi) { unsigned int mid = (lo + hi) >> 1; if (prefix[mid] <= idx) lo = mid; else hi = mid; }
+    const ulonglong2* q = (const ulonglong2*)bases[lo];
+    const unsigned long long b = (idx - prefix[lo]) * 2ULL;
+    ulonglong2* dst = (ulonglong2*)(s_tile + lane * 8);
+    dst[0] = q[b];
+    dst[1] = q[b + 1];
+}
+
+// blake3 of a 32-byte state row (single partial block).
+__device__ __forceinline__ void b3_hash_row32(const unsigned int row[8], unsigned int out[8]) {
+    unsigned int cv[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+    unsigned int m[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) m[i] = row[i];
+    #pragma unroll
+    for (int i = 8; i < 16; i++) m[i] = 0u;
+    b3_compress(cv, m, 32, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) out[i] = cv[i];
+}
+
+// fold64(v4_state_root(S_K)); valid on thread 0 only.
+__device__ __forceinline__ unsigned long long v4_walk_block(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K, unsigned long long seed, unsigned int* s_tile) {
+    const unsigned int x = threadIdx.x;   // state row, 0..31
+
+    // S_0: mix64 keystream per row.
+    unsigned int row4[V4_D4];
+    {
+        unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); row4[k4] = (unsigned int)h; }
+    }
+
+    unsigned long long off = mix64(seed ^ V4_OFFSET_FIRST_SALT) % n_tiles;
+
+    for (unsigned int step = 1; step <= K; step++) {
+        v4_load_tile(bases, prefix, T, off, s_tile, x);
+        __syncthreads();
+
+        // Next offset from the CURRENT tile's snippet (first 32 bytes = 8 words).
+        {
+            unsigned long long sf = 0;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) sf = mix64(sf ^ (unsigned long long)s_tile[w]);
+            off = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf) % n_tiles;
+        }
+
+        // Transition: this thread's new row = rho(row . tile_col_j) for j in 0..32.
+        const unsigned int step_tweak = step * 0x9E3779B9u + x * 0xC2B2AE35u;
+        unsigned int new4[V4_D4];
+        #pragma unroll
+        for (int j4 = 0; j4 < V4_D4; j4++) {
+            unsigned int packed = 0;
+            #pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+                const int j = j4 * 4 + jj;
+                const unsigned int* col = &s_tile[j * V4_D4];   // column j = 32 bytes
+                int acc = 0;
+                #pragma unroll
+                for (int k = 0; k < V4_D4; k++) acc = __dp4a((int)row4[k], (int)col[k], acc);
+                packed |= (unsigned int)v3_rho8(acc, step_tweak + (unsigned int)j * 0x85EBCA6Bu) << (8 * jj);
+            }
+            new4[j4] = packed;
+        }
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = new4[k4];
+        __syncthreads();
+    }
+
+    // root_K: 32 blake3 row leaves + complete depth-5 tree (scratch reuses the tile region).
+    b3_hash_row32(row4, s_tile + x * 8);
+    __syncthreads();
+    unsigned int* src = s_tile;
+    unsigned int* dst = s_tile + V4_D * 8;
+    for (unsigned int n = V4_D; n > 1; n >>= 1) {
+        if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+        __syncthreads();
+        unsigned int* tmp = src; src = dst; dst = tmp;
+    }
+    return (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+}
+
+// v4 grind: one block of 32 threads per nonce. Dynamic shared = 2 KB (tile + fold scratch).
+extern "C" __global__ void pom_mine_v4(
+    const unsigned long long* bases, const unsigned long long* prefix, unsigned int T,
+    unsigned long long n_tiles, unsigned int K,
+    unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long s0, unsigned long long s1, unsigned long long s2, unsigned long long s3,
+    unsigned long long time_,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long nonce_base, unsigned long long n_nonces,
+    unsigned long long* winner) {
+    extern __shared__ unsigned int s_shared[];
+    if ((unsigned long long)blockIdx.x >= n_nonces) return;
+    const unsigned long long nonce = nonce_base + blockIdx.x;
+    const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
+    const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
+    if (threadIdx.x == 0) {
+        const unsigned long long fin_pow = mix64(fin ^ mix64(nonce ^ V4_POW_NONCE_SALT));
+        unsigned long long pv[4];
+        pom_pow_fold(fin_pow, p0, p1, p2, p3, pv);
+        if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
+    }
+}

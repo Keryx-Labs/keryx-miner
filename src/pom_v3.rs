@@ -421,6 +421,7 @@ mod tests {
             openings: vec![],
             steps_v2: None,
             v3: Some(v3),
+            v4: None,
         };
         let bytes = with_v3.to_wire_bytes();
         // A v3 proof decodes only through the full (v3-aware) layout.
