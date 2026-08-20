@@ -724,12 +724,13 @@ impl PomGpuMiner {
         // Worker threads rotate; make sure this device's context is current before raw launches.
         self.ctx.bind_to_thread()?;
         if v4 {
-            let words = crate::pom::pph_words_v4(pre_pow_hash);
+            let s_words = crate::pom::pph_words_v4(pre_pow_hash);
+            let p_words = crate::pom::pph_words_for_era(pre_pow_hash, true);
             let n_tiles = self.n_total_chunks / crate::pom_v4::POM_V4_TILE_CHUNKS;
             if n_tiles == 0 {
                 return Err(anyhow!("PoM GPU: blob too small for the v4 walk"));
             }
-            return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &words, &words, timestamp, target_le, start, batch);
+            return self.kernel.launch_v4(&self.stream, &self.bases_dev, &self.prefix_dev, self.t_count, n_tiles, &p_words, &s_words, timestamp, target_le, start, batch);
         }
         let p_words = crate::pom::pph_words_for_era(pre_pow_hash, h3);
         let s_words = crate::pom::seed_pph_words_for_era(pre_pow_hash, h3, h5_1, h5_2);

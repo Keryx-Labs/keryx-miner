@@ -439,10 +439,9 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32], h3: bool) -> [u8
     out
 }
 
-/// v4 seed/pow salts. MUST equal the node's `POM_V4_PPH_SALT` / `POM_V4_POW_NONCE_SALT`.
+/// v4 seed salt. MUST equal the node's `POM_V4_PPH_SALT`.
 pub const POM_V4_PPH_SALT: [u64; 4] =
     [0x7D7BC84C8D18DE80, 0xDE48EE16AE3F1541, 0x3305F1952B30384A, 0xF78C133968D388B7];
-pub const POM_V4_POW_NONCE_SALT: u64 = 0xD1507C9337DBF7D8;
 
 #[inline]
 pub fn pph_words_v4(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
@@ -458,22 +457,6 @@ pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) ->
     pom_block_seed_from_words(&pph_words_v4(pre_pow_hash), timestamp, nonce)
 }
 
-/// v4 pow value: folds the nonce into `final_state` first. BYTE-IDENTICAL to the node's
-/// `pom_pow_value_v4` and `pom_mine.cu::pom_mine_v4`.
-pub fn pom_pow_value_v4(final_state: u64, pre_pow_hash: &[u8; 32], nonce: u64) -> [u8; 32] {
-    let fs = mix64(final_state ^ mix64(nonce ^ POM_V4_POW_NONCE_SALT));
-    let p = pph_words_v4(pre_pow_hash);
-    let o0 = mix64(fs ^ p[0] ^ 0x9E3779B97F4A7C15);
-    let o1 = mix64(o0 ^ p[1] ^ 0xC2B2AE3D27D4EB4F);
-    let o2 = mix64(o1 ^ p[2] ^ 0x165667B19E3779F9);
-    let o3 = mix64(o2 ^ p[3] ^ 0xD6E8FEB86659FD93);
-    let mut out = [0u8; 32];
-    out[0..8].copy_from_slice(&o0.to_le_bytes());
-    out[8..16].copy_from_slice(&o1.to_le_bytes());
-    out[16..24].copy_from_slice(&o2.to_le_bytes());
-    out[24..32].copy_from_slice(&o3.to_le_bytes());
-    out
-}
 
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty(), "merkle_root: empty leaves");

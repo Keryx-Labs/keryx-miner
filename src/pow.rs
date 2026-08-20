@@ -249,7 +249,7 @@ impl State {
             let (v4, final_state) = pom_v4::build_proof_v4(tier, seed_v4, index)
                 .map_err(|e| info!("PoM v4 proof build failed: {e}"))
                 .ok()?;
-            let pow_value = pom::pom_pow_value_v4(final_state, &pph, nonce);
+            let pow_value = pom::pom_pow_value(final_state, &pph, true);
             if !pom::le_leq(&pow_value, &self.target.to_le_bytes()) {
                 info!("PoM v4 candidate rejected: canonical host walk does not meet target");
                 return None;

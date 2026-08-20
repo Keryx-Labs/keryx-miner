@@ -396,7 +396,6 @@ static_assert(V4_D == 32, "PoM v4 requires D=32");
 #define V4_S0_ROW_SALT       0x03421325594C3C51ULL
 #define V4_OFFSET_FIRST_SALT 0x6D1CCF96AC4D76F9ULL
 #define V4_OFFSET_STEP_SALT  0x89050E78D34609EFULL
-#define V4_POW_NONCE_SALT    0xD1507C9337DBF7D8ULL
 
 // One 1 KB tile (32 canonical chunks) into shared, one chunk per lane.
 __device__ __forceinline__ void v4_load_tile(
@@ -506,9 +505,8 @@ extern "C" __global__ void pom_mine_v4(
     const unsigned long long seed = pom_seed_fold(nonce, time_, s0, s1, s2, s3);
     const unsigned long long fin = v4_walk_block(bases, prefix, T, n_tiles, K, seed, s_shared);
     if (threadIdx.x == 0) {
-        const unsigned long long fin_pow = mix64(fin ^ mix64(nonce ^ V4_POW_NONCE_SALT));
         unsigned long long pv[4];
-        pom_pow_fold(fin_pow, p0, p1, p2, p3, pv);
+        pom_pow_fold(fin, p0, p1, p2, p3, pv);
         if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
     }
 }
