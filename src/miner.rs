@@ -404,10 +404,11 @@ impl MinerManager {
                         let h5_1 = daa >= keryx_miner::pom::h5_1_activation_daa();
                         let h5_2 = daa >= keryx_miner::pom::h5_2_activation_daa();
                         let v3 = daa >= keryx_miner::pom::pom_v3_activation_daa();
+                        let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
                         let batch = if v3 { POM_V3_BATCH } else { POM_BATCH };
-                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3);
+                        let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4);
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
