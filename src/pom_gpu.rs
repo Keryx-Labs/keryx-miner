@@ -35,6 +35,13 @@ const POM_V3_KERNEL_NAME: &str = "pom_mine_v3";
 const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
 const POM_V4_KERNEL_NAME: &str = "pom_mine_v4";
 const POM_V4_SHARED_BYTES: u32 = 2048;
+const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
+const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
+/// Must match V4_TC_WARPS / V4_TC_PIPE in cuda/pom_mine.cu.
+const V4_TC_WARPS: u64 = 4;
+const V4_TC_PIPE: u32 = 3;
+/// Per-warp dynamic shared: V4_TC_PIPE tile buffers + the state, 256 u32 each.
+const POM_V4_TC_SHARED_PER_WARP: u32 = 256 * (V4_TC_PIPE + 1) * 4;
 /// v3 dynamic shared bytes (the 64 KB tile) — needs the opt-in attribute; cc >= 7.0 only.
 const POM_V3_SHARED_BYTES: u32 = crate::pom_v3::POM_V3_TILE_BYTES as u32;
 
@@ -98,6 +105,11 @@ struct LoadedPomKernel {
     function_v3: Option<sys::CUfunction>,
     function_v3_dump: Option<sys::CUfunction>,
     function_v4: Option<sys::CUfunction>,
+    /// Tensor-core v4 solver entries. `tc_enabled` is armed per device after the compute
+    /// capability is known: below sm_80 `pom_mine_v4_tc` is a stub that finds nothing.
+    function_v4_chase: Option<sys::CUfunction>,
+    function_v4_tc: Option<sys::CUfunction>,
+    tc_enabled: bool,
 }
 
 impl Drop for LoadedPomKernel {
@@ -124,7 +136,11 @@ impl LoadedPomKernel {
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
         let (function_v3, function_v3_dump) = load_v3_functions(module);
         let function_v4 = unsafe { result::module::get_function(module, CString::new(POM_V4_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4 })
+        let function_v4_chase =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_CHASE_KERNEL_NAME).unwrap()) }.ok();
+        let function_v4_tc =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false })
     }
 
     fn from_ptx(_label: &'static str, ptx: &'static str) -> Result<Self> {
@@ -133,7 +149,11 @@ impl LoadedPomKernel {
         let function = unsafe { result::module::get_function(module, CString::new(POM_KERNEL_NAME).unwrap()) }?;
         let (function_v3, function_v3_dump) = load_v3_functions(module);
         let function_v4 = unsafe { result::module::get_function(module, CString::new(POM_V4_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4 })
+        let function_v4_chase =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_CHASE_KERNEL_NAME).unwrap()) }.ok();
+        let function_v4_tc =
+            unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false })
     }
 
     fn launch(
@@ -257,17 +277,78 @@ impl LoadedPomKernel {
         Ok(if w == u64::MAX { None } else { Some(w) })
     }
 
+    /// Arms the tensor-core v4 solver for this device. Needs sm_80+ (real int8 mma SASS),
+    /// both entries present, and `KERYX_POM_V4_TC` not set to 0.
+    fn arm_tc(&mut self, device_id: usize, cc: Option<(i32, i32)>) {
+        if std::env::var("KERYX_POM_V4_TC").ok().as_deref() == Some("0") {
+            return;
+        }
+        let sm80 = matches!(cc, Some((major, _)) if major >= 8);
+        self.tc_enabled = sm80 && self.function_v4_chase.is_some() && self.function_v4_tc.is_some();
+        if self.tc_enabled {
+            info!("PoM[gpu{}]: v4 tensor-core solver armed", device_id);
+        }
+    }
+
     /// v4 (re-walk) grind: one block of 32 threads per nonce over `[start, start + batch)`.
     #[allow(clippy::too_many_arguments)]
     fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64) -> Result<Option<u64>> {
-        let function = self.function_v4.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4 entry"))?;
         let t = words4(target_le);
         let k = crate::pom_v4::POM_V4_K as u32;
         let winner = stream.clone_htod(&[u64::MAX])?;
-        let cfg = LaunchConfig { grid_dim: (batch as u32, 1, 1), block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1), shared_mem_bytes: POM_V4_SHARED_BYTES };
+        let (winner_ptr, _wg) = winner.device_ptr(stream);
         let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
         let (prefix_ptr, _pg) = prefix_dev.device_ptr(stream);
-        let (winner_ptr, _wg) = winner.device_ptr(stream);
+
+        if self.tc_enabled {
+            let chase = self.function_v4_chase.ok_or_else(|| anyhow!("PoM GPU: no pom_mine_v4_chase entry"))?;
+            let walk = self.function_v4_tc.ok_or_else(|| anyhow!("PoM GPU: no pom_mine_v4_tc entry"))?;
+            // The chase overwrites every word, so the buffer needs no zeroing.
+            let offsets = stream.alloc_zeros::<u32>(batch as usize * k as usize)?;
+            let (offsets_ptr, _og) = offsets.device_ptr(stream);
+
+            let chase_cfg = LaunchConfig {
+                grid_dim: (((batch + 255) / 256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut chase_params: [*mut c_void; 13] = [
+                (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+                (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+                (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void),
+                (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+                (&timestamp as *const _ as *mut c_void),
+                (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void),
+                (&offsets_ptr as *const _ as *mut c_void),
+            ];
+            unsafe { result::launch_kernel(chase, chase_cfg.grid_dim, chase_cfg.block_dim, chase_cfg.shared_mem_bytes, stream.cu_stream(), &mut chase_params) }?;
+
+            let walk_cfg = LaunchConfig {
+                grid_dim: (((batch + V4_TC_WARPS - 1) / V4_TC_WARPS) as u32, 1, 1),
+                block_dim: ((V4_TC_WARPS * 32) as u32, 1, 1),
+                shared_mem_bytes: (V4_TC_WARPS as u32) * POM_V4_TC_SHARED_PER_WARP,
+            };
+            let mut walk_params: [*mut c_void; 21] = [
+                (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+                (&t_count as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+                (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
+                (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
+                (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void),
+                (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+                (&timestamp as *const _ as *mut c_void),
+                (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void),
+                (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
+                (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void),
+                (&offsets_ptr as *const _ as *mut c_void), (&winner_ptr as *const _ as *mut c_void),
+            ];
+            unsafe { result::launch_kernel(walk, walk_cfg.grid_dim, walk_cfg.block_dim, walk_cfg.shared_mem_bytes, stream.cu_stream(), &mut walk_params) }?;
+            stream.synchronize()?;
+            let w = stream.clone_dtoh(&winner)?[0];
+            return Ok(if w == u64::MAX { None } else { Some(w) });
+        }
+
+        let function = self.function_v4.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4 entry"))?;
+        let cfg = LaunchConfig { grid_dim: (batch as u32, 1, 1), block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1), shared_mem_bytes: POM_V4_SHARED_BYTES };
         let mut params: [*mut c_void; 21] = [
             (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
             (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
@@ -433,7 +514,7 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
 
     for (module_name, label, fatbin) in fatbin_candidates {
         match LoadedPomKernel::from_fatbin(label, fatbin) {
-            Ok(kernel) => {
+            Ok(mut kernel) => {
                 let cc = gpu_compute_capability(device_id);
                 if let Some((major, minor)) = cc {
                     info!(
@@ -448,6 +529,7 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
                     info!("PoM[gpu{}]: startup loaded {} via {}", device_id, label, module_name);
                 }
                 set_gpu_kernel_info(device_id, cc, label, module_name);
+                kernel.arm_tc(device_id, cc);
                 return Ok(kernel);
             }
             Err(e) => {
@@ -458,7 +540,7 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
 
     for (module_name, label, ptx) in POM_PTX_CANDIDATES {
         match LoadedPomKernel::from_ptx(label, ptx) {
-            Ok(kernel) => {
+            Ok(mut kernel) => {
                 let cc = gpu_compute_capability(device_id);
                 if let Some((major, minor)) = cc {
                     info!(
@@ -478,6 +560,7 @@ fn select_pom_kernel(device_id: usize) -> Result<LoadedPomKernel> {
                     &format!("{} PTX fallback", label),
                     module_name,
                 );
+                kernel.arm_tc(device_id, cc);
                 return Ok(kernel);
             }
             Err(e) => {
