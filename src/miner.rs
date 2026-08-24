@@ -338,6 +338,12 @@ impl MinerManager {
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
                 const POM_V3_BATCH: u64 = 512;
+                // v4 does not run one block per nonce the way v3 does — the tensor-core solver
+                // packs several nonces per block and the chase kernel 256 — so the batch is what
+                // decides how much of the card is busy, and the v4 walk is memory-bound. Reusing
+                // v3's 512 left an 84-SM card at 857 kh/s against 3045 once the batch fits the
+                // machine; see `v4_batch_for_device`.
+                let pom_v4_batch = keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id);
 
                 loop {
                     nonces[0] = 0;
@@ -407,7 +413,7 @@ impl MinerManager {
                         let v4 = daa >= keryx_miner::pom::pom_v4_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
-                        let batch = if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        let batch = if v4 { pom_v4_batch } else if v3 { POM_V3_BATCH } else { POM_BATCH };
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4);
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);

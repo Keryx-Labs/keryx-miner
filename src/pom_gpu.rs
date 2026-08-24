@@ -461,6 +461,53 @@ fn is_nextgen_device(device_id: usize) -> bool {
     major > 8 || (major == 8 && minor >= 9)
 }
 
+/// Nonces in flight per SM for the v4 grind.
+///
+/// v4 does not run one block per nonce like v3: the tensor-core solver packs `V4_TC_WARPS`
+/// nonces into a block of that many warps, and the chase kernel runs 256 nonces per block. So
+/// the batch is what decides how much of the card is busy, and v4's walk is memory-bound —
+/// it wants as many loads in flight as possible.
+///
+/// `POM_V3_BATCH` (512) was sized for v3's one-block-per-nonce shape and was never revisited
+/// when v4 landed. On an 84-SM card it leaves the chase kernel with 2 blocks. Measured on an
+/// RTX 5080 over a 9.77 GB blob, K=256:
+///
+/// | batch |    512 |  2048 |  8192 | 32768 | 131072 |
+/// |-------|--------|-------|-------|-------|--------|
+/// | kh/s  |    857 |  1794 |  2848 |  3045 |   2980 |
+///
+/// The plateau is broad, so the exact figure is not critical as long as it clears ~8k. 384 per
+/// SM lands on 32256 for 84 SMs, and one launch still takes ~11 ms — comfortably inside a
+/// template window at 10 BPS (BPS_max = hashrate / batch).
+const POM_V4_NONCES_PER_SM: u64 = 384;
+/// Floor for small cards, so they still clear the knee of the curve.
+const POM_V4_BATCH_MIN: u64 = 8192;
+/// Used when the SM count cannot be read.
+const POM_V4_BATCH_FALLBACK: u64 = 32768;
+
+/// SM count for `device_id`. `None` if the attribute is unavailable.
+fn gpu_sm_count(device_id: u32) -> Option<u64> {
+    let dev = result::device::get(device_id as i32).ok()?;
+    let n = unsafe {
+        result::device::get_attribute(dev, sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+    }
+    .ok()?;
+    (n > 0).then_some(n as u64)
+}
+
+/// Scales a v4 grind batch to the card. Pulled out from the device query so it is testable.
+fn v4_batch_for_sm_count(sm: u64) -> u64 {
+    (sm * POM_V4_NONCES_PER_SM).max(POM_V4_BATCH_MIN)
+}
+
+/// The v4 grind batch to use on `device_id`.
+pub fn v4_batch_for_device(device_id: u32) -> u64 {
+    match gpu_sm_count(device_id) {
+        Some(sm) => v4_batch_for_sm_count(sm),
+        None => POM_V4_BATCH_FALLBACK,
+    }
+}
+
 fn gpu_compute_capability(device_id: usize) -> Option<(i32, i32)> {
     let dev = result::device::get(device_id as i32).ok()?;
     let major = unsafe {
@@ -1854,5 +1901,22 @@ mod v3_kernel_tests {
         let proof = pom_v3::build_proof_v3(0, &PPH, found, seed, &states, &snippets, &index).unwrap();
         assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
         assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
+    }
+}
+
+#[cfg(test)]
+mod v4_batch_tests {
+    use super::*;
+
+    #[test]
+    fn v4_batch_scales_with_the_card_and_has_a_floor() {
+        // 84 SMs (RTX 5080): the measured plateau starts around 8k and peaks near 32k.
+        assert_eq!(v4_batch_for_sm_count(84), 32_256);
+        // 128 SMs (RTX 4090) gets proportionally more; 28 (RTX 3060) is lifted to the floor
+        // rather than left at 10752 -- still fine, but the floor guards smaller parts.
+        assert_eq!(v4_batch_for_sm_count(128), 49_152);
+        assert_eq!(v4_batch_for_sm_count(16), POM_V4_BATCH_MIN);
+        // Never zero, whatever the device reports.
+        assert!(v4_batch_for_sm_count(1) >= POM_V4_BATCH_MIN);
     }
 }
