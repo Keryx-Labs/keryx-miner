@@ -338,11 +338,10 @@ impl MinerManager {
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
                 const POM_V3_BATCH: u64 = 512;
-                // Default and env override follow the ocminer (suprnova) fork.
-                const POM_V4_BATCH: u64 = 1 << 16;
+                // Env override follows the ocminer (suprnova) fork; default scales with the card.
                 let pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
                     .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
-                    .unwrap_or(POM_V4_BATCH);
+                    .unwrap_or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id));
 
                 loop {
                     nonces[0] = 0;

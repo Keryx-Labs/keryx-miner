@@ -478,6 +478,34 @@ fn is_nextgen_device(device_id: usize) -> bool {
     major > 8 || (major == 8 && minor >= 9)
 }
 
+/// v4 grind batch sizing (SM-derived, after GerardMensoif's PR #37): the plateau is broad
+/// from ~8K upward, one launch stays well inside a template window at 10 BPS.
+const POM_V4_NONCES_PER_SM: u64 = 384;
+const POM_V4_BATCH_MIN: u64 = 8192;
+const POM_V4_BATCH_FALLBACK: u64 = 32768;
+
+fn gpu_sm_count(device_id: u32) -> Option<u64> {
+    result::init().ok()?;
+    let dev = result::device::get(device_id as i32).ok()?;
+    let n = unsafe {
+        result::device::get_attribute(dev, sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+    }
+    .ok()?;
+    (n > 0).then_some(n as u64)
+}
+
+fn v4_batch_for_sm_count(sm: u64) -> u64 {
+    (sm * POM_V4_NONCES_PER_SM).max(POM_V4_BATCH_MIN)
+}
+
+/// The v4 grind batch to use on `device_id`.
+pub fn v4_batch_for_device(device_id: u32) -> u64 {
+    match gpu_sm_count(device_id) {
+        Some(sm) => v4_batch_for_sm_count(sm),
+        None => POM_V4_BATCH_FALLBACK,
+    }
+}
+
 fn gpu_compute_capability(device_id: usize) -> Option<(i32, i32)> {
     let dev = result::device::get(device_id as i32).ok()?;
     let major = unsafe {
@@ -1871,5 +1899,18 @@ mod v3_kernel_tests {
         let proof = pom_v3::build_proof_v3(0, &PPH, found, seed, &states, &snippets, &index).unwrap();
         assert_eq!(pom_v3::fold64(&proof.roots[pom_v3::POM_V3_K]), final_state);
         assert!(pom_v3::verify_proof_v3(&PPH, found, seed, &proof, &index.r_t, index.n_chunks));
+    }
+}
+
+#[cfg(test)]
+mod v4_batch_tests {
+    use super::*;
+
+    #[test]
+    fn v4_batch_scales_with_the_card_and_has_a_floor() {
+        assert_eq!(v4_batch_for_sm_count(84), 32_256);
+        assert_eq!(v4_batch_for_sm_count(128), 49_152);
+        assert_eq!(v4_batch_for_sm_count(16), POM_V4_BATCH_MIN);
+        assert!(v4_batch_for_sm_count(1) >= POM_V4_BATCH_MIN);
     }
 }
