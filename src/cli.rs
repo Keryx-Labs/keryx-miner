@@ -158,6 +158,14 @@ pub struct Opt {
     )]
     pub mine_when_not_synced: bool,
 
+    #[cfg(feature = "block-celebration")]
+    #[clap(
+        long = "block-celebration",
+        help = "Enable the TUI block-accepted animation and sound (requires a build with the block-celebration feature)",
+        help_heading = "Terminal UI"
+    )]
+    pub block_celebration: bool,
+
     #[clap(skip)]
     pub devfund_address: String,
 
@@ -278,5 +286,14 @@ mod tests {
     fn model_tier_conflicts_reference_valid_arguments() {
         Opt::command().debug_assert();
         assert!(Opt::try_parse_from(["keryx-miner", "--very-light", "--very-high"]).is_err());
+    }
+
+    #[cfg(feature = "block-celebration")]
+    #[test]
+    fn block_celebration_requires_runtime_opt_in() {
+        let disabled = Opt::try_parse_from(["keryx-miner"]).unwrap();
+        let enabled = Opt::try_parse_from(["keryx-miner", "--block-celebration"]).unwrap();
+        assert!(!disabled.block_celebration);
+        assert!(enabled.block_celebration);
     }
 }

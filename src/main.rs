@@ -28,6 +28,8 @@ use crate::stats::{spawn_stats_server, MinerStats};
 use crate::target::Uint256;
 use crate::ui::{spawn_ui, UiState};
 
+#[cfg(feature = "block-celebration")]
+mod block_sound;
 mod cli;
 mod client;
 mod escrow;
@@ -879,8 +881,24 @@ async fn run() -> Result<(), Error> {
     let stats = Arc::new(MinerStats::new(opt.hiveos));
     stats.set_mining_address(opt.mining_address.clone());
     stats.set_api_port(opt.stats_port);
-    let _ui_guard =
-        ui_state.as_ref().map(|ui| spawn_ui(Arc::clone(&stats), Arc::clone(ui), Arc::clone(&shutdown_requested)));
+    let block_celebration = {
+        #[cfg(feature = "block-celebration")]
+        {
+            opt.block_celebration
+        }
+        #[cfg(not(feature = "block-celebration"))]
+        {
+            false
+        }
+    };
+    let _ui_guard = ui_state.as_ref().map(|ui| {
+        spawn_ui(
+            Arc::clone(&stats),
+            Arc::clone(ui),
+            Arc::clone(&shutdown_requested),
+            block_celebration,
+        )
+    });
 
     match spawn_stats_server(Arc::clone(&stats), opt.stats_bind.clone(), opt.stats_port) {
         Ok(_handle) => {
