@@ -1260,10 +1260,20 @@ pub fn load_key(path: &str) -> Result<String, String> {
 /// Load the OPoI escrow private key from `path`, generating a new one if absent.
 /// The file contains exactly 64 lowercase hex characters (32-byte Schnorr private key).
 pub fn load_or_generate_key(path: &str) -> Result<String, String> {
+    load_or_generate_key_created(path).map(|(key, _created)| key)
+}
+
+/// Create-or-load the escrow private key at `path`, reporting whether this invocation
+/// created the file (false when it was already present, including under the concurrent
+/// first-start race, where the winning file wins). Creation is atomic (temp file +
+/// no-clobber install + parent fsync): a partially-written key file is never visible,
+/// and an existing file — even a malformed one — is never replaced.
+fn load_or_generate_key_created(path: &str) -> Result<(String, bool), String> {
     use rand::RngCore;
     let p = std::path::Path::new(path);
     if p.exists() {
         return load_key(path)
+            .map(|k| (k, false))
             .map_err(|e| format!("{}. Restore the correct key; do not delete a key that may control rewards.", e));
     }
 
@@ -1294,21 +1304,25 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     match install_temp_noclobber(temporary, p) {
         Ok(()) => sync_parent(parent)
             .map_err(|e| format!("Failed to sync escrow key directory '{}': {}", parent.display(), e))?,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return load_key(path),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return load_key(path).map(|k| (k, false)),
         Err(e) => return Err(format!("Failed to install escrow key file '{}': {}", path, e)),
     }
 
     info!("OPoI escrow keypair generated — saved to '{}'", path);
     info!("  Escrow pubkey : {}", pubkey_hex);
     info!("  Keep '{}' safe — needed to claim your OPoI escrow rewards.", path);
-    Ok(privkey_hex)
+    Ok((privkey_hex, true))
 }
 
 /// Derive the x-only public key hex (64 hex chars) from a hex-encoded private key.
+/// The error is prefixed with `INVALID_SECRET_KEY_SCALAR:` (never the key bytes) when
+/// the input parses as hex but is not a valid curve scalar; any other failure is a
+/// hex-decode error. Callers classify the scalar case as unsafe input.
 pub fn pubkey_hex_from_privkey(privkey_hex: &str) -> Result<String, String> {
     let privkey_bytes = hex::decode(privkey_hex).map_err(|e| format!("Invalid privkey hex: {}", e))?;
     let secp = secp256k1::Secp256k1::new();
-    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes).map_err(|e| format!("Invalid private key: {}", e))?;
+    let sk = secp256k1::SecretKey::from_slice(&privkey_bytes)
+        .map_err(|_| "INVALID_SECRET_KEY_SCALAR: privkey is not a valid curve scalar".to_string())?;
     let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
     let (xonly, _) = kp.x_only_public_key();
     Ok(hex::encode(xonly.serialize()))
@@ -1630,6 +1644,190 @@ pub fn save_cert(path: &str, cert_hex: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
+// ── Escrow subcommands (issue #19) ────────────────────────────────────────────
+
+/// Stable process exit codes for the non-mining `escrow init` / `escrow validate`
+/// subcommands. Documented contract for scripting:
+///   EXIT_OK                   = 0 — command succeeded
+///   EXIT_OPERATIONAL          = 1 — operational failure of the command's own
+///                                   output: stdout/serialization (a broken pipe or
+///                                   closed stdout while printing `--json`, or JSON
+///                                   serialization). File-creation/read failures and
+///                                   unsafe paths are deliberately NOT operational:
+///                                   they are EXIT_UNSAFE_INPUT (3)
+///   EXIT_INVALID_CREDENTIALS  = 2 — key/cert/address present but invalid: wrong
+///                                   key, wrong mining address, malformed cert, or
+///                                   an address version that cannot carry a delegation
+///   EXIT_UNSAFE_INPUT         = 3 — input or key file missing, unreadable, or unsafe
+///                                   (malformed existing key, empty argument, a key
+///                                   file that cannot be created)
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_OPERATIONAL: i32 = 1;
+pub const EXIT_INVALID_CREDENTIALS: i32 = 2;
+pub const EXIT_UNSAFE_INPUT: i32 = 3;
+
+/// Classification of an escrow subcommand failure, mapped to the exit-code contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitCode {
+    Ok,
+    Operational,
+    InvalidCredentials,
+    UnsafeInput,
+}
+
+impl ExitCode {
+    pub fn as_i32(self) -> i32 {
+        match self {
+            ExitCode::Ok => EXIT_OK,
+            ExitCode::Operational => EXIT_OPERATIONAL,
+            ExitCode::InvalidCredentials => EXIT_INVALID_CREDENTIALS,
+            ExitCode::UnsafeInput => EXIT_UNSAFE_INPUT,
+        }
+    }
+}
+
+/// A failed `escrow init` / `escrow validate` invocation: human message plus the
+/// stable exit-code class. The message never contains private key bytes.
+#[derive(Debug)]
+pub struct EscrowCommandError {
+    pub kind: ExitCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for EscrowCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EscrowCommandError {}
+
+fn unsafe_input(message: String) -> EscrowCommandError {
+    EscrowCommandError { kind: ExitCode::UnsafeInput, message }
+}
+
+fn invalid_credentials(message: String) -> EscrowCommandError {
+    EscrowCommandError { kind: ExitCode::InvalidCredentials, message }
+}
+
+fn operational(message: String) -> EscrowCommandError {
+    EscrowCommandError { kind: ExitCode::Operational, message }
+}
+
+/// Result of the `escrow init` subcommand.
+#[derive(Debug)]
+pub struct InitOutcome {
+    /// Whether this invocation created the key file (false = already present).
+    pub key_created: bool,
+    /// Path of the key file, exactly as passed.
+    pub key_file: String,
+    /// x-only public key hex (64 hex chars) derived from the key file.
+    pub public_key: String,
+}
+
+/// Result of the `escrow validate` subcommand.
+#[derive(Debug)]
+pub struct ValidateOutcome {
+    pub valid: bool,
+    pub public_key: String,
+    pub mining_address: String,
+    pub certificate_valid: bool,
+}
+
+/// Run `escrow init`: atomically create the key file when absent, otherwise load it.
+/// A malformed existing file is reported as an error and left untouched. On success
+/// returns the outcome plus the exact JSON line to print on stdout when `json` is set;
+/// callers own stdout/stderr and exit-code policy.
+pub fn run_init(key_file: &str, json: bool) -> Result<(InitOutcome, Option<String>), EscrowCommandError> {
+    if key_file.trim().is_empty() {
+        return Err(unsafe_input("--key-file must not be empty".to_string()));
+    }
+    let (privkey, key_created) = load_or_generate_key_created(key_file).map_err(unsafe_input)?;
+    // A key file that loads as 64 hex chars but is not a valid curve scalar is still
+    // an unsafe key file: report it as unsafe input rather than an invalid credential.
+    let public_key = pubkey_hex_from_privkey(&privkey).map_err(unsafe_input)?;
+    // The private key is only ever used in memory here; nothing below prints it.
+    let json_line = if json {
+        // One compact JSON line; every string field is escaped by serde_json rather than
+        // interpolated by hand (a key_file path may contain quotes, backslashes or
+        // control characters, and the public key must never be unescaped either).
+        let line = serde_json::to_string(&serde_json::json!({
+            "key_created": key_created,
+            "key_file": key_file,
+            "public_key": public_key,
+            "authorization_required": true,
+        }))
+        .map_err(|e| operational(format!("Failed to serialize init result: {e}")))?;
+        Some(line)
+    } else {
+        None
+    };
+    Ok((InitOutcome { key_created, key_file: key_file.to_string(), public_key }, json_line))
+}
+
+/// Run `escrow validate`: check the key file, the mining address, and the delegation
+/// cert exactly the way the node does. On success returns the outcome plus the JSON
+/// line to print on stdout (`--json`); callers own stdout/stderr and exit-code policy.
+pub fn run_validate(
+    mining_address: &str,
+    key_file: &str,
+    cert_file: &str,
+    json: bool,
+) -> Result<(ValidateOutcome, Option<String>), EscrowCommandError> {
+    if mining_address.trim().is_empty() {
+        return Err(unsafe_input("--mining-address must not be empty".to_string()));
+    }
+    if key_file.trim().is_empty() {
+        return Err(unsafe_input("--key-file must not be empty".to_string()));
+    }
+    if cert_file.trim().is_empty() {
+        return Err(unsafe_input("--cert-file must not be empty".to_string()));
+    }
+    // A structurally invalid address is unsafe input, not a credential mismatch.
+    if let Err(e) = decode_address(mining_address) {
+        return Err(unsafe_input(format!("Invalid mining address: {e}")));
+    }
+    let privkey = load_key(key_file).map_err(unsafe_input)?;
+    let public_key = pubkey_hex_from_privkey(&privkey).map_err(|e| {
+        // Hex-shaped but not a valid curve scalar is unsafe input, not a credential
+        // mismatch; the message never contains the key bytes.
+        if e.starts_with("INVALID_SECRET_KEY_SCALAR:") {
+            unsafe_input(e)
+        } else {
+            invalid_credentials(e)
+        }
+    })?;
+    // The private key is only ever used in memory; nothing below prints it.
+    // The cert is public (a signature over the pubkey↔address binding); validating it
+    // against this exact address+key is what the node does before accepting a block.
+    load_cert(cert_file, mining_address, &public_key).map_err(|e| {
+        // A cert file that cannot be read is unsafe input; anything else (wrong key,
+        // wrong address, malformed cert, non-delegatable address version) is an
+        // invalid credential.
+        if e.starts_with("Cannot read escrow delegation cert") {
+            unsafe_input(e)
+        } else {
+            invalid_credentials(e)
+        }
+    })?;
+    let json_line = if json {
+        // One compact JSON line; every string field (mining_address especially) is
+        // escaped by serde_json rather than interpolated by hand, so an accepted
+        // address can never inject invalid JSON.
+        let line = serde_json::to_string(&serde_json::json!({
+            "valid": true,
+            "public_key": public_key,
+            "mining_address": mining_address,
+            "certificate_valid": true,
+        }))
+        .map_err(|e| operational(format!("Failed to serialize validate result: {e}")))?;
+        Some(line)
+    } else {
+        None
+    };
+    Ok((ValidateOutcome { valid: true, public_key, mining_address: mining_address.to_string(), certificate_valid: true }, json_line))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1774,6 +1972,333 @@ mod tests {
             assert_eq!(csv_window_for_daa(gate - 1), CHALLENGE_WINDOW_BLOCKS);
         }
         assert_eq!(csv_window_for_daa(gate), SERVICE_BOND_CSV_WINDOW_BLOCKS);
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// Payout address of the private key `0x11..11` — the same fixture the escrow
+    /// module tests sign with.
+    const PAYOUT_ADDRESS: &str = "keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr";
+
+    /// Deterministic test keypair: private key 0x11..11.
+    fn fixture_privkey() -> &'static str {
+        "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+
+    fn fixture_pubkey() -> String {
+        pubkey_hex_from_privkey(fixture_privkey()).unwrap()
+    }
+
+    /// Delegation cert for the escrow key in `fixture_privkey()` (0x11..11) signed by
+    /// PAYOUT_ADDRESS's key (also 0x11..11): a wallet-issued cert binding the escrow
+    /// key to the payout address.
+    fn fixture_cert() -> String {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_slice(&[0x11u8; 32]).unwrap();
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let escrow_pubkey = fixture_pubkey();
+        let mut pk = [0u8; 32];
+        hex::decode_to_slice(&escrow_pubkey, &mut pk).unwrap();
+        let msg = secp256k1::Message::from_digest_slice(&escrow_delegation_message(&pk)).unwrap();
+        hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &kp).as_ref())
+    }
+
+    fn tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    // ── escrow init ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn init_creates_key_and_reports_creation() {
+        let dir = tempdir();
+        let path = dir.path().join("escrow.key");
+        let (outcome, json) = run_init(path.to_str().unwrap(), true).unwrap();
+        assert!(outcome.key_created);
+        assert_eq!(outcome.key_file, path.to_str().unwrap());
+        // The generated key is random: the file must hold exactly 64 lowercase hex
+        // chars, and the reported public key must derive from the on-disk key.
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk.len(), 64);
+        assert!(on_disk.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(outcome.public_key, pubkey_hex_from_privkey(&on_disk).unwrap());
+        // The private key never appears anywhere on stdout.
+        let json = json.expect("json requested");
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["key_created"], true);
+        assert_eq!(value["key_file"], path.to_str().unwrap());
+        assert_eq!(value["public_key"], outcome.public_key);
+        assert_eq!(value["authorization_required"], true);
+        assert!(!json.contains(&on_disk), "private key leaked into JSON output");
+    }
+
+    #[test]
+    fn init_is_idempotent_and_preserves_existing_key() {
+        let dir = tempdir();
+        let path = dir.path().join("escrow.key");
+        fs::write(&path, fixture_privkey()).unwrap();
+
+        let (outcome, _json) = run_init(path.to_str().unwrap(), false).unwrap();
+        assert!(!outcome.key_created);
+        assert_eq!(outcome.public_key, fixture_pubkey());
+        assert_eq!(fs::read_to_string(&path).unwrap(), fixture_privkey());
+    }
+
+    #[test]
+    fn init_rejects_malformed_existing_key_without_replacing_it() {
+        let dir = tempdir();
+        let path = dir.path().join("escrow.key");
+        let malformed = b"not-a-private-key";
+        fs::write(&path, malformed).unwrap();
+
+        let error = run_init(path.to_str().unwrap(), true).unwrap_err();
+        assert!(error.message.contains("64 hex chars"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::UnsafeInput);
+        assert_eq!(fs::read(&path).unwrap(), malformed, "malformed key must not be replaced");
+    }
+
+    #[test]
+    fn init_missing_parent_dir_creates_it() {
+        let dir = tempdir();
+        let path = dir.path().join("nested").join("escrow.key");
+        let (outcome, json) = run_init(path.to_str().unwrap(), false).unwrap();
+        assert!(outcome.key_created);
+        assert!(path.exists());
+        assert!(json.is_none());
+    }
+
+    #[test]
+    fn init_refuses_empty_key_file_path() {
+        assert!(run_init("", true).is_err());
+        assert!(run_init("   ", true).is_err());
+    }
+
+    // ── escrow validate ────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_valid_cert() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        let (outcome, json) =
+            run_validate(PAYOUT_ADDRESS, key.to_str().unwrap(), cert.to_str().unwrap(), true).unwrap();
+        assert!(outcome.valid);
+        assert_eq!(outcome.public_key, fixture_pubkey());
+        assert_eq!(outcome.mining_address, PAYOUT_ADDRESS);
+        assert!(outcome.certificate_valid);
+
+        let json = json.expect("json requested");
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["valid"], true);
+        assert_eq!(value["public_key"], outcome.public_key);
+        assert_eq!(value["mining_address"], PAYOUT_ADDRESS);
+        assert_eq!(value["certificate_valid"], true);
+        assert!(!json.contains(fixture_privkey()), "private key leaked in JSON output");
+    }
+
+    #[test]
+    fn validate_rejects_wrong_key() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        // Different private key (0x22..22) than the escrow key the cert binds (0x11..11).
+        fs::write(&key, "22".repeat(32)).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        let error = run_validate(PAYOUT_ADDRESS, key.to_str().unwrap(), cert.to_str().unwrap(), true).unwrap_err();
+        assert!(error.message.contains("does not match"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::InvalidCredentials);
+    }
+
+    #[test]
+    fn validate_rejects_wrong_address() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        // The devfund address is a valid Keryx address, but not the cert's signer.
+        let error = run_validate(
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            key.to_str().unwrap(),
+            cert.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("does not match"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::InvalidCredentials);
+    }
+
+    #[test]
+    fn validate_rejects_malformed_cert() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, "deadbeef").unwrap();
+
+        let error = run_validate(PAYOUT_ADDRESS, key.to_str().unwrap(), cert.to_str().unwrap(), true).unwrap_err();
+        assert!(error.message.contains("128 hex chars"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::InvalidCredentials);
+    }
+
+    #[test]
+    fn validate_missing_files_fail() {
+        let dir = tempdir();
+        let missing_key = dir.path().join("missing.key");
+        let missing_cert = dir.path().join("missing.cert");
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        let error =
+            run_validate(PAYOUT_ADDRESS, missing_key.to_str().unwrap(), cert.to_str().unwrap(), true).unwrap_err();
+        assert!(error.message.contains("not found"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::UnsafeInput);
+        let error = run_validate(PAYOUT_ADDRESS, key.to_str().unwrap(), missing_cert.to_str().unwrap(), true).unwrap_err();
+        assert!(error.message.contains("Cannot read"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::UnsafeInput);
+    }
+
+    #[test]
+    fn validate_refuses_unsafe_address() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        // A version-1 address cannot carry a delegation: the bech32 data (53 5-bit
+        // groups: version 1 = 'q','y' prefix, then a zero key) decodes to bytes[0] = 1.
+        let error = run_validate(
+            &format!("keryx:qy{}qqqqqqqq", "q".repeat(51)),
+            key.to_str().unwrap(),
+            cert.to_str().unwrap(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("cannot carry a delegation"), "error: {}", error.message);
+        assert_eq!(error.kind, ExitCode::InvalidCredentials);
+    }
+
+    #[test]
+    fn validate_refuses_empty_arguments() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        for (address, key_file, cert_file) in [
+            ("", key.to_str().unwrap(), "c"),
+            (PAYOUT_ADDRESS, "", "c"),
+            (PAYOUT_ADDRESS, key.to_str().unwrap(), ""),
+        ] {
+            let error = run_validate(address, key_file, cert_file, true).unwrap_err();
+            assert_eq!(error.kind, ExitCode::UnsafeInput);
+        }
+    }
+
+    /// An accepted address may carry JSON-special characters in its prefix: address
+    /// decoding only consumes the payload after the first ':', so the prefix is never
+    /// validated. The JSON line must escape them instead of interpolating them raw.
+    #[test]
+    fn validate_escapes_json_special_characters_in_address() {
+        let dir = tempdir();
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, fixture_privkey()).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        let prefix = "ker\"yx\\line\"; inject";
+        let (outcome, json) =
+            run_validate(&format!("{prefix}:{}", PAYOUT_ADDRESS.split_once(':').unwrap().1), key.to_str().unwrap(), cert.to_str().unwrap(), true)
+                .unwrap();
+        assert!(outcome.valid);
+        let json = json.expect("json requested");
+        assert_eq!(json.lines().count(), 1, "JSON output must stay on one line");
+        let value: Value = serde_json::from_str(&json).expect("escaped JSON must parse");
+        assert_eq!(value["mining_address"], format!("{prefix}:{}", PAYOUT_ADDRESS.split_once(':').unwrap().1));
+        assert_eq!(value["public_key"], outcome.public_key);
+        assert_eq!(value["certificate_valid"], true);
+        assert_eq!(value["valid"], true);
+        assert!(!json.contains(fixture_privkey()), "private key leaked in JSON output");
+    }
+
+    /// The init JSON line must escape every string field the same way, with a path
+    /// containing JSON-special characters.
+    #[test]
+    fn init_escapes_json_special_characters_in_path() {
+        let dir = tempdir();
+        let path = dir.path().join("we\"ird\\name").join("esc\"ow.key");
+        let (outcome, json) = run_init(path.to_str().unwrap(), true).unwrap();
+        assert!(outcome.key_created);
+        let json = json.expect("json requested");
+        assert_eq!(json.lines().count(), 1, "JSON output must stay on one line");
+        let value: Value = serde_json::from_str(&json).expect("escaped JSON must parse");
+        assert_eq!(value["key_file"], path.to_str().unwrap());
+        assert_eq!(value["public_key"], outcome.public_key);
+        assert_eq!(value["key_created"], true);
+        assert_eq!(value["authorization_required"], true);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!json.contains(&on_disk), "private key leaked into JSON output");
+    }
+
+    /// A hex-shaped key that is not a valid curve scalar is unsafe input in both
+    /// validate and init, never an invalid credential; the error never contains the key.
+    #[test]
+    fn hex_shaped_invalid_scalar_is_unsafe_input_in_validate_and_init() {
+        let dir = tempdir();
+        let invalid_scalar = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let key = dir.path().join("escrow.key");
+        fs::write(&key, invalid_scalar).unwrap();
+        let cert = dir.path().join("escrow.cert");
+        fs::write(&cert, fixture_cert()).unwrap();
+
+        let error = run_validate(PAYOUT_ADDRESS, key.to_str().unwrap(), cert.to_str().unwrap(), true).unwrap_err();
+        assert_eq!(error.kind, ExitCode::UnsafeInput);
+        assert!(!error.message.contains(invalid_scalar), "key content leaked in error: {}", error.message);
+
+        let error = run_init(key.to_str().unwrap(), true).unwrap_err();
+        assert_eq!(error.kind, ExitCode::UnsafeInput);
+        assert!(!error.message.contains(invalid_scalar), "key content leaked in error: {}", error.message);
+        // The unsafe file must not be replaced.
+        assert_eq!(fs::read_to_string(&key).unwrap(), invalid_scalar);
+    }
+
+    /// The pubkey helper itself must expose the scalar-vs-decode distinction so callers
+    /// can classify, and never echo the key bytes.
+    #[test]
+    fn pubkey_derivation_distinguishes_invalid_scalar_without_leaking_bytes() {
+        let invalid_scalar = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let error = pubkey_hex_from_privkey(invalid_scalar).unwrap_err();
+        assert!(error.contains("INVALID_SECRET_KEY_SCALAR"), "error: {}", error);
+        assert!(!error.contains(invalid_scalar), "key content leaked in error: {}", error);
+        // Malformed hex stays a decode failure (no scalar marker).
+        assert!(pubkey_hex_from_privkey("zz").is_err());
+        assert!(!pubkey_hex_from_privkey("zz").unwrap_err().contains("INVALID_SECRET_KEY_SCALAR"));
+        // A valid scalar still derives.
+        assert!(pubkey_hex_from_privkey(fixture_privkey()).is_ok());
+    }
+
+    // ── exit-code contract ─────────────────────────────────────────────────────
+
+    #[test]
+    fn exit_codes_are_stable_and_distinct() {
+        assert_eq!(EXIT_OK, 0);
+        assert_eq!(EXIT_OPERATIONAL, 1);
+        assert_eq!(EXIT_INVALID_CREDENTIALS, 2);
+        assert_eq!(EXIT_UNSAFE_INPUT, 3);
+        assert_eq!(ExitCode::Ok.as_i32(), 0);
+        assert_eq!(ExitCode::Operational.as_i32(), 1);
+        assert_eq!(ExitCode::InvalidCredentials.as_i32(), 2);
+        assert_eq!(ExitCode::UnsafeInput.as_i32(), 3);
     }
 }
 

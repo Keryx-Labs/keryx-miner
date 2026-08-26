@@ -157,6 +157,24 @@ Escrow keys and claim state are written through a same-directory temporary file,
 
 On HiveOS, the durable files live outside the replaceable miner package at `/hive/miners/custom/keryx-miner-state/escrow.key` and `/hive/miners/custom/keryx-miner-state/escrow_state.json`, with directory mode `0700` and file mode `0600`. Back up both files together before an upgrade or manual recovery. Never delete an invalid key to generate another one: restore the original backup because it controls existing rewards. See [`integrations/hiveos/HIVEOS_README.md`](integrations/hiveos/HIVEOS_README.md) for verified migration and rollback steps.
 
+### Standalone escrow setup
+
+Create or inspect the escrow key without starting CUDA, models, keryxd, stats, or mining:
+
+```bash
+keryx-miner escrow init --key-file /path/escrow.key --json
+keryx-miner escrow validate \
+    --mining-address keryx:... \
+    --key-file /path/escrow.key \
+    --cert-file /path/escrow.cert \
+    --json
+```
+
+JSON is written only to stdout; diagnostics use stderr. The private key is never printed.
+Exit codes are stable for scripts: `0` success, `1` operational failure, `2` invalid
+credentials, and `3` missing, malformed, unsafe, or invalid command input. `init` is
+idempotent and never replaces a malformed existing key.
+
 ### All options
 
 ```bash

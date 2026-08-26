@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use clap::{App, FromArgMatches, IntoApp};
+use clap::{App, CommandFactory, FromArgMatches};
 use keryx_miner::PluginManager;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cli::Opt;
+use crate::cli::{Command, Escrow, Opt};
 use crate::client::grpc::KeryxdHandler;
 use crate::client::stratum::StratumHandler;
 use crate::client::Client;
@@ -228,6 +228,119 @@ fn adjust_console() -> Result<(), Error> {
         | win32console::console::ConsoleMode::ENABLE_EXTENDED_FLAGS;
     console.set_mode(mode)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod escrow_cli_tests {
+    use super::*;
+
+    /// Help and version requests render to stdout and exit 0 — never 3 (unsafe input)
+    /// nor 2 (invalid credentials).
+    #[test]
+    fn help_and_version_exit_ok() {
+        for argv in [
+            vec!["keryx-miner", "escrow", "--help"],
+            vec!["keryx-miner", "escrow", "--version"],
+            vec!["keryx-miner", "escrow", "init", "--help"],
+            vec!["keryx-miner", "escrow", "init", "--version"],
+            vec!["keryx-miner", "escrow", "validate", "--help"],
+            vec!["keryx-miner", "escrow", "validate", "--version"],
+        ] {
+            let command = Opt::command().propagate_version(true);
+            let matches = command.try_get_matches_from(argv.iter().copied());
+            let error = matches.expect_err("help/version must be a clap error, not a parse");
+            assert_eq!(escrow_cli_exit_code(&error), escrow::EXIT_OK, "argv: {argv:?}");
+        }
+    }
+
+    /// Malformed, missing, and unknown CLI usage maps to unsafe input (3), so it can
+    /// never collide with invalid credentials (2). Diagnostics stay on stderr.
+    #[test]
+    fn malformed_usage_exits_unsafe_input_on_stderr() {
+        for argv in [
+            vec!["keryx-miner", "escrow", "frobnicate"],                                     // unknown subcommand
+            vec!["keryx-miner", "escrow", "--bogus"],                                        // unknown option
+            vec!["keryx-miner", "escrow", "init", "--key-file"],                             // missing value
+            vec!["keryx-miner", "escrow", "init"],                                           // missing required arg
+            vec!["keryx-miner", "escrow", "validate"],                                       // missing required args
+            vec!["keryx-miner", "escrow", "validate", "--mining-address", "keryx:x"],        // incomplete
+            vec!["keryx-miner", "escrow", "init", "--key-file", "k.key", "junk"],            // unexpected positional
+        ] {
+            let command = Opt::command().propagate_version(true);
+            let matches = command.try_get_matches_from(argv.iter().copied());
+            let error = matches.expect_err("bad usage must be a clap error");
+            assert!(error.use_stderr(), "usage diagnostics must go to stderr: {argv:?}");
+            assert_eq!(escrow_cli_exit_code(&error), escrow::EXIT_UNSAFE_INPUT, "argv: {argv:?}");
+        }
+    }
+
+    /// Valid escrow invocations still parse — the command surface is unchanged.
+    #[test]
+    fn valid_escrow_usage_still_parses() {
+        let command = Opt::command().propagate_version(true);
+        let matches = command
+            .try_get_matches_from([
+                "keryx-miner",
+                "escrow",
+                "validate",
+                "--mining-address",
+                "keryx:x",
+                "--key-file",
+                "k.key",
+                "--cert-file",
+                "c.cert",
+            ])
+            .unwrap();
+        let opt = Opt::from_arg_matches(&matches).unwrap();
+        match opt.command {
+            Some(Command::Escrow(command)) => match command.action {
+                Escrow::Validate(args) => {
+                    assert_eq!(args.mining_address, "keryx:x");
+                    assert_eq!(args.key_file, "k.key");
+                    assert_eq!(args.cert_file, "c.cert");
+                }
+                other => panic!("unexpected action: {other:?}"),
+            },
+            None => panic!("escrow subcommand missing"),
+        }
+    }
+
+    /// A writer that fails on the very first write, standing in for a broken pipe or a
+    /// closed stdout. The failure carries no payload, so the diagnostic cannot leak it.
+    #[derive(Debug)]
+    struct FailingWriter {
+        err: std::io::Error,
+    }
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.err.kind(), self.err.to_string()))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A broken pipe / closed stdout on a JSON write must surface as an operational
+    /// failure with a diagnostic that never contains the JSON payload — the same
+    /// contract the `--json` subcommands enforce through their stable exit codes
+    /// (Operational = 1, never a panicking 101).
+    #[test]
+    fn json_write_failure_is_operational_and_does_not_leak_payload() {
+        let payload = r#"{"key_created":true,"key_file":"/tmp/some/key","public_key":"deadbeef"}"#;
+        let mut failing = FailingWriter { err: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe") };
+        let error = write_json_line(&mut failing, payload).unwrap_err();
+        assert!(
+            error.contains("Failed to write JSON to stdout"),
+            "diagnostic must name the failed channel: {error}"
+        );
+        assert!(
+            !error.contains(payload) && !error.contains("deadbeef"),
+            "diagnostic must not contain the JSON payload: {error}"
+        );
+        assert_eq!(escrow::ExitCode::Operational.as_i32(), escrow::EXIT_OPERATIONAL);
+    }
 }
 
 #[cfg(test)]
@@ -753,7 +866,128 @@ fn tokio_blocking_threads() -> Option<usize> {
     std::env::var("KERYX_BLOCKING_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).map(|n| n.clamp(2, 64))
 }
 
+/// Exit code for a Clap error on the standalone `escrow` CLI surface. Help/version
+/// requests are rendered by Clap to stdout and exit 0; every other failure (unknown
+/// option, missing or malformed argument, missing or unknown subcommand) is a usage
+/// error that prints to stderr and exits EXIT_UNSAFE_INPUT (3) — never Clap's own
+/// exit code 2, which belongs to EXIT_INVALID_CREDENTIALS.
+fn escrow_cli_exit_code(error: &clap::Error) -> i32 {
+    if error.use_stderr() {
+        escrow::EXIT_UNSAFE_INPUT
+    } else {
+        escrow::EXIT_OK
+    }
+}
+
+/// Write `line` plus a newline to `out` — the exact stdout contract of the escrow
+/// `--json` subcommands. Fallible on purpose: a broken pipe or closed stdout
+/// surfaces as an operational failure instead of a panicking `println!` (which
+/// would exit 101 and break the documented 0/1/2/3 exit-code contract). The error
+/// text never contains the JSON payload or any key material.
+fn write_json_line(out: &mut dyn std::io::Write, line: &str) -> Result<(), String> {
+    out.write_all(line.as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("Failed to write JSON to stdout: {e}"))
+}
+
+/// Run an `escrow` subcommand to completion and exit with its documented exit code.
+/// Called from `main` before any node connection, model download, CUDA/plugin
+/// initialization, stats server, or mining setup. JSON (when `--json` was passed) is
+/// printed to stdout; everything else goes to stderr; private key bytes are never
+/// printed. Never returns.
+fn run_escrow_subcommand(subcommand: &Escrow) -> ! {
+    let exit_code = match subcommand {
+        Escrow::Init(args) => match escrow::run_init(&args.key_file, args.json) {
+            Ok((outcome, json_line)) => {
+                if let Some(line) = json_line {
+                    // A broken pipe / closed stdout is an operational failure, not a
+                    // panic (101). The diagnostic never contains the JSON or key bytes.
+                    if let Err(e) = write_json_line(&mut std::io::stdout().lock(), &line) {
+                        eprintln!("escrow init failed: {e}");
+                        escrow::ExitCode::Operational.as_i32()
+                    } else {
+                        escrow::ExitCode::Ok.as_i32()
+                    }
+                } else {
+                    // Diagnostics-only (no --json): summarize on stderr. The public key
+                    // is safe to print; private key bytes never are.
+                    eprintln!(
+                        "{} OPoI escrow key '{}' — public key {}",
+                        if outcome.key_created { "Created" } else { "Loaded" },
+                        outcome.key_file,
+                        outcome.public_key
+                    );
+                    eprintln!("Authorize this public key in your wallet to receive OPoI escrow rewards.");
+                    escrow::ExitCode::Ok.as_i32()
+                }
+            }
+            Err(e) => {
+                eprintln!("escrow init failed: {e}");
+                e.kind.as_i32()
+            }
+        },
+        Escrow::Validate(args) => {
+            match escrow::run_validate(&args.mining_address, &args.key_file, &args.cert_file, args.json) {
+                Ok((outcome, json_line)) => {
+                    if let Some(line) = json_line {
+                        // A broken pipe / closed stdout is an operational failure, not a
+                        // panic (101). The diagnostic never contains the JSON or key bytes.
+                        if let Err(e) = write_json_line(&mut std::io::stdout().lock(), &line) {
+                            eprintln!("escrow validate failed: {e}");
+                            escrow::ExitCode::Operational.as_i32()
+                        } else {
+                            escrow::ExitCode::Ok.as_i32()
+                        }
+                    } else {
+                        eprintln!(
+                            "valid: public key {} — mining address {} — certificate valid: {}",
+                            outcome.public_key, outcome.mining_address, outcome.certificate_valid
+                        );
+                        escrow::ExitCode::Ok.as_i32()
+                    }
+                }
+                Err(e) => {
+                    eprintln!("escrow validate failed: {e}");
+                    e.kind.as_i32()
+                }
+            }
+        }
+    };
+    std::process::exit(exit_code);
+}
+
 fn main() -> Result<(), Error> {
+    // Non-mining escrow administration runs standalone — before node connection, model
+    // download, CUDA/plugin initialization, the stats server, or mining. The `escrow`
+    // subcommand is detected by its leading token (the mining CLI has no positional
+    // arguments, so a mining invocation can never start with it); it is parsed without
+    // plugin augmentation and exits with a documented exit code. `run_escrow_subcommand`
+    // prints JSON to stdout (only with --json); diagnostics go to stderr.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("escrow")) {
+        // Fallible parse so help/version still exit 0 (Clap renders them to stdout) but
+        // any malformed/missing/unknown CLI usage exits EXIT_UNSAFE_INPUT (3) instead of
+        // colliding with EXIT_INVALID_CREDENTIALS (2). Diagnostics stay on stderr.
+        let command = Opt::command().propagate_version(true);
+        let matches = match command.try_get_matches() {
+            Ok(matches) => matches,
+            Err(e) => {
+                let _ = e.print();
+                std::process::exit(escrow_cli_exit_code(&e));
+            }
+        };
+        let opt: Opt = match Opt::from_arg_matches(&matches) {
+            Ok(opt) => opt,
+            Err(e) => {
+                let _ = e.print();
+                std::process::exit(escrow_cli_exit_code(&e));
+            }
+        };
+        if let Some(Command::Escrow(command)) = &opt.command {
+            run_escrow_subcommand(&command.action);
+        }
+    }
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
     if let Some(n) = tokio_blocking_threads() {

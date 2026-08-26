@@ -125,6 +125,13 @@ pub struct Opt {
     )]
     pub recover_escrow_api: String,
 
+    // ── Standalone administration subcommands ────────────────────────────────
+    // Non-mining administration surface (`keryx-miner escrow init|validate`). Runs
+    // before any node/model/CUDA/stats/mining initialization and exits by itself.
+
+    #[clap(subcommand)]
+    pub command: Option<Command>,
+
     // ── Mining ────────────────────────────────────────────────────────────────
 
     #[clap(short, long, help = "Enable debug logging level")]
@@ -183,6 +190,62 @@ pub struct Opt {
         help_heading = "Monitoring"
     )]
     pub plain_log_file: Option<String>,
+}
+
+/// Top-level standalone administration commands.
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Manage the OPoI escrow key and delegation certificate
+    Escrow(EscrowCommand),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct EscrowCommand {
+    #[clap(subcommand)]
+    pub action: Escrow,
+}
+
+/// Non-mining escrow administration subcommands.
+///
+/// These run standalone — before node connection, model download, CUDA/plugin
+/// initialization, the stats server, or mining — and exit on their own. JSON output
+/// (with `--json`) is the only thing ever written to stdout; diagnostics go to stderr.
+#[derive(clap::Subcommand, Debug)]
+pub enum Escrow {
+    /// Create (or load, if present) the OPoI escrow private key file
+    Init(EscrowInit),
+    /// Verify the escrow key and its delegation cert against a mining address
+    Validate(EscrowValidate),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct EscrowInit {
+    /// Path to the OPoI escrow private key file (created if absent, never overwritten)
+    #[clap(long, value_name = "PATH")]
+    pub key_file: String,
+
+    /// Emit the machine-readable result as JSON on stdout (diagnostics stay on stderr)
+    #[clap(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct EscrowValidate {
+    /// The Keryx address the escrow delegation must be bound to
+    #[clap(long = "mining-address", value_name = "ADDRESS")]
+    pub mining_address: String,
+
+    /// Path to the OPoI escrow private key file
+    #[clap(long, value_name = "PATH")]
+    pub key_file: String,
+
+    /// Path to the escrow delegation cert file (128 hex chars)
+    #[clap(long, value_name = "PATH")]
+    pub cert_file: String,
+
+    /// Emit the machine-readable result as JSON on stdout (diagnostics stay on stderr)
+    #[clap(long)]
+    pub json: bool,
 }
 
 fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
@@ -278,5 +341,38 @@ mod tests {
     fn model_tier_conflicts_reference_valid_arguments() {
         Opt::command().debug_assert();
         assert!(Opt::try_parse_from(["keryx-miner", "--very-light", "--very-high"]).is_err());
+    }
+
+    #[test]
+    fn escrow_subcommands_parse_and_require_their_arguments() {
+        let init = Opt::try_parse_from(["keryx-miner", "escrow", "init", "--key-file", "k.key", "--json"]).unwrap();
+        match init.command {
+            Some(Command::Escrow(EscrowCommand { action: Escrow::Init(args) })) => {
+                assert_eq!(args.key_file, "k.key");
+                assert!(args.json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let validate =
+            Opt::try_parse_from(["keryx-miner", "escrow", "validate", "--mining-address", "keryx:x", "--key-file", "k.key", "--cert-file", "c.cert"]).unwrap();
+        match validate.command {
+            Some(Command::Escrow(EscrowCommand { action: Escrow::Validate(args) })) => {
+                assert_eq!(args.mining_address, "keryx:x");
+                assert_eq!(args.key_file, "k.key");
+                assert_eq!(args.cert_file, "c.cert");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // Both subcommands require their paths.
+        assert!(Opt::try_parse_from(["keryx-miner", "escrow", "init"]).is_err());
+        assert!(Opt::try_parse_from(["keryx-miner", "escrow", "validate"]).is_err());
+        assert!(Opt::try_parse_from(["keryx-miner", "escrow", "validate", "--mining-address", "keryx:x"]).is_err());
+        // Unknown subcommand is rejected.
+        assert!(Opt::try_parse_from(["keryx-miner", "escrow", "frobnicate"]).is_err());
+        // The mining CLI (no subcommand) is unchanged.
+        assert!(Opt::try_parse_from(["keryx-miner", "--mining-address", "keryx:x"]).is_ok());
+        assert!(Opt::try_parse_from(["keryx-miner"]).unwrap().command.is_none());
     }
 }
