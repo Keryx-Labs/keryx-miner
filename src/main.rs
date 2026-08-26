@@ -571,6 +571,7 @@ async fn get_client(
     escrow_cert: Option<String>,
     chain_daa: Option<u64>,
     ipfs_url: String,
+    stats: Arc<MinerStats>,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -580,6 +581,7 @@ async fn get_client(
             mine_when_not_synced,
             Some(block_template_ctr.clone()),
             ipfs_url.clone(),
+            stats,
         )
         .await?)
     } else if keryxd_address.starts_with("grpc://") {
@@ -593,6 +595,7 @@ async fn get_client(
             escrow_cert,
             chain_daa,
             ipfs_url,
+            stats,
         )
         .await?)
     } else {
@@ -677,7 +680,13 @@ async fn client_main(
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
     let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
+    stats.set_ipfs_api_url(ipfs_url.clone());
+    tokio::task::spawn_blocking({
+        let stats = Arc::clone(&stats);
+        move || crate::ipfs::ensure_daemon(ipfs_url, stats)
+    })
+    .await
+    .ok();
 
     let mut client = get_client(
         opt.keryxd_address.clone(),
@@ -689,6 +698,7 @@ async fn client_main(
         escrow_cert,
         chain_daa,
         opt.ipfs_url.clone(),
+        Arc::clone(&stats),
     )
     .await?;
 

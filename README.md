@@ -157,6 +157,14 @@ Escrow keys and claim state are written through a same-directory temporary file,
 
 On HiveOS, the durable files live outside the replaceable miner package at `/hive/miners/custom/keryx-miner-state/escrow.key` and `/hive/miners/custom/keryx-miner-state/escrow_state.json`, with directory mode `0700` and file mode `0600`. Back up both files together before an upgrade or manual recovery. Never delete an invalid key to generate another one: restore the original backup because it controls existing rewards. See [`integrations/hiveos/HIVEOS_README.md`](integrations/hiveos/HIVEOS_README.md) for verified migration and rollback steps.
 
+### IPFS health
+
+The existing `/stats` and `/v1/miner/stats` responses include an `ipfs` object with the
+configured API URL, Kubo reachability and version, daemon ownership, and the latest upload
+timestamp, result, CID, and short error. `inference_rewards_enabled` follows real upload
+outcomes: a failed upload disables inference readiness until a later upload succeeds.
+Uploaded inference text is never included in stats.
+
 ### All options
 
 ```bash

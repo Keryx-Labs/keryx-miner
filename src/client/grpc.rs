@@ -154,6 +154,10 @@ pub struct KeryxdHandler {
     /// Status bar sink, so the standing is visible without reading the log.
     stats: Option<Arc<crate::stats::MinerStats>>,
 
+    /// Shared miner stats: IPFS health is recorded here at real probe/upload
+    /// outcomes (issue #19).
+    ipfs_stats: Arc<crate::stats::MinerStats>,
+
     /// DAA of every miss seen since this miner started, for the lifetime tally. Counting the
     /// active strike counter would miss the worst ones: the third strike resets it to zero, and a
     /// served response clears it too. Each miss carries its own daa, so a set of those is exact
@@ -235,6 +239,7 @@ impl KeryxdHandler {
         escrow_cert: Option<String>,
         chain_daa: Option<u64>,
         ipfs_url: String,
+        stats: Arc<crate::stats::MinerStats>,
     ) -> Result<Box<Self>, Error>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
@@ -314,6 +319,7 @@ impl KeryxdHandler {
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
             strike_status: None,
             stats: None,
+            ipfs_stats: stats,
             misses_seen: std::collections::HashSet::new(),
         }))
     }
@@ -740,10 +746,26 @@ impl KeryxdHandler {
 
         let ipfs_url = self.ipfs_url.clone();
         let result_clone = result.clone();
-        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload(&result_clone, &ipfs_url)).await {
+        let stats = Arc::clone(&self.ipfs_stats);
+        let cid = match tokio::task::spawn_blocking({
+            let stats = Arc::clone(&stats);
+            move || crate::ipfs::upload_with_stats(&result_clone, &ipfs_url, &stats)
+        })
+        .await
+        {
             Ok(Ok(cid)) => cid,
-            Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
-            Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
+            Ok(Err(e)) => {
+                warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e);
+                return true;
+            }
+            // The blocking task never ran (or panicked): the upload outcome was not
+            // recorded by `upload_with_stats`, so record the failure here — short
+            // diagnostic, rewards disabled — before skipping the AiResponse.
+            Err(e) => {
+                warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e);
+                crate::ipfs::record_upload_failure(&stats, &e.to_string());
+                return true;
+            }
         };
 
         let challenge_window_end = self.last_known_daa + 1000;

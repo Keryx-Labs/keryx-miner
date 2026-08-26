@@ -63,6 +63,19 @@ pub struct MinerStats {
     gpu_telemetry: Mutex<HashMap<u32, GpuTelemetry>>,
     gpu_memory_temp_supported: Mutex<HashMap<u32, bool>>,
     hiveos: AtomicBool,
+    // ── IPFS health (issue #19) ───────────────────────────────────────────────
+    // Updated at real `/api/v0/version` probes and `/api/v0/add` upload outcomes.
+    // Never holds uploaded inference text, prompts, or secrets — only the CIDv0
+    // string and short error messages.
+    ipfs_api_url: Mutex<Option<String>>,
+    ipfs_reachable: AtomicBool,
+    kubo_version: Mutex<Option<String>>,
+    daemon_managed: AtomicBool,
+    last_upload_epoch_s: AtomicU64,
+    last_upload_success: AtomicBool,
+    last_upload_cid: Mutex<Option<String>>,
+    last_error: Mutex<Option<String>>,
+    inference_rewards_enabled: AtomicBool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -104,6 +117,22 @@ pub struct MinerStatsSnapshot {
     pub escrow_pending_sompi: u64,
     pub last_update_epoch_s: u64,
     pub devices: Vec<DeviceRate>,
+    pub ipfs: IpfsStats,
+}
+
+/// Nested IPFS health section of the stats snapshot (issue #19).
+/// `last_error` carries a short diagnostic only — never uploaded content or secrets.
+#[derive(Serialize, Default)]
+pub struct IpfsStats {
+    pub api_url: Option<String>,
+    pub api_reachable: bool,
+    pub kubo_version: Option<String>,
+    pub daemon_managed: bool,
+    pub last_upload_epoch_s: u64,
+    pub last_upload_success: bool,
+    pub last_upload_cid: Option<String>,
+    pub last_error: Option<String>,
+    pub inference_rewards_enabled: bool,
 }
 
 impl MinerStats {
@@ -131,6 +160,15 @@ impl MinerStats {
             gpu_telemetry: Mutex::new(HashMap::new()),
             gpu_memory_temp_supported: Mutex::new(HashMap::new()),
             hiveos: AtomicBool::new(hiveos),
+            ipfs_api_url: Mutex::new(None),
+            ipfs_reachable: AtomicBool::new(false),
+            kubo_version: Mutex::new(None),
+            daemon_managed: AtomicBool::new(false),
+            last_upload_epoch_s: AtomicU64::new(0),
+            last_upload_success: AtomicBool::new(false),
+            last_upload_cid: Mutex::new(None),
+            last_error: Mutex::new(None),
+            inference_rewards_enabled: AtomicBool::new(false),
         }
     }
 
@@ -195,6 +233,61 @@ impl MinerStats {
     pub fn set_escrow_pending(&self, outputs: u64, amount_sompi: u64) {
         self.escrow_pending_outputs.store(outputs, Ordering::Release);
         self.escrow_pending_sompi.store(amount_sompi, Ordering::Release);
+    }
+
+    // ── IPFS health (issue #19) ────────────────────────────────────────────────
+
+    /// Record the API URL the miner was configured with. Called once at startup.
+    pub fn set_ipfs_api_url(&self, url: String) {
+        if let Ok(mut slot) = self.ipfs_api_url.lock() {
+            *slot = Some(url);
+        }
+    }
+
+    /// Record the outcome of a `/api/v0/version` probe: reachability, the kubo
+    /// version reported by the node, and whether the daemon is auto-managed.
+    /// Failures must not panic — an unreachable node only flips the flags.
+    pub fn set_ipfs_version_probe(&self, reachable: bool, kubo_version: Option<String>, daemon_managed: bool) {
+        self.ipfs_reachable.store(reachable, Ordering::Release);
+        self.daemon_managed.store(daemon_managed, Ordering::Release);
+        if let Ok(mut slot) = self.kubo_version.lock() {
+            *slot = kubo_version;
+        }
+    }
+
+    /// Record the outcome of a `/api/v0/add` upload: CIDv0 string on success,
+    /// short diagnostic on failure. Never stores uploaded text or secrets.
+    pub fn set_ipfs_upload_outcome(&self, success: bool, cid: Option<String>, error: Option<String>) {
+        self.last_upload_epoch_s.store(now_epoch_s(), Ordering::Release);
+        self.last_upload_success.store(success, Ordering::Release);
+        if let Ok(mut slot) = self.last_upload_cid.lock() {
+            *slot = cid;
+        }
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = error;
+        }
+    }
+
+    /// Whether inference rewards are expected to work: the daemon is reachable
+    /// (or locally auto-managed) and the API is configured.
+    pub fn set_inference_rewards_enabled(&self, enabled: bool) {
+        self.inference_rewards_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Current reachability flag, as last recorded by a `/api/v0/version` probe.
+    pub fn is_ipfs_reachable(&self) -> bool {
+        self.ipfs_reachable.load(Ordering::Acquire)
+    }
+
+    /// Kubo version reported by the last successful `/api/v0/version` probe.
+    pub fn kubo_version(&self) -> Option<String> {
+        self.kubo_version.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Lock guard for the short last-error diagnostic slot (ipfs.rs uses this
+    /// so probe failures stay non-panicking).
+    pub fn last_error_lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn refresh_gpu_telemetry(&self) {
@@ -422,6 +515,17 @@ impl MinerStats {
             escrow_pending_sompi: self.escrow_pending_sompi.load(Ordering::Acquire),
             last_update_epoch_s: self.last_update_epoch_s.load(Ordering::Acquire),
             devices,
+            ipfs: IpfsStats {
+                api_url: self.ipfs_api_url.lock().ok().and_then(|s| s.clone()),
+                api_reachable: self.ipfs_reachable.load(Ordering::Acquire),
+                kubo_version: self.kubo_version.lock().ok().and_then(|s| s.clone()),
+                daemon_managed: self.daemon_managed.load(Ordering::Acquire),
+                last_upload_epoch_s: self.last_upload_epoch_s.load(Ordering::Acquire),
+                last_upload_success: self.last_upload_success.load(Ordering::Acquire),
+                last_upload_cid: self.last_upload_cid.lock().ok().and_then(|s| s.clone()),
+                last_error: self.last_error.lock().ok().and_then(|s| s.clone()),
+                inference_rewards_enabled: self.inference_rewards_enabled.load(Ordering::Acquire),
+            },
         }
     }
 }
@@ -444,6 +548,91 @@ mod tests {
         let device = snapshot.devices.iter().find(|device| device.id == "GPU0").unwrap();
         assert_eq!(device.blocks_accepted, 1);
         assert_eq!(device.blocks_rejected, 1);
+    }
+
+    #[test]
+    fn ipfs_section_defaults_are_observable_without_a_daemon() {
+        let stats = MinerStats::new(false);
+        let snapshot = stats.snapshot();
+
+        // Pre-existing fields stay intact and the nested ipfs section is present.
+        assert_eq!(snapshot.synced, true);
+        assert_eq!(snapshot.api_port, None);
+        assert_eq!(snapshot.ipfs.api_url, None);
+        assert!(!snapshot.ipfs.api_reachable);
+        assert_eq!(snapshot.ipfs.kubo_version, None);
+        assert!(!snapshot.ipfs.daemon_managed);
+        assert_eq!(snapshot.ipfs.last_upload_epoch_s, 0);
+        assert!(!snapshot.ipfs.last_upload_success);
+        assert_eq!(snapshot.ipfs.last_upload_cid, None);
+        assert_eq!(snapshot.ipfs.last_error, None);
+        assert!(!snapshot.ipfs.inference_rewards_enabled);
+    }
+
+    #[test]
+    fn daemon_managed_flag_distinguishes_auto_started_daemons() {
+        let stats = MinerStats::new(false);
+        // External daemon: reachable, not auto-managed.
+        stats.set_ipfs_version_probe(true, Some("0.41.0".to_string()), false);
+        let snapshot = stats.snapshot();
+        assert!(snapshot.ipfs.api_reachable);
+        assert!(!snapshot.ipfs.daemon_managed);
+
+        // Daemon started by the miner itself: same reachability, managed flag set.
+        stats.set_ipfs_version_probe(true, Some("0.41.0".to_string()), true);
+        let snapshot = stats.snapshot();
+        assert!(snapshot.ipfs.api_reachable);
+        assert!(snapshot.ipfs.daemon_managed);
+
+        // Auto-managed daemon that failed to come up stays observable.
+        stats.set_ipfs_version_probe(false, None, true);
+        let snapshot = stats.snapshot();
+        assert!(!snapshot.ipfs.api_reachable);
+        assert!(snapshot.ipfs.daemon_managed);
+    }
+
+    #[test]
+    fn ipfs_probe_and_upload_outcomes_are_reflected_in_the_snapshot() {
+        let stats = MinerStats::new(false);
+        stats.set_ipfs_api_url("http://127.0.0.1:5001".to_string());
+        stats.set_ipfs_version_probe(true, Some("0.41.0".to_string()), false);
+        stats.set_ipfs_upload_outcome(true, Some("QmXp1ExampleCidv0String".to_string()), None);
+        stats.set_inference_rewards_enabled(true);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.ipfs.api_url.as_deref(), Some("http://127.0.0.1:5001"));
+        assert!(snapshot.ipfs.api_reachable);
+        assert_eq!(snapshot.ipfs.kubo_version.as_deref(), Some("0.41.0"));
+        assert!(!snapshot.ipfs.daemon_managed);
+        assert!(snapshot.ipfs.last_upload_success);
+        assert_eq!(snapshot.ipfs.last_upload_cid.as_deref(), Some("QmXp1ExampleCidv0String"));
+        assert_eq!(snapshot.ipfs.last_error, None);
+        assert!(snapshot.ipfs.inference_rewards_enabled);
+        assert!(snapshot.ipfs.last_upload_epoch_s > 0);
+
+        // Failure transition: reachability loss and a failed upload stay observable.
+        stats.set_ipfs_version_probe(false, None, false);
+        stats.set_ipfs_upload_outcome(false, None, Some("connection refused".to_string()));
+        let snapshot = stats.snapshot();
+        assert!(!snapshot.ipfs.api_reachable);
+        assert!(!snapshot.ipfs.last_upload_success);
+        assert_eq!(snapshot.ipfs.last_upload_cid, None);
+        assert_eq!(snapshot.ipfs.last_error.as_deref(), Some("connection refused"));
+        // The previous successful CID is gone once a later attempt fails.
+        assert!(snapshot.ipfs.last_upload_epoch_s > 0);
+    }
+
+    #[test]
+    fn serialized_stats_never_contain_uploaded_text() {
+        let stats = MinerStats::new(false);
+        stats.set_ipfs_api_url("http://127.0.0.1:5001".to_string());
+        // Simulate what an upload records — never the text itself.
+        stats.set_ipfs_upload_outcome(true, Some("QmSecretCid".to_string()), None);
+
+        let json = serde_json::to_string(&stats.snapshot()).expect("snapshot serializes");
+        assert!(json.contains("QmSecretCid"));
+        assert!(!json.contains("super secret inference output"));
+        assert!(!json.contains("prompt"));
     }
 }
 

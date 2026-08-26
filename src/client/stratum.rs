@@ -149,6 +149,9 @@ pub struct StratumHandler {
     inference_cache: InferenceCache,
     /// True while a capability challenge inference is in flight — prevents duplicate spawns.
     challenge_in_flight: Arc<AtomicBool>,
+    /// Shared miner stats: IPFS health is recorded here at real probe/upload
+    /// outcomes (issue #19).
+    ipfs_stats: Arc<crate::stats::MinerStats>,
 }
 
 #[async_trait(?Send)]
@@ -250,6 +253,7 @@ impl StratumHandler {
         mine_when_not_synced: bool,
         block_template_ctr: Option<Arc<AtomicU16>>,
         ipfs_url: String,
+        stats: Arc<crate::stats::MinerStats>,
     ) -> Result<Box<Self>, Error> {
         info!("Connecting to {}", address);
         let socket = TcpStream::connect(address).await?;
@@ -298,6 +302,7 @@ impl StratumHandler {
             current_task_slot,
             inference_cache,
             challenge_in_flight: Arc::new(AtomicBool::new(false)),
+            ipfs_stats: stats,
         }))
     }
 
@@ -741,9 +746,10 @@ impl StratumHandler {
         let ipfs_url = self.ipfs_url.clone();
         let cache_ref = Arc::clone(&self.inference_cache);
         let challenge_flag = Arc::clone(&self.challenge_in_flight);
+        let ipfs_stats = Arc::clone(&self.ipfs_stats);
 
         tokio::task::spawn_blocking(move || {
-            run_inference_and_upload(model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref);
+            run_inference_and_upload(model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref, ipfs_stats);
             // Clear both flags — PoW resumes on the next mining.notify from the bridge.
             miner_flag.store(false, Ordering::SeqCst);
             challenge_flag.store(false, Ordering::SeqCst);
@@ -772,8 +778,9 @@ fn run_inference_and_upload(
     ipfs_url: String,
     stable_id: String,
     cache: InferenceCache,
+    ipfs_stats: Arc<crate::stats::MinerStats>,
 ) {
-    let cid_opt = do_inference_and_upload(&model_id, &prompt, max_tokens, &ipfs_url, &stable_id);
+    let cid_opt = do_inference_and_upload(&model_id, &prompt, max_tokens, &ipfs_url, &stable_id, &ipfs_stats);
     let mut guard = cache.blocking_lock();
     guard.in_progress.remove(&stable_id);
     if let Some(cid) = cid_opt {
@@ -804,6 +811,7 @@ fn do_inference_and_upload(
     max_tokens: usize,
     ipfs_url: &str,
     stable_id: &str,
+    ipfs_stats: &Arc<crate::stats::MinerStats>,
 ) -> Option<String> {
     info!("OPoI [{}]: starting SLM inference (max_tokens={})", stable_id, max_tokens);
     let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens)?;
@@ -811,7 +819,7 @@ fn do_inference_and_upload(
         warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;
     }
-    match crate::ipfs::upload(&text, ipfs_url) {
+    match crate::ipfs::upload_with_stats(&text, ipfs_url, ipfs_stats) {
         Ok(cid_bytes) => {
             // Convert raw 34-byte multihash to base58 CIDv0 string via AiResponsePayload helper.
             let cid = keryx_inference::AiResponsePayload::new([0u8; 32], 0, cid_bytes, 0).cid_v0();
