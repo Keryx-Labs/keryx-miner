@@ -36,10 +36,14 @@ mod keryxd_messages;
 mod logging;
 mod miner;
 mod pow;
-mod stats;
 mod target;
 mod ui;
 mod watch;
+
+// `stats` is owned by the library crate (keryx_miner::stats) so binary modules and library
+// modules share one compiled module and one `READINESS_STATS` OnceLock. Re-export at the
+// binary crate root so existing `crate::stats::*` references resolve to the library module.
+pub use keryx_miner::stats;
 
 // PoM mining is CUDA-only (the walk kernel is CUDA). The OpenCL/AMD plugin did legacy
 // kHeavyHash only — it cannot produce a possession proof, so an OpenCL worker's blocks are
@@ -430,6 +434,18 @@ fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
     }
 }
 
+/// Canonical kebab-case tier name for structured readiness output.
+fn tier_name(t: keryx_miner::models::Tier) -> &'static str {
+    use keryx_miner::models::Tier::*;
+    match t {
+        VeryLight => "very-light",
+        Light => "light",
+        Default => "default",
+        High => "high",
+        VeryHigh => "very-high",
+    }
+}
+
 /// Parse a `--force-model` tier name. None on an unrecognised token.
 fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
     use keryx_miner::models::Tier;
@@ -765,6 +781,13 @@ fn main() -> Result<(), Error> {
     let outcome = rt.block_on(run());
     if let Err(e) = &outcome {
         report_fatal(&e.to_string());
+        // Fatal startup failures become structural: keep the already-running stats server
+        // observable briefly so deployment tooling can read `phase: "fatal"` + `fatal_error`
+        // instead of racing immediate process exit. No-op when failure preceded stats setup.
+        if let Some(stats) = crate::stats::readiness_stats() {
+            stats.set_fatal_error(Some(e.to_string()));
+            std::thread::sleep(Duration::from_secs(5));
+        }
     }
     outcome
 }
@@ -877,6 +900,10 @@ async fn run() -> Result<(), Error> {
     }
 
     let stats = Arc::new(MinerStats::new(opt.hiveos));
+    // Register the process-wide readiness handle FIRST, before any download/probe/client
+    // activity: every readiness reporter (slm/pom_gpu download progress, the gRPC client's
+    // keryxd flags, fatal paths) reads through this registration.
+    crate::stats::install_readiness_stats(Arc::clone(&stats));
     stats.set_mining_address(opt.mining_address.clone());
     stats.set_api_port(opt.stats_port);
     let _ui_guard =
@@ -1051,6 +1078,13 @@ async fn run() -> Result<(), Error> {
         _ => None,
     };
 
+    // Readiness: expose the resolved escrow state structurally. The key counts as loaded when
+    // the OPoI keyfile resolved; the certificate is valid exactly when a cert resolved for this
+    // payout address (explicit flag, local self-signature, or validated file). The public key
+    // is safe to expose — it is embedded in every coinbase extra_data anyway.
+    let escrow_pubkey_hex = escrow_privkey.as_deref().and_then(|k| escrow::pubkey_hex_from_privkey(k).ok());
+    stats.set_escrow_readiness(escrow_privkey.is_some(), escrow_cert.is_some(), escrow_pubkey_hex);
+
     // Phase-3 OPoI / PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
@@ -1104,6 +1138,18 @@ async fn run() -> Result<(), Error> {
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::slm::init_supported(specs);
     log::debug!("OPoI Phase-3 active — {} model(s) staged.", specs.len());
+    // Readiness: register every per-GPU assignment BEFORE any download starts, so the first-run
+    // model acquisition (prefetch below) reports into the right device row — download progress is
+    // keyed by model_id and requires the row to exist. tier = kebab-case, model_id = hex of the
+    // 32-byte on-chain id, model = the GGUF directory name (matches the node's label).
+    for (device_id, gpu_tier, spec) in &pom_assignments {
+        stats.configure_device(
+            *device_id,
+            tier_name(*gpu_tier).to_string(),
+            hex::encode(spec.model_id),
+            spec.dir_name.to_string(),
+        );
+    }
     // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
     // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
     // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a

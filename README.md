@@ -151,6 +151,20 @@ models/
 
 If the miner still downloads a model although the folder is there, check your tier flag before anything else: the flag decides **which** model is requested, `--models-dir` only says **where** to look.
 
+### Structured readiness
+
+The existing `/stats` and `/v1/miner/stats` responses use `stats_schema_version: 2` and
+retain all legacy fields. The top-level `phase`, `fatal_error`, `keryxd`, `escrow`, and
+`template_notifications` fields expose startup state without log parsing. Every configured
+CUDA device also reports its UUID, selected tier and model, download progress, integrity,
+load, inference, PoM, error, and mining state independently.
+
+For deployment tooling, the model/node readiness portion is satisfied when the escrow
+certificate is valid, keryxd is connected, and at least one device is in `mining` with
+inference verified, PoM ready, and non-zero hashrate. `partial` means another device is
+still preparing and none has failed. `degraded` takes precedence when any tracked device
+has failed while another continues mining.
+
 ### Escrow state durability
 
 Escrow keys and claim state are written through a same-directory temporary file, synced, and atomically installed. An unreadable key or malformed state file stops escrow initialization without replacing the existing bytes. Recovery output uses the same atomic write path.

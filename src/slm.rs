@@ -58,11 +58,30 @@ pub fn gguf_path_for(spec: &ModelSpec) -> std::path::PathBuf {
 /// consistent, and an already-complete file (e.g. pre-staged with `wget -c`) is
 /// detected via a 416 response and left untouched instead of being re-downloaded.
 fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
+    download_file_inner(url, dest, None)
+}
+
+/// Like `download_file` but reports per-chunk download progress (bytes downloaded / total) to the
+/// readiness stats while streaming, keyed by the model's hex id. The final sample on completion —
+/// including the "already on disk" fast paths — is also pushed so `percent` reaches 100 even when
+/// a pre-staged file skips the stream.
+fn download_model_file(url: &str, dest: &std::path::Path, model_id: &[u8; 32]) -> Result<()> {
+    download_file_inner(url, dest, Some(*model_id))
+}
+
+fn download_file_inner(url: &str, dest: &std::path::Path, model_id: Option<[u8; 32]>) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 240; // survives long gateway outages (~40 min of retries)
     const BACKOFF_SECS: u64 = 10;
     ui_download_info(&format!("[keryx-miner] Downloading {} ...", url));
     let mut attempt = 0u32;
     let mut last_logged_percent: u64 = 0;
+    let report_progress = |downloaded: u64, total: Option<u64>| {
+        if let Some(model_id) = model_id {
+            crate::stats::readiness_stats()
+                .as_deref()
+                .map(|stats| stats.set_device_download(&hex::encode(model_id), downloaded, total));
+        }
+    };
     loop {
         // Resume offset = how many bytes we already have on disk.
         let resume_from = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
@@ -103,6 +122,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 (f, resume_from, total)
             } else if resume_from > 0 && status == 416 {
                 // Range not satisfiable ⇒ the file is already fully downloaded.
+                report_progress(resume_from, Some(resume_from));
                 if ui_progress_to_stderr() {
                     eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
                 } else {
@@ -117,6 +137,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                 if resume_from > 0 {
                     if let Some(t) = total {
                         if resume_from >= t {
+                            report_progress(resume_from, Some(resume_from));
                             if ui_progress_to_stderr() {
                                 eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
                             } else {
@@ -166,6 +187,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                         break;
                     }
                     downloaded += n as u64;
+                    report_progress(downloaded, total);
                     if let Some(t) = total {
                         let pct = downloaded * 100 / t.max(1);
                         if ui_progress_to_stderr() {
@@ -198,6 +220,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         // usually returns a parsable Content-Range and self-heals.
         let complete = stream_err.is_none() && matches!(total, Some(t) if downloaded >= t);
         if complete {
+            report_progress(downloaded, total);
             if ui_progress_to_stderr() {
                 eprintln!();
             }
@@ -291,7 +314,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
             "[keryx-miner] Downloading model '{}' via IPFS. This happens once.",
             spec.name
         ));
-        download_file(&ipfs_url(spec.weight_cids[0]), &gguf)?;
+        download_model_file(&ipfs_url(spec.weight_cids[0]), &gguf, &spec.model_id)?;
         if !crate::gguf::is_complete_file(&gguf) {
             return Err(anyhow!(
                 "model '{}' download finished but GGUF is incomplete at {}",
@@ -526,16 +549,25 @@ fn verify_model_file(gguf: &Path, ok_flag: &Path, expected: [u8; 32], name: &str
 fn verify_gguf(spec: &ModelSpec, gguf: &Path, ok_flag: &Path) -> Result<()> {
     if marker_certifies(ok_flag, &spec.model_id) {
         verified_models().write().unwrap().insert(spec.model_id);
+        crate::stats::readiness_stats()
+            .as_deref()
+            .map(|stats| stats.set_model_integrity(&hex::encode(spec.model_id), true));
         return Ok(());
     }
     verified_models().write().unwrap().remove(&spec.model_id);
     ui_download_info(&format!("[keryx-miner] Verifying model '{}' integrity before mining...", spec.name));
     if let Err(error) = verify_model_file(gguf, ok_flag, spec.model_id, spec.name) {
         mark_model_unavailable(&spec.model_id, "integrity_mismatch");
+        crate::stats::readiness_stats()
+            .as_deref()
+            .map(|stats| stats.set_model_integrity(&hex::encode(spec.model_id), false));
         return Err(error);
     }
     verified_models().write().unwrap().insert(spec.model_id);
     mark_model_available(&spec.model_id, "integrity_verified");
+    crate::stats::readiness_stats()
+        .as_deref()
+        .map(|stats| stats.set_model_integrity(&hex::encode(spec.model_id), true));
     ui_download_info(&format!("[keryx-miner] Model '{}' integrity verified.", spec.name));
     Ok(())
 }
@@ -676,17 +708,28 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
             log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
+            crate::stats::readiness_stats().as_deref().map(|stats| {
+                stats.set_model_loaded(&hex::encode(model_id), false);
+                stats.set_device_error(dev_id, Some(format!("inference model load failed: {e}")));
+            });
             return None;
         }
     }
+    crate::stats::readiness_stats().as_deref().map(|stats| stats.set_model_loaded(&hex::encode(model_id), true));
 
     match crate::llama_engine::generate(&templated, max_tokens) {
         Some(text) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
+            crate::stats::readiness_stats()
+                .as_deref()
+                .map(|stats| stats.set_model_inference_verified(&hex::encode(model_id), true));
             Some(text)
         }
         _ => {
             log::warn!("SlmEngine '{}': llama generate failed or empty — response dropped", spec.name);
+            crate::stats::readiness_stats()
+                .as_deref()
+                .map(|stats| stats.set_model_inference_verified(&hex::encode(model_id), false));
             None
         }
     }

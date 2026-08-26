@@ -1043,11 +1043,45 @@ fn mining_tiers() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
     MINING_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Kebab-case tier label reported in readiness (`"very-light"` … `"very-high"`), matching the
+/// `--force-model` spelling and the readiness schema's example (`"tier": "light"`).
+fn tier_label(tier: crate::models::Tier) -> &'static str {
+    use crate::models::Tier::*;
+    match tier {
+        VeryLight => "very-light",
+        Light => "light",
+        Default => "default",
+        High => "high",
+        VeryHigh => "very-high",
+    }
+}
+
+/// The registered spec owning `model_id`, if any — the readiness `model` label is the spec's
+/// human-readable `dir_name` (e.g. "GLM-4-9B-0414").
+fn spec_for_model_id(model_id: [u8; 32]) -> Option<&'static crate::models::ModelSpec> {
+    crate::models::REGISTRY.iter().copied().find(|s| s.model_id == model_id)
+}
+
+/// Push a device's configured tier + model to the readiness stats. Called on every assignment
+/// (startup and era-crossing swaps) and on OOM downgrades, so the reported model always matches
+/// what the device is actually staged to mine.
+fn register_device_readiness(device_id: u32) {
+    let Some(tier) = device_tiers().lock().ok().and_then(|g| g.get(&device_id).copied()) else { return };
+    let Some(model_id) = mining_tiers().lock().ok().and_then(|g| g.get(&device_id).map(|(id, _)| *id)) else { return };
+    let model_label = spec_for_model_id(model_id)
+        .map(|s| s.dir_name.to_string())
+        .unwrap_or_else(|| hex::encode(model_id)[..8].to_string());
+    crate::stats::readiness_stats().as_deref().map(|stats| {
+        stats.configure_device(device_id, tier_label(tier).to_string(), hex::encode(model_id), model_label);
+    });
+}
+
 /// Record a GPU's mining tier so its miner can be rebuilt after an inference swapped the model away.
 pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     if let Ok(mut g) = mining_tiers().lock() {
         g.insert(device_id, (model_id, gguf_path));
     }
+    register_device_readiness(device_id);
 }
 
 /// Per-GPU **hardware** tier (VRAM-derived, DAA-independent). Distinct from `mining_tiers` (the
@@ -1065,6 +1099,7 @@ pub fn set_device_tier(device_id: u32, tier: crate::models::Tier) {
     if let Ok(mut g) = device_tiers().lock() {
         g.insert(device_id, tier);
     }
+    register_device_readiness(device_id);
 }
 
 /// Hot-swap the resident mining model at an era crossing: when `daa` reaches a model's gate, the
@@ -1278,6 +1313,9 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
         return false;
     }
     if is_installed(device_id) {
+        // The miner is already resident — clear any stale per-device load/index error so a
+        // recovered device stops reading as failed.
+        crate::stats::readiness_stats().as_deref().map(|stats| stats.set_device_error(device_id, None));
         return true;
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
@@ -1429,19 +1467,34 @@ fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // Re-check under the per-device lifecycle lock: a worker that queued on the lock before the
     // pause was raised must not reload the mining model while inference is still generating.
+    // This is normal control flow, not a device failure — a healthy device pausing for
+    // inference must not read as Fatal/Degraded, so no error is recorded here.
     if inference_paused() {
         return false;
     }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
-        None => return false,
+        None => {
+            crate::stats::readiness_stats()
+                .as_deref()
+                .map(|stats| stats.set_device_error(device_id, Some("no mining tier assigned".into())));
+            return false;
+        }
     };
     // This GPU's tier at the current block DAA (recomputed per block, H2-gated).
     let tier = match crate::models::pom_tier_index(&model_id, daa) {
         Some(t) => t,
-        None => return false,
+        None => {
+            crate::stats::readiness_stats()
+                .as_deref()
+                .map(|stats| stats.set_device_error(device_id, Some("model not active at current DAA".into())));
+            return false;
+        }
     };
     if is_oom_banlisted(device_id, &model_id) {
+        crate::stats::readiness_stats()
+            .as_deref()
+            .map(|stats| stats.set_device_error(device_id, Some("model OOM'd on this GPU — banlisted".into())));
         return false; // this model OOM'd on this GPU before — don't retry (avoids a hot reload spin).
     }
     // Build THIS model's possession index once (host, heavy) — deferred from boot so the pre-PoM
@@ -1476,6 +1529,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 }
                 Err(e) => {
                     log::error!("PoM: host index build failed for tier {} on gpu{}: {}", tier, device_id, e);
+                    crate::stats::readiness_stats()
+                        .as_deref()
+                        .map(|stats| stats.set_device_error(device_id, Some(format!("host index build failed: {e}"))));
                     return false;
                 }
             }
@@ -1561,6 +1617,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                     device_id,
                     e_msg
                 );
+                crate::stats::readiness_stats().as_deref().map(|stats| {
+                    stats.set_device_error(device_id, Some(format!("transient GPU runtime fault: {e_msg}")))
+                });
                 reset_stale_gpu_state(device_id, use_llama);
                 return false;
             }
@@ -1572,6 +1631,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         device_id,
                         e_msg
                     );
+                    crate::stats::readiness_stats()
+                        .as_deref()
+                        .map(|stats| stats.set_device_error(device_id, Some(format!("PTX incompatibility: {e_msg}"))));
                 }
                 MinerLoadFailureKind::OomLikely => {
                     log::error!(
@@ -1579,6 +1641,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         device_id,
                         e_msg
                     );
+                    crate::stats::readiness_stats()
+                        .as_deref()
+                        .map(|stats| stats.set_device_error(device_id, Some(format!("model load OOM: {e_msg}"))));
                     oom_banlist_add(device_id, model_id);
                     downgrade_after_oom(device_id, &model_id, daa);
                 }
@@ -1588,12 +1653,18 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                         device_id,
                         e_msg
                     );
+                    crate::stats::readiness_stats()
+                        .as_deref()
+                        .map(|stats| stats.set_device_error(device_id, Some(format!("miner load failed: {e_msg}"))));
                 }
             }
             return false;
         }
         Err(_) => {
             log::error!("PoM[gpu{}]: device miner load panicked (likely OOM) — banlisting this model and downgrading.", device_id);
+            crate::stats::readiness_stats()
+                .as_deref()
+                .map(|stats| stats.set_device_error(device_id, Some("model load panicked (likely OOM)".into())));
             oom_banlist_add(device_id, model_id);
             downgrade_after_oom(device_id, &model_id, daa);
             return false;
@@ -1604,11 +1675,19 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     if let Some(idx) = crate::pom::active_index_for_model(&model_id) {
         if n != idx.n_chunks {
             log::error!("PoM[gpu{}]: gather N={} != tier {} index N={} — refusing to mine", device_id, n, tier, idx.n_chunks);
+            crate::stats::readiness_stats().as_deref().map(|stats| {
+                stats.set_device_error(device_id, Some("gather N != host index N — refusing to mine".into()))
+            });
             return false;
         }
     }
     install(device_id, gm);
     info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
+    // The GPU miner AND the host weight index are both live — the device is PoM-ready.
+    crate::stats::readiness_stats().as_deref().map(|stats| {
+        stats.set_device_pom_ready(device_id, true);
+        stats.set_device_error(device_id, None);
+    });
     true
 }
 

@@ -13,6 +13,7 @@ pub mod pom_gpu;
 pub mod pom_v3;
 pub mod pom_v4;
 pub mod slm;
+pub mod stats;
 pub mod xoshiro256starstar;
 use libloading::{Library, Symbol};
 
@@ -38,11 +39,7 @@ pub struct PluginManager {
 */
 impl PluginManager {
     pub fn new() -> Self {
-        Self {
-            plugins: Vec::new(),
-            loaded_libraries: Vec::new(),
-            startup_warnings: Vec::new(),
-        }
+        Self { plugins: Vec::new(), loaded_libraries: Vec::new(), startup_warnings: Vec::new() }
     }
 
     fn record_startup_warning(&mut self, message: String) {

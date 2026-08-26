@@ -176,10 +176,34 @@ impl Client for KeryxdHandler {
     async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         self.opoi_challenge_active = Some(miner.opoi_challenge_flag());
         self.stats = Some(miner.stats_handle());
-        // Harvest in-flight inference on a timer, independently of node notifications.
-        // On a sole-producer node, pausing mining for inference stops block production,
-        // so the node stops sending NewBlockTemplate notifications — without this timer
-        // the finished inference would never be collected and mining would deadlock.
+        let outcome = self.listen_loop(miner).await;
+        // Readiness: every exit path of the loop — the node closed the stream, a handler
+        // errored, or the stream dropped — means the session is down. Clear the event-driven
+        // flags so a reconnect derives them from scratch (connect()/GetInfoResponse/
+        // NotifyNewBlockTemplateResponse) instead of carrying stale state across sessions.
+        if let Some(stats) = crate::stats::readiness_stats() {
+            stats.set_keryxd_connected(false);
+            stats.set_template_notifications(false);
+        }
+        outcome
+    }
+
+    fn get_block_channel(&self) -> Sender<BlockSeed> {
+        self.block_channel.clone()
+    }
+
+    fn flush_escrow_state(&mut self) -> Result<(), Error> {
+        self.escrow_watcher.as_mut().map_or(Ok(()), |watcher| watcher.flush_state().map_err(Into::into))
+    }
+}
+
+impl KeryxdHandler {
+    /// The actual message loop (see `Client::listen` for why it is split from the readiness
+    /// bookkeeping). Harvests in-flight inference on a timer, independently of node
+    /// notifications: on a sole-producer node, pausing mining for inference stops block
+    /// production, so the node stops sending NewBlockTemplate notifications — without this
+    /// timer the finished inference would never be collected and mining would deadlock.
+    async fn listen_loop(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(200));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -215,16 +239,6 @@ impl Client for KeryxdHandler {
         Ok(())
     }
 
-    fn get_block_channel(&self) -> Sender<BlockSeed> {
-        self.block_channel.clone()
-    }
-
-    fn flush_escrow_state(&mut self) -> Result<(), Error> {
-        self.escrow_watcher.as_mut().map_or(Ok(()), |watcher| watcher.flush_state().map_err(Into::into))
-    }
-}
-
-impl KeryxdHandler {
     pub async fn connect<D>(
         address: D,
         miner_address: String,
@@ -266,6 +280,13 @@ impl KeryxdHandler {
                 None
             }
         };
+
+        // Readiness: the connection is down until the node actually answers the GetInfo
+        // handshake below (see GetInfoResponse) — and reconnects start from a cleared
+        // flag so a stale "connected" never survives a dropped stream.
+        if let Some(stats) = crate::stats::readiness_stats() {
+            stats.set_keryxd_connected(false);
+        }
 
         let mut client = RpcClient::connect(address).await?;
         // Outbound message channel to the node. ALL client->node messages share this:
@@ -912,6 +933,10 @@ impl KeryxdHandler {
                 None => self.report_service_strikes(&resp),
             },
             Payload::GetBlockTemplateResponse(template) => {
+                // Readiness: the node's own sync verdict, refreshed with every template.
+                if let Some(stats) = crate::stats::readiness_stats() {
+                    stats.set_keryxd_synced(template.is_synced);
+                }
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
                     .and_then(|b| b.header.as_ref())
@@ -1139,6 +1164,11 @@ impl KeryxdHandler {
             }
             Payload::GetInfoResponse(info) => {
                 info!("Keryxd version: {}", info.server_version);
+                // Readiness: the first usable node response — this is the connection being up.
+                if let Some(stats) = crate::stats::readiness_stats() {
+                    stats.set_keryxd_connected(true);
+                    stats.set_keryxd_version(Some(info.server_version.clone()));
+                }
                 // Register for all notification types:
                 // - NewBlockTemplate drives the mining loop
                 // - BlockAdded lets us scan confirmed blocks for AiRequests
@@ -1162,8 +1192,18 @@ impl KeryxdHandler {
                 self.client_get_block_template().await?;
             }
             Payload::NotifyNewBlockTemplateResponse(res) => match res.error {
-                None => info!("Registered for new template notifications"),
-                Some(e) => error!("Failed registering for new template notifications: {:?}", e),
+                None => {
+                    info!("Registered for new template notifications");
+                    if let Some(stats) = crate::stats::readiness_stats() {
+                        stats.set_template_notifications(true);
+                    }
+                }
+                Some(e) => {
+                    error!("Failed registering for new template notifications: {:?}", e);
+                    if let Some(stats) = crate::stats::readiness_stats() {
+                        stats.set_template_notifications(false);
+                    }
+                }
             },
             Payload::NotifyBlockAddedResponse(res) => match res.error {
                 None => info!("Registered for block added notifications (AI request scanning)"),
