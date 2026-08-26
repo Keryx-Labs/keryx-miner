@@ -811,7 +811,7 @@ fn do_inference_and_upload(
         warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;
     }
-    match crate::ipfs::upload(&text, ipfs_url) {
+    match crate::ipfs::upload_with_recovery(&text, ipfs_url) {
         Ok(cid_bytes) => {
             // Convert raw 34-byte multihash to base58 CIDv0 string via AiResponsePayload helper.
             let cid = keryx_inference::AiResponsePayload::new([0u8; 32], 0, cid_bytes, 0).cid_v0();

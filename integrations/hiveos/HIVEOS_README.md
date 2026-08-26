@@ -13,6 +13,15 @@ The directory is mode `0700`; both files are mode `0600`. `h-run.sh` validates a
 
 Back up both durable files together before an upgrade or recovery. If validation fails, restore the matching pair from backup. Do not delete `escrow.key` to regenerate it because the original key controls existing rewards.
 
+## Local IPFS/Kubo
+
+The launcher supplies `HOME=/root` only when HiveOS omitted or emptied `HOME`; an explicit
+operator value is preserved. Keryx gives every managed Kubo child that same `HOME` and the
+matching `IPFS_PATH`, waits up to 60 seconds for the local API, and exits before mining or
+advertising inference capability if upload storage remains unavailable. A failed local
+inference upload performs one serialized Kubo recovery and one retry. Remote `--ipfs-url`
+endpoints are never started, stopped, or otherwise managed by the miner.
+
 ## Rollback-safe upgrade
 
 An old Keryx package understands the escrow path flags but defaults to files in its replaceable working directory. Before changing the Install URL, persist these exact flags in the HiveOS Flight Sheet **Extra config**:
