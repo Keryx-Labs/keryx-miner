@@ -1016,8 +1016,8 @@ impl KeryxdHandler {
             Payload::GetBlockResponse(msg) => {
                 let mut was_validation = false;
                 if let Some(e) = msg.error {
-                    // Validation answer: "cannot find header <hash>" — the block never
-                    // existed on this chain, its escrow entries are ghosts.
+                    // Validation answer: "cannot find header <hash>" — unknown to this
+                    // node (pruned or not yet synced), the entries are kept.
                     was_validation = self
                         .escrow_watcher
                         .as_mut()
