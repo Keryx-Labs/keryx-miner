@@ -678,9 +678,6 @@ async fn client_main(
     stats: Arc<MinerStats>,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
-    let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url)).await.ok();
-
     let mut client = get_client(
         opt.keryxd_address.clone(),
         opt.mining_address.clone().unwrap_or_default(),
@@ -1221,6 +1218,16 @@ async fn run() -> Result<(), Error> {
         error!("No workers specified");
         return Err("No workers specified".into());
     }
+
+    // IPFS readiness gate: make sure the daemon is up before any client/capability activity.
+    // Runs once here, outside the reconnect loop, so a dead daemon fails startup instead of
+    // spinning reconnect attempts, and the miner never advertises/serves inference it cannot
+    // publish. `ensure_daemon` returns only when the API is reachable (waiting up to 60
+    // seconds, failing immediately if the child exits).
+    let ipfs_url = opt.ipfs_url.clone();
+    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
+        .await
+        .map_err(|e| format!("IPFS startup task failed: {}", e))??;
 
     let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
     if opt.devfund_percent > 0 {

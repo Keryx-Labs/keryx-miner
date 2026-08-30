@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# HiveOS may launch miners without HOME set, which aborts child processes that
+# need it (notably Kubo/IPFS: "Error: $HOME is not defined"). Fall back to /root
+# at the earliest launcher point, BEFORE any helper script is sourced, so every
+# sourced script and every child sees HOME. A real HOME is never overridden.
+export HOME="${HOME:-/root}"
+
 cd "$(dirname "$0")" || exit 1
 
 [ -t 1 ] && . colors
@@ -21,8 +27,10 @@ if [[ -n "${STY:-}" && -z "${KERYX_TRUECOLOR:-}" ]]; then
   export KERYX_TRUECOLOR=0
 fi
 
-# Shared, stable model cache path across package updates/reinstalls.
-export KERYX_MODELS_DIR="/hive/miners/custom/models"
+# Shared, stable model cache path across package updates/reinstalls. An
+# explicitly supplied KERYX_MODELS_DIR (e.g. a sandboxed test root) is
+# preserved; HiveOS packages fall back to the shared cache by default.
+export KERYX_MODELS_DIR="${KERYX_MODELS_DIR:-/hive/miners/custom/models}"
 
 cleanup_legacy_models() {
   local legacy_dir="$CUSTOM_MINER_DIR/models"

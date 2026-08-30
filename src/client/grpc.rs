@@ -740,7 +740,7 @@ impl KeryxdHandler {
 
         let ipfs_url = self.ipfs_url.clone();
         let result_clone = result.clone();
-        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload(&result_clone, &ipfs_url)).await {
+        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload_with_recovery(&result_clone, &ipfs_url)).await {
             Ok(Ok(cid)) => cid,
             Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
             Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
