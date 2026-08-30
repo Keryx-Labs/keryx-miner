@@ -680,10 +680,8 @@ impl EscrowWatcher {
     }
 
     /// Match a GetBlock error message against the pending validation set (the node's
-    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed.
-    /// A block the node cannot return is unknown, not a ghost: a pruned node forgets
-    /// coinbases whose outputs are still unspent. The entries stay; a real ghost is
-    /// rejected at claim time and retired by the orphan path.
+    /// "cannot find header <hash>" text embeds the hash). Returns true when consumed. A block
+    /// the node cannot return is unknown, not a ghost: its entries stay.
     pub fn on_block_validation_error(&mut self, message: &str) -> bool {
         let hash = match self.validation_pending.iter().find(|h| message.contains(h.as_str())) {
             Some(h) => h.clone(),
@@ -2009,12 +2007,12 @@ mod persistence_tests {
         assert_eq!(pending.len(), 2);
         assert!(watcher.validation_in_progress());
 
-        // Pruned (or not yet synced) on this node: the outputs may well be unspent.
+        // Unknown to this node: kept.
         assert!(watcher.on_block_validation_error(&format!("cannot find header {}", "02".repeat(32))));
         assert!(!watcher.state.entries[0].slashed);
         assert!(watcher.validation_in_progress());
 
-        // Stored but no longer on the selected chain: its coinbase never materialized.
+        // Known but off the selected chain: purged.
         assert!(watcher.consume_validation_ok(&"03".repeat(32), false));
         assert!(watcher.state.entries[1].slashed);
         assert!(!watcher.validation_in_progress());

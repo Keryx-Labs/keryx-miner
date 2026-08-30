@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PoM mining kernel → PTX set (loaded at runtime into the miner's CUDA context).
     // Build a fallback ladder so mixed/older rigs don't fail on a single too-new .target.
     println!("cargo:rerun-if-changed=cuda/pom_mine.cu");
+    println!("cargo:rerun-if-changed=cuda/keccak_f1600.cuh");
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=POM_SM_LIST");
     println!("cargo:rerun-if-env-changed=POM_FATBIN_LEGACY");

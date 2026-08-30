@@ -457,6 +457,36 @@ pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) ->
     pom_block_seed_from_words(&pph_words_v4(pre_pow_hash), timestamp, nonce)
 }
 
+/// Initial sponge state of `cSHAKE256("ProofOfWorkHash")`. MUST equal the node's `PowHash`.
+#[rustfmt::skip]
+const POW_HASH_INITIAL_STATE: [u64; 25] = [
+    1242148031264380989, 3008272977830772284, 2188519011337848018, 1992179434288343456, 8876506674959887717,
+    5399642050693751366, 1745875063082670864, 8605242046444978844, 17936695144567157056, 3343109343542796272,
+    1123092876221303306, 4963925045340115282, 17037383077651887893, 16629644495023626889, 12833675776649114147,
+    3784524041015224902, 1082795874807940378, 13952716920571277634, 13411128033953605860, 15060696040649351053,
+    9928834659948351306, 5237849264682708699, 12825353012139217522, 6706187291358897596, 196324915476054915,
+];
+
+/// Sponge state with `pre_pow_hash` and `timestamp` absorbed, before the nonce. The GPU kernels
+/// take it as-is and absorb the nonce per candidate.
+pub fn pom_seed_h10_state(pre_pow_hash: &[u8; 32], timestamp: u64) -> [u64; 25] {
+    let mut st = POW_HASH_INITIAL_STATE;
+    for (i, w) in pph_words(pre_pow_hash).iter().enumerate() {
+        st[i] ^= w;
+    }
+    st[4] ^= timestamp;
+    st
+}
+
+/// H10 block seed: leading 64 bits of `PowHash(pre_pow_hash, timestamp, nonce)`.
+/// BYTE-IDENTICAL to the node's `pom_block_seed_h10`.
+pub fn pom_block_seed_h10(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    let mut st = pom_seed_h10_state(pre_pow_hash, timestamp);
+    st[9] ^= nonce;
+    crate::keccak::f1600(&mut st);
+    st[0]
+}
+
 
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty(), "merkle_root: empty leaves");
@@ -1404,7 +1434,7 @@ fn gate(mainnet: u64, testnet: u64) -> u64 {
 /// Testnet: 0 (PoM from genesis) — node TESTNET_PARAMS.pom_activation = new(0).
 #[inline(always)]
 pub fn pom_activation_daa() -> u64 {
-    gate(37_780_000, 0)
+    gate(37_780_000, 1)
 }
 
 /// H3 (PoM block-level hardfork) activation DAA score. At/after this score the block header
@@ -1472,7 +1502,7 @@ pub fn h5_2_activation_daa() -> u64 {
 /// `pom_v3_activation`: mainnet 76_316_623, testnet 0 — the lineup carries no pre-H6 models, so
 /// anything above 0 leaves the miner with no model to walk on a chain starting at genesis.
 pub fn pom_v3_activation_daa() -> u64 {
-    gate(76_316_623, 0)
+    gate(76_316_623, 1)
 }
 
 /// PoM v4 (re-walk) gate. MUST equal the node's `pom_v4_activation`.
@@ -1480,12 +1510,17 @@ pub fn pom_v4_activation_daa() -> u64 {
     gate(79_210_000, 500)
 }
 
+/// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
+pub fn h10_activation_daa() -> u64 {
+    gate(87_440_000, 500)
+}
+
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of
 /// the AiRequest, not by the digest of its payload. MUST equal the node's
 /// `reward_routing_activation`: a miner deriving the other identity signs responses the node
 /// cannot credit, and is struck for work it actually did.
 pub fn reward_routing_activation_daa() -> u64 {
-    gate(79_210_000, 500)
+    gate(79_210_000, 0)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
@@ -2008,4 +2043,27 @@ mod tests {
         assert_eq!(proof.tier, 1);
     }
 
+}
+
+#[cfg(test)]
+mod seed_h10_tests {
+    use super::*;
+
+    // Cross-implementation vectors: pinned in the node's `pom::seed_h10_tests` and produced by
+    // the GPU keccak too (`cuda/tests/seed_h10_check.cu`).
+    #[test]
+    fn seed_h10_matches_the_pinned_vectors_and_differs_from_v4() {
+        assert_eq!(pom_block_seed_h10(&[0u8; 32], 0, 0), 0x1fadaf72b089e024);
+        let pph = [0x5au8; 32];
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        let h10 = pom_block_seed_h10(&pph, ts, nonce);
+        assert_eq!(h10, 0xcec7e2d9fce5bda6);
+        assert_eq!(pom_block_seed_h10(&[0xa5u8; 32], ts, u64::MAX), 0x60977326f8e922ab);
+        assert_ne!(h10, pom_block_seed_v4(&pph, ts, nonce));
+        assert_ne!(h10, pom_block_seed_h10(&pph, ts, nonce ^ 1));
+        let mut st = pom_seed_h10_state(&pph, ts);
+        st[9] ^= nonce;
+        crate::keccak::f1600(&mut st);
+        assert_eq!(h10, st[0]);
+    }
 }
