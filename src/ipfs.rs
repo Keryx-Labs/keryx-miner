@@ -239,6 +239,27 @@ fn kubo_child_env(home: &Path, is_windows: bool) -> Vec<(OsString, OsString)> {
         ]
     }
 }
+struct KuboCommandFactory<'a> {
+    ipfs_bin: &'a Path,
+    child_env: &'a [(OsString, OsString)],
+}
+
+impl<'a> KuboCommandFactory<'a> {
+    fn new(ipfs_bin: &'a Path, child_env: &'a [(OsString, OsString)]) -> Self {
+        Self { ipfs_bin, child_env }
+    }
+
+    fn command(&self) -> std::process::Command {
+        self.command_with_parent_setup(|_| {})
+    }
+
+    fn command_with_parent_setup(&self, setup: impl FnOnce(&mut std::process::Command)) -> std::process::Command {
+        let mut command = std::process::Command::new(self.ipfs_bin);
+        setup(&mut command);
+        command.envs(self.child_env.iter().cloned());
+        command
+    }
+}
 
 fn adjacent_kubo_binary(exe_dir: &Path, is_windows: bool) -> PathBuf {
     exe_dir.join(if is_windows { "ipfs.exe" } else { "ipfs" })
@@ -363,11 +384,12 @@ pub fn ensure_daemon(api_url: &str) -> anyhow::Result<()> {
     )?;
     let ipfs_bin = find_or_download_kubo()?;
     let child_env = kubo_child_env(&home, cfg!(target_os = "windows"));
+    let kubo_commands = KuboCommandFactory::new(&ipfs_bin, &child_env);
     if !ipfs_repo.exists() {
         log::info!("Initialising IPFS repo at {}", ipfs_repo.display());
-        let status = std::process::Command::new(&ipfs_bin)
+        let mut command = kubo_commands.command();
+        let status = command
             .arg("init")
-            .envs(child_env.iter().cloned())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -392,9 +414,9 @@ pub fn ensure_daemon(api_url: &str) -> anyhow::Result<()> {
         },
         Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
     };
-    let mut child = std::process::Command::new(&ipfs_bin)
+    let mut command = kubo_commands.command();
+    let mut child = command
         .args(["daemon", "--routing=dhtclient"])
-        .envs(child_env)
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
@@ -575,6 +597,50 @@ mod tests {
     fn os(value: &str) -> &OsStr {
         OsStr::new(value)
     }
+    const CHILD_ENV_CAPTURE: &str = "KERYX_TEST_CHILD_ENV_CAPTURE";
+    const UNRELATED_CHILD_ENV: &str = "KERYX_TEST_UNRELATED_CHILD_ENV";
+
+    fn run_child_env_probe(kubo_commands: &KuboCommandFactory<'_>, inherited_env: &[(&str, &str)]) -> String {
+        let dir = tempfile::tempdir().expect("temporary child environment capture directory");
+        let capture = dir.path().join("environment.txt");
+        let mut command = kubo_commands.command_with_parent_setup(|command| {
+            command
+                .env_remove("HOME")
+                .env_remove("USERPROFILE")
+                .env_remove("IPFS_PATH")
+                .env_remove(UNRELATED_CHILD_ENV);
+            for (key, value) in inherited_env {
+                command.env(key, value);
+            }
+        });
+        command
+            .args(["--exact", "ipfs::tests::kubo_child_environment_probe", "--nocapture"])
+            .env(CHILD_ENV_CAPTURE, &capture);
+        let output = command.output().expect("spawn child environment probe");
+        assert!(
+            output.status.success(),
+            "child environment probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(capture).expect("read child environment capture")
+    }
+
+    #[test]
+    fn kubo_child_environment_probe() {
+        let Some(capture) = std::env::var_os(CHILD_ENV_CAPTURE) else {
+            return;
+        };
+        let captured = ["HOME", "USERPROFILE", "IPFS_PATH", UNRELATED_CHILD_ENV]
+            .map(|key| {
+                let value = std::env::var_os(key)
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unset>".to_string());
+                format!("{key}={value}")
+            })
+            .join("\n");
+        std::fs::write(capture, captured).expect("write child environment capture");
+    }
 
     #[test]
     fn normalize_api_url_adds_http_only_to_scheme_less_values() {
@@ -720,6 +786,52 @@ mod tests {
             ]
         );
         assert!(kubo_child_env(Path::new("/custom/home"), true).is_empty());
+    }
+
+    #[test]
+    fn windows_kubo_command_factory_preserves_native_environment_for_init_and_daemon() {
+        let child_env = kubo_child_env(Path::new("/unused/windows/home"), true);
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let kubo_commands = KuboCommandFactory::new(&test_exe, &child_env);
+        let inherited = [
+            ("HOME", "C:\\native-home"),
+            ("USERPROFILE", "C:\\Users\\miner"),
+            ("IPFS_PATH", "D:\\kubo-repo"),
+            (UNRELATED_CHILD_ENV, "preserved"),
+        ];
+        let expected = concat!(
+            "HOME=C:\\native-home\n",
+            "USERPROFILE=C:\\Users\\miner\n",
+            "IPFS_PATH=D:\\kubo-repo\n",
+            "KERYX_TEST_UNRELATED_CHILD_ENV=preserved"
+        );
+        let init_env = run_child_env_probe(&kubo_commands, &inherited);
+        let daemon_env = run_child_env_probe(&kubo_commands, &inherited);
+        assert_eq!(init_env, expected);
+        assert_eq!(daemon_env, expected);
+    }
+
+    #[test]
+    fn unix_kubo_command_factory_overrides_home_and_repo_for_init_and_daemon() {
+        let child_env = kubo_child_env(Path::new("/selected/home"), false);
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let kubo_commands = KuboCommandFactory::new(&test_exe, &child_env);
+        let inherited = [
+            ("HOME", "/inherited/home"),
+            ("USERPROFILE", "/irrelevant/profile"),
+            ("IPFS_PATH", "/operator/repo"),
+            (UNRELATED_CHILD_ENV, "preserved"),
+        ];
+        let expected = concat!(
+            "HOME=/selected/home\n",
+            "USERPROFILE=/irrelevant/profile\n",
+            "IPFS_PATH=/selected/home/.ipfs\n",
+            "KERYX_TEST_UNRELATED_CHILD_ENV=preserved"
+        );
+        let init_env = run_child_env_probe(&kubo_commands, &inherited);
+        let daemon_env = run_child_env_probe(&kubo_commands, &inherited);
+        assert_eq!(init_env, expected);
+        assert_eq!(daemon_env, expected);
     }
 
     #[test]
