@@ -778,14 +778,15 @@ mod tests {
 
     #[test]
     fn kubo_child_env_sets_matching_home_and_repo_on_unix_but_is_untouched_on_windows() {
+        let home = Path::new("/custom/home");
         assert_eq!(
-            kubo_child_env(Path::new("/custom/home"), false),
+            kubo_child_env(home, false),
             vec![
-                (OsString::from("HOME"), OsString::from("/custom/home")),
-                (OsString::from("IPFS_PATH"), OsString::from("/custom/home/.ipfs")),
+                (OsString::from("HOME"), home.as_os_str().to_os_string()),
+                (OsString::from("IPFS_PATH"), home.join(".ipfs").into_os_string()),
             ]
         );
-        assert!(kubo_child_env(Path::new("/custom/home"), true).is_empty());
+        assert!(kubo_child_env(home, true).is_empty());
     }
 
     #[test]
@@ -813,7 +814,8 @@ mod tests {
 
     #[test]
     fn unix_kubo_command_factory_overrides_home_and_repo_for_init_and_daemon() {
-        let child_env = kubo_child_env(Path::new("/selected/home"), false);
+        let selected_home = Path::new("/selected/home");
+        let child_env = kubo_child_env(selected_home, false);
         let test_exe = std::env::current_exe().expect("current test executable");
         let kubo_commands = KuboCommandFactory::new(&test_exe, &child_env);
         let inherited = [
@@ -822,11 +824,10 @@ mod tests {
             ("IPFS_PATH", "/operator/repo"),
             (UNRELATED_CHILD_ENV, "preserved"),
         ];
-        let expected = concat!(
-            "HOME=/selected/home\n",
-            "USERPROFILE=/irrelevant/profile\n",
-            "IPFS_PATH=/selected/home/.ipfs\n",
-            "KERYX_TEST_UNRELATED_CHILD_ENV=preserved"
+        let expected = format!(
+            "HOME={}\nUSERPROFILE=/irrelevant/profile\nIPFS_PATH={}\nKERYX_TEST_UNRELATED_CHILD_ENV=preserved",
+            selected_home.display(),
+            selected_home.join(".ipfs").display()
         );
         let init_env = run_child_env_probe(&kubo_commands, &inherited);
         let daemon_env = run_child_env_probe(&kubo_commands, &inherited);
