@@ -1,0 +1,17 @@
+Coin Drop by Universfield
+
+Source: https://pixabay.com/sound-effects/film-special-effects-coin-drop-229314/
+License summary: https://pixabay.com/service/license-summary/
+Full Pixabay terms: https://pixabay.com/service/terms/
+
+Pixabay permits free use and modification without attribution, subject to its
+Content License. This copy was trimmed and given a 50 ms silent lead-in for
+Keryx Miner's block-accepted celebration. It is distributed as part of the
+application, not as a standalone audio product.
+
+Source provenance recorded: 2026-08-05
+Original local source SHA-256:
+af8a9ec4d8b718703980c28b58c851aacf515da9fc1e2d90ac592d1295d0ef76
+
+Embedded build asset: coin-sound.mp3
+SHA-256: 440976a31e0ce6f391edc1fac122efde73232c5f07e2c0c984e24230d7dbc087

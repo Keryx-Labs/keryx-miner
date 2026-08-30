@@ -163,6 +163,14 @@ On HiveOS, the durable files live outside the replaceable miner package at `/hiv
 ./keryx-miner --help
 ```
 
+### Block celebration
+
+Block celebration is excluded from default builds so its native audio dependency does not affect release portability. To include it, build with `--features block-celebration`, then pass `--block-celebration` when starting the miner. Both opt-ins are required; animation and sound start disabled otherwise.
+
+When enabled in the terminal UI, it displays a short coin animation and plays a sound on the miner host after a locally mined block is accepted. Press `B` to toggle the animation and `M` to mute or enable the sound independently during the session. If the host has no audio device, mining continues without sound.
+
+The embedded sound is a trimmed adaptation of "Coin Drop" by Universfield under the Pixabay Content License. See `assets/coin-sound-LICENSE.txt` for details.
+
 
 ---
 

@@ -9,6 +9,8 @@ description = "A fast CPU & GPU miner for Keryx"
 categories = ["command-line-utilities"]
 keywords = ["blockchain", "cli"]
 include = [
+    "assets/coin-sound.mp3",
+    "assets/coin-sound-LICENSE.txt",
     "src/**/*.rs",
     "src/**/*.s",
     "proto/**",
@@ -68,12 +70,14 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+soloud = { version = "1.1.1", default-features = false, features = ["miniaudio"], optional = true }
 
 [features]
 default = ["parking_lot"]
 parking_lot = ["parking", "tokio/parking_lot"]
 bench = []
 no-asm = ["keccak"]
+block-celebration = ["dep:soloud"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keccak = "0.1"
