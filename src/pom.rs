@@ -1512,7 +1512,7 @@ pub fn pom_v4_activation_daa() -> u64 {
 
 /// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
 pub fn h10_activation_daa() -> u64 {
-    gate(87_440_000, 500)
+    gate(87_360_000, 500)
 }
 
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of
