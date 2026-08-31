@@ -53,7 +53,7 @@ use futures_util::StreamExt;
 use log::{error, info, warn};
 use rand::{thread_rng, RngCore};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc::{self, error::SendError, Sender}, oneshot};
 use tokio::task::JoinHandle;
@@ -71,9 +71,6 @@ pub struct KeryxdHandler {
     stream: Streaming<KaspadMessage>,
     miner_address: String,
     mine_when_not_synced: bool,
-    devfund_address: Option<String>,
-    devfund_percent: u16,
-    block_template_ctr: Arc<AtomicU16>,
 
     block_channel: Sender<BlockSeed>,
     block_handle: BlockHandle,
@@ -163,11 +160,6 @@ pub struct KeryxdHandler {
 
 #[async_trait(?Send)]
 impl Client for KeryxdHandler {
-    fn add_devfund(&mut self, address: String, percent: u16) {
-        self.devfund_address = Some(address);
-        self.devfund_percent = percent;
-    }
-
     async fn register(&mut self) -> Result<(), Error> {
         // We actually register in connect
         Ok(())
@@ -229,7 +221,6 @@ impl KeryxdHandler {
         address: D,
         miner_address: String,
         mine_when_not_synced: bool,
-        block_template_ctr: Option<Arc<AtomicU16>>,
         escrow_privkey: Option<String>,
         escrow_state_file: String,
         escrow_cert: Option<String>,
@@ -284,10 +275,6 @@ impl KeryxdHandler {
             send_channel,
             miner_address,
             mine_when_not_synced,
-            devfund_address: None,
-            devfund_percent: 0,
-            block_template_ctr: block_template_ctr
-                .unwrap_or_else(|| Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16))),
             block_channel,
             block_handle,
             ai_request_queue: VecDeque::new(),
@@ -303,8 +290,6 @@ impl KeryxdHandler {
             challenge_inference_rx: None,
             opoi_challenge_active: None,
             pending_block_submissions,
-            // Seeded from the node so era-gated decisions (devfund payout) are right on the very
-            // first template request, not only once one has been received.
             last_known_daa: chain_daa.unwrap_or(0),
             ipfs_url,
             escrow_pubkey,
@@ -349,18 +334,7 @@ impl KeryxdHandler {
     }
 
     async fn client_get_block_template(&mut self) -> Result<(), SendError<KaspadMessage>> {
-        // From H6 the delegation cert is verified against the block's own pay address, and this
-        // miner can only hold one for its own. A devfund block would be refused at the template.
-        let devfund_payable = self.last_known_daa < keryx_miner::pom::pom_v3_activation_daa();
-        let pay_address = match &self.devfund_address {
-            Some(devfund_address)
-                if devfund_payable && self.block_template_ctr.load(Ordering::SeqCst) <= self.devfund_percent =>
-            {
-                devfund_address.clone()
-            }
-            _ => self.miner_address.clone(),
-        };
-        self.block_template_ctr.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v + 1) % 10_000)).unwrap();
+        let pay_address = self.miner_address.clone();
         // Append a per-request random nonce so that parallel blocks at the same blue_score
         // get distinct coinbase payloads → distinct tx_ids (avoids DAG coinbase collisions).
         let nonce_hex = format!("{:016x}", thread_rng().next_u64());

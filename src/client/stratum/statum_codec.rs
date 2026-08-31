@@ -1,6 +1,6 @@
 use bytes::BytesMut;
 use log::error;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_repr::*;
 use std::fmt::{Display, Formatter};
@@ -31,12 +31,43 @@ impl Display for ErrorCode {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone)]
 pub(crate) struct StratumError(pub(crate) ErrorCode, pub(crate) String, #[serde(default)] pub(crate) Option<Value>);
+
+impl<'de> Deserialize<'de> for StratumError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireError {
+            Tuple(i64, String, #[serde(default)] Option<Value>),
+            Object {
+                code: i64,
+                message: String,
+                #[serde(default)]
+                data: Option<Value>,
+            },
+        }
+        let (code, message, data) = match WireError::deserialize(deserializer)? {
+            WireError::Tuple(code, message, data) => (code, message, data),
+            WireError::Object { code, message, data } => (code, message, data),
+        };
+        let code = match code {
+            21 => ErrorCode::JobNotFound,
+            22 => ErrorCode::DuplicateShare,
+            23 => ErrorCode::LowDifficultyShare,
+            24 => ErrorCode::Unauthorized,
+            25 => ErrorCode::NotSubscribed,
+            _ => ErrorCode::Unknown,
+        };
+        Ok(Self(code, message, data))
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub(crate) enum MiningNotify {
+    MiningNotifyWithTaskV3((String, [u64; 4], u64, u64, u32, String)),
+    MiningNotifyShortV3((String, [u64; 4], u64, u64, u32)),
     // 5-element: job_id, header_hash, timestamp, daa_score, task_json (AiRequest payload)
     MiningNotifyWithTask((String, [u64; 4], u64, u64, String)),
     MiningNotifyShortV2((String, [u64; 4], u64, u64)),
@@ -47,6 +78,7 @@ pub(crate) enum MiningNotify {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum MiningSubmit {
+    MiningSubmitWithPom((String, String, String, String, String, String)),
     // 5-element: address, job_id, nonce, opoi_tag, ipfs_cid (Phase 2 full inference submit)
     MiningSubmitWithCID((String, String, String, String, String)),
     MiningSubmitWithTag((String, String, String, String)), // address, job_id, nonce, opoi_tag
@@ -80,6 +112,8 @@ pub(crate) enum StratumCommand {
     Subscribe(MiningSubscribe),
     #[serde(rename = "mining.authorize")]
     Authorize((String, String)),
+    #[serde(rename = "mining.keepalive")]
+    MiningKeepalive([(); 0]),
     #[serde(rename = "mining.submit")]
     MiningSubmit(MiningSubmit),
     // Phase 2 OPoI: miner → bridge — declare loaded SLM model IDs (sent after authorize)

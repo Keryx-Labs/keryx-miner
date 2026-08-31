@@ -12,9 +12,8 @@ use std::os::fd::AsRawFd;
 use clap::{App, FromArgMatches, IntoApp};
 use keryx_miner::PluginManager;
 use log::{error, info, warn};
-use rand::{thread_rng, RngCore};
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -567,12 +566,13 @@ async fn get_client(
     keryxd_address: String,
     mining_address: String,
     mine_when_not_synced: bool,
-    block_template_ctr: Arc<AtomicU16>,
     escrow_privkey: Option<String>,
     escrow_state_file: String,
     escrow_cert: Option<String>,
     chain_daa: Option<u64>,
     ipfs_url: String,
+    keepalive_seconds: u64,
+    keepalive_timeout_seconds: u64,
 ) -> Result<Box<dyn Client + 'static>, Error> {
     if keryxd_address.starts_with("stratum+tcp://") {
         let (_schema, address) = keryxd_address.split_once("://").unwrap();
@@ -580,8 +580,9 @@ async fn get_client(
             address.to_string().clone(),
             mining_address.clone(),
             mine_when_not_synced,
-            Some(block_template_ctr.clone()),
             ipfs_url.clone(),
+            keepalive_seconds,
+            keepalive_timeout_seconds,
         )
         .await?)
     } else if keryxd_address.starts_with("grpc://") {
@@ -589,7 +590,6 @@ async fn get_client(
             keryxd_address.clone(),
             mining_address.clone(),
             mine_when_not_synced,
-            Some(block_template_ctr.clone()),
             escrow_privkey,
             escrow_state_file,
             escrow_cert,
@@ -670,7 +670,6 @@ fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::E
 
 async fn client_main(
     opt: &Opt,
-    block_template_ctr: Arc<AtomicU16>,
     plugin_manager: &PluginManager,
     escrow_privkey: Option<String>,
     escrow_cert: Option<String>,
@@ -682,18 +681,16 @@ async fn client_main(
         opt.keryxd_address.clone(),
         opt.mining_address.clone().unwrap_or_default(),
         opt.mine_when_not_synced,
-        block_template_ctr.clone(),
         escrow_privkey,
         opt.escrow_state_file.clone(),
         escrow_cert,
         chain_daa,
         opt.ipfs_url.clone(),
+        opt.stratum_keepalive_seconds,
+        opt.stratum_keepalive_timeout_seconds,
     )
     .await?;
 
-    if opt.devfund_percent > 0 {
-        client.add_devfund(opt.devfund_address.clone(), opt.devfund_percent);
-    }
     client.register().await?;
     let mut miner_manager = MinerManager::new(client.get_block_channel(), opt.num_threads, plugin_manager, stats);
     let listen_result = tokio::select! {
@@ -1229,15 +1226,6 @@ async fn run() -> Result<(), Error> {
         .await
         .map_err(|e| format!("IPFS startup task failed: {}", e))??;
 
-    let block_template_ctr = Arc::new(AtomicU16::new((thread_rng().next_u64() % 10_000u64) as u16));
-    if opt.devfund_percent > 0 {
-        info!(
-            "devfund enabled, mining {}.{}% of the time to devfund address: {} ",
-            opt.devfund_percent / 100,
-            opt.devfund_percent % 100,
-            opt.devfund_address
-        );
-    }
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, exiting miner main loop");
@@ -1245,7 +1233,6 @@ async fn run() -> Result<(), Error> {
         }
         match client_main(
             &opt,
-            block_template_ctr.clone(),
             &plugin_manager,
             escrow_privkey.clone(),
             escrow_cert.clone(),
