@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use protocol::{difficulty_to_target, effective_target, nonce_range, MiningJob};
 
-use crate::client::stratum::statum_codec::{ErrorCode, MiningNotify, MiningSubmit, NewLineJsonCodecError, StratumLine};
+use crate::client::stratum::statum_codec::{ErrorCode, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
     MiningSubscribe, SetExtranonce, StratumCommand, StratumError, StratumLinePayload, StratumResult,
 };
