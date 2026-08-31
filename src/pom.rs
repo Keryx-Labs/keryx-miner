@@ -885,6 +885,29 @@ pub struct WeightIndex {
     /// Optional in-RAM dense tree (all levels). When present, `merkle_path` is a pure lookup
     /// instead of the sparse recompute.
     dense: Option<Vec<Vec<[u8; 32]>>>,
+    /// Memo for UPPER-level Merkle siblings (see `merkle_path`): those repeat constantly across
+    /// a proof's path lookups, and each miss recomputes a subtree. Only levels holding at most
+    /// `sibling_memo_max_nodes()` nodes are cached, bounding the memo to a few MB. The tree is
+    /// immutable once built, so entries never go stale.
+    sibling_memo: Mutex<HashMap<(u32, u64), [u8; 32]>>,
+}
+
+/// Cache siblings only at levels holding at most this many nodes. 65536 entries x (12 B key +
+/// 32 B value + map overhead) bounds the memo at a few MB even if every slot is touched.
+const SIBLING_MEMO_MAX_NODES_DEFAULT: u64 = 65_536;
+
+/// Per-level node-count ceiling for memoization; `KERYX_POM_PATH_MEMO_MAX` overrides.
+fn sibling_memo_max_nodes() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KERYX_POM_PATH_MEMO_MAX").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(SIBLING_MEMO_MAX_NODES_DEFAULT)
+    })
+}
+
+/// `KERYX_POM_PATH_MEMO=0` disables the sibling memo (A/B knob + safety valve).
+fn memo_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("KERYX_POM_PATH_MEMO").ok().as_deref() != Some("0"))
 }
 
 impl Drop for WeightIndex {
@@ -998,6 +1021,7 @@ fn open_existing_tree(tree_path: &Path, gguf_path: &str, expected_model_id: [u8;
         checkpoints,
         total_levels,
         dense: None,
+        sibling_memo: Mutex::new(HashMap::new()),
     })
 }
 
@@ -1146,6 +1170,7 @@ impl WeightIndex {
             checkpoints,
             total_levels,
             dense: None,
+            sibling_memo: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1265,6 +1290,17 @@ impl WeightIndex {
             }
 
             let sib_idx = idx ^ 1;
+            // Upper levels repeat across a proof's path lookups — serve them from the memo.
+            let memoize = memo_enabled() && self.count_at_level(level) <= sibling_memo_max_nodes();
+            if memoize {
+                if let Ok(m) = self.sibling_memo.lock() {
+                    if let Some(&hit) = m.get(&(level, sib_idx)) {
+                        path.push(hit);
+                        idx >>= 1;
+                        continue;
+                    }
+                }
+            }
             let is_stored = level > 0 && (level.is_multiple_of(CHECKPOINT_INTERVAL) || level == total_levels - 1);
 
             let node = if is_stored {
@@ -1283,6 +1319,11 @@ impl WeightIndex {
                 let span = 1u64 << (level - src_level);
                 self.compute_subtree_hash(real_sib_idx * span, span, src_level)
             };
+            if memoize {
+                if let Ok(mut m) = self.sibling_memo.lock() {
+                    m.insert((level, sib_idx), node);
+                }
+            }
 
             path.push(node);
             idx >>= 1;
@@ -1604,6 +1645,7 @@ pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
         checkpoints,
         total_levels,
         dense: None,
+        sibling_memo: Mutex::new(HashMap::new()),
     }
 }
 
@@ -1745,6 +1787,7 @@ mod tests {
             checkpoints,
             total_levels,
             dense: None,
+            sibling_memo: Mutex::new(HashMap::new()),
         };
 
         // Every chunk read by pread matches the canonical chunk, across all segments + padding.
@@ -1869,6 +1912,23 @@ mod tests {
             for (i, (cp, mp)) in checkpoint_path.iter().zip(memory_path.iter()).enumerate() {
                 assert_eq!(cp, mp, "path mismatch at off={off}, level={i}");
             }
+        }
+    }
+
+    /// The sibling memo must not change a single byte of any path: a fresh index (cold memo)
+    /// and a reused index (cold then warm) must agree at every offset, including the
+    /// duplicate-last right edge of a non-power-of-two N.
+    #[test]
+    fn merkle_path_memo_is_byte_identical() {
+        let n = 12345;
+        let idx = synth_index(n);
+        let fresh = synth_index(n);
+        for off in (0..n).step_by(97) {
+            let a = fresh.merkle_path(off);
+            let b = idx.merkle_path(off);
+            let c = idx.merkle_path(off); // warm hit
+            assert_eq!(a, b, "memo changed the path at off {off}");
+            assert_eq!(b, c, "warm memo differs from cold at off {off}");
         }
     }
 
