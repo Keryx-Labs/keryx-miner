@@ -8,8 +8,12 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
+mod ai;
 mod protocol;
 mod statum_codec;
+
+use ai::{AiRequest, InferenceGuard};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use protocol::{difficulty_to_target, effective_target, nonce_range, MiningJob};
 
@@ -132,6 +136,7 @@ pub struct StratumHandler {
     last_stratum_id: Arc<AtomicU32>,
 
     shares_stats: Arc<ShareStats>,
+    ai_response: Arc<Mutex<Option<(u32, Instant)>>>,
     shares_pending: PendingShares,
     keepalive_interval: Duration,
     keepalive_timeout: Duration,
@@ -191,7 +196,7 @@ impl Client for StratumHandler {
                 .send(StratumLine {
                     id: None,
                     payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(model_ids)),
-                    jsonrpc: None,
+                    jsonrpc: Some("2.0".into()),
                     error: None,
                 })
                 .await?;
@@ -270,6 +275,7 @@ impl StratumHandler {
             extranonce: None,
             last_stratum_id,
             shares_stats: share_state,
+            ai_response: Arc::new(Mutex::new(None)),
             shares_pending,
             keepalive_interval: Duration::from_secs(keepalive_seconds.max(1)),
             keepalive_timeout: Duration::from_secs(keepalive_timeout_seconds.max(1)),
@@ -374,6 +380,19 @@ impl StratumHandler {
     }
 
     async fn handle_message(&mut self, msg: StratumLine, miner: &mut MinerManager) -> Result<(), Error> {
+        {
+            let mut pending = self.ai_response.lock().await;
+            if pending.map(|(id, _)| Some(id)) == Some(msg.id) {
+                *pending = None;
+                match (&msg.payload, &msg.error) {
+                    (StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) }, None) => {
+                        info!("AI response accepted")
+                    }
+                    _ => warn!("AI response rejected: {:?}", msg.error),
+                }
+                return Ok(());
+            }
+        }
         if self.keepalive_pending.map(|(id, _)| Some(id)) == Some(msg.id) {
             self.keepalive_pending = None;
             return match (&msg.payload, &msg.error) {
@@ -426,6 +445,9 @@ impl StratumHandler {
                                 return miner.process_block(None).await;
                             }
                             let target = effective_target(self.target_pool, job.block_bits)?;
+                            if self.challenge_in_flight.load(Ordering::SeqCst) {
+                                return miner.process_block(None).await;
+                            }
                             if let Some(task_json) = job.task_json {
                                 if self.handle_ai_task(job.id.clone(), task_json, miner).await {
                                     return Ok(());
@@ -447,6 +469,10 @@ impl StratumHandler {
                                     pom_proof: Vec::new(),
                                 }))
                                 .await
+                        }
+                        StratumCommand::MiningAiRequest(fields) => {
+                            self.handle_ai_request(fields, miner).await;
+                            Ok(())
                         }
                         StratumCommand::MiningChallenge((model_id_hex, nonce_hex)) => {
                             self.handle_challenge(model_id_hex, nonce_hex, miner).await;
@@ -506,6 +532,15 @@ impl StratumHandler {
 
     async fn maintain_keepalive(&mut self) -> Result<(), Error> {
         let now = Instant::now();
+        if self
+            .ai_response
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(_, since)| now.duration_since(*since) >= self.keepalive_timeout)
+        {
+            return Err("AI response acknowledgement timed out".into());
+        }
         if let Some((_, since)) = self.keepalive_pending {
             if now.duration_since(since) >= self.keepalive_timeout {
                 return Err("Stratum keepalive timed out".into());
@@ -550,8 +585,54 @@ impl StratumHandler {
         }
     }
 
-    /// Parse the task JSON from a `MiningNotifyWithTask`, store it in `current_task_slot`,
-    /// and spawn a background inference+IPFS upload if the result is not already cached.
+    async fn handle_ai_request(
+        &mut self,
+        fields: (String, String, String, String, String, u32, String),
+        miner: &mut MinerManager,
+    ) {
+        let request = match AiRequest::parse(fields) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!("Invalid AI request: {}", error);
+                return;
+            }
+        };
+        if !keryx_miner::slm::is_model_ready(&request.model_id) {
+            warn!("AI request {}: model is not ready", request.task_id);
+            return;
+        }
+        if self.ai_response.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
+            warn!("AI request {}: inference is busy", request.task_id);
+            return;
+        }
+        let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        if let Err(error) = miner.process_block(None).await {
+            warn!("Could not pause mining for AI request: {}", error);
+            return;
+        }
+        let sender = self.send_channel.clone();
+        let worker = self.miner_address.clone();
+        let pending = self.ai_response.clone();
+        let last_id = self.last_stratum_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result =
+                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
+                    .unwrap_or_default();
+            let id = last_id.fetch_add(1, Ordering::SeqCst);
+            match request.response(id, worker, &result) {
+                Ok(line) => {
+                    *pending.blocking_lock() = Some((id, Instant::now()));
+                    if sender.blocking_send(line).is_err() {
+                        *pending.blocking_lock() = None;
+                        warn!("AI response {}: connection closed", request.task_id);
+                    }
+                }
+                Err(error) => warn!("AI request {}: {}", request.task_id, error),
+            }
+        });
+    }
+
     /// Handle a `mining.challenge` from the bridge.
     ///
     /// The bridge relays the node's periodic capability challenge: the miner must prove
@@ -595,9 +676,8 @@ impl StratumHandler {
         tokio::task::spawn_blocking(move || {
             let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
             let text = result.unwrap_or_default();
-            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
+            // PoW resumes on the next mining.notify from the bridge.
             miner_flag.store(false, Ordering::SeqCst);
-            challenge_flag.store(false, Ordering::SeqCst);
             if text.is_empty() {
                 warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
             } else {
@@ -611,6 +691,7 @@ impl StratumHandler {
             if send_channel.blocking_send(line).is_err() {
                 warn!("OPoI challenge: send_channel closed, could not deliver response");
             }
+            challenge_flag.store(false, Ordering::SeqCst);
         });
     }
 
@@ -733,9 +814,9 @@ fn make_challenge_response_line(model_id_hex: &str, nonce_hex: &str, result: &st
         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningChallengeResponse((
             model_id_hex.to_string(),
             nonce_hex.to_string(),
-            result.to_string(),
+            BASE64.encode(result.as_bytes()),
         ))),
-        jsonrpc: None,
+        jsonrpc: Some("2.0".into()),
         error: None,
     }
 }

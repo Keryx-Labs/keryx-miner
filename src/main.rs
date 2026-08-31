@@ -974,14 +974,19 @@ async fn run() -> Result<(), Error> {
     };
 
     // Resolve OPoI escrow private key (once, before the reconnect loop).
-    let escrow_privkey: Option<String> = match escrow::load_or_generate_key(&opt.escrow_key_file) {
-        Ok(k) => {
-            info!("OPoI: escrow key loaded from '{}'.", opt.escrow_key_file);
-            Some(k)
-        }
-        Err(e) => {
-            error!("Failed to load/generate OPoI escrow key: {}", e);
-            return Err(e.into());
+    let pool_mode = opt.keryxd_address.starts_with("stratum+tcp://");
+    let escrow_privkey: Option<String> = if pool_mode {
+        None
+    } else {
+        match escrow::load_or_generate_key(&opt.escrow_key_file) {
+            Ok(k) => {
+                info!("OPoI: escrow key loaded from '{}'.", opt.escrow_key_file);
+                Some(k)
+            }
+            Err(e) => {
+                error!("Failed to load/generate OPoI escrow key: {}", e);
+                return Err(e.into());
+            }
         }
     };
 
@@ -1221,10 +1226,12 @@ async fn run() -> Result<(), Error> {
     // spinning reconnect attempts, and the miner never advertises/serves inference it cannot
     // publish. `ensure_daemon` returns only when the API is reachable (waiting up to 60
     // seconds, failing immediately if the child exits).
-    let ipfs_url = opt.ipfs_url.clone();
-    tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
-        .await
-        .map_err(|e| format!("IPFS startup task failed: {}", e))??;
+    if !pool_mode {
+        let ipfs_url = opt.ipfs_url.clone();
+        tokio::task::spawn_blocking(move || crate::ipfs::ensure_daemon(&ipfs_url))
+            .await
+            .map_err(|e| format!("IPFS startup task failed: {}", e))??;
+    }
 
     loop {
         if shutdown_requested.load(Ordering::Acquire) {

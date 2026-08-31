@@ -119,10 +119,14 @@ pub(crate) enum StratumCommand {
     // Phase 2 OPoI: miner → bridge — declare loaded SLM model IDs (sent after authorize)
     #[serde(rename = "mining.declare_capabilities")]
     MiningDeclareCapabilities(Vec<String>),
+    #[serde(rename = "mining.ai_request")]
+    MiningAiRequest((String, String, String, String, String, u32, String)),
+    #[serde(rename = "mining.ai_response")]
+    MiningAiResponse((String, String, String, String, String)),
     // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
-    // Phase 2 OPoI: miner → bridge — [model_id_hex, nonce_hex, result_text] challenge
+    // Capability response: [model_id_hex, nonce_hex, result_b64].
     // response. The nonce is echoed back so the bridge can reject replayed/stale responses.
     #[serde(rename = "mining.challenge_response")]
     MiningChallengeResponse((String, String, String)),
@@ -193,7 +197,7 @@ pub(crate) struct NewLineJsonCodec {
 
 impl NewLineJsonCodec {
     pub fn new() -> Self {
-        Self { lines_codec: LinesCodec::new() }
+        Self { lines_codec: LinesCodec::new_with_max_length(2 * 1024 * 1024) }
     }
 }
 
