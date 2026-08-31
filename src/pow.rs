@@ -39,6 +39,7 @@ pub enum BlockSeed {
         nonce_mask: u64,
         nonce_fixed: u64,
         hash: Option<String>,
+        pom_proof: Vec<u8>,
     },
 }
 
@@ -226,7 +227,7 @@ impl State {
     /// Proof-of-Model possession mining (slice 3a, CPU). If the memory-hard walk over
     /// `index` (the resident tier weights) yields `pom_pow_value <= target` for `nonce`,
     /// build the possession proof, set the nonce, attach the borsh-encoded proof, and return
-    /// the full block to submit. Solo only: a pool `PartialBlock` cannot carry a per-miner proof.
+    /// the block or share to submit.
     pub fn generate_block_if_pom(&self, nonce: u64, index: &WeightIndex, tier: u8, device_id: u32) -> Option<BlockSeed> {
         let mut pph = [0u8; 32];
         pph.copy_from_slice(&self.pow_hash_header[0..32]);
@@ -362,7 +363,10 @@ impl State {
                 }
                 block.pom_proof = proof_bytes; // plain bytes field (empty = none on the wire)
             }
-            BlockSeed::PartialBlock { .. } => return None,
+            BlockSeed::PartialBlock { nonce: header_nonce, pom_proof, .. } => {
+                *header_nonce = nonce;
+                *pom_proof = proof_bytes;
+            }
         }
         Some(block_seed)
     }

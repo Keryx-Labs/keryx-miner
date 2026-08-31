@@ -174,16 +174,6 @@ The embedded sound is a trimmed adaptation of "Coin Drop" by Universfield under 
 
 ---
 
-## Dev Fund
-
-2% of mining rewards support development by default.
-
-```bash
---devfund-percent XX.YY
-```
-
----
-
 ## Connect
 
 * **Website:** [keryx-labs.com](https://keryx-labs.com)
