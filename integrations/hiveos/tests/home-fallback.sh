@@ -50,7 +50,7 @@ hive_models_path=/hive/miners/custom/models
 [[ -e "$hive_state_path" ]] && hive_state_preexisting=1 || hive_state_preexisting=0
 [[ -e "$hive_models_path" ]] && hive_models_preexisting=1 || hive_models_preexisting=0
 root_before=""
-[[ -d /root ]] && root_before="$(ls -A /root)"
+[[ -r /root && -x /root ]] && root_before="$(ls -A /root)"
 
 # Source the launcher with the given HOME environment (extra env(1) args),
 # then assert HOME was already correct WHILE pre-hive-upgrade.sh was being
@@ -109,7 +109,7 @@ launch_case "custom" /custom/home \
 # HOME value is only exported to children, never written to, and the only
 # launcher writes are the state and model dirs pinned inside TEST_ROOT.
 root_after=""
-[[ -d /root ]] && root_after="$(ls -A /root)"
+[[ -r /root && -x /root ]] && root_after="$(ls -A /root)"
 [[ "$root_before" == "$root_after" ]] || fail "/root changed during the test"
 [[ -e "$hive_state_path" ]] && [[ "$hive_state_preexisting" == 1 ]] \
     || [[ ! -e "$hive_state_path" ]] || fail "live HiveOS state path was created: $hive_state_path"
