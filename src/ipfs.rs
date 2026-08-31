@@ -1,4 +1,6 @@
 /// IPFS integration — upload inference results and auto-manage kubo daemon.
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -196,23 +198,94 @@ fn url_host(url: &str) -> Option<&str> {
     Some(host)
 }
 
-fn resolve_home(candidate_home: Option<&str>, fallback_cwd: &std::path::Path) -> std::path::PathBuf {
-    match candidate_home {
-        Some(home) if !home.trim().is_empty() => std::path::PathBuf::from(home),
-        _ => fallback_cwd.to_path_buf(),
+fn nonblank_os(value: &OsStr) -> bool {
+    !value.is_empty() && value.to_str().map_or(true, |value| !value.trim().is_empty())
+}
+
+fn resolve_home(
+    candidate_home: Option<&OsStr>,
+    candidate_userprofile: Option<&OsStr>,
+    fallback_cwd: &Path,
+    is_windows: bool,
+) -> anyhow::Result<PathBuf> {
+    if is_windows {
+        return candidate_userprofile
+            .filter(|home| nonblank_os(home))
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("USERPROFILE is not set or is empty on Windows"));
+    }
+
+    Ok(candidate_home.filter(|home| nonblank_os(home)).map(PathBuf::from).unwrap_or_else(|| fallback_cwd.to_path_buf()))
+}
+
+fn resolve_ipfs_repo(candidate_ipfs_path: Option<&OsStr>, selected_home: &Path, is_windows: bool) -> PathBuf {
+    if !is_windows {
+        return selected_home.join(".ipfs");
+    }
+
+    candidate_ipfs_path
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| selected_home.join(".ipfs"))
+}
+
+fn kubo_child_env(home: &Path, is_windows: bool) -> Vec<(OsString, OsString)> {
+    if is_windows {
+        Vec::new()
+    } else {
+        vec![
+            ("HOME".into(), home.as_os_str().to_os_string()),
+            ("IPFS_PATH".into(), home.join(".ipfs").into_os_string()),
+        ]
+    }
+}
+struct KuboCommandFactory<'a> {
+    ipfs_bin: &'a Path,
+    child_env: &'a [(OsString, OsString)],
+}
+
+impl<'a> KuboCommandFactory<'a> {
+    fn new(ipfs_bin: &'a Path, child_env: &'a [(OsString, OsString)]) -> Self {
+        Self { ipfs_bin, child_env }
+    }
+
+    fn command(&self) -> std::process::Command {
+        self.command_with_parent_setup(|_| {})
+    }
+
+    fn command_with_parent_setup(&self, setup: impl FnOnce(&mut std::process::Command)) -> std::process::Command {
+        let mut command = std::process::Command::new(self.ipfs_bin);
+        setup(&mut command);
+        command.envs(self.child_env.iter().cloned());
+        command
     }
 }
 
-fn ipfs_home() -> std::path::PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    resolve_home(std::env::var("HOME").ok().as_deref(), &cwd)
+fn adjacent_kubo_binary(exe_dir: &Path, is_windows: bool) -> PathBuf {
+    exe_dir.join(if is_windows { "ipfs.exe" } else { "ipfs" })
 }
 
-fn kubo_child_env(home: &std::path::Path) -> Vec<(String, String)> {
-    vec![
-        ("HOME".to_string(), home.display().to_string()),
-        ("IPFS_PATH".to_string(), home.join(".ipfs").display().to_string()),
-    ]
+fn resolve_kubo_paths(
+    candidate_home: Option<&OsStr>,
+    candidate_userprofile: Option<&OsStr>,
+    candidate_ipfs_path: Option<&OsStr>,
+    fallback_cwd: &Path,
+    is_windows: bool,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    if is_windows {
+        if let Some(ipfs_path) = candidate_ipfs_path.filter(|path| !path.is_empty()) {
+            let log_home = candidate_userprofile
+                .filter(|home| nonblank_os(home))
+                .or_else(|| candidate_home.filter(|home| nonblank_os(home)))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| fallback_cwd.to_path_buf());
+            return Ok((log_home, PathBuf::from(ipfs_path)));
+        }
+    }
+
+    let home = resolve_home(candidate_home, candidate_userprofile, fallback_cwd, is_windows)?;
+    let repo = resolve_ipfs_repo(candidate_ipfs_path, &home, is_windows);
+    Ok((home, repo))
 }
 
 /// Time remaining before `deadline`, or zero once the deadline has passed.
@@ -270,7 +343,7 @@ fn spawn_still_needed(api_url: &str) -> bool {
 /// Local recovery is serialized process-wide: once a caller discovers the API is down it
 /// acquires the recovery lock, and under the lock re-probes before spawning. If the daemon
 /// was restored by another caller (the lock winner) in the meantime, the waiter reuses it
-/// instead of spawning a second Kubo. The lock is held for the entire spawn + readiness
+/// instead of spawning a second one. The lock is held for the entire spawn + readiness
 /// wait, so at most one daemon spawn happens at a time.
 pub fn ensure_daemon(api_url: &str) -> anyhow::Result<()> {
     let api_url = normalize_api_url(api_url);
@@ -298,17 +371,25 @@ pub fn ensure_daemon(api_url: &str) -> anyhow::Result<()> {
     }
 
     log::info!("IPFS daemon not running — attempting to start kubo...");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let candidate_home = std::env::var("HOME").ok();
+    let candidate_userprofile = std::env::var_os("USERPROFILE");
+    let candidate_ipfs_path = std::env::var_os("IPFS_PATH");
+    let (home, ipfs_repo) = resolve_kubo_paths(
+        candidate_home.as_ref().map(|home| OsStr::new(home.as_str())),
+        candidate_userprofile.as_deref(),
+        candidate_ipfs_path.as_deref(),
+        &cwd,
+        cfg!(target_os = "windows"),
+    )?;
     let ipfs_bin = find_or_download_kubo()?;
-
-    // Every Kubo child gets explicit HOME and IPFS_PATH derived from the same home path.
-    let home = ipfs_home();
-    let ipfs_repo = home.join(".ipfs");
-    let child_env = kubo_child_env(&home);
+    let child_env = kubo_child_env(&home, cfg!(target_os = "windows"));
+    let kubo_commands = KuboCommandFactory::new(&ipfs_bin, &child_env);
     if !ipfs_repo.exists() {
         log::info!("Initialising IPFS repo at {}", ipfs_repo.display());
-        let status = std::process::Command::new(&ipfs_bin)
+        let mut command = kubo_commands.command();
+        let status = command
             .arg("init")
-            .envs(child_env.iter().cloned())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -333,9 +414,9 @@ pub fn ensure_daemon(api_url: &str) -> anyhow::Result<()> {
         },
         Err(_) => (std::process::Stdio::null(), std::process::Stdio::null()),
     };
-    let mut child = std::process::Command::new(&ipfs_bin)
+    let mut command = kubo_commands.command();
+    let mut child = command
         .args(["daemon", "--routing=dhtclient"])
-        .envs(child_env)
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
@@ -375,10 +456,13 @@ pub fn ensure_daemon(api_url: &str) -> anyhow::Result<()> {
 }
 
 fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
+    let is_windows = cfg!(target_os = "windows");
+    let binary_name = if is_windows { "ipfs.exe" } else { "ipfs" };
+
     // 1. Check PATH.
-    if let Ok(out) = std::process::Command::new("ipfs").arg("version").output() {
+    if let Ok(out) = std::process::Command::new(binary_name).arg("version").output() {
         if out.status.success() {
-            return Ok(std::path::PathBuf::from("ipfs"));
+            return Ok(std::path::PathBuf::from(binary_name));
         }
     }
 
@@ -387,7 +471,7 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let local_bin = exe_dir.join("ipfs");
+    let local_bin = adjacent_kubo_binary(&exe_dir, is_windows);
     if local_bin.exists() {
         return Ok(local_bin);
     }
@@ -395,7 +479,7 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     // 3. Download kubo for the current platform.
     let version = fetch_latest_kubo_version();
     let (os, arch) = detect_platform()?;
-    let archive_ext = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
+    let archive_ext = if is_windows { "zip" } else { "tar.gz" };
     let archive_name = format!("kubo_v{}_{}-{}.{}", version, os, arch, archive_ext);
     let url = format!("https://dist.ipfs.tech/kubo/v{}/{}", version, archive_name);
     let archive_path = exe_dir.join(&archive_name);
@@ -406,7 +490,7 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     extract_ipfs_binary(&archive_path, &exe_dir)?;
     std::fs::remove_file(&archive_path).ok();
 
-    let bin = exe_dir.join(if cfg!(target_os = "windows") { "ipfs.exe" } else { "ipfs" });
+    let bin = adjacent_kubo_binary(&exe_dir, is_windows);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -510,6 +594,53 @@ fn extract_ipfs_binary(archive: &std::path::Path, dest_dir: &std::path::Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn os(value: &str) -> &OsStr {
+        OsStr::new(value)
+    }
+    const CHILD_ENV_CAPTURE: &str = "KERYX_TEST_CHILD_ENV_CAPTURE";
+    const UNRELATED_CHILD_ENV: &str = "KERYX_TEST_UNRELATED_CHILD_ENV";
+
+    fn run_child_env_probe(kubo_commands: &KuboCommandFactory<'_>, inherited_env: &[(&str, &str)]) -> String {
+        let dir = tempfile::tempdir().expect("temporary child environment capture directory");
+        let capture = dir.path().join("environment.txt");
+        let mut command = kubo_commands.command_with_parent_setup(|command| {
+            command
+                .env_remove("HOME")
+                .env_remove("USERPROFILE")
+                .env_remove("IPFS_PATH")
+                .env_remove(UNRELATED_CHILD_ENV);
+            for (key, value) in inherited_env {
+                command.env(key, value);
+            }
+        });
+        command
+            .args(["--exact", "ipfs::tests::kubo_child_environment_probe", "--nocapture"])
+            .env(CHILD_ENV_CAPTURE, &capture);
+        let output = command.output().expect("spawn child environment probe");
+        assert!(
+            output.status.success(),
+            "child environment probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::read_to_string(capture).expect("read child environment capture")
+    }
+
+    #[test]
+    fn kubo_child_environment_probe() {
+        let Some(capture) = std::env::var_os(CHILD_ENV_CAPTURE) else {
+            return;
+        };
+        let captured = ["HOME", "USERPROFILE", "IPFS_PATH", UNRELATED_CHILD_ENV]
+            .map(|key| {
+                let value = std::env::var_os(key)
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unset>".to_string());
+                format!("{key}={value}")
+            })
+            .join("\n");
+        std::fs::write(capture, captured).expect("write child environment capture");
+    }
 
     #[test]
     fn normalize_api_url_adds_http_only_to_scheme_less_values() {
@@ -541,21 +672,174 @@ mod tests {
     }
 
     #[test]
-    fn kubo_child_env_sets_explicit_home_and_derived_ipfs_path() {
-        let env = kubo_child_env(std::path::Path::new("/custom/home"));
-        let home = env.iter().find(|(k, _)| k == "HOME").expect("HOME env set");
-        let ipfs_path = env.iter().find(|(k, _)| k == "IPFS_PATH").expect("IPFS_PATH env set");
-        assert_eq!(home.1, "/custom/home");
-        assert_eq!(ipfs_path.1, "/custom/home/.ipfs");
+    fn windows_home_prefers_userprofile_over_home_and_cwd() {
+        let cwd = Path::new("/fallback/cwd");
+        let home = resolve_home(Some(os("/home")), Some(os("/userprofile")), cwd, true).expect("Windows home");
+        assert_eq!(home, PathBuf::from("/userprofile"));
     }
 
     #[test]
-    fn resolve_home_preserves_explicit_and_falls_back_for_missing_or_empty() {
-        let cwd = std::path::Path::new("/fallback/cwd");
-        assert_eq!(resolve_home(Some("/custom/home"), cwd), std::path::PathBuf::from("/custom/home"));
-        assert_eq!(resolve_home(None, cwd), cwd.to_path_buf());
-        assert_eq!(resolve_home(Some(""), cwd), cwd.to_path_buf());
-        assert_eq!(resolve_home(Some("   "), cwd), cwd.to_path_buf());
+    fn windows_home_requires_userprofile() {
+        let cwd = Path::new("/fallback/cwd");
+        for userprofile in [None, Some(os("")), Some(os("   "))] {
+            let err = resolve_home(Some(os("/home")), userprofile, cwd, true).expect_err("missing USERPROFILE");
+            assert!(format!("{err:#}").contains("USERPROFILE"), "{err:#}");
+        }
+        for candidate_ipfs_path in [None, Some(os(""))] {
+            let err = resolve_kubo_paths(Some(os("/home")), None, candidate_ipfs_path, cwd, true)
+                .expect_err("empty or unset Windows IPFS_PATH must require USERPROFILE");
+            assert!(format!("{err:#}").contains("USERPROFILE"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn unix_home_uses_home_or_fallback_cwd() {
+        let cwd = Path::new("/fallback/cwd");
+        assert_eq!(
+            resolve_home(Some(os("/home")), Some(os("/userprofile")), cwd, false).expect("Unix home"),
+            PathBuf::from("/home")
+        );
+        assert_eq!(resolve_home(None, Some(os("/userprofile")), cwd, false).expect("Unix fallback"), cwd.to_path_buf());
+        assert_eq!(
+            resolve_home(Some(os("   ")), Some(os("/userprofile")), cwd, false).expect("Unix fallback"),
+            cwd.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn windows_repo_preserves_explicit_ipfs_path_and_defaults_to_userprofile() {
+        let cwd = Path::new("/fallback/cwd");
+        let (home, repo) =
+            resolve_kubo_paths(Some(os("/home")), Some(os("/userprofile")), Some(os("/custom/ipfs")), cwd, true)
+                .expect("Windows paths");
+        assert_eq!(home, PathBuf::from("/userprofile"));
+        assert_eq!(repo, PathBuf::from("/custom/ipfs"));
+
+        for candidate in [None, Some(os(""))] {
+            let (_, repo) =
+                resolve_kubo_paths(None, Some(os("/userprofile")), candidate, cwd, true).expect("Windows paths");
+            assert_eq!(repo, PathBuf::from("/userprofile/.ipfs"));
+        }
+    }
+
+    #[test]
+    fn windows_explicit_repo_uses_home_or_cwd_for_log_home_without_userprofile() {
+        let cwd = Path::new("/fallback/cwd");
+        let (home, repo) = resolve_kubo_paths(None, None, Some(os("/custom/ipfs")), cwd, true).expect("Windows paths");
+        assert_eq!(home, cwd);
+        assert_eq!(repo, PathBuf::from("/custom/ipfs"));
+
+        let (home, _) =
+            resolve_kubo_paths(Some(os("/home")), None, Some(os("/custom/ipfs")), cwd, true).expect("Windows paths");
+        assert_eq!(home, PathBuf::from("/home"));
+
+        let (home, _) = resolve_kubo_paths(Some(os("/home")), Some(os("   ")), Some(os("/custom/ipfs")), cwd, true)
+            .expect("Windows paths");
+        assert_eq!(home, PathBuf::from("/home"));
+    }
+
+    #[test]
+    fn unix_repo_ignores_supplied_ipfs_path() {
+        let home = Path::new("/selected/home");
+        for candidate in [Some(os("/custom/ipfs")), Some(os("  /custom/ipfs  ")), Some(os("")), None] {
+            assert_eq!(
+                resolve_ipfs_repo(candidate, home, false),
+                home.join(".ipfs"),
+                "candidate IPFS_PATH must not alter the Unix repo"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfs_repo_preserves_whitespace_path_on_windows() {
+        let home = Path::new("/selected/home");
+        assert_eq!(resolve_ipfs_repo(Some(os("  /custom/ipfs  ")), home, true), PathBuf::from("  /custom/ipfs  "));
+        assert_eq!(resolve_ipfs_repo(Some(os("   ")), home, true), PathBuf::from("   "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_ignores_non_unicode_ipfs_path_while_windows_preserves_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw_ipfs_path = OsStr::from_bytes(b"/repo/\xff");
+        let home = Path::new("/selected/home");
+        assert_eq!(
+            resolve_ipfs_repo(Some(raw_ipfs_path), home, false),
+            home.join(".ipfs"),
+            "Unix must ignore a non-Unicode IPFS_PATH"
+        );
+        assert_eq!(
+            resolve_ipfs_repo(Some(raw_ipfs_path), home, true).as_os_str().as_bytes(),
+            b"/repo/\xff",
+            "Windows must preserve a non-Unicode IPFS_PATH"
+        );
+    }
+
+    #[test]
+    fn kubo_child_env_sets_matching_home_and_repo_on_unix_but_is_untouched_on_windows() {
+        let home = Path::new("/custom/home");
+        assert_eq!(
+            kubo_child_env(home, false),
+            vec![
+                (OsString::from("HOME"), home.as_os_str().to_os_string()),
+                (OsString::from("IPFS_PATH"), home.join(".ipfs").into_os_string()),
+            ]
+        );
+        assert!(kubo_child_env(home, true).is_empty());
+    }
+
+    #[test]
+    fn windows_kubo_command_factory_preserves_native_environment_for_init_and_daemon() {
+        let child_env = kubo_child_env(Path::new("/unused/windows/home"), true);
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let kubo_commands = KuboCommandFactory::new(&test_exe, &child_env);
+        let inherited = [
+            ("HOME", "C:\\native-home"),
+            ("USERPROFILE", "C:\\Users\\miner"),
+            ("IPFS_PATH", "D:\\kubo-repo"),
+            (UNRELATED_CHILD_ENV, "preserved"),
+        ];
+        let expected = concat!(
+            "HOME=C:\\native-home\n",
+            "USERPROFILE=C:\\Users\\miner\n",
+            "IPFS_PATH=D:\\kubo-repo\n",
+            "KERYX_TEST_UNRELATED_CHILD_ENV=preserved"
+        );
+        let init_env = run_child_env_probe(&kubo_commands, &inherited);
+        let daemon_env = run_child_env_probe(&kubo_commands, &inherited);
+        assert_eq!(init_env, expected);
+        assert_eq!(daemon_env, expected);
+    }
+
+    #[test]
+    fn unix_kubo_command_factory_overrides_home_and_repo_for_init_and_daemon() {
+        let selected_home = Path::new("/selected/home");
+        let child_env = kubo_child_env(selected_home, false);
+        let test_exe = std::env::current_exe().expect("current test executable");
+        let kubo_commands = KuboCommandFactory::new(&test_exe, &child_env);
+        let inherited = [
+            ("HOME", "/inherited/home"),
+            ("USERPROFILE", "/irrelevant/profile"),
+            ("IPFS_PATH", "/operator/repo"),
+            (UNRELATED_CHILD_ENV, "preserved"),
+        ];
+        let expected = format!(
+            "HOME={}\nUSERPROFILE=/irrelevant/profile\nIPFS_PATH={}\nKERYX_TEST_UNRELATED_CHILD_ENV=preserved",
+            selected_home.display(),
+            selected_home.join(".ipfs").display()
+        );
+        let init_env = run_child_env_probe(&kubo_commands, &inherited);
+        let daemon_env = run_child_env_probe(&kubo_commands, &inherited);
+        assert_eq!(init_env, expected);
+        assert_eq!(daemon_env, expected);
+    }
+
+    #[test]
+    fn adjacent_kubo_binary_uses_platform_name() {
+        let exe_dir = Path::new("/opt/keryx");
+        assert_eq!(adjacent_kubo_binary(exe_dir, false), exe_dir.join("ipfs"));
+        assert_eq!(adjacent_kubo_binary(exe_dir, true), exe_dir.join("ipfs.exe"));
     }
 
     #[test]

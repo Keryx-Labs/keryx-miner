@@ -16,11 +16,13 @@ Back up both durable files together before an upgrade or recovery. If validation
 ## Local IPFS/Kubo
 
 The launcher supplies `HOME=/root` only when HiveOS omitted or emptied `HOME`; an explicit
-operator value is preserved. Keryx gives every managed Kubo child that same `HOME` and the
-matching `IPFS_PATH`, waits up to 60 seconds for the local API, and exits before mining or
-advertising inference capability if upload storage remains unavailable. A failed local
-inference upload performs one serialized Kubo recovery and one retry. Remote `--ipfs-url`
-endpoints are never started, stopped, or otherwise managed by the miner.
+operator value is preserved. On Unix, Kubo children receive the selected `HOME` and an explicit
+`IPFS_PATH=$HOME/.ipfs`, so an inherited operator `IPFS_PATH` cannot alter HiveOS/Linux behavior;
+this remains v0.5.3-compatible. On Windows, Kubo inherits its native environment, preserving an
+operator `IPFS_PATH` and otherwise using `USERPROFILE/.ipfs`. Keryx waits up to 60 seconds for the
+local API and exits before mining or advertising inference capability if upload storage remains
+unavailable. A failed local inference upload performs one serialized Kubo recovery and one retry.
+Remote `--ipfs-url` endpoints are never started, stopped, or otherwise managed by the miner.
 
 ## Rollback-safe upgrade
 
