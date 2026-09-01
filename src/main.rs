@@ -701,6 +701,10 @@ async fn client_main(
             info!("Shutdown requested, stopping client listen loop");
             Ok(())
         }
+        _ = wait_for_fatal_gpu_fault() => {
+            error!("Fatal CUDA fault detected; stopping the client so the process can restart with fresh CUDA contexts");
+            Err("fatal CUDA fault — process restart required".into())
+        }
     };
     // Flush funds-critical client state before potentially blocking on worker shutdown.
     let mut flush_error = None;
@@ -730,6 +734,12 @@ async fn client_main(
 async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
     while !shutdown_requested.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_fatal_gpu_fault() {
+    while !crate::miner::fatal_gpu_fault() && !keryx_miner::pom_gpu::fatal_gpu_fault() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1259,6 +1269,12 @@ async fn run() -> Result<(), Error> {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, skipping reconnect");
             break;
+        }
+        // CUDA sticky faults survive Context drop/recreation inside one process. With GPU workers
+        // active, leave recovery to a process supervisor so the next run gets fresh CUDA state.
+        // CPU-only mining keeps the lightweight in-process reconnect path.
+        if worker_count > 0 {
+            return Err("Client disconnected while CUDA workers are active — clean process restart required".into());
         }
         info!("Client closed, reconnecting");
         tokio::time::sleep(Duration::from_millis(100)).await;
