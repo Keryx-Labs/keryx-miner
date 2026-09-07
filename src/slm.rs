@@ -9,6 +9,7 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use crate::models::ModelSpec;
@@ -472,6 +473,24 @@ fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
     unavailable_models().read().unwrap().contains(model_id)
 }
 
+/// Raised while the public gateways cannot fetch from this miner's IPFS node: every model is
+/// withdrawn from `ai:cap` until the node is reachable again.
+static PUBLISHING_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_publishing_blocked(blocked: bool) {
+    if PUBLISHING_BLOCKED.swap(blocked, Ordering::AcqRel) != blocked {
+        if blocked {
+            log::warn!("SlmEngine: IPFS node unreachable from the public gateways — all models withdrawn from ai:cap");
+        } else {
+            log::info!("SlmEngine: IPFS node reachable again — models back in ai:cap");
+        }
+    }
+}
+
+pub fn publishing_blocked() -> bool {
+    PUBLISHING_BLOCKED.load(Ordering::Acquire)
+}
+
 /// GGUFs whose UnixFS digest was checked against the pinned `model_id` in this process.
 fn verified_models() -> &'static RwLock<HashSet<[u8; 32]>> {
     static MODELS: OnceLock<RwLock<HashSet<[u8; 32]>>> = OnceLock::new();
@@ -619,6 +638,9 @@ fn discover_model_files(root: &Path, wanted: &[&'static ModelSpec]) -> HashMap<[
 /// Return the model_ids of supported models that have fully-downloaded files (.ok flag present)
 /// and are not currently withdrawn.
 pub fn loaded_model_ids() -> Vec<[u8; 32]> {
+    if publishing_blocked() {
+        return Vec::new();
+    }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     specs.iter()
         .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
@@ -641,6 +663,9 @@ pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
 /// True only when the model is supported, its files are completely downloaded, and it is not
 /// currently withdrawn from `ai:cap`.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
+    if publishing_blocked() {
+        return false;
+    }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
     model_dir(spec).join(".ok").exists() && !model_is_unavailable(model_id)

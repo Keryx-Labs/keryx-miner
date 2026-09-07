@@ -720,6 +720,19 @@ impl KeryxdHandler {
             Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
         };
 
+        // Off the submission path: makes the project gateway fetch the response and reports a
+        // node nobody can read from.
+        let probe_cid = crate::ipfs::multihash_to_cid_v0(&cid);
+        tokio::task::spawn_blocking(move || match crate::ipfs::response_is_retrievable(&probe_cid) {
+            crate::ipfs::GatewayProbe::Reachable => {}
+            crate::ipfs::GatewayProbe::NotFound(status) => {
+                warn!("OPoI: gateway refused response CID {} (HTTP {}) — this node's responses may be unreadable", probe_cid, status)
+            }
+            crate::ipfs::GatewayProbe::Undetermined(e) => {
+                warn!("OPoI: gateway could not fetch response CID {} ({}) — check that kubo port 4001 is reachable", probe_cid, e)
+            }
+        });
+
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
         // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
@@ -939,7 +952,11 @@ impl KeryxdHandler {
                 if keryx_miner::slm::loaded_model_ids().is_empty() {
                     // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
                     if self.last_known_daa % 200 == 0 {
-                        log::warn!("OPoI: no models ready — mining suspended until model files are available");
+                        if keryx_miner::slm::publishing_blocked() {
+                            log::warn!("OPoI: IPFS node unreachable from the public gateways — mining suspended until it is reachable again (kubo port 4001)");
+                        } else {
+                            log::warn!("OPoI: no models ready — mining suspended until model files are available");
+                        }
                     }
                     self.set_opoi_pause(true);
                     miner.process_block(None).await?;

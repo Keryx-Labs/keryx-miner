@@ -1233,6 +1233,36 @@ async fn run() -> Result<(), Error> {
             .map_err(|e| format!("IPFS startup task failed: {}", e))??;
     }
 
+    // Solo only: the pool owns the IPFS node in stratum mode.
+    if !pool_mode {
+        let ipfs_url = opt.ipfs_url.clone();
+        tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&ipfs_url))
+            .await
+            .map_err(|e| format!("IPFS reachability task failed: {}", e))??;
+
+        let ipfs_url = opt.ipfs_url.clone();
+        let shutdown = Arc::clone(&shutdown_requested);
+        tokio::spawn(async move {
+            let interval = crate::ipfs::reachability_recheck_interval();
+            loop {
+                tokio::time::sleep(interval).await;
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let url = ipfs_url.clone();
+                let verdict = tokio::task::spawn_blocking(move || crate::ipfs::verify_public_reachability(&url)).await;
+                match verdict {
+                    Ok(Ok(())) => keryx_miner::slm::set_publishing_blocked(false),
+                    Ok(Err(e)) => {
+                        warn!("{}", e);
+                        keryx_miner::slm::set_publishing_blocked(true);
+                    }
+                    Err(e) => warn!("IPFS reachability recheck task failed: {}", e),
+                }
+            }
+        });
+    }
+
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, exiting miner main loop");

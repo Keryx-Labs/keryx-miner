@@ -33,8 +33,12 @@ fn normalize_api_url(api_url: &str) -> String {
 /// Upload `text` to the IPFS node at `api_url` and return the raw 34-byte multihash.
 /// The multihash format is: [0x12, 0x20, <32-byte sha2-256 digest>].
 pub fn upload(text: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
+    upload_with_pin(text, api_url, true)
+}
+
+fn upload_with_pin(text: &str, api_url: &str, pin: bool) -> anyhow::Result<[u8; 34]> {
     let api_url = normalize_api_url(api_url);
-    let url = format!("{}/api/v0/add?pin=true&quieter=true", api_url.trim_end_matches('/'));
+    let url = format!("{}/api/v0/add?pin={}&quieter=true", api_url.trim_end_matches('/'), pin);
     let boundary = "keryxboundary1234567890";
     let body = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n--{boundary}--\r\n",
@@ -92,6 +96,142 @@ fn base58btc_decode(input: &str) -> Option<Vec<u8>> {
     let mut out = vec![0u8; leading_zeros];
     out.extend(result.iter().rev());
     Some(out)
+}
+
+
+/// Public gateway every reader of an inference result goes through.
+pub const PROJECT_GATEWAY: &str = "https://keryx-labs.com";
+/// Independent gateway consulted only when the project gateway gives no verdict.
+const FALLBACK_GATEWAY: &str = "https://ipfs.io";
+/// Total time the startup reachability check keeps retrying.
+const REACHABILITY_WINDOW_SECS: u64 = 120;
+/// Per-request timeout of a startup reachability probe.
+const REACHABILITY_PROBE_TIMEOUT_SECS: u64 = 20;
+/// Pause between two startup reachability rounds.
+const REACHABILITY_RETRY_PAUSE_SECS: u64 = 5;
+/// Timeout of the single per-response probe.
+const RESPONSE_PROBE_TIMEOUT_SECS: u64 = 20;
+/// Interval between two background reachability checks while the miner runs.
+const REACHABILITY_RECHECK_SECS: u64 = 3_600;
+
+/// How often a running miner re-runs `verify_public_reachability`.
+pub fn reachability_recheck_interval() -> Duration {
+    Duration::from_secs(REACHABILITY_RECHECK_SECS)
+}
+
+/// Outcome of asking a public gateway for a CID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayProbe {
+    /// The gateway served the content.
+    Reachable,
+    /// The gateway refused the path (4xx).
+    NotFound(u16),
+    /// No verdict: timeout, transport error or gateway-side error.
+    Undetermined(String),
+}
+
+/// Encode a raw 34-byte multihash as a base58btc CIDv0 string.
+pub fn multihash_to_cid_v0(multihash: &[u8; 34]) -> String {
+    base58btc_encode(multihash)
+}
+
+fn base58btc_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut digits: Vec<u8> = vec![0];
+    for &byte in input {
+        let mut carry = byte as u32;
+        for digit in digits.iter_mut() {
+            carry += (*digit as u32) << 8;
+            *digit = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let leading_zeros = input.iter().take_while(|&&b| b == 0).count();
+    let mut out = String::with_capacity(leading_zeros + digits.len());
+    out.extend(std::iter::repeat('1').take(leading_zeros));
+    out.extend(digits.iter().rev().map(|&d| ALPHABET[d as usize] as char));
+    out
+}
+
+fn classify_gateway_status(status: u16) -> GatewayProbe {
+    match status {
+        200..=299 => GatewayProbe::Reachable,
+        400..=499 => GatewayProbe::NotFound(status),
+        other => GatewayProbe::Undetermined(format!("HTTP {}", other)),
+    }
+}
+
+/// Ask `gateway` for `cid` and classify the answer. The request makes the gateway fetch the
+/// content, so a successful probe also leaves it cached there.
+pub fn probe_gateway(gateway: &str, cid: &str, timeout: Duration) -> GatewayProbe {
+    let url = format!("{}/ipfs/{}", gateway.trim_end_matches('/'), cid);
+    match ureq::get(&url).timeout(timeout).call() {
+        Ok(response) => {
+            let status = response.status();
+            let mut reader = response.into_reader();
+            let mut sink = [0u8; 4096];
+            let _ = std::io::Read::read(&mut reader, &mut sink);
+            classify_gateway_status(status)
+        }
+        Err(ureq::Error::Status(status, _)) => classify_gateway_status(status),
+        Err(e) => GatewayProbe::Undetermined(e.to_string()),
+    }
+}
+
+/// Refuse to run on a kubo the public gateways cannot fetch from: a probe file is added locally
+/// and requested through the project gateway (then the fallback) until the window expires.
+pub fn verify_public_reachability(api_url: &str) -> anyhow::Result<()> {
+    let unix_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let probe = format!("keryx-miner reachability probe {} {}", unix_now, rand::random::<u64>());
+    let cid = multihash_to_cid_v0(&upload_with_pin(&probe, api_url, false)?);
+    log::info!("IPFS reachability check: asking {} for probe {}", PROJECT_GATEWAY, cid);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(REACHABILITY_WINDOW_SECS);
+    let mut last = String::from("no probe sent");
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        for gateway in [PROJECT_GATEWAY, FALLBACK_GATEWAY] {
+            let timeout = remaining_budget(deadline, std::time::Instant::now())
+                .min(Duration::from_secs(REACHABILITY_PROBE_TIMEOUT_SECS));
+            if timeout.is_zero() {
+                break;
+            }
+            match probe_gateway(gateway, &cid, timeout) {
+                GatewayProbe::Reachable => {
+                    log::info!("IPFS reachability check passed via {} (attempt {})", gateway, attempt);
+                    return Ok(());
+                }
+                GatewayProbe::NotFound(status) => last = format!("{} answered HTTP {}", gateway, status),
+                GatewayProbe::Undetermined(e) => last = format!("{}: {}", gateway, e),
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(remaining_budget(deadline, now).min(Duration::from_secs(REACHABILITY_RETRY_PAUSE_SECS)));
+    }
+    Err(anyhow::anyhow!(
+        "IPFS node at {} is not reachable from the public gateways after {}s (last: {}).\n\
+         Inference results published from this node could not be read by anyone, so mining is refused.\n\
+         Fix: expose kubo's swarm port (TCP/UDP 4001) or enable a relay, then check that `ipfs id` lists a public address.",
+        api_url,
+        REACHABILITY_WINDOW_SECS,
+        last
+    ))
+}
+
+/// Ask the project gateway once for a freshly uploaded response.
+pub fn response_is_retrievable(cid: &str) -> GatewayProbe {
+    probe_gateway(PROJECT_GATEWAY, cid, Duration::from_secs(RESPONSE_PROBE_TIMEOUT_SECS))
 }
 
 /// Check that the IPFS API at `api_url` is reachable.
@@ -594,6 +734,25 @@ fn extract_ipfs_binary(archive: &std::path::Path, dest_dir: &std::path::Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multihash_round_trips_through_base58_cid_v0() {
+        let cid = "QmUCaqwpMTV8NsFkSw34W6oXrJ2qhtPVWnu2ASy21p9uCL";
+        let mh = cid_v0_to_multihash(cid).unwrap();
+        assert_eq!(multihash_to_cid_v0(&mh), cid);
+        let mut leading = [0u8; 34];
+        leading[0] = 0x12;
+        leading[1] = 0x20;
+        assert_eq!(cid_v0_to_multihash(&multihash_to_cid_v0(&leading)).unwrap(), leading);
+    }
+
+    #[test]
+    fn gateway_status_classification() {
+        assert_eq!(classify_gateway_status(200), GatewayProbe::Reachable);
+        assert_eq!(classify_gateway_status(206), GatewayProbe::Reachable);
+        assert_eq!(classify_gateway_status(404), GatewayProbe::NotFound(404));
+        assert!(matches!(classify_gateway_status(504), GatewayProbe::Undetermined(_)));
+    }
     fn os(value: &str) -> &OsStr {
         OsStr::new(value)
     }
