@@ -909,6 +909,63 @@ impl PomGpuMiner {
         })
     }
 
+    /// Same as `load_raw`, but uploads only `tensor_names` instead of every tensor in the GGUF.
+    /// Used for a shard: the walk gathers over exactly this device's own slice of the canonical
+    /// bytes, so no cross-GPU pointer dependency exists and no other GPU needs to be involved.
+    pub fn load_raw_subset(gguf_path: &str, device_id: usize, tensor_names: &[String]) -> Result<Self> {
+        let ctx = CudaContext::new(device_id)?;
+        ctx.bind_to_thread()?;
+        let stream = ctx.default_stream();
+
+        let mut file = std::fs::File::open(gguf_path)?;
+        let meta = crate::gguf::GgufMeta::read(&mut file)?;
+        let want: std::collections::HashSet<&str> = tensor_names.iter().map(|s| s.as_str()).collect();
+        let names: Vec<String> = meta.sorted_names().into_iter().filter(|n| want.contains(n.as_str())).collect();
+        if names.len() != tensor_names.len() {
+            return Err(anyhow!(
+                "PoM GPU: shard subset requested {} tensors, but only {} were found in the GGUF — manifest/GGUF mismatch",
+                tensor_names.len(), names.len()
+            ));
+        }
+
+        let mut uploads: Vec<CudaSlice<u8>> = Vec::with_capacity(names.len());
+        let mut bases: Vec<u64> = Vec::new();
+        let mut prefix: Vec<u64> = vec![0];
+        let mut host_buf: Vec<u8> = Vec::new();
+        for name in &names {
+            let t = &meta.tensors[name];
+            let chunks = t.nbytes / CHUNK_BYTES as u64;
+            if chunks == 0 {
+                continue;
+            }
+            host_buf.resize(t.nbytes as usize, 0);
+            crate::pom::read_exact_at(&file, &mut host_buf, meta.tensor_data_offset + t.offset)?;
+            let dev = stream.clone_htod(host_buf.as_slice())?;
+            bases.push(dev.device_ptr(&stream).0 as u64);
+            uploads.push(dev);
+            prefix.push(prefix.last().unwrap() + chunks);
+        }
+        let n_total_chunks = *prefix.last().unwrap();
+        if n_total_chunks == 0 {
+            return Err(anyhow!("PoM GPU: shard produced 0 chunks"));
+        }
+
+        let bases_dev = stream.clone_htod(bases.as_slice())?;
+        let prefix_dev = stream.clone_htod(prefix.as_slice())?;
+        let kernel = select_pom_kernel(device_id)?;
+
+        Ok(Self {
+            ctx,
+            stream,
+            kernel,
+            bases_dev,
+            prefix_dev,
+            t_count: bases.len() as u32,
+            n_total_chunks,
+            _uploads: uploads,
+        })
+    }
+
     /// Gather over the IN-PROCESS llama.cpp engine in canonical GGUF (name-sorted) order.
     /// A tensor whose resident copy matches the GGUF unambiguously (unique name, exact size)
     /// is walked zero-dup in place; host-resident tensors get a small device upload of our
