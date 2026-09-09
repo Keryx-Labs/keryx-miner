@@ -421,7 +421,7 @@ impl MinerManager {
                             let built = state.as_ref().and_then(|s| {
                                 let tier = keryx_miner::pom_gpu::current_tier(worker_device_id, s.daa_score)?;
                                 let model_id = keryx_miner::pom_gpu::mining_model_id(worker_device_id)?;
-                                let idx = keryx_miner::pom::active_index_for_model(&model_id)?;
+                                let idx = keryx_miner::pom_gpu::active_index_for_device(worker_device_id, model_id)?;
                                 s.generate_block_if_pom(nonce, idx.as_ref(), tier, worker_device_id)
                             });
                             if let Some(mut block_seed) = built {

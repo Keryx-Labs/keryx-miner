@@ -792,6 +792,40 @@ async fn run() -> Result<(), Error> {
         std::env::set_var("KERYX_MODELS_DIR", "/hive/miners/custom/models");
     }
 
+    // --print-shards: one-shot diagnostic that computes and prints a shard manifest (layer
+    // ranges, chunk counts, Merkle roots) for TIER:TARGET_GIB, then exits before any
+    // network/GPU setup. Placed after the models-dir env-var block above so it honours
+    // --models-dir/--hiveos when resolving the GGUF path, but before everything else.
+    if let Some(spec) = opt.print_shards.as_deref() {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (tier_name, target_gib) = match parts.as_slice() {
+            [t, g] => (*t, g.parse::<u64>().map_err(|e| format!("--print-shards: bad TARGET_GIB: {e}"))?),
+            _ => return Err("--print-shards expects TIER:TARGET_GIB, e.g. very-high:8".into()),
+        };
+        let tier = parse_tier_name(tier_name).ok_or_else(|| format!("--print-shards: unrecognised tier '{tier_name}'"))?;
+        let spec = keryx_miner::models::spec_for_tier(tier);
+        let gguf_path = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+        if !std::path::Path::new(&gguf_path).exists() {
+            return Err(format!("--print-shards: {gguf_path} not found — run once without --print-shards first so the model is fetched, then retry").into());
+        }
+        let mut file = std::fs::File::open(&gguf_path)?;
+        let meta = keryx_miner::gguf::GgufMeta::read(&mut file)?;
+        let target_bytes = target_gib * 1_000_000_000;
+        let shards = keryx_miner::shard::pack_shards(&meta, target_bytes)
+            .map_err(|e| format!("--print-shards: packing failed: {e}"))?;
+        println!("model_id = {}", hex::encode(spec.model_id));
+        println!("target_bytes = {target_bytes}");
+        for s in &shards {
+            let tree_filename = format!("pom-tree.shard{}-{}g.bin", s.index, target_gib);
+            let idx = keryx_miner::pom::WeightIndex::build_from_gguf_subset(&gguf_path, spec.model_id, &s.tensor_names, &tree_filename)?;
+            println!(
+                "shard {} layers=[{},{}) n_chunks={} root={}",
+                s.index, s.layer_lo, s.layer_hi, idx.n_chunks, hex::encode(idx.r_t)
+            );
+        }
+        return Ok(());
+    }
+
     let is_tty = std::io::stdout().is_terminal();
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     {
@@ -1153,6 +1187,55 @@ async fn run() -> Result<(), Error> {
                 "PoM: GPU {} → {} (index + GPU walk load lazily once the lineup is active).",
                 device_id, spec.dir_name
             );
+        }
+    }
+
+    // --shard: additive per-device override. A device named here mines ONLY its shard (never
+    // the whole tier) — the tier-assignment loop above already ensured its model's GGUF is on
+    // disk (via --force-model naming the same tier), which load_raw_subset needs.
+    if let Some(raw) = opt.shard.as_deref() {
+        for entry in raw.split(',') {
+            let parts: Vec<&str> = entry.trim().split(':').collect();
+            let (tier_name, target_gib_s, idx_s) = match parts.as_slice() {
+                [t, g, i] => (*t, *g, *i),
+                _ => {
+                    warn!("--shard: malformed entry '{entry}' (want TIER:TARGET_GIB:IDX) — ignoring.");
+                    continue;
+                }
+            };
+            let (Some(tier), Ok(target_gib), Ok(idx)) =
+                (parse_tier_name(tier_name), target_gib_s.parse::<u64>(), idx_s.parse::<u16>())
+            else {
+                warn!("--shard: malformed entry '{entry}' — ignoring.");
+                continue;
+            };
+            let spec = keryx_miner::models::spec_for_tier(tier);
+            let gguf_path = keryx_miner::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            let target_bytes = target_gib * 1_000_000_000;
+            let mut file = match std::fs::File::open(&gguf_path) {
+                Ok(f) => f,
+                Err(e) => { warn!("--shard: cannot open {gguf_path}: {e} — ignoring entry '{entry}'."); continue; }
+            };
+            let meta = match keryx_miner::gguf::GgufMeta::read(&mut file) {
+                Ok(m) => m,
+                Err(e) => { warn!("--shard: cannot parse {gguf_path}: {e} — ignoring entry '{entry}'."); continue; }
+            };
+            let shards = match keryx_miner::shard::pack_shards(&meta, target_bytes) {
+                Ok(s) => s,
+                Err(e) => { warn!("--shard: packing failed for '{entry}': {e} — ignoring."); continue; }
+            };
+            let Some(manifest) = shards.into_iter().find(|s| s.index == idx) else {
+                warn!("--shard: index {idx} out of range for '{entry}' — ignoring.");
+                continue;
+            };
+            // Device id: --shard is positional-CSV like --force-model, so its Nth entry (in
+            // parse order) targets CUDA device N. This mirrors forced_tiers' indexing exactly.
+            // KNOWN SIMPLIFICATION: this positional scheme is fragile if two entries are
+            // textually identical (position() finds the first match for both) — acceptable for
+            // this POC's one-shard-per-process, one-entry-per-invocation design.
+            let device_id = raw.split(',').position(|e| e.trim() == entry.trim()).unwrap_or(0) as u32;
+            info!("--shard: GPU {device_id} -> shard {idx} of {} ({target_gib} GiB target, layers [{},{}))", spec.dir_name, manifest.layer_lo, manifest.layer_hi);
+            keryx_miner::pom_gpu::set_shard_for_device(device_id, spec.model_id, gguf_path, target_bytes, manifest);
         }
     }
 
