@@ -1291,6 +1291,43 @@ fn mining_tiers() -> &'static Mutex<HashMap<u32, ([u8; 32], String)>> {
     MINING_TIERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// A device's shard assignment (from `--shard`). Disjoint from `MINING_TIERS`: a device is
+/// either a whole-tier miner (existing path) or a shard miner (this path), never both.
+#[derive(Clone)]
+pub struct ShardAssignment {
+    pub model_id: [u8; 32],
+    pub gguf_path: String,
+    pub target_bytes: u64,
+    pub manifest: crate::shard::ShardManifest,
+}
+
+static SHARD_ASSIGNMENTS: OnceLock<Mutex<HashMap<u32, ShardAssignment>>> = OnceLock::new();
+
+fn shard_assignments() -> &'static Mutex<HashMap<u32, ShardAssignment>> {
+    SHARD_ASSIGNMENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn set_shard_for_device(device_id: u32, model_id: [u8; 32], gguf_path: String, target_bytes: u64, manifest: crate::shard::ShardManifest) {
+    if let Ok(mut g) = shard_assignments().lock() {
+        g.insert(device_id, ShardAssignment { model_id, gguf_path, target_bytes, manifest });
+    }
+}
+
+pub fn shard_for_device(device_id: u32) -> Option<ShardAssignment> {
+    shard_assignments().lock().ok()?.get(&device_id).cloned()
+}
+
+/// The possession index for whatever this device is mining — its shard's index if it's a shard
+/// device, else the whole-model index (existing `active_index_for_model` path). Single lookup
+/// point so callers (the mining loop) don't need to know which kind of device they're on.
+pub fn active_index_for_device(device_id: u32, model_id: [u8; 32]) -> Option<Arc<crate::pom::WeightIndex>> {
+    if shard_for_device(device_id).is_some() {
+        crate::pom::active_shard_index(device_id)
+    } else {
+        crate::pom::active_index_for_model(&model_id)
+    }
+}
+
 /// Record a GPU's mining tier so its miner can be rebuilt after an inference swapped the model away.
 pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     if let Ok(mut g) = mining_tiers().lock() {
@@ -1542,6 +1579,9 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
 /// at index-build time): below the H4 gate it is None, so the miner never claims a tier for a
 /// block outside the lineup's era.
 pub fn current_tier(device_id: u32, daa: u64) -> Option<u8> {
+    if let Some(shard) = shard_for_device(device_id) {
+        return crate::models::pom_shard_tier_index(&shard.model_id, shard.target_bytes, shard.manifest.index, daa);
+    }
     let model_id = mining_tiers().lock().ok()?.get(&device_id).map(|(id, _)| *id)?;
     crate::models::pom_tier_index(&model_id, daa)
 }
@@ -1679,6 +1719,9 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // pause was raised must not reload the mining model while inference is still generating.
     if inference_paused() {
         return false;
+    }
+    if let Some(shard) = shard_for_device(device_id) {
+        return ensure_shard_installed_inner(device_id, &shard);
     }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
         Some(x) => x,
@@ -1857,6 +1900,72 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     }
     install(device_id, gm);
     info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
+    true
+}
+
+/// Install path for a shard device: raw scoped upload only, no llama engine, no era-crossing,
+/// own possession index (keyed by device, not model_id — see `pom.rs::POM_SHARD_INDICES`).
+fn ensure_shard_installed_inner(device_id: u32, shard: &ShardAssignment) -> bool {
+    if is_oom_banlisted(device_id, &shard.model_id) {
+        return false;
+    }
+    if crate::pom::active_shard_index(device_id).is_none() {
+        let _guard = match index_build_lock().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if crate::pom::active_shard_index(device_id).is_none() {
+            let tree_filename = format!("pom-tree.shard{}-{}g.bin", shard.manifest.index, shard.target_bytes / 1_000_000_000);
+            info!(
+                "PoM[gpu{}]: building host index for shard {} (layers {}..{}) — this can take a while...",
+                device_id, shard.manifest.index, shard.manifest.layer_lo, shard.manifest.layer_hi
+            );
+            match crate::pom::WeightIndex::build_from_gguf_subset(&shard.gguf_path, shard.model_id, &shard.manifest.tensor_names, &tree_filename) {
+                Ok(idx) => {
+                    info!("PoM[gpu{}]: shard {} host index ready — N={} chunks", device_id, shard.manifest.index, idx.n_chunks);
+                    crate::pom::set_shard_index(device_id, idx);
+                }
+                Err(e) => {
+                    log::error!("PoM[gpu{}]: shard {} host index build failed: {}", device_id, shard.manifest.index, e);
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Shard devices never run the llama engine and never zero-dup: raw scoped upload only.
+    info!(
+        "PoM[gpu{}]: shard {} — walk uses a raw scoped upload (no zero-dup, no llama engine)",
+        device_id, shard.manifest.index
+    );
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PomGpuMiner::load_raw_subset(&shard.gguf_path, device_id as usize, &shard.manifest.tensor_names)
+    }));
+    let gm = match loaded {
+        Ok(Ok(gm)) => gm,
+        Ok(Err(e)) => {
+            log::error!("PoM[gpu{}]: shard {} miner load failed: {}", device_id, shard.manifest.index, e);
+            oom_banlist_add(device_id, shard.model_id);
+            return false;
+        }
+        Err(_) => {
+            log::error!("PoM[gpu{}]: shard {} miner load panicked (likely OOM)", device_id, shard.manifest.index);
+            oom_banlist_add(device_id, shard.model_id);
+            return false;
+        }
+    };
+    let n = gm.n_chunks();
+    if let Some(idx) = crate::pom::active_shard_index(device_id) {
+        if n != idx.n_chunks {
+            log::error!(
+                "PoM[gpu{}]: shard {} gather N={} != shard index N={} — refusing to mine",
+                device_id, shard.manifest.index, n, idx.n_chunks
+            );
+            return false;
+        }
+    }
+    install(device_id, gm);
+    info!("PoM[gpu{}]: shard {} miner ready — N={} chunks resident", device_id, shard.manifest.index, n);
     true
 }
 
