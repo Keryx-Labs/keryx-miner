@@ -2210,14 +2210,21 @@ mod tests {
         let tensor_data_offset = (header.len() as u64).div_ceil(ALIGNMENT) * ALIGNMENT;
         let mut buf = header;
         buf.resize(tensor_data_offset as usize, 0u8);
-        for (i, &(_, nbytes)) in tensor_sizes.iter().enumerate() {
+        for (i, &(name, nbytes)) in tensor_sizes.iter().enumerate() {
             let start = (tensor_data_offset + offsets[i]) as usize;
             let end = start + nbytes as usize;
             if buf.len() < end {
                 buf.resize(end, 0u8);
             }
+            // Content is keyed by the tensor NAME (not its positional index or file offset) so
+            // the same tensor gets byte-identical content across different synthetic files —
+            // needed for tests that compare a subset built from one file against a reference
+            // index built from a second file containing only some of the same-named tensors.
+            let name_seed: u64 = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |acc, b| {
+                (acc ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+            });
             for (j, b) in buf[start..end].iter_mut().enumerate() {
-                *b = ((i as u64 * 7 + j as u64) % 251) as u8; // distinguishable, deterministic content
+                *b = (name_seed.wrapping_add(j as u64) % 251) as u8; // distinguishable, deterministic content
             }
         }
 
@@ -2228,8 +2235,11 @@ mod tests {
     fn build_from_gguf_subset_root_matches_full_dense_tree_over_same_leaves() {
         let dir = tempfile::tempdir().unwrap();
         let gguf_path = dir.path().join("model.gguf");
+        // Distinct per-tensor sizes so a wrong-tensor-selected bug would also show up as a
+        // wrong `n_chunks`, not just a different root (a same-size swap could otherwise slip
+        // past a chunk-count-only check).
         write_synthetic_gguf(&gguf_path, &[
-            ("blk.0.a", 320), ("blk.0.b", 320), ("blk.1.a", 320), ("output.weight", 320),
+            ("blk.0.a", 320), ("blk.0.b", 352), ("blk.1.a", 384), ("output.weight", 416),
         ]);
         let model_id = [7u8; 32];
 
@@ -2242,10 +2252,21 @@ mod tests {
             gguf_path.to_str().unwrap(), model_id, &subset_names, "pom-tree.shard0-test.bin",
         ).unwrap();
 
-        // Subset root must differ from the full root (fewer leaves) but subset n_chunks must
-        // equal exactly the chunk count of the 3 included tensors (320*3/32 = 30).
+        // Independent reference: a SECOND GGUF containing only the 3 intended tensors (same
+        // names/sizes/order), indexed through the unmodified whole-file `build_from_gguf` path.
+        // If the subset filter selected the wrong 3-of-4 tensors (e.g. dropped `blk.0.b` instead
+        // of `blk.1.a`), `subset.r_t`/`n_chunks` would NOT match this reference — unlike a bare
+        // "differs from the full root" check, which any 3-of-4 selection would also satisfy.
+        let ref_gguf_path = dir.path().join("model-shard0-reference.gguf");
+        write_synthetic_gguf(&ref_gguf_path, &[("blk.0.a", 320), ("blk.0.b", 352), ("output.weight", 416)]);
+        let reference = WeightIndex::build_from_gguf(ref_gguf_path.to_str().unwrap(), model_id).unwrap();
+
+        assert_eq!(subset.n_chunks, reference.n_chunks);
+        assert_eq!(subset.r_t, reference.r_t, "subset root must match an independently-built index over exactly the intended tensors");
+
+        // Sanity: the subset is still a proper subset of the full model (root differs, fewer chunks).
         assert_ne!(subset.r_t, full.r_t);
-        assert_eq!(subset.n_chunks, 30);
+        assert_eq!(subset.n_chunks, (320 + 352 + 416) / 32);
     }
 
 }
