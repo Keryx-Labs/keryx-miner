@@ -51,6 +51,27 @@ pub struct Opt {
     pub force_model: Option<String>,
 
     #[clap(
+        long = "shard",
+        value_name = "TIER:TARGET_GIB:IDX[,TIER:TARGET_GIB:IDX...]",
+        help = "Mine one fixed-size shard of a model instead of the whole tier (CUDA-driver order, CSV): \
+                e.g. --shard very-high:8:0 -> GPU0 mines shard 0 of an 8 GiB split of the very-high model. \
+                A GPU listed here mines ONLY its shard, never the whole tier. Requires the model's GGUF to \
+                be present (combine with --force-model naming the same tier so it gets prefetched).",
+        help_heading = "OPoI / Inference"
+    )]
+    pub shard: Option<String>,
+
+    #[clap(
+        long = "print-shards",
+        value_name = "TIER:TARGET_GIB",
+        help = "Compute and print the shard manifest (layer ranges, chunk counts, Merkle roots) for a \
+                tier at a given byte target, then exit without mining. Used to produce the rows pinned \
+                into a private testnet node's shard tier table.",
+        help_heading = "OPoI / Inference"
+    )]
+    pub print_shards: Option<String>,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",
