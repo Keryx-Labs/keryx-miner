@@ -145,6 +145,10 @@ pub struct KeryxdHandler {
     /// Last service-bond strike poll instant.
     last_strike_poll: std::time::Instant,
 
+    /// Last time we asked the node for a fresh template on the idle-chain fallback timer
+    /// (see `listen`'s tick handler) — distinct from `last_strike_poll`.
+    last_template_poll: std::time::Instant,
+
     /// Last rendered service-bond status — logged only on change.
     strike_status: Option<String>,
 
@@ -189,11 +193,23 @@ impl Client for KeryxdHandler {
                     // Timer tick: if a regular inference just finished, get a fresh template.
                     if self.inference_rx.is_some() && self.poll_inference().await {
                         self.client_get_block_template().await?;
+                        self.last_template_poll = std::time::Instant::now();
                     // If a challenge is in flight, keep pinging the node so the result is
                     // delivered as soon as the inference task completes. This is critical on
                     // sole-producer nodes where mining suspension stops NewBlockTemplate
                     // notifications and the response would otherwise never be sent.
                     } else if self.challenge_inference_rx.is_some() {
+                        self.client_get_block_template().await?;
+                        self.last_template_poll = std::time::Instant::now();
+                    } else if self.last_template_poll.elapsed().as_millis() >= 500 {
+                        // Idle-chain fallback: nothing is in flight, and on a sole-producer
+                        // chain that never mines a real block (e.g. a fresh private testnet
+                        // stuck below its own PoM activation gate), the node's virtual state
+                        // never changes, so it never sends another NewBlockTemplate
+                        // notification either — the miner would otherwise sit on a stale
+                        // template forever. Re-requesting is cheap and idempotent when
+                        // nothing has actually changed.
+                        self.last_template_poll = std::time::Instant::now();
                         self.client_get_block_template().await?;
                     }
                     if self.escrow_pubkey.is_some() && self.last_strike_poll.elapsed().as_secs() >= 60 {
@@ -297,6 +313,7 @@ impl KeryxdHandler {
             escrow_cert,
             service_identity,
             last_strike_poll: std::time::Instant::now() - std::time::Duration::from_secs(55),
+            last_template_poll: std::time::Instant::now(),
             strike_status: None,
             stats: None,
             misses_seen: std::collections::HashSet::new(),
