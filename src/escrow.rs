@@ -2,14 +2,14 @@
 //
 // After each block, scans for coinbase outputs matching this miner's escrow script.
 // When the CSV window (36 000 blocks) expires, builds a Schnorr-signed claim TX and
-// broadcasts it via gRPC.  State is persisted to `escrow_state.json` so claims survive
-// miner restarts.
+// broadcasts it via gRPC.  State is persisted as a snapshot (`escrow_state.json`) plus an
+// append-only journal (`escrow_state.journal`) so claims survive miner restarts.
 
 use blake2b_simd::Params as Blake2bParams;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
@@ -32,10 +32,12 @@ const SIG_HASH_ALL: u8 = 0x01;
 /// Drop done (claimed / terminally-slashed) entries every N processed blocks so the
 /// in-memory vector and the on-disk state stay bounded under a high block rate.
 const COMPACT_EVERY_BLOCKS: u32 = 2_000;
-/// Minimum wall-clock interval between state-file writes. Without this debounce the
-/// watcher rewrites the entire (multi-thousand-entry) state file on every block, which
-/// saturates the async client loop and starves block-template delivery → mining stalls.
+/// Minimum wall-clock interval between journal writes (one fsync per batch of lines).
 const STATE_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+/// Wall-clock interval between full snapshots while the journal keeps growing.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(600);
+/// Journal size that forces a snapshot before the interval elapses.
+const JOURNAL_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EscrowEntry {
@@ -203,6 +205,28 @@ fn select_claim_batch(entries: &[EscrowEntry], daa_score: u64, in_flight_outpoin
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct EscrowState {
     pub entries: Vec<EscrowEntry>,
+    /// Sequence of the last journal line folded into this snapshot; older lines are stale.
+    #[serde(default)]
+    pub journal_seq: u64,
+}
+
+/// One journal line: the full entry after a change, keyed by its outpoint on replay.
+#[derive(Serialize, Deserialize)]
+struct JournalLine {
+    s: u64,
+    e: EscrowEntry,
+}
+
+fn journal_path_for(state_path: &Path) -> PathBuf {
+    state_path.with_extension("journal")
+}
+
+fn append_journal_line(pending: &mut Vec<u8>, seq: &mut u64, entry: &EscrowEntry) {
+    *seq += 1;
+    if let Ok(mut line) = serde_json::to_vec(&JournalLine { s: *seq, e: entry.clone() }) {
+        line.push(b'\n');
+        pending.extend_from_slice(&line);
+    }
 }
 
 /// Max escrow outputs per claim TX. Compute mass is `506 + 1118 * inputs` grams (1,000 per
@@ -295,9 +319,14 @@ pub struct EscrowWatcher {
     /// block_hash -> indices into `state.entries`, for O(reds) red-set slashing instead of
     /// scanning every entry per red hash. Rebuilt on load/compaction; appended on track.
     block_index: HashMap<String, Vec<usize>>,
-    /// Debounced persistence: pending unsaved changes + last write time.
-    dirty: bool,
-    last_save: Instant,
+    /// Journal lines not yet written to disk, and the sequence of the last line produced.
+    journal_pending: Vec<u8>,
+    journal_seq: u64,
+    journal_bytes_since_snapshot: usize,
+    last_journal_write: Instant,
+    /// A compaction removed entries: only a snapshot can persist that.
+    snapshot_due: bool,
+    last_snapshot: Instant,
     /// handle_block call counter, used to trigger periodic compaction.
     blocks_since_compact: u32,
     /// handle_block call counter for the periodic INFO status line.
@@ -344,6 +373,7 @@ impl EscrowWatcher {
         let payout_spk_script_hex = hex::encode(&payout_spk_script);
 
         let state = load_state(&state_path)?;
+        let state_seq = state.journal_seq;
 
         info!("EscrowWatcher ready: pubkey={}", hex::encode(pubkey_bytes));
 
@@ -363,8 +393,12 @@ impl EscrowWatcher {
             last_daa_score: 0,
             outpoint_set: HashSet::new(),
             block_index: HashMap::new(),
-            dirty: false,
-            last_save: Instant::now(),
+            journal_pending: Vec::new(),
+            journal_seq: state_seq,
+            journal_bytes_since_snapshot: 0,
+            last_journal_write: Instant::now(),
+            snapshot_due: false,
+            last_snapshot: Instant::now(),
             blocks_since_compact: 0,
             blocks_since_status: 0,
             validation_pending: HashSet::new(),
@@ -394,27 +428,60 @@ impl EscrowWatcher {
         self.state.entries.retain(|e| !e.claimed && !e.slashed);
         if self.state.entries.len() != before {
             self.rebuild_indexes();
-            self.mark_dirty();
+            self.snapshot_due = true;
         }
     }
 
-    #[inline]
-    fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// Persist state at most once per `STATE_SAVE_INTERVAL` to keep disk I/O off the
-    /// per-block hot path. Worst case on crash we lose a couple of seconds of tracking,
-    /// which is re-derived from the chain on the next blocks.
+    /// Persist off the per-block hot path: journal lines are appended at most once per
+    /// `STATE_SAVE_INTERVAL`; the full snapshot is rewritten on compaction, every
+    /// `SNAPSHOT_INTERVAL`, or once the journal outgrows `JOURNAL_SNAPSHOT_BYTES`.
     fn maybe_flush(&mut self) {
-        if self.dirty && self.last_save.elapsed() >= STATE_SAVE_INTERVAL {
-            if let Err(e) = self.save_state() {
+        let journal_grown = self.journal_bytes_since_snapshot + self.journal_pending.len();
+        if self.snapshot_due
+            || journal_grown >= JOURNAL_SNAPSHOT_BYTES
+            || (journal_grown > 0 && self.last_snapshot.elapsed() >= SNAPSHOT_INTERVAL)
+        {
+            if let Err(e) = self.write_snapshot() {
                 warn!("EscrowWatcher: failed to save state: {}", e);
-            } else {
-                self.dirty = false;
             }
-            self.last_save = Instant::now();
+            return;
         }
+        if !self.journal_pending.is_empty() && self.last_journal_write.elapsed() >= STATE_SAVE_INTERVAL {
+            if let Err(e) = self.write_journal() {
+                warn!("EscrowWatcher: failed to append the state journal: {}", e);
+            }
+        }
+    }
+
+    /// Append the pending journal lines and sync them.
+    fn write_journal(&mut self) -> Result<(), String> {
+        self.last_journal_write = Instant::now();
+        if self.journal_pending.is_empty() {
+            return Ok(());
+        }
+        let path = journal_path_for(&self.state_path);
+        let write = || -> io::Result<()> {
+            ensure_parent(&path)?;
+            let mut file = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            file.write_all(&self.journal_pending)?;
+            file.sync_data()
+        };
+        write().map_err(|e| format!("Failed to append escrow journal '{}': {}", path.display(), e))?;
+        self.journal_bytes_since_snapshot += self.journal_pending.len();
+        self.journal_pending.clear();
+        Ok(())
+    }
+
+    /// Rewrite the full snapshot; the journal is emptied with it.
+    fn write_snapshot(&mut self) -> Result<(), String> {
+        self.state.journal_seq = self.journal_seq;
+        self.save_state()?;
+        self.journal_pending.clear();
+        self.journal_bytes_since_snapshot = 0;
+        self.snapshot_due = false;
+        self.last_snapshot = Instant::now();
+        self.last_journal_write = self.last_snapshot;
+        Ok(())
     }
 
     /// Return the 64-char hex x-only public key of the mining key.
@@ -490,7 +557,7 @@ impl EscrowWatcher {
                                 &entry.coinbase_txid[..16.min(entry.coinbase_txid.len())]
                             );
                             entry.slashed = true;
-                            self.mark_dirty();
+                            append_journal_line(&mut self.journal_pending, &mut self.journal_seq, entry);
                         }
                     }
                 }
@@ -569,7 +636,7 @@ impl EscrowWatcher {
                     if !block_hash.is_empty() {
                         self.block_index.entry(block_hash.to_string()).or_default().push(idx);
                     }
-                    self.mark_dirty();
+                    append_journal_line(&mut self.journal_pending, &mut self.journal_seq, &self.state.entries[idx]);
                 }
             }
         }
@@ -653,10 +720,10 @@ impl EscrowWatcher {
                     if !e.claimed && !e.slashed {
                         e.slashed = true;
                         self.validation_purged += 1;
+                        append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
                     }
                 }
             }
-            self.mark_dirty();
         }
         self.finish_validation_if_done();
     }
@@ -730,8 +797,8 @@ impl EscrowWatcher {
         // Forgiveness is safe because orphan_retries is NOT reset: a genuinely dead
         // entry re-fails its full batch, re-bisects to a solo rejection, increments the
         // counter and still converges to the permanent slash at MAX_ORPHAN_RETRIES.
-        let mut healed = false;
         for e in self.state.entries.iter_mut() {
+            let mut healed = false;
             if e.batch_cap != 0 && daa_score >= e.cap_set_daa + CAP_EXPIRY_DAA {
                 e.batch_cap = 0;
                 healed = true;
@@ -749,9 +816,9 @@ impl EscrowWatcher {
                     healed = true;
                 }
             }
-        }
-        if healed {
-            self.mark_dirty();
+            if healed {
+                append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
+            }
         }
 
         let batch = select_claim_batch(&self.state.entries, daa_score, &self.in_flight_outpoints);
@@ -919,6 +986,7 @@ impl EscrowWatcher {
                             .min(UNKNOWN_RETRY_MAX_COOLDOWN_DAA);
                         e.orphan_retry_after_daa = Some(last_daa + cooldown);
                     }
+                    append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
                 }
                 // Burns are terminal and operator-relevant (the miner is being penalised) — surface
                 // them once at WARN. Everything else is transient bisection repair, kept at DEBUG.
@@ -943,7 +1011,6 @@ impl EscrowWatcher {
                 }
             }
         }
-        self.mark_dirty();
         self.maybe_flush();
         outcome
     }
@@ -958,6 +1025,7 @@ impl EscrowWatcher {
                     total_sompi += e.amount_sompi;
                 }
                 e.claimed = true;
+                append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
             }
         }
         total_sompi
@@ -1092,7 +1160,8 @@ impl EscrowWatcher {
             csv_window: CHALLENGE_WINDOW_BLOCKS,
         });
         self.outpoint_set.insert(key);
-        self.mark_dirty();
+        let idx = self.state.entries.len() - 1;
+        append_journal_line(&mut self.journal_pending, &mut self.journal_seq, &self.state.entries[idx]);
         self.maybe_flush();
     }
 
@@ -1101,10 +1170,8 @@ impl EscrowWatcher {
     }
 
     pub fn flush_state(&mut self) -> Result<(), String> {
-        if self.dirty {
-            self.save_state()?;
-            self.dirty = false;
-            self.last_save = Instant::now();
+        if self.snapshot_due || self.journal_bytes_since_snapshot > 0 || !self.journal_pending.is_empty() {
+            self.write_snapshot()?;
         }
         Ok(())
     }
@@ -1241,11 +1308,18 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> io::Result<()> {
     sync_parent(parent)
 }
 
-/// Persist escrow state without exposing a partially-written JSON file.
+/// Persist escrow state without exposing a partially-written JSON file, then empty the
+/// journal: every line it held is folded into this snapshot.
 pub fn save_state_atomic(path: &Path, state: &EscrowState) -> Result<(), String> {
-    let json = serde_json::to_vec_pretty(state).map_err(|e| format!("Failed to serialize escrow state: {}", e))?;
+    let json = serde_json::to_vec(state).map_err(|e| format!("Failed to serialize escrow state: {}", e))?;
     atomic_replace(path, &json)
-        .map_err(|e| format!("Failed to atomically write escrow state '{}': {}", path.display(), e))
+        .map_err(|e| format!("Failed to atomically write escrow state '{}': {}", path.display(), e))?;
+    let journal = journal_path_for(path);
+    if journal.exists() {
+        fs::write(&journal, b"")
+            .map_err(|e| format!("Failed to empty escrow journal '{}': {}", journal.display(), e))?;
+    }
+    Ok(())
 }
 
 /// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
@@ -1329,13 +1403,56 @@ pub fn pubkey_hex_from_privkey(privkey_hex: &str) -> Result<String, String> {
 }
 
 fn load_state(path: &Path) -> Result<EscrowState, String> {
-    match fs::read_to_string(path) {
+    let mut state: EscrowState = match fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| {
             format!("Escrow state '{}' is corrupt: {}. Restore it or run --recover-escrow.", path.display(), e)
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(EscrowState::default()),
-        Err(e) => Err(format!("Failed to read escrow state '{}': {}", path.display(), e)),
+        })?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => EscrowState::default(),
+        Err(e) => return Err(format!("Failed to read escrow state '{}': {}", path.display(), e)),
+    };
+    replay_journal(&journal_path_for(path), &mut state)?;
+    Ok(state)
+}
+
+/// Fold the journal lines newer than the snapshot into `state`; each line upserts the entry
+/// with its outpoint. A line that does not parse (a write cut short) is skipped.
+fn replay_journal(path: &Path, state: &mut EscrowState) -> Result<(), String> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Failed to read escrow journal '{}': {}", path.display(), e)),
+    };
+    let mut index: HashMap<String, usize> =
+        state.entries.iter().enumerate().map(|(i, e)| (format!("{}:{}", e.coinbase_txid, e.output_index), i)).collect();
+    let (mut applied, mut skipped, mut stale) = (0u64, 0u64, 0u64);
+    for line in io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("Failed to read escrow journal '{}': {}", path.display(), e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(JournalLine { s, e }) = serde_json::from_str::<JournalLine>(&line) else {
+            skipped += 1;
+            continue;
+        };
+        if s <= state.journal_seq {
+            stale += 1;
+            continue;
+        }
+        state.journal_seq = s;
+        let key = format!("{}:{}", e.coinbase_txid, e.output_index);
+        match index.get(&key) {
+            Some(&i) => state.entries[i] = e,
+            None => {
+                index.insert(key, state.entries.len());
+                state.entries.push(e);
+            }
+        }
+        applied += 1;
     }
+    if applied > 0 || skipped > 0 {
+        info!("EscrowWatcher: journal replayed — {} line(s) applied, {} stale, {} unreadable", applied, stale, skipped);
+    }
+    Ok(())
 }
 
 // ── Script builders ───────────────────────────────────────────────────────────
@@ -1815,6 +1932,7 @@ mod persistence_tests {
                 is_inference: false,
                 csv_window: csv_window_for_daa(confirm_daa),
             }],
+            journal_seq: 0,
         }
     }
 
@@ -2027,16 +2145,101 @@ mod persistence_tests {
         let address = format!("keryx:{}", "q".repeat(61));
         let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path.clone()).unwrap();
         watcher.state = state(77);
-        watcher.dirty = true;
+        watcher.snapshot_due = true;
 
         fail_at(1);
         assert!(watcher.flush_state().is_err());
-        assert!(watcher.dirty);
+        assert!(watcher.snapshot_due);
         fail_at(0);
         watcher.flush_state().unwrap();
 
-        assert!(!watcher.dirty);
+        assert!(!watcher.snapshot_due);
         let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(loaded.entries[0].confirm_daa, 77);
+    }
+
+    fn journal_line(seq: u64, e: &EscrowEntry) -> String {
+        let mut line = serde_json::to_string(&JournalLine { s: seq, e: e.clone() }).unwrap();
+        line.push('\n');
+        line
+    }
+
+    #[test]
+    fn journal_lines_newer_than_the_snapshot_are_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let mut snapshot = state(10);
+        snapshot.journal_seq = 5;
+        save_state_atomic(&path, &snapshot).unwrap();
+
+        let mut claimed = snapshot.entries[0].clone();
+        claimed.claimed = true;
+        let fresh = entry(7, 20, csv_window_for_daa(20));
+        let mut journal = journal_line(5, &claimed); // stale: already folded into the snapshot
+        journal.push_str(&journal_line(6, &fresh));
+        journal.push_str(&journal_line(7, &claimed));
+        journal.push_str("{\"s\":8,\"e\":{\"coinbase_txid\":\"cut");
+        fs::write(journal_path_for(&path), journal).unwrap();
+
+        let loaded = load_state(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+        assert!(loaded.entries[0].claimed);
+        assert_eq!(loaded.entries[1].coinbase_txid, fresh.coinbase_txid);
+        assert_eq!(loaded.journal_seq, 7);
+    }
+
+    #[test]
+    fn stale_journal_lines_do_not_undo_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let mut snapshot = state(10);
+        snapshot.entries[0].claimed = true;
+        snapshot.journal_seq = 9;
+        save_state_atomic(&path, &snapshot).unwrap();
+
+        let mut unclaimed = snapshot.entries[0].clone();
+        unclaimed.claimed = false;
+        fs::write(journal_path_for(&path), journal_line(3, &unclaimed)).unwrap();
+
+        let loaded = load_state(&path).unwrap();
+        assert!(loaded.entries[0].claimed);
+        assert_eq!(loaded.journal_seq, 9);
+    }
+
+    #[test]
+    fn a_snapshot_empties_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let journal = journal_path_for(&path);
+        fs::write(&journal, journal_line(1, &state(1).entries[0])).unwrap();
+        save_state_atomic(&path, &state(2)).unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), b"");
+    }
+
+    #[test]
+    fn changes_go_to_the_journal_and_survive_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path.clone()).unwrap();
+        watcher.track_inference_escrow("ab".repeat(32), 100, 5_000);
+        watcher.track_inference_escrow("cd".repeat(32), 101, 6_000);
+        assert!(!watcher.journal_pending.is_empty());
+        watcher.write_journal().unwrap();
+        assert!(watcher.journal_pending.is_empty());
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(journal_path_for(&path)).unwrap().lines().count(), 2);
+
+        let reloaded = load_state(&path).unwrap();
+        assert_eq!(reloaded.entries.len(), 2);
+        assert_eq!(reloaded.journal_seq, 2);
+
+        watcher.state.entries[0].claimed = true;
+        watcher.snapshot_due = true;
+        watcher.flush_state().unwrap();
+        assert_eq!(fs::read(journal_path_for(&path)).unwrap(), b"");
+        let snapshot: EscrowState = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(snapshot.journal_seq, 2);
+        assert!(snapshot.entries[0].claimed);
     }
 }

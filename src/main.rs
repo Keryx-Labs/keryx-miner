@@ -665,7 +665,7 @@ fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::E
             csv_window: escrow::csv_window_for_daa(confirm_daa),
         });
     }
-    Ok((escrow::EscrowState { entries }, total_sompi))
+    Ok((escrow::EscrowState { entries, journal_seq: 0 }, total_sompi))
 }
 
 async fn client_main(
