@@ -1166,10 +1166,12 @@ impl KeryxdHandler {
             },
             // Virtual chain advanced: fetch every added chain block in full. Their coinbases
             // are the only ones that materialize UTXOs, so escrow tracking feeds off this
-            // stream (handle_block gates tracking on is_chain_block). Removed chain blocks
-            // are ignored: entries from reorged-out blocks fail their claims as orphans and
-            // are cleaned up by the existing retry/slash machinery.
+            // stream (handle_block gates tracking on is_chain_block). Entries of removed
+            // chain blocks are purged right away: their coinbase no longer exists.
             Payload::VirtualSelectedParentChainChangedNotification(notif) => {
+                if let Some(watcher) = self.escrow_watcher.as_mut() {
+                    watcher.on_chain_blocks_removed(&notif.removed_chain_block_hashes);
+                }
                 for hash in notif.added_chain_block_hashes {
                     self.client_send(GetBlockRequestMessage { hash, include_transactions: true }).await?;
                 }

@@ -728,6 +728,29 @@ impl EscrowWatcher {
         self.finish_validation_if_done();
     }
 
+    /// Purge the entries of chain blocks the node just reorged out: their coinbase never
+    /// materialised. Their outpoints are released so a block re-added later is tracked afresh.
+    pub fn on_chain_blocks_removed(&mut self, hashes: &[String]) {
+        let mut purged = 0u64;
+        for hash in hashes {
+            let Some(indices) = self.block_index.remove(hash) else { continue };
+            for i in indices {
+                let e = &mut self.state.entries[i];
+                if e.claimed || e.slashed {
+                    continue;
+                }
+                e.slashed = true;
+                purged += 1;
+                self.outpoint_set.remove(&format!("{}:{}", e.coinbase_txid, e.output_index));
+                append_journal_line(&mut self.journal_pending, &mut self.journal_seq, e);
+            }
+        }
+        if purged > 0 {
+            debug!("EscrowWatcher: {} escrow entr{} purged — their block left the selected chain", purged, if purged == 1 { "y" } else { "ies" });
+            self.maybe_flush();
+        }
+    }
+
     fn finish_validation_if_done(&mut self) {
         if !self.validation_pending.is_empty() {
             return;
@@ -2156,6 +2179,66 @@ mod persistence_tests {
         assert!(!watcher.snapshot_due);
         let loaded: EscrowState = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(loaded.entries[0].confirm_daa, 77);
+    }
+
+    fn chain_block(hash: &str, coinbase_txid: &str, daa_score: u64, escrow_script_hex: &str) -> crate::proto::RpcBlock {
+        crate::proto::RpcBlock {
+            header: Some(crate::proto::RpcBlockHeader { daa_score, ..Default::default() }),
+            transactions: vec![RpcTransaction {
+                outputs: vec![
+                    RpcTransactionOutput { amount: 1_000, ..Default::default() },
+                    RpcTransactionOutput {
+                        amount: 250,
+                        script_public_key: Some(RpcScriptPublicKey {
+                            version: 0,
+                            script_public_key: escrow_script_hex.to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                verbose_data: Some(crate::proto::RpcTransactionVerboseData {
+                    transaction_id: coinbase_txid.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            verbose_data: Some(crate::proto::RpcBlockVerboseData {
+                hash: hash.to_string(),
+                is_chain_block: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_reorged_out_block_purges_its_entries_and_a_re_added_one_is_tracked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("escrow_state.json");
+        let address = format!("keryx:{}", "q".repeat(61));
+        let mut watcher = EscrowWatcher::new(&"11".repeat(32), &address, path).unwrap();
+        let script = watcher.escrow_script_bonded_hex.clone();
+        let hash = "aa".repeat(32);
+        let block = chain_block(&hash, &"bb".repeat(32), 500, &script);
+
+        watcher.handle_block(&block);
+        assert_eq!(watcher.pending_escrow(), (1, 250));
+
+        watcher.on_chain_blocks_removed(&[hash.clone(), "cc".repeat(32)]);
+        assert_eq!(watcher.pending_escrow(), (0, 0));
+        assert!(watcher.state.entries[0].slashed);
+        assert!(!watcher.outpoint_set.contains(&format!("{}:1", "bb".repeat(32))));
+        assert!(!watcher.journal_pending.is_empty());
+
+        // The block comes back into the selected chain: its coinbase is tracked afresh.
+        watcher.handle_block(&block);
+        assert_eq!(watcher.pending_escrow(), (1, 250));
+        assert_eq!(watcher.state.entries.len(), 2);
+        assert!(!watcher.state.entries[1].slashed);
+
+        // A second removal purges the live entry, not the already-slashed one.
+        watcher.on_chain_blocks_removed(&[hash]);
+        assert_eq!(watcher.pending_escrow(), (0, 0));
     }
 
     fn journal_line(seq: u64, e: &EscrowEntry) -> String {
