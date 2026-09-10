@@ -1317,6 +1317,16 @@ pub fn shard_for_device(device_id: u32) -> Option<ShardAssignment> {
     shard_assignments().lock().ok()?.get(&device_id).cloned()
 }
 
+/// True when at least one device on this process is mining a shard (`--shard`). A shard device
+/// never loads the full model, so it can never satisfy the whole-model OPoI-mandatory mining gate
+/// (`grpc.rs`'s "no models ready" check) — that check is written for whole-tier devices, which are
+/// always expected to become OPoI-capable once their model finishes loading. Callers use this to
+/// skip that gate only when the reason `loaded_model_ids()` is empty is "this process only runs
+/// shard devices by design," not "a whole-tier model failed to load and OPoI is being dodged."
+pub fn any_shard_devices_active() -> bool {
+    shard_assignments().lock().map(|g| !g.is_empty()).unwrap_or(false)
+}
+
 /// The possession index for whatever this device is mining — its shard's index if it's a shard
 /// device, else the whole-model index (existing `active_index_for_model` path). Single lookup
 /// point so callers (the mining loop) don't need to know which kind of device they're on.

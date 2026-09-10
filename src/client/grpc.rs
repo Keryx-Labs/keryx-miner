@@ -949,7 +949,10 @@ impl KeryxdHandler {
                 }
                 // OPoI is mandatory: refuse to mine if no models are ready.
                 // Covers miners with missing/truncated model files that somehow passed prefetch.
-                if keryx_miner::slm::loaded_model_ids().is_empty() {
+                // Exempt: a process running only shard devices (`--shard`) never loads a full
+                // model by design (see `pom_gpu::any_shard_devices_active`'s doc) — this gate is
+                // for whole-tier devices whose OPoI capability should have come up alongside PoM.
+                if keryx_miner::slm::loaded_model_ids().is_empty() && !keryx_miner::pom_gpu::any_shard_devices_active() {
                     // Throttle to one log per ~200 templates (~every 20s at 10 BPS) to avoid spam.
                     if self.last_known_daa % 200 == 0 {
                         if keryx_miner::slm::publishing_blocked() {
