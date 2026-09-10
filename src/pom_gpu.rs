@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 use anyhow::{anyhow, Result};
-use log::{info, warn};
+use log::{error, info, warn};
 
 use cudarc::driver::{result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, LaunchConfig};
 
@@ -1191,6 +1191,19 @@ pub fn inference_paused() -> bool {
     INFERENCE_PAUSED.load(Ordering::Acquire)
 }
 
+/// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
+static FATAL_GPU_FAULT: AtomicBool = AtomicBool::new(false);
+
+pub fn fatal_gpu_fault() -> bool {
+    FATAL_GPU_FAULT.load(Ordering::Acquire)
+}
+
+fn mark_fatal_gpu_fault(device_id: u32, message: &str) {
+    if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
+        error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. Full process restart required.", device_id, message);
+    }
+}
+
 /// True while the GPU miner is being (re)built — a heavy one-time model load that blocks the
 /// mining worker. The PoW stall watchdog treats this like an inference pause, not a crash.
 static LOADING: AtomicUsize = AtomicUsize::new(0);
@@ -1210,7 +1223,18 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
         let g = miners().lock().ok()?;
         g.get(&device_id)?.clone()
     };
-    miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4, seed_h10).ok().flatten()
+    match miner.mine(pre_pow_hash, timestamp, target_le, start, batch, h3, walk_v2, h5_1, h5_2, v3, v4, seed_h10) {
+        Ok(found) => found,
+        Err(e) => {
+            let message = e.to_string();
+            if is_sticky_gpu_runtime_fault(&message) {
+                mark_fatal_gpu_fault(device_id, &message);
+            } else {
+                warn!("PoM[gpu{}]: mining call failed: {}", device_id, message);
+            }
+            None
+        }
+    }
 }
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
@@ -1616,22 +1640,19 @@ fn classify_miner_load_error(err: &str) -> MinerLoadFailureKind {
     MinerLoadFailureKind::Other
 }
 
-fn is_transient_gpu_runtime_fault(err: &str) -> bool {
+fn is_sticky_gpu_runtime_fault(err: &str) -> bool {
     let s = err.to_ascii_lowercase();
     s.contains("illegal address")
         || s.contains("illegal memory")
         || s.contains("cuda_error_illegal_address")
-        || s.contains("invalid device pointer")
+        || s.contains("device-side assert")
+        || s.contains("cuda_error_assert")
+        || s.contains("hardware stack error")
+        || s.contains("illegal instruction")
         || s.contains("misaligned address")
-}
-
-fn reset_stale_gpu_state(device_id: u32, use_llama: bool) {
-    // Order matters: the miner walks llama's resident tensors, so it must be released — and any
-    // in-flight walk drained — before those tensors are freed.
-    uninstall(device_id);
-    if use_llama {
-        crate::llama_engine::unload_for_gpu(device_id as usize);
-    }
+        || s.contains("invalid address space")
+        || s.contains("invalid pc")
+        || s.contains("launch failure")
 }
 
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
@@ -1763,13 +1784,8 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         Ok(Ok(gm)) => gm,
         Ok(Err(e)) => {
             let e_msg = e.to_string();
-            if is_transient_gpu_runtime_fault(&e_msg) {
-                log::warn!(
-                    "PoM[gpu{}]: transient GPU runtime fault while loading miner ({}); dropping stale miner state and forcing a rebuild on the next cycle.",
-                    device_id,
-                    e_msg
-                );
-                reset_stale_gpu_state(device_id, use_llama);
+            if is_sticky_gpu_runtime_fault(&e_msg) {
+                mark_fatal_gpu_fault(device_id, &e_msg);
                 return false;
             }
             match classify_miner_load_error(&e_msg) {
@@ -1967,10 +1983,12 @@ mod tests {
     }
 
     #[test]
-    fn detects_transient_illegal_address_faults() {
-        assert!(is_transient_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
-        assert!(is_transient_gpu_runtime_fault("illegal memory access was encountered"));
-        assert!(!is_transient_gpu_runtime_fault("out of memory"));
+    fn detects_sticky_cuda_faults() {
+        assert!(is_sticky_gpu_runtime_fault("CUDA_ERROR_ILLEGAL_ADDRESS"));
+        assert!(is_sticky_gpu_runtime_fault("illegal memory access was encountered"));
+        assert!(is_sticky_gpu_runtime_fault("device-side assert triggered"));
+        assert!(!is_sticky_gpu_runtime_fault("out of memory"));
+        assert!(!is_sticky_gpu_runtime_fault("invalid device pointer"));
     }
 
     #[test]

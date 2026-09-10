@@ -701,6 +701,10 @@ async fn client_main(
             info!("Shutdown requested, stopping client listen loop");
             Ok(())
         }
+        _ = wait_for_fatal_gpu_fault() => {
+            error!("Fatal CUDA fault detected; stopping the client so the process can restart with fresh CUDA contexts");
+            Err("fatal CUDA fault — process restart required".into())
+        }
     };
     // Flush funds-critical client state before potentially blocking on worker shutdown.
     let mut flush_error = None;
@@ -730,6 +734,12 @@ async fn client_main(
 async fn wait_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
     while !shutdown_requested.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_fatal_gpu_fault() {
+    while !crate::miner::fatal_gpu_fault() && !keryx_miner::pom_gpu::fatal_gpu_fault() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -1308,6 +1318,13 @@ async fn run() -> Result<(), Error> {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, skipping reconnect");
             break;
+        }
+        // A sticky CUDA fault outlives every context in this process: only a new process recovers.
+        if crate::miner::fatal_gpu_fault() || keryx_miner::pom_gpu::fatal_gpu_fault() {
+            return Err("fatal CUDA fault — exiting for a clean process restart".into());
+        }
+        if opt.exit_on_disconnect && worker_count > 0 {
+            return Err("client disconnected with GPU workers active — exiting as requested by --exit-on-disconnect".into());
         }
         info!("Client closed, reconnecting");
         tokio::time::sleep(Duration::from_millis(100)).await;

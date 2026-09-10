@@ -188,7 +188,7 @@ impl<'gpu> CudaGPUWorker<'gpu> {
 
         let load_ptx = |ptx, label: &str| {
             Module::from_ptx(ptx, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
-                error!("Failed to load {} PTX (driver too old?): {}", label, e);
+                error!("Failed to load {} PTX: {}", label, e);
                 e
             })
         };

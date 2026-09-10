@@ -16,6 +16,36 @@ use keryx_miner::{PluginManager, WorkerSpec};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
+/// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
+static FATAL_GPU_FAULT: AtomicBool = AtomicBool::new(false);
+
+pub fn fatal_gpu_fault() -> bool {
+    FATAL_GPU_FAULT.load(Ordering::Acquire)
+}
+
+fn is_fatal_cuda_error_message(message: &str) -> bool {
+    let s = message.to_ascii_lowercase();
+    s.contains("illegal memory access")
+        || s.contains("illegal address")
+        || s.contains("cuda_error_illegal_address")
+        || s.contains("device-side assert")
+        || s.contains("cuda_error_assert")
+        || s.contains("hardware stack error")
+        || s.contains("illegal instruction")
+        || s.contains("misaligned address")
+        || s.contains("invalid address space")
+        || s.contains("invalid pc")
+        || s.contains("invalid program counter")
+        || s.contains("launch failure")
+        || s.contains("launch failed")
+}
+
+fn mark_fatal_gpu_fault(device: &str, message: &str) {
+    if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
+        error!("{}: fatal CUDA fault: {}. A full process restart is required.", device, message);
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 extern "C-unwind" fn signal_panic(_signal: nix::libc::c_int) {
     // MUST be `extern "C-unwind"`: a plain `extern "C"` handler turns this panic into a
@@ -64,24 +94,16 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -
 }
 
 #[cfg(any(target_os = "windows"))]
-struct RawHandle(*mut std::ffi::c_void);
-
-#[cfg(any(target_os = "windows"))]
-unsafe impl Send for RawHandle {}
-
-#[cfg(any(target_os = "windows"))]
 fn register_freeze_handler() {}
 
 #[cfg(target_os = "windows")]
-fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -> std::thread::JoinHandle<()> {
-    use std::os::windows::io::AsRawHandle;
-    let raw_handle = RawHandle(handle.as_raw_handle());
-
-    std::thread::spawn(move || unsafe {
-        let ensure_full_move = raw_handle;
-        sleep(Duration::from_millis(1000));
+fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, _handle: &MinerHandler) -> std::thread::JoinHandle<()> {
+    // Killing a CUDA thread from outside skips its destructors; give it the Unix grace, then exit.
+    std::thread::spawn(move || {
+        sleep(Duration::from_millis(30_000));
         if kill_switch.load(Ordering::SeqCst) {
-            kernel32::TerminateThread(ensure_full_move.0, 0);
+            error!("GPU worker did not stop within 30s; terminating the process instead of the thread");
+            std::process::exit(70);
         }
     })
 }
@@ -402,7 +424,12 @@ impl MinerManager {
                                 }
                             }
                         }
-                        if !keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa) {
+                        let installed = keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
+                        if keryx_miner::pom_gpu::fatal_gpu_fault() {
+                            mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while rebuilding the PoM miner");
+                            return Err("fatal CUDA fault during PoM rebuild".into());
+                        }
+                        if !installed {
                             std::thread::sleep(std::time::Duration::from_millis(200));
                             continue;
                         }
@@ -417,6 +444,10 @@ impl MinerManager {
                         // walk: small batches keep template latency low at 10 BPS.
                         let batch = if v4 { pom_v4_batch } else if v3 { POM_V3_BATCH } else { POM_BATCH };
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10);
+                        if keryx_miner::pom_gpu::fatal_gpu_fault() {
+                            mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
+                            return Err("fatal CUDA fault during PoM mining".into());
+                        }
                         pom_nonce = pom_nonce.wrapping_add(batch);
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
@@ -456,11 +487,22 @@ impl MinerManager {
                     };
                     state_ref.pow_gpu(gpu_work);
                     if let Err(e) = gpu_work.sync() {
+                        let message = e.to_string();
+                        if is_fatal_cuda_error_message(&message) {
+                            mark_fatal_gpu_fault(&device_id, &message);
+                            return Err(e);
+                        }
                         warn!("CUDA run ignored: {}", e);
                         continue
                     }
 
-                    gpu_work.copy_output_to(&mut nonces)?;
+                    if let Err(e) = gpu_work.copy_output_to(&mut nonces) {
+                        let message = e.to_string();
+                        if is_fatal_cuda_error_message(&message) {
+                            mark_fatal_gpu_fault(&device_id, &message);
+                        }
+                        return Err(e);
+                    }
                     // When PoM is active the GPU still runs kHeavyHash (3a is CPU-only); its
                     // solutions are NOT valid PoM blocks, so don't submit them. GPU PoM = 3b.
                     if nonces[0] != 0 && state_ref.daa_score < keryx_miner::pom::pom_activation_daa() {

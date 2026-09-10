@@ -118,6 +118,12 @@ pub struct Opt {
     pub recover_escrow: bool,
 
     #[clap(
+        long = "exit-on-disconnect",
+        help = "Exit instead of reconnecting when the node or pool connection drops while GPU workers are active (for supervised setups such as HiveOS)"
+    )]
+    pub exit_on_disconnect: bool,
+
+    #[clap(
         long = "recover-escrow-api",
         help = "Base URL of the Keryx API to use for escrow recovery",
         help_heading = "OPoI / Inference",
