@@ -142,10 +142,10 @@ This is a concept proof, not a finished feature. In particular:
 - `keryx-node`, branch `shard-poc`: commit `76aa3c6f` (shard tier table + gating scaffold, then
   a placeholder row), commit `ecb0f09e` (real manifest data + the `SIMNET_PARAMS` activation
   profile from §3).
-- `keryx-miner`, branch `shard-poc`: commits `3cf1bd4` (shard registry + install path), `15649ec`
-  (`--shard`/`--print-shards` CLI), `ba2aa2f` (wiring into tier assignment and the mining loop),
-  `b9c0990` (OPoI-gate exemption for shard devices), `183d3e5` (idle-chain template re-poll
-  fix), `645fd5d` (the two diagnostic examples in §5).
+- `keryx-miner`, branch `shard-poc`: commits `3aa1598` (shard registry + install path), `177a33a`
+  (`--shard`/`--print-shards` CLI), `79099bd` (wiring into tier assignment and the mining loop),
+  `fba09c8` (OPoI-gate exemption for shard devices), `af7ebee` (idle-chain template re-poll
+  fix), `7136086` (the two diagnostic examples in §5).
 - To rerun the in-process proof or the guard check: `cargo run --example shard_walk_poc
   --features cuda` / `cargo run --example shard_guard_poc --features cuda` from the miner repo
   (both accept `--gguf-path`, `--target-bytes`, and `--mainnet` flags; default to the

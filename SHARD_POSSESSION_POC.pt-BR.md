@@ -159,10 +159,10 @@ Isto é uma prova de conceito, não uma funcionalidade terminada. Em particular:
 - `keryx-node`, branch `shard-poc`: commit `76aa3c6f` (tabela de tiers de fatia + esqueleto do
   gate, com uma linha placeholder), commit `ecb0f09e` (dados reais do manifest + o perfil de
   ativação do `SIMNET_PARAMS` do §3).
-- `keryx-miner`, branch `shard-poc`: commits `3cf1bd4` (registro de fatia + caminho de
-  instalação), `15649ec` (CLI `--shard`/`--print-shards`), `ba2aa2f` (integração na atribuição de
-  tiers e no loop de mineração), `b9c0990` (isenção do gate de OPoI pra dispositivos de fatia),
-  `183d3e5` (correção do re-poll de template em chain ociosa), `645fd5d` (os dois exemplos de
+- `keryx-miner`, branch `shard-poc`: commits `3aa1598` (registro de fatia + caminho de
+  instalação), `177a33a` (CLI `--shard`/`--print-shards`), `79099bd` (integração na atribuição de
+  tiers e no loop de mineração), `fba09c8` (isenção do gate de OPoI pra dispositivos de fatia),
+  `af7ebee` (correção do re-poll de template em chain ociosa), `7136086` (os dois exemplos de
   diagnóstico do §5).
 - Pra rodar de novo a prova em processo único ou a checagem do guard: `cargo run --example
   shard_walk_poc --features cuda` / `cargo run --example shard_guard_poc --features cuda` a
