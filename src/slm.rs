@@ -9,8 +9,9 @@ use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::models::ModelSpec;
 
@@ -439,24 +440,156 @@ pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     Ok(())
 }
 
-fn unavailable_models() -> &'static RwLock<HashSet<[u8; 32]>> {
-    static MODELS: OnceLock<RwLock<HashSet<[u8; 32]>>> = OnceLock::new();
-    MODELS.get_or_init(|| RwLock::new(HashSet::new()))
+/// A model withdrawn from `ai:cap`, with the schedule of its next serve probe (`None` = stays
+/// withdrawn until the miner restarts).
+struct Withdrawal {
+    reason: String,
+    attempts: u32,
+    next_probe: Option<Instant>,
+}
+
+fn unavailable_models() -> &'static RwLock<HashMap<[u8; 32], Withdrawal>> {
+    static MODELS: OnceLock<RwLock<HashMap<[u8; 32], Withdrawal>>> = OnceLock::new();
+    MODELS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Probe recoveries per model since its last served response.
+fn probe_recoveries() -> &'static RwLock<HashMap<[u8; 32], u32>> {
+    static RECOVERIES: OnceLock<RwLock<HashMap<[u8; 32], u32>>> = OnceLock::new();
+    RECOVERIES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+const PROBE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
+const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+/// Probe recoveries without a served response in between after which a model stays withdrawn.
+const MAX_PROBE_RECOVERIES: u32 = 2;
+const PROBE_TICK: Duration = Duration::from_secs(15);
+const PROBE_PROMPT: &str = "Reply with one word: OK";
+const PROBE_MAX_TOKENS: usize = 8;
+
+static PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Generations in flight (requests, challenges and probes).
+static SERVING: AtomicUsize = AtomicUsize::new(0);
+
+struct ServingGuard;
+
+impl ServingGuard {
+    fn new() -> Self {
+        SERVING.fetch_add(1, Ordering::AcqRel);
+        ServingGuard
+    }
+}
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        SERVING.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Withdrawal reasons a later probe can clear: the engine may load the model next time.
+fn probeable(reason: &str) -> bool {
+    matches!(reason, "llama_load_failed" | "llama_load_oom" | "llama_engine_load_failed" | "llama_engine_oom")
+}
+
+fn probe_backoff(attempts: u32) -> Duration {
+    PROBE_BACKOFF_INITIAL.saturating_mul(1u32 << attempts.min(16)).min(PROBE_BACKOFF_MAX)
 }
 
 /// Withdraw a model from `ai:cap`: the files are on disk but this miner cannot serve it right
 /// now. Announcing it anyway earns assigned requests it cannot answer, hence service-bond strikes.
+/// The GPUs mining its tier park until it serves again.
 pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
-    if unavailable_models().write().unwrap().insert(*model_id) {
-        log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({})", hex::encode(model_id), reason);
+    let recoveries = probe_recoveries().read().unwrap().get(model_id).copied().unwrap_or(0);
+    let mut models = unavailable_models().write().unwrap();
+    if models.contains_key(model_id) {
+        return;
+    }
+    let retry = probeable(reason) && recoveries < MAX_PROBE_RECOVERIES;
+    let next_probe = retry.then(|| Instant::now() + PROBE_BACKOFF_INITIAL);
+    models.insert(*model_id, Withdrawal { reason: reason.to_string(), attempts: 0, next_probe });
+    drop(models);
+    let id = hex::encode(model_id);
+    if retry {
+        log::warn!(
+            "SlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked until it serves again, first probe in {}s",
+            id, reason, PROBE_BACKOFF_INITIAL.as_secs()
+        );
+    } else if probeable(reason) {
+        log::error!(
+            "SlmEngine: model {:.8} withdrawn from ai:cap ({}) after {} probe recoveries — mining on its tier stays parked; restart the miner or change its tier assignment",
+            id, reason, recoveries
+        );
+    } else {
+        log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked", id, reason);
     }
 }
 
 /// Re-announce a model after it serves again.
 pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
-    if unavailable_models().write().unwrap().remove(model_id) {
-        log::info!("SlmEngine: model {:.8} back in ai:cap ({})", hex::encode(model_id), reason);
+    if reason == "generation_success" {
+        note_recovery(model_id, PROBE_IN_FLIGHT.load(Ordering::Acquire));
     }
+    if unavailable_models().write().unwrap().remove(model_id).is_some() {
+        log::info!("SlmEngine: model {:.8} back in ai:cap ({}) — mining on its tier resumes", hex::encode(model_id), reason);
+    }
+}
+
+/// A served response resets the model's probe-recovery count; a probe recovery raises it.
+fn note_recovery(model_id: &[u8; 32], from_probe: bool) {
+    let mut recoveries = probe_recoveries().write().unwrap();
+    if from_probe {
+        *recoveries.entry(*model_id).or_insert(0) += 1;
+    } else {
+        recoveries.remove(model_id);
+    }
+}
+
+fn schedule_next_probe(model_id: &[u8; 32]) {
+    let mut models = unavailable_models().write().unwrap();
+    let Some(w) = models.get_mut(model_id) else { return };
+    if w.next_probe.is_none() {
+        return;
+    }
+    w.attempts += 1;
+    let delay = probe_backoff(w.attempts);
+    w.next_probe = Some(Instant::now() + delay);
+    log::warn!(
+        "SlmEngine: model {:.8} still cannot serve ({}) — probe {} failed, next probe in {}s",
+        hex::encode(model_id), w.reason, w.attempts, delay.as_secs()
+    );
+}
+
+/// How often the probe task looks for a withdrawn model due for a serve probe.
+pub fn probe_tick() -> Duration {
+    PROBE_TICK
+}
+
+pub fn probe_in_flight() -> bool {
+    PROBE_IN_FLIGHT.load(Ordering::Acquire)
+}
+
+/// The withdrawn model whose probe is due, when nothing is generating.
+pub fn withdrawn_model_due_for_probe() -> Option<[u8; 32]> {
+    if publishing_blocked() || probe_in_flight() || SERVING.load(Ordering::Acquire) > 0 {
+        return None;
+    }
+    let now = Instant::now();
+    let models = unavailable_models().read().unwrap();
+    models.iter().filter(|(_, w)| w.next_probe.is_some_and(|t| t <= now)).map(|(id, _)| *id).min()
+}
+
+/// Try to serve a withdrawn model again; it is re-announced on success. Blocking.
+pub fn probe_withdrawn_model(model_id: &[u8; 32]) -> bool {
+    if PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    log::info!("SlmEngine: probing withdrawn model {:.8}", hex::encode(model_id));
+    let served = load_and_run_inference(model_id, PROBE_PROMPT, PROBE_MAX_TOKENS).is_some();
+    if !served {
+        schedule_next_probe(model_id);
+    }
+    PROBE_IN_FLIGHT.store(false, Ordering::Release);
+    served
 }
 
 /// The registry entry that owns this model_id — the caller's spec must not decide where a model
@@ -469,8 +602,13 @@ fn registered_spec(spec: &ModelSpec) -> Result<&'static ModelSpec> {
         .ok_or_else(|| anyhow!("model '{}' is not registered", spec.name))
 }
 
-fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
-    unavailable_models().read().unwrap().contains(model_id)
+pub fn model_is_unavailable(model_id: &[u8; 32]) -> bool {
+    unavailable_models().read().unwrap().contains_key(model_id)
+}
+
+#[cfg(test)]
+fn withdrawal_state(model_id: &[u8; 32]) -> Option<(u32, bool)> {
+    unavailable_models().read().unwrap().get(model_id).map(|w| (w.attempts, w.next_probe.is_some()))
 }
 
 /// Raised while the public gateways cannot fetch from this miner's IPFS node: every model is
@@ -678,6 +816,7 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
 /// submitted): a miner must not be rewarded for garbage.
 pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize) -> Option<String> {
+    let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
 
@@ -881,5 +1020,66 @@ mod tests {
         let other = [0xc1u8; 32];
         mark_model_unavailable(&model_id, "again");
         assert!(!model_is_unavailable(&other));
+    }
+
+    #[test]
+    fn a_load_failure_schedules_a_probe_and_backs_off() {
+        let model_id = [0xd4u8; 32];
+        mark_model_unavailable(&model_id, "llama_load_failed");
+        assert_eq!(withdrawal_state(&model_id), Some((0, true)));
+
+        schedule_next_probe(&model_id);
+        schedule_next_probe(&model_id);
+        assert_eq!(withdrawal_state(&model_id), Some((2, true)));
+        assert_eq!(probe_backoff(0), PROBE_BACKOFF_INITIAL);
+        assert_eq!(probe_backoff(1), PROBE_BACKOFF_INITIAL * 2);
+        assert_eq!(probe_backoff(20), PROBE_BACKOFF_MAX);
+
+        mark_model_available(&model_id, "generation_success");
+        assert_eq!(withdrawal_state(&model_id), None);
+    }
+
+    #[test]
+    fn an_integrity_withdrawal_is_never_probed() {
+        let model_id = [0xe5u8; 32];
+        mark_model_unavailable(&model_id, "integrity_mismatch");
+        assert_eq!(withdrawal_state(&model_id), Some((0, false)));
+        schedule_next_probe(&model_id);
+        assert_eq!(withdrawal_state(&model_id), Some((0, false)));
+        mark_model_available(&model_id, "integrity_verified");
+    }
+
+    #[test]
+    fn repeated_probe_recoveries_make_the_withdrawal_permanent() {
+        let model_id = [0xf6u8; 32];
+        for _ in 0..MAX_PROBE_RECOVERIES {
+            mark_model_unavailable(&model_id, "llama_load_oom");
+            assert_eq!(withdrawal_state(&model_id), Some((0, true)));
+            note_recovery(&model_id, true);
+            mark_model_available(&model_id, "probe");
+        }
+        mark_model_unavailable(&model_id, "llama_load_oom");
+        assert_eq!(withdrawal_state(&model_id), Some((0, false)));
+
+        // A served response resets the count: the next withdrawal probes again.
+        note_recovery(&model_id, false);
+        mark_model_available(&model_id, "served");
+        mark_model_unavailable(&model_id, "llama_load_oom");
+        assert_eq!(withdrawal_state(&model_id), Some((0, true)));
+        mark_model_available(&model_id, "cleanup");
+    }
+
+    #[test]
+    fn a_probe_is_only_due_when_nothing_generates() {
+        let model_id = [0x1au8; 32];
+        unavailable_models().write().unwrap().insert(
+            model_id,
+            Withdrawal { reason: "llama_load_failed".into(), attempts: 0, next_probe: Some(Instant::now()) },
+        );
+        let guard = ServingGuard::new();
+        assert_eq!(withdrawn_model_due_for_probe(), None);
+        drop(guard);
+        assert!(withdrawn_model_due_for_probe().is_some());
+        unavailable_models().write().unwrap().remove(&model_id);
     }
 }

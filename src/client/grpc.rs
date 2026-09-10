@@ -582,7 +582,7 @@ impl KeryxdHandler {
     }
 
     fn try_start_inference(&mut self) {
-        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() {
+        if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || keryx_miner::slm::probe_in_flight() {
             return;
         }
         if let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {

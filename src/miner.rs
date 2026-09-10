@@ -401,7 +401,10 @@ impl MinerManager {
                                     None => { state = None; continue; }
                                 }
                             }
-                            keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa);
+                        }
+                        if !keryx_miner::pom_gpu::ensure_installed(worker_device_id, daa) {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
                         let walk_v2 = daa >= keryx_miner::pom::h5_activation_daa();

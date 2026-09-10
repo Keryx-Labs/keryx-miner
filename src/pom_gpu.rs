@@ -1468,6 +1468,10 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if inference_paused() {
         return false;
     }
+    if mining_model_id(device_id).is_some_and(|m| crate::slm::model_is_unavailable(&m)) {
+        park(device_id);
+        return false;
+    }
     if is_installed(device_id) {
         return true;
     }
@@ -1479,6 +1483,19 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     drop(guard);
     LOADING.fetch_sub(1, Ordering::Relaxed);
     ok
+}
+
+/// Uninstall a device whose mining model is withdrawn from `ai:cap`; it idles until the model
+/// serves again.
+fn park(device_id: u32) {
+    if !is_installed(device_id) {
+        return;
+    }
+    let lock = device_lifecycle(device_id);
+    let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    uninstall(device_id);
+    drop(guard);
+    log::warn!("PoM[gpu{}]: parked — its mining model is withdrawn from ai:cap", device_id);
 }
 
 /// PoM tier index of the mining model at a given block DAA. Recomputed per block (not frozen

@@ -601,6 +601,10 @@ impl StratumHandler {
             warn!("AI request {}: model is not ready", request.task_id);
             return;
         }
+        let probe_deadline = Instant::now() + Duration::from_secs(20);
+        while keryx_miner::slm::probe_in_flight() && Instant::now() < probe_deadline {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         if self.ai_response.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
             warn!("AI request {}: inference is busy", request.task_id);
             return;

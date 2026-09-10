@@ -1263,6 +1263,25 @@ async fn run() -> Result<(), Error> {
         });
     }
 
+    {
+        let shutdown = Arc::clone(&shutdown_requested);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(keryx_miner::slm::probe_tick()).await;
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(model_id) = keryx_miner::slm::withdrawn_model_due_for_probe() {
+                    if let Err(e) =
+                        tokio::task::spawn_blocking(move || keryx_miner::slm::probe_withdrawn_model(&model_id)).await
+                    {
+                        warn!("SlmEngine: probe task failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             info!("Shutdown requested, exiting miner main loop");
