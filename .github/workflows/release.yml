@@ -217,15 +217,15 @@ jobs:
           restore-keys: |
             llama-windows-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-
 
+      # Default (PowerShell) shell on purpose: under bash, Git's GNU `link` shadows MSVC's link.exe.
       - name: Build keryx-miner.exe, keryxcuda.dll and keryx-llama.dll
-        shell: bash
         env:
           CUDA_HOME: ${{ env.CUDA_PATH }}
           NVCC: ${{ env.CUDA_PATH }}\bin\nvcc.exe
           # The runner's MSVC minor version may be newer than the one this CUDA release was qualified against.
           NVCC_PREPEND_FLAGS: -allow-unsupported-compiler
         run: |
-          nvcc --version | tail -2
+          nvcc --version
           cargo build --release -p keryx-miner -p keryxcuda
 
       - name: Check the CUDA architectures embedded in keryx-llama.dll
