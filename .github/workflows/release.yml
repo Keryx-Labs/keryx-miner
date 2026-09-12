@@ -1,0 +1,261 @@
+name: release
+
+# Builds the miner for Linux (x86_64, glibc >= 2.34) and Windows (x86_64, MSVC) and attaches the
+# packages to a single draft GitHub Release:
+#   keryx-miner-<tag>-linux-amd64.zip   keryx-miner + libkeryxcuda.so + libkeryx-llama.so
+#                                       + the CUDA runtime it links (libcudart, libcublas, libcublasLt)
+#   keryx-miner-<tag'>_hiveos.tar.gz    same files + integrations/hiveos scripts, folder keryx-miner/
+#                                       (<tag'> = tag with '-' replaced by '_': HiveOS derives the
+#                                       miner name from the archive name, cut at the LAST dash)
+#   keryx-miner-<tag>-win64-amd64.zip   keryx-miner.exe + keryxcuda.dll + keryx-llama.dll + CUDA runtime DLLs
+# Trigger by pushing a version tag (`git tag v0.5.5-PoM && git push origin v0.5.5-PoM`), or run
+# manually from the Actions tab (a `v0.0.0-dev-<run>` draft is created for testing; delete it after).
+# The release is left as a DRAFT for the notes and a manual publish.
+#
+# One build per OS, CUDA 12.9, native kernels for sm_70..sm_120 (Volta to Blackwell; RTX 50 need
+# sm_120 and abort on the first inference without it). The package carries its own CUDA runtime:
+# the HiveOS run script puts the package directory first in LD_LIBRARY_PATH, desktop users set it
+# themselves or rely on an installed CUDA 12 runtime. A CUDA 12 runtime works with any 12-series
+# driver (>= 525) since nothing is JIT-compiled at run time. NOT YET VERIFIED on a driver-535 HiveOS
+# rig: keep the first release built this way as a draft until such a rig has mined and served an
+# inference with it.
+#
+# The PoM fatbins under cuda/ are repository artifacts and are shipped as committed; nvcc is still
+# required at build time for the PTX ladder and for libkeryx-llama. The first run builds llama.cpp
+# (pinned tag, eight CUDA architectures) and takes hours; later runs restore it from the cache.
+# Every job lists the architectures embedded in the llama library with cuobjdump and fails when one
+# it must ship is missing.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LLAMA_TAG: b10015
+  CUDA_VERSION: "12.9.1"
+  KERYX_LLAMA_ARCHS: "70;75;80;86;89;90;100;120"
+  NUM_JOBS: "4"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.mk.outputs.release_tag }}
+    steps:
+      - name: Create the draft release (once)
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isTag = context.ref.startsWith('refs/tags/');
+            const tag = isTag ? context.ref.replace('refs/tags/', '') : `v0.0.0-dev-${context.runNumber}`;
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: `Keryx-miner-${tag}`,
+              body: 'keryx-miner for Linux, HiveOS and Windows. Release notes to come.',
+              draft: true,
+              prerelease: false,
+            });
+            core.setOutput('release_tag', tag);
+
+  build-linux:
+    needs: create-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    name: Build linux-amd64 + hiveos
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
+
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache the llama.cpp checkout and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/llama-src-${{ env.LLAMA_TAG }}
+            target/llama-build-${{ env.LLAMA_TAG }}
+          key: llama-linux-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('tools/keryx-llama/**', 'build.rs') }}
+          restore-keys: |
+            llama-linux-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-
+
+      - name: Build keryx-miner, libkeryxcuda.so and libkeryx-llama.so
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
+          NVCC: ${{ env.CUDA_PATH }}/bin/nvcc
+        run: |
+          nvcc --version | tail -2
+          cargo build --release -p keryx-miner -p keryxcuda
+
+      - name: Check the build products
+        run: |
+          set -e
+          ls -la target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so
+          echo "highest glibc symbol version required:"
+          objdump -T target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so | grep -oE 'GLIBC_2\.[0-9]+' | sort -Vu | tail -1
+          # Only the CUDA driver/runtime libraries may be unresolved on a GPU-less runner.
+          ldd target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so | grep 'not found' | grep -vE 'libcuda|libcublas|libcudart|libcurand' && exit 1 || true
+
+      - name: Check the CUDA architectures embedded in libkeryx-llama.so
+        run: |
+          set -e
+          "$CUDA_PATH/bin/cuobjdump" -lelf target/release/libkeryx-llama.so | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | sort -k2 -V
+          have="$("$CUDA_PATH/bin/cuobjdump" -lelf target/release/libkeryx-llama.so | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')"
+          for want in sm_70 sm_86 sm_90 sm_120; do
+            case " $have " in *" $want "*) ;; *) echo "::error::libkeryx-llama.so lacks $want kernels (has: $have)"; exit 1 ;; esac
+          done
+
+      - name: Stage the package files
+        run: |
+          mkdir -p dist/stage
+          cp target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so dist/stage/
+          libdir="$CUDA_PATH/targets/x86_64-linux/lib"
+          cp -L "$libdir/libcudart.so.12" "$libdir/libcublas.so.12" "$libdir/libcublasLt.so.12" dist/stage/
+          ls -la dist/stage
+
+      - name: Package (Linux zip)
+        run: |
+          tag="${{ needs.create-release.outputs.release_tag }}"
+          archive="dist/keryx-miner-${tag}-linux-amd64.zip"
+          (cd dist/stage && zip -j "../../$archive" *)
+          echo "archive_linux=$archive" >> "$GITHUB_ENV"
+
+      - name: Package (HiveOS tarball)
+        run: |
+          tag="${{ needs.create-release.outputs.release_tag }}"
+          version="${tag#v}"; version="${version%%-*}"
+          stage="dist/hiveos/keryx-miner"
+          mkdir -p "$stage"
+          cp dist/stage/* "$stage/"
+          cp integrations/hiveos/h-config.sh integrations/hiveos/h-run.sh integrations/hiveos/h-stats.sh \
+             integrations/hiveos/h-stop.sh integrations/hiveos/pre-hive-upgrade.sh "$stage/"
+          (cd "$stage" && bash "$GITHUB_WORKSPACE/integrations/hiveos/createmanifest.sh" "$version" keryx-miner)
+          chmod +x "$stage"/*.sh "$stage/keryx-miner"
+          archive="dist/keryx-miner-${tag//-/_}_hiveos.tar.gz"
+          tar -C dist/hiveos -czf "$archive" keryx-miner
+          tar tzf "$archive"
+          echo "archive_hiveos=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload to the draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.release_tag }}
+          draft: true
+          files: |
+            ${{ env.archive_linux }}
+            ${{ env.archive_hiveos }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows:
+    needs: create-release
+    runs-on: windows-2022
+    timeout-minutes: 360
+    name: Build win64-amd64
+    steps:
+      - name: Fix CRLF on Windows
+        run: git config --global core.autocrlf false
+
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up the MSVC environment (cl.exe for nvcc)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "visual_studio_integration"]'
+
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache the llama.cpp checkout and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/llama-src-${{ env.LLAMA_TAG }}
+            target/llama-build-${{ env.LLAMA_TAG }}
+          key: llama-windows-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('tools/keryx-llama/**', 'build.rs') }}
+          restore-keys: |
+            llama-windows-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-
+
+      - name: Build keryx-miner.exe, keryxcuda.dll and keryx-llama.dll
+        shell: bash
+        env:
+          CUDA_HOME: ${{ env.CUDA_PATH }}
+          NVCC: ${{ env.CUDA_PATH }}\bin\nvcc.exe
+          # The runner's MSVC minor version may be newer than the one this CUDA release was qualified against.
+          NVCC_PREPEND_FLAGS: -allow-unsupported-compiler
+        run: |
+          nvcc --version | tail -2
+          cargo build --release -p keryx-miner -p keryxcuda
+
+      - name: Check the CUDA architectures embedded in keryx-llama.dll
+        shell: bash
+        run: |
+          set -e
+          "$CUDA_PATH/bin/cuobjdump.exe" -lelf target/release/keryx-llama.dll | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | sort -k2 -V
+          have="$("$CUDA_PATH/bin/cuobjdump.exe" -lelf target/release/keryx-llama.dll | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')"
+          for want in sm_70 sm_86 sm_90 sm_120; do
+            case " $have " in *" $want "*) ;; *) echo "::error::keryx-llama.dll lacks $want kernels (has: $have)"; exit 1 ;; esac
+          done
+
+      - name: Package (Windows zip)
+        shell: bash
+        run: |
+          mkdir -p dist/win
+          cp target/release/keryx-miner.exe target/release/keryxcuda.dll target/release/keryx-llama.dll dist/win/
+          # CUDA runtime DLLs the two libraries load at run time.
+          cp "$CUDA_PATH"/bin/cublas64_12.dll "$CUDA_PATH"/bin/cublasLt64_12.dll "$CUDA_PATH"/bin/cudart64_12.dll dist/win/
+          cp "$CUDA_PATH"/bin/curand64_10.dll dist/win/
+          ls -la dist/win
+          archive="dist/keryx-miner-${{ needs.create-release.outputs.release_tag }}-win64-amd64.zip"
+          powershell "Compress-Archive -Path dist/win/* -DestinationPath \"$archive\""
+          echo "archive=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload to the draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.release_tag }}
+          draft: true
+          files: ${{ env.archive }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
