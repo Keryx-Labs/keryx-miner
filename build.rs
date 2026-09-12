@@ -26,10 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=POM_FATBIN_NEXTGEN");
     println!("cargo:rerun-if-changed=cuda/pom_mine_legacy.fatbin");
     println!("cargo:rerun-if-changed=cuda/pom_mine_nextgen.fatbin");
-    let nvcc = env::var("NVCC").ok().unwrap_or_else(|| {
-        let pinned = "/home/slash/cuda-12.2/bin/nvcc";
-        if std::path::Path::new(pinned).exists() { pinned.to_string() } else { "nvcc".to_string() }
-    });
+    let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
     {
         let out_dir = env::var("OUT_DIR").unwrap();
         let sm_list = env::var("POM_SM_LIST").unwrap_or_else(|_| "90,89,86,80,75,70,61".to_string());
@@ -143,10 +140,10 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
-    // Ship real kernels for common GPUs plus compute_89 PTX, which drivers JIT-forward
-    // to newer architectures such as Blackwell. Override for machine-specific builds.
+    // Native kernels for every supported GPU generation (Volta to Blackwell); needs nvcc >= 12.8.
+    // Override with a shorter list for a faster development build.
     let archs = env::var("KERYX_LLAMA_ARCHS")
-        .unwrap_or_else(|_| "75-real;80-real;86-real;89-real;89-virtual".to_string());
+        .unwrap_or_else(|_| "70;75;80;86;89;90;100;120".to_string());
     let mut cfg = std::process::Command::new("cmake");
     cfg.arg("-S").arg(&src)
         .arg("-B").arg(&build_dir)
@@ -253,7 +250,15 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Resolves the CUDA toolkit root for include/lib paths from the nvcc in use.
 fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    let p = std::path::Path::new(nvcc);
+    let mut p = std::path::PathBuf::from(nvcc);
+    if p.components().count() == 1 {
+        // Bare name: resolve it on PATH so the toolkit root can be derived from it.
+        if let Some(found) = env::var_os("PATH").and_then(|paths| {
+            env::split_paths(&paths).map(|dir| dir.join(nvcc)).find(|cand| cand.is_file())
+        }) {
+            p = found;
+        }
+    }
     if let Some(root) = p.parent().and_then(|bin| bin.parent()) {
         if root.components().count() > 0 && root.join("include").exists() {
             return Ok(root.to_path_buf());
