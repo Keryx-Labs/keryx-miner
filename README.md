@@ -8,7 +8,15 @@ Proof of work is **PoM — Proof of Model**: every nonce walks the weights of th
 
 ## Precompiled Binaries
 
-Download the latest release from the [Releases page](https://github.com/Keryx-Labs/keryx-miner/releases).
+Download the latest release from the [Releases page](https://github.com/Keryx-Labs/keryx-miner/releases). Each release ships three packages, built by CI from the tagged source:
+
+| Package | For |
+|---------|-----|
+| `keryx-miner-<version>-linux-amd64.zip` | Linux desktop and servers (glibc 2.34+) |
+| `keryx-miner-<version>_hiveos.tar.gz` | HiveOS rigs (install as a custom miner from the archive URL) |
+| `keryx-miner-<version>-win64-amd64.zip` | Windows 10/11 |
+
+Every package carries native CUDA kernels for **every GPU from Volta to Blackwell** (sm_70 to sm_120: GTX 16xx, RTX 20/30/40/50, V100, A100, H100, B200) and the CUDA runtime libraries it needs, next to the binary. The only host requirement is an NVIDIA driver from the CUDA 12 era (**525 or newer**; HiveOS 535 included). Pascal (GTX 10xx) cannot hold the smallest model and is not supported.
 
 ---
 
@@ -17,68 +25,28 @@ Download the latest release from the [Releases page](https://github.com/Keryx-La
 ### Requirements
 
 - Rust + Cargo ([rustup.rs](https://rustup.rs/))
-- `protoc` (`protobuf-compiler`)
-- `cmake` and `git` (the inference engine builds llama.cpp from source)
-- **CUDA 12.2 toolkit** — `nvcc` is mandatory, there is no CUDA-less build: `build.rs` compiles the PoM mining kernel into a PTX ladder on every build, and the miner cannot mine without it
-- **GCC ≤ 12** (Ubuntu 22.04 / GCC 11 works out of the box); on newer hosts use Option B
+- `protoc` (`protobuf-compiler`), `cmake`, `git` (the inference engine builds llama.cpp from source)
+- **CUDA toolkit 12.8 or newer** (releases use 12.9) with a host compiler it supports (Ubuntu 22.04 / GCC 11 works out of the box). `nvcc` is mandatory: `build.rs` compiles the PoM mining kernel into a PTX ladder and builds the inference engine. A 12.2 toolkit builds too with `KERYX_LLAMA_ARCHS="70;75;80;86;89;90"`, but the engine then has no Blackwell kernels and an RTX 50 is refused at startup by the engine check.
 
-CUDA **12.2** specifically: nvcc 12.2 emits code that runs on **NVIDIA driver ≥ 535**, whereas newer toolkits raise that floor (HiveOS commonly ships 535.x). The two prebuilt PoM fatbins are committed to the repo and are simply embedded by the build — you never need to regenerate them unless you change `cuda/pom_mine.cu`, in which case see [cuda/README.md](cuda/README.md).
-
-### Option A — CUDA 12.2 toolkit installed on host (recommended)
-
-Install the toolkit side-by-side (runfile, toolkit-only, no driver), then point the build at it:
+### Build
 
 ```bash
-# one-time: install the CUDA 12.2 toolkit to ~/cuda-12.2 (no driver, no root needed)
-wget https://developer.download.nvidia.com/compute/cuda/12.2.2/local_installers/cuda_12.2.2_535.104.05_linux.run
-bash cuda_12.2.2_535.104.05_linux.run --silent --toolkit --toolkitpath="$HOME/cuda-12.2" --override
-
 git clone https://github.com/Keryx-Labs/keryx-miner.git
 cd keryx-miner
-CUDA_ROOT="$HOME/cuda-12.2" CUDA_PATH="$HOME/cuda-12.2" \
-  PATH="$HOME/cuda-12.2/bin:$PATH" \
-  cargo build --release
+cargo build --release
 ```
 
-Produces `target/release/keryx-miner` plus `libkeryx-llama.so` next to it. **Both are needed** — the inference engine is loaded from that shared object at runtime, so keep them together when you move the binary.
+`nvcc` must be on your `PATH` (or set `NVCC=/path/to/nvcc`); the toolkit root is derived from it. Produces three files in `target/release/`, which must stay together: `keryx-miner`, `libkeryxcuda.so` (the mining plugin) and `libkeryx-llama.so` (the inference engine, loaded at runtime).
 
-The first build clones and compiles llama.cpp (cached under `target/`, near no-op on rebuilds). Its GPU architectures come from `KERYX_LLAMA_ARCHS`, default `75-real;80-real;86-real;89-real;89-virtual`. Official releases use a wider set:
+The first build clones and compiles llama.cpp for every supported GPU generation (long; cached under `target/`, near no-op afterwards). For a faster development build on one card, restrict the list, e.g. `KERYX_LLAMA_ARCHS="86" cargo build --release` for an RTX 30xx. `KERYX_LLAMA_SKIP=1` skips the engine build entirely; a prebuilt `libkeryx-llama.so` must then sit next to the binary.
 
-```bash
-KERYX_LLAMA_ARCHS="70;75;80;86;89;90" cargo build --release
-```
+Windows builds the same way with the CUDA toolkit and Visual Studio 2022 installed; see `.github/workflows/release.yml` for the exact steps the releases use.
 
-`KERYX_LLAMA_SKIP=1` skips that step entirely, but a prebuilt `libkeryx-llama.so` must then sit next to the binary or no tier can be mined.
+### Runtime libraries
 
-### Option B — CUDA 13.x or incompatible gcc on host (build via container)
+The engine links `libcudart.so.12`, `libcublas.so.12` and `libcublasLt.so.12` from the toolkit you built with. The binary and the engine look for them **next to themselves first**, so copy the three files from `$CUDA_PATH/targets/x86_64-linux/lib/` into `target/release/` (this is what the release packages do), or keep the toolkit's library directory on the system library path. Mining itself needs only `libcuda.so.1`, which comes with the driver.
 
-If your system has CUDA 13.x or gcc 13+ (e.g. Fedora 40+, Ubuntu 25+), build inside a CUDA 12.2 container. The binary runs on the host via driver forward-compatibility.
-
-Requires: [Podman](https://podman.io/) (rootless) or Docker, NVIDIA driver ≥ 535.
-
-```bash
-cd keryx-miner
-podman run --rm --security-opt label=disable \
-  -v "$PWD":/src -w /src \
-  -e CARGO_TARGET_DIR=/src/target-cuda \
-  docker.io/nvidia/cuda:12.2.2-devel-ubuntu22.04 \
-  bash -c '
-    apt-get update -qq && apt-get install -y -qq \
-      curl build-essential cmake git pkg-config libssl-dev ca-certificates protobuf-compiler >/dev/null 2>&1
-    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null 2>&1
-    . "$HOME/.cargo/env"
-    export CUDA_PATH=/usr/local/cuda PROTOC=/usr/bin/protoc
-    export KERYX_LLAMA_ARCHS="70;75;80;86;89;90"
-    cargo build --release'
-```
-
-Binary and `libkeryx-llama.so`: `target-cuda/release/`.
-
-> This path has **not been re-tested since the llama.cpp migration**. `cmake`, `git` and an explicit `KERYX_LLAMA_ARCHS` were added because the container has no GPU to auto-detect; if it fails, Option A on a distro with GCC ≤ 12 is the supported route.
-
-> **Runtime dependencies.** Mining needs only `libcuda.so.1` (the driver). Inference additionally `dlopen`s `libcublas.so.12` and `libcurand.so.10`, so the host must have the matching CUDA 12.2 runtime libs (`libcublas-12-2`, `libcurand-12-2`). On HiveOS the miner installs and registers them automatically on first run; on other hosts install them via your package manager or the CUDA 12.2 toolkit.
-
-> **Blackwell (RTX 50xx).** Nothing to configure: the committed nextgen fatbin carries native `sm_89`/`sm_90`/`sm_100`/`sm_120` SASS, so a 50-series card runs native code with no JIT. This matters — a Blackwell card falling back to JIT from PTX emitted by CUDA 12.2 loses roughly half its hashrate (measured on RTX 5090 and 5080). If you ever rebuild the fatbins yourself, the nextgen one requires CUDA ≥ 12.8; see [cuda/README.md](cuda/README.md).
+The two prebuilt PoM fatbins are committed to the repo and embedded as they are; regenerate them only if you change `cuda/pom_mine.cu` (see [cuda/README.md](cuda/README.md)).
 
 ---
 
@@ -89,6 +57,12 @@ Binary and `libkeryx-llama.so`: `target-cuda/release/`.
 ```
 
 Inference is not optional. A miner that holds no model cannot prove possession and cannot mine — there is no PoW-only mode.
+
+### Startup checks
+
+Before mining, the miner verifies that the CUDA runtime and the inference engine load, then runs a tiny kernel on **each mining GPU** through the engine. A library without kernels for one of your cards makes the miner stop with a message naming the GPU, instead of aborting on the first inference request hours later (which costs strikes). `--skip-engine-probe` bypasses that last check if you are sure it is wrong.
+
+`--exit-on-disconnect` makes the miner exit instead of reconnecting when the node or pool connection drops while the GPUs are active, for supervised setups (HiveOS, pm2) that restart it.
 
 ### Model tiers
 
@@ -153,9 +127,9 @@ If the miner still downloads a model although the folder is there, check your ti
 
 ### Escrow state durability
 
-Escrow keys and claim state are written through a same-directory temporary file, synced, and atomically installed. An unreadable key or malformed state file stops escrow initialization without replacing the existing bytes. Recovery output uses the same atomic write path.
+Escrow claim state lives in two files next to the miner: `escrow_state.json`, a snapshot rewritten every 10 minutes (and on shutdown), and `escrow_state.journal`, an append-only log of every change since that snapshot, synced within 2 seconds. On start the snapshot is loaded and the journal replayed, so a crash loses at most the last 2 seconds of claims. Both files are written through a same-directory temporary file and atomically installed; an unreadable key or a malformed snapshot stops escrow initialization without replacing the existing files.
 
-On HiveOS, the durable files live outside the replaceable miner package at `/hive/miners/custom/keryx-miner-state/escrow.key` and `/hive/miners/custom/keryx-miner-state/escrow_state.json`, with directory mode `0700` and file mode `0600`. Back up both files together before an upgrade or manual recovery. Never delete an invalid key to generate another one: restore the original backup because it controls existing rewards. See [`integrations/hiveos/HIVEOS_README.md`](integrations/hiveos/HIVEOS_README.md) for verified migration and rollback steps.
+On HiveOS, the durable files live outside the replaceable miner package, under `/hive/miners/custom/keryx-miner-state/` (`escrow.key`, `escrow_state.json`, `escrow_state.journal`), with directory mode `0700`.
 
 ### All options
 
