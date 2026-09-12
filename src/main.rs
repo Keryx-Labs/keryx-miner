@@ -760,6 +760,12 @@ fn tokio_blocking_threads() -> Option<usize> {
 }
 
 fn main() -> Result<(), Error> {
+    // Hidden child mode of the startup engine check (see llama_engine::probe_device).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(i) = argv.iter().position(|a| a == "--probe-engine-device") {
+        let gpu = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::process::exit(keryx_miner::llama_engine::run_device_probe_child(gpu));
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
     if let Some(n) = tokio_blocking_threads() {
@@ -1222,6 +1228,32 @@ async fn run() -> Result<(), Error> {
         Err(e) => {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
+        }
+    }
+    // A library without kernels for a mining GPU passes the load probe and aborts the process on
+    // the first request; check every mining GPU up front (in a child process) instead.
+    if opt.skip_engine_probe {
+        warn!("Engine device check skipped (--skip-engine-probe).");
+    } else {
+        let mut gpus: Vec<u32> = pom_assignments.iter().map(|(device_id, _, _)| *device_id).collect();
+        gpus.sort_unstable();
+        gpus.dedup();
+        for gpu in gpus {
+            match tokio::task::spawn_blocking(move || keryx_miner::llama_engine::probe_device(gpu as usize)).await {
+                Ok(keryx_miner::llama_engine::DeviceProbe::Ok) => {
+                    info!("GPU {}: inference library verified on this device.", gpu)
+                }
+                Ok(keryx_miner::llama_engine::DeviceProbe::Unknown(why)) => {
+                    warn!("GPU {}: engine device check inconclusive ({}).", gpu, why)
+                }
+                Ok(keryx_miner::llama_engine::DeviceProbe::Unsupported(why)) => {
+                    error!("GPU {}: the inference library cannot run on this device ({}).", gpu, why);
+                    error!("This package has no CUDA kernels for GPU {}: install the release built for this GPU generation.", gpu);
+                    error!("If you are sure this check is wrong, restart with --skip-engine-probe.");
+                    return Err("inference library has no kernels for a mining GPU — cannot start OPoI mining".into());
+                }
+                Err(e) => warn!("GPU {}: engine device check task failed: {}", gpu, e),
+            }
         }
     }
     info!("Found plugins: {:?}", plugins);

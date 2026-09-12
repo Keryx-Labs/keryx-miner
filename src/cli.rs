@@ -118,6 +118,13 @@ pub struct Opt {
     pub recover_escrow: bool,
 
     #[clap(
+        long = "skip-engine-probe",
+        help = "Skip the startup check that the inference library has CUDA kernels for every mining GPU",
+        help_heading = "OPoI / Inference"
+    )]
+    pub skip_engine_probe: bool,
+
+    #[clap(
         long = "exit-on-disconnect",
         help = "Exit instead of reconnecting when the node or pool connection drops while GPU workers are active (for supervised setups such as HiveOS)"
     )]

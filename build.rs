@@ -91,6 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if target_arch == "x86_64" && target_os != "windows" && target_os != "macos" {
         cc::Build::new().flag("-c").file("src/keccakf1600_x86-64.s").compile("libkeccak.a");
     }
+    if target_os == "linux" {
+        // The package ships its CUDA runtime next to the binary; dlopen from the miner must find it.
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+    }
     if target_arch == "x86_64" && target_os == "macos" {
         cc::Build::new().flag("-c").file("src/keccakf1600_x86-64-osx.s").compile("libkeccak.a");
     }
@@ -240,6 +244,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             .arg(format!("-L{}", cuda_home.join("lib64/stubs").display()))
             .arg(format!("-L{}", cuda_home.join("targets/x86_64-linux/lib/stubs").display()))
             .args(["-lcuda", "-lpthread", "-ldl"])
+            // Resolve the CUDA runtime shipped next to the library before any system copy.
+            .arg("-Wl,-rpath,$ORIGIN")
             .arg("-o").arg(&so),
     )?;
     Ok(())

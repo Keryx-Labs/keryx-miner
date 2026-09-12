@@ -13,6 +13,9 @@
 #include "llama.h"
 #include "llama-model.h"
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
 #ifdef __APPLE__
 // Metal: llama.cpp's ggml-metal backend stores quantized tensors in unified-memory MTLBuffers.
 // `t->data` is a CPU-readable pointer into that unified memory (also GPU-visible on Apple Silicon
@@ -221,6 +224,55 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     }
     out[written] = 0;
     return written;
+}
+
+// Runs one tiny graph on `gpu` so a library without kernels for that device fails here rather
+// than on the first request. ggml aborts the process on a missing kernel image: call from a
+// child process. Returns 0 on success.
+KERYX_EXPORT int keryx_llama_probe_device(int gpu) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+    if (gpu < 0 || gpu >= ggml_backend_cuda_get_device_count()) {
+        keryx_set_error("probe", "no such CUDA device");
+        return 1;
+    }
+    ggml_backend_t backend = ggml_backend_cuda_init(gpu);
+    if (!backend) {
+        keryx_set_error("probe", "ggml_backend_cuda_init failed");
+        return 2;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context* ctx = ggml_init(ip);
+    ggml_tensor* a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor* b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+    ggml_tensor* c = ggml_add(ctx, a, b);
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, c);
+    int rc = 0;
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        keryx_set_error("probe", "ggml_backend_alloc_ctx_tensors failed");
+        rc = 3;
+    } else {
+        const float v[4] = { 1.f, 2.f, 3.f, 4.f };
+        ggml_backend_tensor_set(a, v, 0, sizeof v);
+        ggml_backend_tensor_set(b, v, 0, sizeof v);
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            keryx_set_error("probe", "graph compute failed");
+            rc = 4;
+        } else {
+            float out[4] = { 0.f, 0.f, 0.f, 0.f };
+            ggml_backend_tensor_get(c, out, 0, sizeof out);
+            if (out[0] != 2.f || out[3] != 8.f) {
+                keryx_set_error("probe", "graph compute returned wrong values");
+                rc = 5;
+            }
+        }
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return rc;
 }
 
 KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {

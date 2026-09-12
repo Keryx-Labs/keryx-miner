@@ -24,6 +24,7 @@ type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut 
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
+type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 
 const ABI: c_int = 3;
 
@@ -181,6 +182,111 @@ pub fn probe_library() -> Result<std::path::PathBuf, String> {
         }
     }
     Ok(so)
+}
+
+/// Child-process body of the per-GPU engine check: loads the library and runs one tiny graph on
+/// `gpu`. Exit codes: 0 ok, 40 library without the probe symbol, 41 library load failure, 42 probe
+/// failed; a library without kernels for the device aborts the process instead.
+pub fn run_device_probe_child(gpu: usize) -> i32 {
+    let Some(so) = so_path() else {
+        eprintln!("engine probe: library not found next to the miner binary");
+        return 41;
+    };
+    let lib = match unsafe { libloading::Library::new(&so) } {
+        Ok(lib) => lib,
+        Err(e) => {
+            eprintln!("engine probe: {} failed to load: {}", so.display(), e);
+            return 41;
+        }
+    };
+    let (probe, last_error) = unsafe {
+        (sym::<ProbeDeviceFn>(&lib, "keryx_llama_probe_device"), sym::<ErrorFn>(&lib, "keryx_llama_last_error"))
+    };
+    let Some(probe) = probe else {
+        std::mem::forget(lib);
+        return 40;
+    };
+    let rc = unsafe { probe(gpu as c_int) };
+    let code = if rc == 0 {
+        0
+    } else {
+        let why = last_error
+            .map(|f| unsafe { CStr::from_ptr(f()) }.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        eprintln!("engine probe: gpu {} failed (code {}): {}", gpu, rc, why);
+        42
+    };
+    std::mem::forget(lib);
+    code
+}
+
+pub enum DeviceProbe {
+    Ok,
+    Unsupported(String),
+    Unknown(String),
+}
+
+/// Checks that the engine library can run a kernel on `gpu`, in a child process: ggml aborts the
+/// whole process when the library has no kernel image for the device, which must not take the
+/// miner down.
+pub fn probe_device(gpu: usize) -> DeviceProbe {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return DeviceProbe::Unknown(format!("current_exe: {}", e)),
+    };
+    let mut child = match Command::new(&exe)
+        .arg("--probe-engine-device")
+        .arg(gpu.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return DeviceProbe::Unknown(format!("spawn: {}", e)),
+    };
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_string(&mut text);
+        }
+        text
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() > Duration::from_secs(120) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return DeviceProbe::Unknown("timed out after 120 s".into());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => return DeviceProbe::Unknown(format!("wait: {}", e)),
+        }
+    };
+    let text = reader.join().unwrap_or_default();
+    let tail = {
+        let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let keep = lines.len().saturating_sub(3);
+        lines.drain(..keep);
+        lines.join(" | ")
+    };
+    match status.code() {
+        Some(0) => DeviceProbe::Ok,
+        Some(40) => DeviceProbe::Unknown("the library predates the device check".into()),
+        Some(41) => DeviceProbe::Unknown(tail),
+        Some(code) => DeviceProbe::Unsupported(format!("exit {}: {}", code, tail)),
+        None => DeviceProbe::Unsupported(if tail.is_empty() {
+            "aborted: no CUDA kernel for this GPU in the library".to_string()
+        } else {
+            format!("aborted: {}", tail)
+        }),
+    }
 }
 
 /// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns the
