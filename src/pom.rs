@@ -946,10 +946,21 @@ fn compute_checkpoint_offsets(n_chunks: u64) -> (Vec<StoredLevel>, u32) {
 
 /// Open an existing checkpoint tree file and reconstruct the WeightIndex.
 /// Detects legacy full-tree files (size mismatch) and returns an error so the caller can rebuild.
-fn open_existing_tree(tree_path: &Path, gguf_path: &str, expected_model_id: [u8; 32]) -> Result<WeightIndex> {
+fn open_existing_tree(
+    tree_path: &Path,
+    gguf_path: &str,
+    expected_model_id: [u8; 32],
+    subset: Option<&[String]>,
+) -> Result<WeightIndex> {
     let mut file = File::open(gguf_path)?;
     let meta = crate::gguf::GgufMeta::read(&mut file)?;
-    let names = meta.sorted_names();
+    let names: Vec<String> = match subset {
+        Some(s) => {
+            let want: std::collections::HashSet<&str> = s.iter().map(|x| x.as_str()).collect();
+            meta.sorted_names().into_iter().filter(|n| want.contains(n.as_str())).collect()
+        }
+        None => meta.sorted_names(),
+    };
 
     // Compute n_chunks (fast — header arithmetic only, no tensor data reads).
     let mut n_chunks: u64 = 0;
@@ -1043,8 +1054,33 @@ impl WeightIndex {
     /// GGUF: only every K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On
     /// subsequent restarts the existing tree is reused (GGUF is immutable), avoiding a rebuild.
     pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> Result<Self> {
+        Self::build_from_gguf_impl(path, model_id, None, "pom-tree.bin")
+    }
+
+    /// Same as `build_from_gguf`, but over only `tensor_names` (already sorted or not — this
+    /// re-sorts). `tree_filename` must be unique per (model, shard) pair so different shards'
+    /// checkpoint trees never collide on disk next to the same GGUF.
+    pub fn build_from_gguf_subset(
+        path: &str,
+        model_id: [u8; 32],
+        tensor_names: &[String],
+        tree_filename: &str,
+    ) -> Result<Self> {
+        Self::build_from_gguf_impl(path, model_id, Some(tensor_names), tree_filename)
+    }
+
+    /// Shared implementation behind `build_from_gguf`/`build_from_gguf_subset` — `subset = None`
+    /// indexes every tensor in the file (whole-model, unchanged behavior); `Some(names)` indexes
+    /// only the given tensors (a shard). `tree_filename` names the sparse checkpoint tree file
+    /// persisted next to the GGUF.
+    fn build_from_gguf_impl(
+        path: &str,
+        model_id: [u8; 32],
+        subset: Option<&[String]>,
+        tree_filename: &str,
+    ) -> Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
-        let tree_path = dir.join("pom-tree.bin");
+        let tree_path = dir.join(tree_filename);
 
         // Clean up old PID-named files left by previous versions.
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1060,7 +1096,7 @@ impl WeightIndex {
 
         // Reuse existing checkpoint tree if valid.
         if tree_path.exists() {
-            match open_existing_tree(&tree_path, path, model_id) {
+            match open_existing_tree(&tree_path, path, model_id, subset) {
                 Ok(idx) => {
                     log::info!("PoM: reusing cached weight index — {} chunks", idx.n_chunks);
                     return Ok(idx);
@@ -1075,7 +1111,13 @@ impl WeightIndex {
 
         let mut file = File::open(path)?;
         let meta = crate::gguf::GgufMeta::read(&mut file)?;
-        let names = meta.sorted_names(); // canonical order
+        let names: Vec<String> = match subset {
+            Some(s) => {
+                let want: std::collections::HashSet<&str> = s.iter().map(|x| x.as_str()).collect();
+                meta.sorted_names().into_iter().filter(|n| want.contains(n.as_str())).collect()
+            }
+            None => meta.sorted_names(),
+        }; // canonical order (filtered to `subset` when given)
 
         // Phase 0: hash leaves from GGUF chunks → write first checkpoint level (level K) to disk.
         // Process in batches of 2^K leaves, building a mini-tree per batch and writing only
@@ -1600,6 +1642,28 @@ pub fn any_active_index() -> Option<([u8; 32], Arc<WeightIndex>)> {
     pom_indices().lock().ok().and_then(|g| g.iter().min_by_key(|(m, _)| **m).map(|(m, i)| (*m, i.clone())))
 }
 
+/// Possession index for a SHARD, keyed by the CUDA device mining it (not by model_id — a shard
+/// shares its parent model's model_id, so keying by model_id would collide with or shadow the
+/// whole-model entry in `POM_INDICES`). This phase is one shard per device per process, so
+/// device-keying is sufficient; a future multi-shard-per-device design would need a composite key.
+static POM_SHARD_INDICES: OnceLock<Mutex<HashMap<u32, Arc<WeightIndex>>>> = OnceLock::new();
+
+fn pom_shard_indices() -> &'static Mutex<HashMap<u32, Arc<WeightIndex>>> {
+    POM_SHARD_INDICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Install a shard's possession index for the device mining it. Idempotent per device.
+pub fn set_shard_index(device_id: u32, index: WeightIndex) {
+    if let Ok(mut g) = pom_shard_indices().lock() {
+        g.insert(device_id, Arc::new(index));
+    }
+}
+
+/// The shard possession index active for a specific device, if built.
+pub fn active_shard_index(device_id: u32) -> Option<Arc<WeightIndex>> {
+    pom_shard_indices().lock().ok()?.get(&device_id).cloned()
+}
+
 /// Test-only WeightIndex over arbitrary RAM chunks (`data` = chunk-aligned canonical bytes) —
 /// real checkpoint tree + merkle paths, no GGUF.
 #[cfg(test)]
@@ -2101,6 +2165,108 @@ mod tests {
         // The proof verifies against the same target the node would use.
         assert!(verify_proof(&pph, nonce, seed, &proof, idx.n_chunks, k, t, &idx.r_t, &target, false));
         assert_eq!(proof.tier, 1);
+    }
+
+    /// Write a minimal synthetic GGUF (v3, 1 kv: `general.alignment`=32, all tensors F32) that
+    /// round-trips through the real `GgufMeta::read` parser — mirrors `gguf.rs`'s own
+    /// `parses_minimal_gguf` fixture, generalized to N named tensors with real backing data so
+    /// `WeightIndex::build_from_gguf`/`build_from_gguf_subset` can pread real bytes from it.
+    /// `tensor_sizes` values are on-disk byte lengths and must each be a multiple of 4 (F32).
+    fn write_synthetic_gguf(path: &std::path::Path, tensor_sizes: &[(&str, u64)]) {
+        const ALIGNMENT: u64 = 32;
+
+        let mut header: Vec<u8> = Vec::new();
+        header.extend_from_slice(&0x4655_4747u32.to_le_bytes()); // "GGUF" magic
+        header.extend_from_slice(&3u32.to_le_bytes()); // version
+        header.extend_from_slice(&(tensor_sizes.len() as u64).to_le_bytes()); // tensor_count
+        header.extend_from_slice(&1u64.to_le_bytes()); // kv_count
+        // kv: general.alignment = u32 32
+        let key = b"general.alignment";
+        header.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        header.extend_from_slice(key);
+        header.extend_from_slice(&4u32.to_le_bytes()); // value type: u32
+        header.extend_from_slice(&(ALIGNMENT as u32).to_le_bytes());
+
+        // Per-tensor offsets within the data section, each aligned (matches real GGUF writers).
+        let mut offsets: Vec<u64> = Vec::with_capacity(tensor_sizes.len());
+        let mut cur: u64 = 0;
+        for &(_, nbytes) in tensor_sizes {
+            assert!(nbytes % 4 == 0, "synthetic tensor size must be a multiple of 4 (F32)");
+            offsets.push(cur);
+            cur = (cur + nbytes).div_ceil(ALIGNMENT) * ALIGNMENT;
+        }
+
+        for (i, &(name, nbytes)) in tensor_sizes.iter().enumerate() {
+            header.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            header.extend_from_slice(name.as_bytes());
+            header.extend_from_slice(&1u32.to_le_bytes()); // n_dims = 1
+            header.extend_from_slice(&(nbytes / 4).to_le_bytes()); // ne0 (element count, F32)
+            header.extend_from_slice(&0u32.to_le_bytes()); // dtype = F32
+            header.extend_from_slice(&offsets[i].to_le_bytes());
+        }
+
+        // Data section starts at the first alignment-multiple at/after the header end — same
+        // arithmetic `GgufMeta::read` uses.
+        let tensor_data_offset = (header.len() as u64).div_ceil(ALIGNMENT) * ALIGNMENT;
+        let mut buf = header;
+        buf.resize(tensor_data_offset as usize, 0u8);
+        for (i, &(name, nbytes)) in tensor_sizes.iter().enumerate() {
+            let start = (tensor_data_offset + offsets[i]) as usize;
+            let end = start + nbytes as usize;
+            if buf.len() < end {
+                buf.resize(end, 0u8);
+            }
+            // Content is keyed by the tensor NAME (not its positional index or file offset) so
+            // the same tensor gets byte-identical content across different synthetic files —
+            // needed for tests that compare a subset built from one file against a reference
+            // index built from a second file containing only some of the same-named tensors.
+            let name_seed: u64 = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |acc, b| {
+                (acc ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+            for (j, b) in buf[start..end].iter_mut().enumerate() {
+                *b = (name_seed.wrapping_add(j as u64) % 251) as u8; // distinguishable, deterministic content
+            }
+        }
+
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    #[test]
+    fn build_from_gguf_subset_root_matches_full_dense_tree_over_same_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf_path = dir.path().join("model.gguf");
+        // Distinct per-tensor sizes so a wrong-tensor-selected bug would also show up as a
+        // wrong `n_chunks`, not just a different root (a same-size swap could otherwise slip
+        // past a chunk-count-only check).
+        write_synthetic_gguf(&gguf_path, &[
+            ("blk.0.a", 320), ("blk.0.b", 352), ("blk.1.a", 384), ("output.weight", 416),
+        ]);
+        let model_id = [7u8; 32];
+
+        // Full index over everything.
+        let full = WeightIndex::build_from_gguf(gguf_path.to_str().unwrap(), model_id).unwrap();
+
+        // Subset index over just layer 0's tensors + output (skip blk.1.a).
+        let subset_names = vec!["blk.0.a".to_string(), "blk.0.b".to_string(), "output.weight".to_string()];
+        let subset = WeightIndex::build_from_gguf_subset(
+            gguf_path.to_str().unwrap(), model_id, &subset_names, "pom-tree.shard0-test.bin",
+        ).unwrap();
+
+        // Independent reference: a SECOND GGUF containing only the 3 intended tensors (same
+        // names/sizes/order), indexed through the unmodified whole-file `build_from_gguf` path.
+        // If the subset filter selected the wrong 3-of-4 tensors (e.g. dropped `blk.0.b` instead
+        // of `blk.1.a`), `subset.r_t`/`n_chunks` would NOT match this reference — unlike a bare
+        // "differs from the full root" check, which any 3-of-4 selection would also satisfy.
+        let ref_gguf_path = dir.path().join("model-shard0-reference.gguf");
+        write_synthetic_gguf(&ref_gguf_path, &[("blk.0.a", 320), ("blk.0.b", 352), ("output.weight", 416)]);
+        let reference = WeightIndex::build_from_gguf(ref_gguf_path.to_str().unwrap(), model_id).unwrap();
+
+        assert_eq!(subset.n_chunks, reference.n_chunks);
+        assert_eq!(subset.r_t, reference.r_t, "subset root must match an independently-built index over exactly the intended tensors");
+
+        // Sanity: the subset is still a proper subset of the full model (root differs, fewer chunks).
+        assert_ne!(subset.r_t, full.r_t);
+        assert_eq!(subset.n_chunks, (320 + 352 + 416) / 32);
     }
 
 }

@@ -174,6 +174,27 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     }
 }
 
+/// The one (model, target_bytes) combination this POC shards. 8 GiB, matching the spec's
+/// suggested target for Kimi-Linear-48B on a 24 GB card (raw-scoped upload leaves headroom for
+/// the rest of the process). A second sharded model/target needs a second constant here AND a
+/// matching second block of rows in the node's `POM_SHARDS_POC` (keryx-node
+/// consensus/core/src/config/params.rs) — the two must stay in lockstep by construction; there
+/// is no dynamic negotiation in this phase.
+pub const POC_SHARD_TARGET_BYTES: u64 = 8 * 1_000_000_000;
+
+/// Shard tier index for the POC sharded model. Mirrors the node's `POM_SHARDS_POC` row order
+/// (index 0 -> tier 5, index 1 -> tier 6, ... immediately after the 5-row H6 table). `None` for
+/// any model/target this POC doesn't shard, or before the H6 gate.
+pub fn pom_shard_tier_index(model_id: &[u8; 32], target_bytes: u64, shard_index: u16, daa: u64) -> Option<u8> {
+    if daa < crate::pom::pom_v3_activation_daa() {
+        return None;
+    }
+    if *model_id != KIMI_LINEAR_48B.model_id || target_bytes != POC_SHARD_TARGET_BYTES {
+        return None;
+    }
+    5u8.checked_add(shard_index as u8)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     VeryLight,
@@ -337,5 +358,19 @@ mod tests {
             assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, gate - 1), None);
             assert!(pom_model_for_tier(gate - 1, Tier::Default).is_none());
         }
+    }
+
+    #[test]
+    fn pom_shard_tier_index_offsets_from_h6_table_size() {
+        let daa = crate::pom::pom_v3_activation_daa(); // any DAA at/after H6
+        // Shard 0 and shard 1 of the POC model land at 5 and 6 (H6 table has 5 whole-tier rows).
+        assert_eq!(pom_shard_tier_index(&KIMI_LINEAR_48B.model_id, POC_SHARD_TARGET_BYTES, 0, daa), Some(5));
+        assert_eq!(pom_shard_tier_index(&KIMI_LINEAR_48B.model_id, POC_SHARD_TARGET_BYTES, 1, daa), Some(6));
+        // Wrong model_id -> None.
+        assert_eq!(pom_shard_tier_index(&QWEN3_6_27B.model_id, POC_SHARD_TARGET_BYTES, 0, daa), None);
+        // Wrong target_bytes -> None (not the pinned POC target).
+        assert_eq!(pom_shard_tier_index(&KIMI_LINEAR_48B.model_id, POC_SHARD_TARGET_BYTES + 1, 0, daa), None);
+        // Before H6 activation -> None.
+        assert_eq!(pom_shard_tier_index(&KIMI_LINEAR_48B.model_id, POC_SHARD_TARGET_BYTES, 0, 0), None);
     }
 }
