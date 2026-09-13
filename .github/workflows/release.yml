@@ -38,6 +38,7 @@ permissions:
 env:
   LLAMA_TAG: b10015
   CUDA_VERSION: "12.9.1"
+  PROTOC_VERSION: "23.4"
   KERYX_LLAMA_ARCHS: "70;75;80;86;89;90;100;120"
   NUM_JOBS: "4"
 
@@ -49,22 +50,13 @@ jobs:
     steps:
       - name: Create the draft release (once)
         id: mk
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const isTag = context.ref.startsWith('refs/tags/');
-            const tag = isTag ? context.ref.replace('refs/tags/', '') : `v0.0.0-dev-${context.runNumber}`;
-            await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: tag,
-              target_commitish: context.sha,
-              name: `Keryx-miner-${tag}`,
-              body: 'keryx-miner for Linux, HiveOS and Windows. Release notes to come.',
-              draft: true,
-              prerelease: false,
-            });
-            core.setOutput('release_tag', tag);
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then tag="${GITHUB_REF#refs/tags/}"; else tag="v0.0.0-dev-${GITHUB_RUN_NUMBER}"; fi
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            --title "Keryx-miner-$tag" --notes "keryx-miner for Linux, HiveOS and Windows. Release notes to come."
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
 
   build-linux:
     needs: create-release
@@ -73,12 +65,13 @@ jobs:
     name: Build linux-amd64 + hiveos
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protoc
+        run: |
+          curl -sSL -o protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v${{ env.PROTOC_VERSION }}/protoc-${{ env.PROTOC_VERSION }}-linux-x86_64.zip
+          mkdir -p "$HOME/protoc" && unzip -q -o protoc.zip -d "$HOME/protoc" && rm protoc.zip
+          echo "$HOME/protoc/bin" >> "$GITHUB_PATH"
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -91,11 +84,19 @@ jobs:
           sub-packages: '["nvcc", "cudart-dev", "driver-dev", "cuobjdump"]'
           non-cuda-sub-packages: '["libcublas-dev", "libcurand-dev"]'
 
-      - name: Cache cargo registry and dependencies
-        uses: Swatinem/rust-cache@v2
+      - name: Cache the cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
 
       - name: Cache the llama.cpp checkout and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/llama-src-${{ env.LLAMA_TAG }}
@@ -162,7 +163,7 @@ jobs:
           echo "archive_hiveos=$archive" >> "$GITHUB_ENV"
 
       - name: Upload to the draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-release.outputs.release_tag }}
           draft: true
@@ -182,20 +183,17 @@ jobs:
         run: git config --global core.autocrlf false
 
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protoc
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v${{ env.PROTOC_VERSION }}/protoc-${{ env.PROTOC_VERSION }}-win64.zip" -OutFile protoc.zip
+          Expand-Archive -Path protoc.zip -DestinationPath "$env:USERPROFILE\protoc" -Force
+          Remove-Item protoc.zip
+          "$env:USERPROFILE\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up the MSVC environment (cl.exe for nvcc)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
 
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.36
@@ -204,11 +202,19 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "cuobjdump", "visual_studio_integration"]'
 
-      - name: Cache cargo registry and dependencies
-        uses: Swatinem/rust-cache@v2
+      - name: Cache the cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
 
       - name: Cache the llama.cpp checkout and build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/llama-src-${{ env.LLAMA_TAG }}
@@ -217,14 +223,18 @@ jobs:
           restore-keys: |
             llama-windows-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-
 
-      # Default (PowerShell) shell on purpose: under bash, Git's GNU `link` shadows MSVC's link.exe.
+      # cmd shell with vcvarsall on purpose: MSVC's cl.exe and link.exe must come first on PATH
+      # (under bash, Git's GNU `link` shadows link.exe).
       - name: Build keryx-miner.exe, keryxcuda.dll and keryx-llama.dll
+        shell: cmd
         env:
           CUDA_HOME: ${{ env.CUDA_PATH }}
           NVCC: ${{ env.CUDA_PATH }}\bin\nvcc.exe
           # The runner's MSVC minor version may be newer than the one this CUDA release was qualified against.
           NVCC_PREPEND_FLAGS: -allow-unsupported-compiler
         run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" x64
           nvcc --version
           cargo build --release -p keryx-miner -p keryxcuda
 
@@ -252,7 +262,7 @@ jobs:
           echo "archive=$archive" >> "$GITHUB_ENV"
 
       - name: Upload to the draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-release.outputs.release_tag }}
           draft: true
