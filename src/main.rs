@@ -766,6 +766,19 @@ fn main() -> Result<(), Error> {
         let gpu = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
         std::process::exit(keryx_miner::llama_engine::run_device_probe_child(gpu));
     }
+    // Hidden pipeline-head check: --split-test <gguf> --split-rpc <host:port,...> --split-ts <f,...>
+    // [--split-manifest <tsv>] [--split-gpu <n>] [--split-prompt <text>] [--split-tokens <n>]
+    if let Some(i) = argv.iter().position(|a| a == "--split-test") {
+        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
+        let gguf = argv.get(i + 1).cloned().unwrap_or_default();
+        let rpc = val("--split-rpc").unwrap_or_default();
+        let ts = val("--split-ts").unwrap_or_default();
+        let manifest = val("--split-manifest").unwrap_or_default();
+        let gpu = val("--split-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let prompt = val("--split-prompt").unwrap_or_else(|| "The capital of France is".to_string());
+        let tokens = val("--split-tokens").and_then(|s| s.parse().ok()).unwrap_or(64);
+        std::process::exit(keryx_miner::llama_engine::run_split_test(&gguf, gpu, &rpc, &ts, &manifest, &prompt, tokens));
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
     if let Some(n) = tokio_blocking_threads() {

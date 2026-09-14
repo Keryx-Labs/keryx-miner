@@ -16,6 +16,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "ggml-rpc.h"
 #ifdef __APPLE__
 // Metal: llama.cpp's ggml-metal backend stores quantized tensors in unified-memory MTLBuffers.
 // `t->data` is a CPU-readable pointer into that unified memory (also GPU-visible on Apple Silicon
@@ -29,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -95,20 +97,12 @@ static void keryx_install_log_filter() {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 3; }
+KERYX_EXPORT int keryx_llama_abi() { return 4; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
 
-KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
-    keryx_last_error.clear();
-    keryx_install_log_filter();
-    llama_backend_init();
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 999;
-    mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
-    mp.main_gpu     = gpu;
-    mp.use_mmap     = true;
+static KeryxLlama* keryx_load_with(const char* gguf_path, int n_ctx, const llama_model_params& mp) {
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) {
         keryx_set_error("model", std::string("llama_model_load_from_file failed for ") + gguf_path);
@@ -151,6 +145,88 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
     return h;
+}
+
+KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 999;
+    mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
+    mp.main_gpu     = gpu;
+    mp.use_mmap     = true;
+    return keryx_load_with(gguf_path, n_ctx, mp);
+}
+
+// Pipeline head: layers split across the listed rpc-server shards (in order) and local GPU `gpu`
+// (last). `tensor_split` = one proportion per device, same order. `manifest` (optional) lets the
+// head load from a GGUF that holds no data for the remote layers. The handle is inference-only:
+// remote tensors have no local device pointer, never walk it.
+KERYX_EXPORT KeryxLlama* keryx_llama_load_split(const char* gguf_path, int gpu, int n_ctx,
+                                                const char* rpc_endpoints, const char* tensor_split,
+                                                const char* manifest) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+    if (manifest && *manifest) {
+#if defined(_WIN32)
+        _putenv_s("KERYX_RPC_MANIFEST", manifest);
+#else
+        setenv("KERYX_RPC_MANIFEST", manifest, 1);
+#endif
+    }
+    llama_backend_init();
+    static std::vector<ggml_backend_dev_t> devices; // llama keeps the pointer for the model's life
+    static std::vector<float> split;
+    devices.clear(); split.clear();
+    std::stringstream eps(rpc_endpoints ? rpc_endpoints : "");
+    std::string ep;
+    while (std::getline(eps, ep, ',')) {
+        if (ep.empty()) continue;
+        ggml_backend_reg_t reg = ggml_backend_rpc_add_server(ep.c_str());
+        if (!reg) {
+            keryx_set_error("rpc", "cannot register shard " + ep);
+            return nullptr;
+        }
+        ggml_backend_register(reg);
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+            devices.push_back(ggml_backend_reg_dev_get(reg, i));
+        }
+    }
+#ifdef __APPLE__
+    const std::string local = "MTL" + std::to_string(gpu);
+#else
+    const std::string local = "CUDA" + std::to_string(gpu);
+#endif
+    ggml_backend_dev_t local_dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (local == ggml_backend_dev_name(d)) { local_dev = d; break; }
+    }
+    if (!local_dev) {
+        keryx_set_error("device", "local device " + local + " not found");
+        return nullptr;
+    }
+    devices.push_back(local_dev);
+    std::stringstream ts(tensor_split ? tensor_split : "");
+    std::string f;
+    while (std::getline(ts, f, ',')) {
+        if (!f.empty()) split.push_back(std::stof(f));
+    }
+    if (split.size() != devices.size()) {
+        keryx_set_error("split", "tensor_split has " + std::to_string(split.size()) + " entries for "
+                        + std::to_string(devices.size()) + " devices");
+        return nullptr;
+    }
+    split.resize(llama_max_devices(), 0.0f);
+    devices.push_back(nullptr);
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers  = 999;
+    mp.split_mode    = LLAMA_SPLIT_MODE_LAYER;
+    mp.devices       = devices.data();
+    mp.tensor_split  = split.data();
+    mp.use_mmap      = true;
+    return keryx_load_with(gguf_path, n_ctx, mp);
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }

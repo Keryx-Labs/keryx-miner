@@ -19,6 +19,7 @@ use std::sync::{Mutex, OnceLock};
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type ErrorFn = unsafe extern "C" fn() -> *const c_char;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
+type LoadSplitFn = unsafe extern "C" fn(*const c_char, c_int, c_int, *const c_char, *const c_char, *const c_char) -> *mut c_void;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
@@ -26,7 +27,7 @@ type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 
-const ABI: c_int = 3;
+const ABI: c_int = 4;
 
 /// Why a load attempt failed. `stage` says how far it got; the detail carries the engine's own
 /// message, including the VRAM figures when CUDA reported them.
@@ -484,6 +485,66 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
         }
     }
     None
+}
+
+/// Pipeline-head check: loads `gguf` with its layers split across `rpc` shards and local GPU
+/// `gpu` per `tensor_split`, generates once, prints the text and the token rate. Exit code for
+/// the hidden `--split-test` mode: 0 ok, 41 library, 42 load, 43 generation.
+pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, manifest: &str, prompt: &str, max_tokens: usize) -> i32 {
+    let Some(so) = so_path() else {
+        eprintln!("split test: library not found next to the miner binary");
+        return 41;
+    };
+    let lib = match unsafe { libloading::Library::new(&so) } {
+        Ok(lib) => lib,
+        Err(e) => {
+            eprintln!("split test: {} failed to load: {}", so.display(), e);
+            return 41;
+        }
+    };
+    unsafe {
+        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error)) = (
+            sym::<AbiFn>(&lib, "keryx_llama_abi"),
+            sym::<LoadSplitFn>(&lib, "keryx_llama_load_split"),
+            sym::<GenFn>(&lib, "keryx_llama_generate"),
+            sym::<FreeFn>(&lib, "keryx_llama_free"),
+            sym::<ErrorFn>(&lib, "keryx_llama_last_error"),
+        ) else {
+            eprintln!("split test: {} is missing engine symbols", so.display());
+            return 41;
+        };
+        if abi() != ABI {
+            eprintln!("split test: {} has ABI {}, this miner expects {}", so.display(), abi(), ABI);
+            return 41;
+        }
+        let (Ok(cg), Ok(cr), Ok(ct), Ok(cm), Ok(cp)) = (
+            CString::new(gguf), CString::new(rpc), CString::new(tensor_split), CString::new(manifest), CString::new(prompt),
+        ) else {
+            eprintln!("split test: argument contains a NUL byte");
+            return 42;
+        };
+        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+        let t0 = std::time::Instant::now();
+        let model = load_split(cg.as_ptr(), gpu as c_int, n_ctx, cr.as_ptr(), ct.as_ptr(), cm.as_ptr());
+        if model.is_null() {
+            eprintln!("split test: load failed: {}", CStr::from_ptr(last_error()).to_string_lossy());
+            return 42;
+        }
+        eprintln!("split test: loaded in {:.1} s (shards: {}, split: {})", t0.elapsed().as_secs_f64(), rpc, tensor_split);
+        let mut buf = vec![0u8; 64 * 1024];
+        let t1 = std::time::Instant::now();
+        let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
+        let dt = t1.elapsed().as_secs_f64();
+        free(model);
+        if n <= 0 {
+            eprintln!("split test: generation failed");
+            return 43;
+        }
+        buf.truncate(n as usize);
+        println!("{}", String::from_utf8_lossy(&buf));
+        eprintln!("split test: {} bytes in {:.2} s", n, dt);
+    }
+    0
 }
 
 /// Generate OPoI text via the in-process engine. None on any failure (caller falls back).
