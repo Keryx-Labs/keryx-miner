@@ -103,6 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SKIP");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SRC");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_ARCHS");
+    println!("cargo:rerun-if-changed=tools/keryx-llama/patches");
     if env::var("KERYX_LLAMA_SKIP").as_deref() == Ok("1") {
         println!("cargo:warning=KERYX_LLAMA_SKIP=1 — libkeryx-llama.so not built; a prebuilt one must sit next to the miner binary or in-process llama tiers cannot be mined");
     } else if target_arch == "x86_64" && (target_os == "linux" || target_os == "windows") {
@@ -139,6 +140,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
+    apply_llama_patches(&src)?;
+
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
     // Native kernels for every supported GPU generation (Volta to Blackwell); needs nvcc >= 12.8.
     // Override with a shorter list for a faster development build.
@@ -149,6 +152,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         .arg("-B").arg(&build_dir)
         .args([
             "-DGGML_CUDA=ON",
+            "-DGGML_RPC=ON",
             &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
             "-DBUILD_SHARED_LIBS=OFF",
             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
@@ -205,10 +209,11 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .arg("-I").arg(src.join("common"))
                 .arg(lib("src/Release/llama.lib"))
                 .arg(lib("ggml/src/ggml-cuda/Release/ggml-cuda.lib"))
+                .arg(lib("ggml/src/ggml-rpc/Release/ggml-rpc.lib"))
                 .arg(lib("ggml/src/Release/ggml-cpu.lib"))
                 .arg(lib("ggml/src/Release/ggml.lib"))
                 .arg(lib("ggml/src/Release/ggml-base.lib"))
-                .args(["-lcublas", "-lcublasLt", "-lcuda"])
+                .args(["-lcublas", "-lcublasLt", "-lcuda", "-lws2_32"])
                 .arg("-o").arg(&dll),
         )?;
         return Ok(());
@@ -231,6 +236,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             .arg("-Wl,--start-group")
             .arg(lib("src/libllama.a"))
             .arg(lib("ggml/src/ggml-cuda/libggml-cuda.a"))
+            .arg(lib("ggml/src/ggml-rpc/libggml-rpc.a"))
             .arg(lib("ggml/src/libggml-cpu.a"))
             .arg(lib("ggml/src/libggml.a"))
             .arg(lib("ggml/src/libggml-base.a"))
@@ -274,6 +280,33 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
         return Ok(default.to_path_buf());
     }
     Err(format!("cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}").into())
+}
+
+/// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order;
+/// a patch that is already applied is skipped.
+fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = std::path::Path::new("tools/keryx-llama/patches");
+    let mut patches: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map(|x| x == "patch").unwrap_or(false))
+        .collect();
+    patches.sort();
+    for patch in patches {
+        let patch = std::fs::canonicalize(&patch)?;
+        let applied = std::process::Command::new("git")
+            .current_dir(src)
+            .args(["apply", "--check", "--reverse"]).arg(&patch)
+            .status()?
+            .success();
+        if applied {
+            continue;
+        }
+        run(
+            &format!("git apply of {}", patch.display()),
+            std::process::Command::new("git").current_dir(src).arg("apply").arg(&patch),
+        )?;
+    }
+    Ok(())
 }
 
 fn run(desc: &str, cmd: &mut std::process::Command) -> Result<(), Box<dyn std::error::Error>> {

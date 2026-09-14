@@ -36,6 +36,9 @@ SRC=/tmp/llama-src-$TAG
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
 fi
+for P in "$REPO"/tools/keryx-llama/patches/*.patch; do
+  git -C "$SRC" apply --check --reverse "$P" 2>/dev/null || git -C "$SRC" apply "$P"
+done
 
 docker run --rm --network host \
   -v "$SRC":/llama -v "$REPO":/repo:ro -v "$OUT":/out "${CUDAMOUNT[@]}" \
@@ -47,7 +50,7 @@ docker run --rm --network host \
     fi
     export PATH=/tmp/cmk/bin:$KCUDA/bin:$PATH CUDA_HOME=$KCUDA
     B=/tmp/llama-pic-build
-    /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON \
+    /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON -DGGML_RPC=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
@@ -57,6 +60,7 @@ docker run --rm --network host \
       -I /llama/include -I /llama/ggml/include -I /llama/src -I /llama/common \
       -I $KCUDA/include \
       -Wl,--start-group $B/src/libllama.a $B/ggml/src/ggml-cuda/libggml-cuda.a \
+        $B/ggml/src/ggml-rpc/libggml-rpc.a \
         $B/ggml/src/libggml-cpu.a $B/ggml/src/libggml.a $B/ggml/src/libggml-base.a \
       -Wl,--end-group \
       -L$KCUDA/lib64 -L$KCUDA/targets/x86_64-linux/lib -lcudart -lcublas -lcublasLt \
@@ -72,6 +76,7 @@ docker run --rm --network host \
         -I /llama/include -I /llama/ggml/include -I /llama/src \
         -I $KCUDA/include \
         -Wl,--start-group $B/src/libllama.a $B/ggml/src/ggml-cuda/libggml-cuda.a \
+          $B/ggml/src/ggml-rpc/libggml-rpc.a \
           $B/ggml/src/libggml-cpu.a $B/ggml/src/libggml.a $B/ggml/src/libggml-base.a \
         -Wl,--end-group \
         -L$KCUDA/lib64 -L$KCUDA/targets/x86_64-linux/lib -lcudart -lcublas -lcublasLt \

@@ -1,0 +1,58 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index d380577..89045ca 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -462,9 +462,53 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++// KERYX_RPC_MANIFEST: TSV "name<TAB>nbytes<TAB>fnv1a64hex"; tensors listed there are set by
++// hash without reading local bytes (the local file may hold no data for them).
++struct keryx_manifest_entry { size_t nbytes; uint64_t hash; };
++static const std::unordered_map<std::string, keryx_manifest_entry> & keryx_rpc_manifest() {
++    static std::unordered_map<std::string, keryx_manifest_entry> m;
++    static bool loaded = false;
++    if (!loaded) {
++        loaded = true;
++        const char * path = std::getenv("KERYX_RPC_MANIFEST");
++        if (path) {
++            std::ifstream ifs(path);
++            std::string name, nbytes, hash;
++            while (std::getline(ifs, name, '\t') && std::getline(ifs, nbytes, '\t') && std::getline(ifs, hash)) {
++                m[name] = { (size_t) std::stoull(nbytes), std::stoull(hash, nullptr, 16) };
++            }
++            GGML_LOG_INFO("[keryx] rpc manifest '%s': %zu tensors\n", path, m.size());
++        }
++    }
++    return m;
++}
++
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    {
++        const auto & man = keryx_rpc_manifest();
++        auto it = man.find(tensor->name);
++        if (it != man.end() && offset == 0 && size == it->second.nbytes) {
++            rpc_msg_set_tensor_hash_req request;
++            request.tensor = rpc_tensor;
++            request.offset = offset;
++            request.hash = it->second.hash;
++            rpc_msg_set_tensor_hash_rsp response;
++            bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
++            RPC_STATUS_ASSERT(status);
++            if (!response.result) {
++                GGML_ABORT("[keryx] shard server lacks tensor '%s' (hash %016" PRIx64 ")", tensor->name, request.hash);
++            }
++            if (std::getenv("KERYX_RPC_TRACE")) {
++                fprintf(stderr, "[keryx] manifest hash for '%s' (%zu B, data=%p)\n", tensor->name, size, data);
++            }
++            return;
++        }
++    }
++    if (std::getenv("KERYX_RPC_TRACE")) {
++        fprintf(stderr, "[keryx] data path for '%s' (%zu B, offset %zu)\n", tensor->name, size, offset);
++    }
+     if (size > HASH_THRESHOLD) {
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
