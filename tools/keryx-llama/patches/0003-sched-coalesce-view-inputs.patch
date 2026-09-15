@@ -1,0 +1,77 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 8761592..2d5c65d 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1353,19 +1353,52 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     // create a copy of the input in the split's backend
+                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                         ggml_backend_t backend = sched->backends[cur_backend_id];
+-                        for (int c = 0; c < sched->n_copies; c++) {
+-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+-                            if (sched->n_copies > 1) {
+-                                ggml_set_input(tensor_copy);
+-                                ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
++                        // views of one unallocated graph tensor: transfer the source once, view it on the split backend
++                        struct ggml_tensor * vs = src->view_src;
++                        const bool via_view_src = vs != NULL && vs->buffer == NULL && vs->data == NULL
++                            && !(vs->flags & GGML_TENSOR_FLAG_INPUT)
++                            && src->type == vs->type && src->nb[0] == ggml_type_size(src->type)
++                            && ggml_nbytes(vs) <= 4*ggml_nbytes(src)
++                            && sched->hv_tensor_backend_ids[hash_id(vs)] == src_backend_id;
++                        if (via_view_src) {
++                            const size_t vs_id = hash_id(vs);
++                            if (tensor_id_copy(vs_id, cur_backend_id, 0) == NULL) {
++                                for (int c = 0; c < sched->n_copies; c++) {
++                                    struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, vs);
++                                    ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), vs->name, c);
++                                    if (sched->n_copies > 1) {
++                                        ggml_set_input(tensor_copy);
++                                        ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
++                                    }
++                                    tensor_id_copy(vs_id, cur_backend_id, c) = tensor_copy;
++                                    SET_CAUSE(tensor_copy, "4.cpy");
++                                }
++                                int n_inputs = split->n_inputs++;
++                                GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
++                                split->inputs[n_inputs] = vs;
+                             }
+-                            tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+-                            SET_CAUSE(tensor_copy, "4.cpy");
++                            for (int c = 0; c < sched->n_copies; c++) {
++                                struct ggml_tensor * tensor_copy = ggml_view_4d(sched->ctx, tensor_id_copy(vs_id, cur_backend_id, c),
++                                    src->ne[0], src->ne[1], src->ne[2], src->ne[3], src->nb[1], src->nb[2], src->nb[3], src->view_offs);
++                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
++                                SET_CAUSE(tensor_copy, "4.cpy");
++                            }
++                        } else {
++                            for (int c = 0; c < sched->n_copies; c++) {
++                                struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
++                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++                                if (sched->n_copies > 1) {
++                                    ggml_set_input(tensor_copy);
++                                    ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
++                                }
++                                tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
++                                SET_CAUSE(tensor_copy, "4.cpy");
++                            }
++                            int n_inputs = split->n_inputs++;
++                            GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
++                            split->inputs[n_inputs] = src;
+                         }
+-                        int n_inputs = split->n_inputs++;
+-                        GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+-                        split->inputs[n_inputs] = src;
+                     }
+                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                 }
+@@ -1766,7 +1799,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     sched->debug_graph_size = 0;
+     sched->debug_prev_graph_size = 0;
+ 
+-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
++    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*3*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+ 
+     const int initial_splits_capacity = 16;

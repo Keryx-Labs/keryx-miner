@@ -1,0 +1,29 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 89045ca..b97598e 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -571,11 +571,23 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+     RPC_STATUS_ASSERT(status);
+ }
+ 
++static void ggml_backend_rpc_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
++    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
++    rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
++    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
++    std::vector<uint8_t> input(input_size, value);
++    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
++    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
++    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
++    RPC_STATUS_ASSERT(status);
++}
++
+ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
+     /* .free_buffer     = */ ggml_backend_rpc_buffer_free_buffer,
+     /* .get_base        = */ ggml_backend_rpc_buffer_get_base,
+     /* .init_tensor     = */ ggml_backend_rpc_buffer_init_tensor,
+-    /* .memset_tensor   = */ NULL,
++    /* .memset_tensor   = */ ggml_backend_rpc_buffer_memset_tensor,
+     /* .set_tensor      = */ ggml_backend_rpc_buffer_set_tensor,
+     /* .get_tensor      = */ ggml_backend_rpc_buffer_get_tensor,
+     /* .set_tensor_2d   = */ NULL,

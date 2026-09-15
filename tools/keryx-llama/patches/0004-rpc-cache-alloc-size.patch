@@ -1,0 +1,41 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index b97598e..e75e093 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -673,10 +673,35 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+             request.srcs[i] = serialize_tensor(tensor->src[i]);
+         }
+ 
+-        // TODO: cache the alloc responses to avoid extra RPC calls?
++        // the answer depends on shapes and types only: cache it per endpoint
++        std::string key = buft_ctx->endpoint + "/" + std::to_string(buft_ctx->device) + "/";
++        auto shape_key = [&](const rpc_tensor & t) {
++            key.append((const char *)&t.type, sizeof(t.type));
++            key.append((const char *)t.ne, sizeof(t.ne));
++            key.append((const char *)t.nb, sizeof(t.nb));
++            key.append((const char *)&t.op, sizeof(t.op));
++            key.append((const char *)t.op_params, sizeof(t.op_params));
++        };
++        shape_key(request.tensor);
++        for (int i = 0; i < GGML_MAX_SRC; i++) {
++            shape_key(request.srcs[i]);
++        }
++        static std::unordered_map<std::string, size_t> alloc_size_cache;
++        static std::mutex alloc_size_cache_mutex;
++        {
++            std::lock_guard<std::mutex> lock(alloc_size_cache_mutex);
++            auto it = alloc_size_cache.find(key);
++            if (it != alloc_size_cache.end()) {
++                return it->second;
++            }
++        }
+         rpc_msg_get_alloc_size_rsp response;
+         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+         RPC_STATUS_ASSERT(status);
++        {
++            std::lock_guard<std::mutex> lock(alloc_size_cache_mutex);
++            alloc_size_cache[key] = response.alloc_size;
++        }
+ 
+         return response.alloc_size;
+     }
