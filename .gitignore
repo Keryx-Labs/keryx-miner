@@ -8,3 +8,4 @@ escrow_state.json
 target-hive/
 Cargo.lock
 /tools/model-split/libfnv.so
+__pycache__/
