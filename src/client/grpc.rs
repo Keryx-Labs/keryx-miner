@@ -361,8 +361,10 @@ impl KeryxdHandler {
                 format!("/ai:cap:{}", hex_ids.join(","))
             }
         };
+        // Shard gateway address (H14): where pipeline heads reach this miner's served shards.
+        let ep_part = keryx_miner::shard_gateway::advertised().map(|ep| format!("/ai:ep:{}", ep)).unwrap_or_default();
         let extra_data =
-            format!("{}{}{}/{}/ai:v1:{}{}", EXTRA_DATA, escrow_part, esig_part, nonce_hex, opoi_tag, cap_part);
+            format!("{}{}{}/{}/ai:v1:{}{}{}", EXTRA_DATA, escrow_part, esig_part, nonce_hex, opoi_tag, cap_part, ep_part);
         // Harvest a pending challenge response if the inference task just finished.
         let inference_result = match self.challenge_inference_rx.take() {
             Some((challenge_str, mut rx)) => match rx.try_recv() {
@@ -855,8 +857,13 @@ impl KeryxdHandler {
                     self.backfill_seed(block.header.as_ref());
                     self.backfill_pump().await?;
                     if !block.transactions.is_empty() {
+                        let daa = block.header.as_ref().map_or(0, |h| h.daa_score);
+                        // Shard directory: every coinbase advertising a gateway is a reachable shard.
+                        if let Ok(payload) = hex::decode(&block.transactions[0].payload) {
+                            keryx_miner::shard_gateway::note_coinbase(&payload, daa);
+                        }
                         // Full block — scan directly.
-                        self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
+                        self.scan_txs_for_ai_requests(&block.transactions, daa);
                         // Pause and drain mining BEFORE spawning inference, so no PoM op can
                         // race the model swap: PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME.
                         if self.inference_rx.is_none()

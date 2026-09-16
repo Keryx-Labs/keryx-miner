@@ -793,12 +793,69 @@ fn main() -> Result<(), Error> {
         std::process::exit(keryx_miner::llama_engine::run_split_test(&gguf, gpu, &rpc, &ts, &manifest, &layer_map, &prompt, tokens));
     }
     // Hidden shard-server check: --shard-test <shard.gguf> [--shard-gpu <n>] [--shard-endpoint <host:port>]
+    // [--shard-gateway <host:port> --shard-key <escrow.key>]: with a gateway, any model_id resolves
+    // to this shard (test only).
     if let Some(i) = argv.iter().position(|a| a == "--shard-test") {
         let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
         let gguf = argv.get(i + 1).cloned().unwrap_or_default();
         let gpu = val("--shard-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
         let endpoint = val("--shard-endpoint").unwrap_or_else(|| "127.0.0.1:50052".to_string());
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        if let Some(listen) = val("--shard-gateway") {
+            let key = val("--shard-key").unwrap_or_else(|| "shard-test-escrow.key".to_string());
+            let privkey = escrow::load_or_generate_key(&key).expect("escrow key");
+            let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(&privkey).expect("identity"));
+            println!("shard test: gateway identity {}", hex::encode(identity.pubkey));
+            let local = endpoint.clone();
+            let resolve: keryx_miner::shard_gateway::ShardResolver = std::sync::Arc::new(move |_id: &[u8; 32]| Some((local.clone(), 9u8)));
+            rt.spawn(async move {
+                if let Err(e) = keryx_miner::shard_gateway::serve(listen, identity, resolve).await {
+                    eprintln!("shard test: gateway failed: {}", e);
+                }
+            });
+        }
         std::process::exit(keryx_miner::llama_engine::run_shard_test(&gguf, gpu, &endpoint));
+    }
+    // Hidden link-proxy check: --link-proxy <gateway host:port> [--link-model <hex64>] [--link-port <n>]
+    // [--link-key <escrow.key>]: opens the tunnel, pings, self-tests SIGN, then proxies 127.0.0.1:<n>.
+    if let Some(i) = argv.iter().position(|a| a == "--link-proxy") {
+        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
+        let remote = argv.get(i + 1).cloned().unwrap_or_default();
+        let model: [u8; 32] = val("--link-model").and_then(|h| hex::decode(h).ok()).and_then(|v| v.try_into().ok()).unwrap_or([0xABu8; 32]);
+        let port: u16 = val("--link-port").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let key = val("--link-key").unwrap_or_else(|| "link-test-escrow.key".to_string());
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let code = rt.block_on(async move {
+            let privkey = escrow::load_or_generate_key(&key).expect("escrow key");
+            let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(&privkey).expect("identity"));
+            let link = match keryx_miner::shard_gateway::connect_link(&remote, model, identity, port).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("link proxy: {}", e);
+                    return 45;
+                }
+            };
+            println!("link proxy: shard {} tier {} at {} → 127.0.0.1:{}", hex::encode(link.peer_pubkey), link.tier, link.remote, link.local_port);
+            match link.ping().await {
+                Ok(rtt) => println!("link proxy: ping {:.2} ms", rtt.as_secs_f64() * 1000.0),
+                Err(e) => {
+                    eprintln!("link proxy: ping failed: {}", e);
+                    return 46;
+                }
+            }
+            match link.sign([7u8; 78]).await {
+                Ok(l) => println!("link proxy: SIGN ok (tier {}, key {})", l.tier, hex::encode(l.escrow_pubkey)),
+                Err(e) => {
+                    eprintln!("link proxy: SIGN failed: {}", e);
+                    return 47;
+                }
+            }
+            println!("link proxy: serving — Ctrl-C to stop");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+        std::process::exit(code);
     }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
@@ -1043,6 +1100,21 @@ async fn run() -> Result<(), Error> {
     // Escrow delegation cert: binds the escrow key to the payout address. From H6 a coinbase
     // without a valid pair is an invalid block, so a bad cert fails here instead of producing
     // rejected blocks.
+    // Shard gateway (H14): the authenticated, encrypted front of the served shards. Its
+    // identity is the escrow key, so a link signature is the responder key the node verifies.
+    if let (Some(listen), Some(privkey)) = (opt.shard_gateway.clone(), escrow_privkey.as_deref()) {
+        let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(privkey)?);
+        let public = opt.shard_public.clone().unwrap_or_else(|| listen.clone());
+        keryx_miner::shard_gateway::set_advertised(&public);
+        let resolve: keryx_miner::shard_gateway::ShardResolver = std::sync::Arc::new(|id: &[u8; 32]| keryx_miner::pom_gpu::shard_local_endpoint(id));
+        info!("Shard gateway: listening on {}, announced as {}.", listen, public);
+        tokio::spawn(async move {
+            if let Err(e) = keryx_miner::shard_gateway::serve(listen, identity, resolve).await {
+                error!("Shard gateway: {}", e);
+            }
+        });
+    }
+
     let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
         (Some(privkey), Some(address)) => {
             let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;

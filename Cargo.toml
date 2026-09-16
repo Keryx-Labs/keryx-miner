@@ -60,6 +60,7 @@ semver = "1.0"
 # Proof-of-Model: possession proof construction (borsh wire-format must match the node).
 borsh = { version = "1", features = ["derive"] }
 blake3 = "1"
+chacha20poly1305 = "0.10"
 # PoM GPU plumbing (context/stream/module/memcpy for the walk kernel). Inference itself runs
 # in the dlopen'd libkeryx-llama.so (see llama_engine) — no ML framework in the binary.
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "cuda-version-from-build-system", "dynamic-linking"] }

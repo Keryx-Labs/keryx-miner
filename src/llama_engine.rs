@@ -213,6 +213,11 @@ pub fn serve_shard(gpu: usize, endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Loopback endpoint the resident shard of `gpu` is served on, once serving.
+pub fn shard_endpoint(gpu: usize) -> Option<String> {
+    shards().lock().ok()?.get(&gpu)?.endpoint.clone()
+}
+
 /// Whether a resident shard is active on `gpu` for exactly this GGUF.
 pub fn shard_active_for(gguf: &str, gpu: usize) -> bool {
     shards().lock().ok().map_or(false, |g| g.get(&gpu).map_or(false, |e| e.gguf == gguf))

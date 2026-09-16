@@ -61,6 +61,24 @@ pub struct Opt {
     pub shard_port: u16,
 
     #[clap(
+        long = "shard-gateway",
+        value_name = "HOST:PORT",
+        help = "Listen address of the shard gateway (H14): the authenticated, encrypted front of the shard servers. \
+                Unset = shards are mined but not served.",
+        help_heading = "Model split"
+    )]
+    pub shard_gateway: Option<String>,
+
+    #[clap(
+        long = "shard-public",
+        value_name = "HOST:PORT",
+        help = "Public address of the shard gateway, announced in the coinbase as /ai:ep: so pipeline heads can reach it. \
+                Defaults to --shard-gateway.",
+        help_heading = "Model split"
+    )]
+    pub shard_public: Option<String>,
+
+    #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
         help_heading = "OPoI / Inference",

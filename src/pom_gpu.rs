@@ -1877,6 +1877,15 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 
 static SHARD_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(50052);
 
+/// Loopback endpoint and tier of a served shard, for the gateway: `None` unless this miner
+/// mines and serves `model_id`.
+pub fn shard_local_endpoint(model_id: &[u8; 32]) -> Option<(String, u8)> {
+    let k = crate::models::shard_index(model_id)?;
+    let dev = device_for_model(model_id)?;
+    let endpoint = crate::llama_engine::shard_endpoint(dev as usize)?;
+    Some((endpoint, crate::models::NETWORK_MODEL_TIER + 1 + k))
+}
+
 /// Base loopback port of the in-process shard servers (one per GPU: base + device id).
 pub fn set_shard_port(port: u16) {
     SHARD_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
