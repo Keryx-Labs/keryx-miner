@@ -12,6 +12,7 @@ pub mod models;
 pub mod pom;
 pub mod pom_gpu;
 pub mod pom_v3;
+pub mod pipeline;
 pub mod pom_v4;
 pub mod shard_gateway;
 pub mod slm;

@@ -189,6 +189,9 @@ message GetBlockTemplateResponseMessage{
   // GetBlockTemplateRequest.inferenceResult field. Mining is suspended (isSynced=false) until passed.
   string inferenceChallenge = 10;
 
+  // H14: armed network-model audits for pipeline heads (";"-separated entries).
+  string pipelineAssignments = 11;
+
   RPCError error = 1000;
 }
 

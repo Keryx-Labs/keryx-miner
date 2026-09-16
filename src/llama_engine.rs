@@ -699,6 +699,50 @@ pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, man
     0
 }
 
+/// Pipeline head generation: loads `gguf` with its shard layers bound to the rpc devices in
+/// `rpc` (per `layer_map`, `KERYX_RPC_RESIDENT`), generates once, frees. Blocking.
+pub fn head_generate(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, layer_map: &str, prompt: &str, max_tokens: usize) -> Result<String, String> {
+    std::env::set_var("KERYX_LAYER_MAP", layer_map);
+    std::env::set_var("KERYX_RPC_RESIDENT", "1");
+    let so = so_path().ok_or("keryx-llama shared library not found")?;
+    let lib = unsafe { libloading::Library::new(&so) }.map_err(|e| format!("{} failed to load: {}", so.display(), e))?;
+    unsafe {
+        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error)) = (
+            sym::<AbiFn>(&lib, "keryx_llama_abi"),
+            sym::<LoadSplitFn>(&lib, "keryx_llama_load_split"),
+            sym::<GenFn>(&lib, "keryx_llama_generate"),
+            sym::<FreeFn>(&lib, "keryx_llama_free"),
+            sym::<ErrorFn>(&lib, "keryx_llama_last_error"),
+        ) else {
+            return Err(format!("{} is missing engine symbols", so.display()));
+        };
+        if abi() != ABI {
+            return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), ABI));
+        }
+        let (Ok(cg), Ok(cr), Ok(ct), Ok(cp)) = (CString::new(gguf), CString::new(rpc), CString::new(tensor_split), CString::new(prompt)) else {
+            return Err("argument contains a NUL byte".into());
+        };
+        let cm = CString::new("").unwrap();
+        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+        let t0 = std::time::Instant::now();
+        let model = load_split(cg.as_ptr(), gpu as c_int, n_ctx, cr.as_ptr(), ct.as_ptr(), cm.as_ptr());
+        if model.is_null() {
+            return Err(format!("head load failed: {}", CStr::from_ptr(last_error()).to_string_lossy()));
+        }
+        log::info!("pipeline head: model assembled in {:.1} s over {}", t0.elapsed().as_secs_f64(), rpc);
+        let mut buf = vec![0u8; 64 * 1024];
+        let t1 = std::time::Instant::now();
+        let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
+        free(model);
+        if n <= 0 {
+            return Err("head generation failed".into());
+        }
+        buf.truncate(n as usize);
+        log::info!("pipeline head: {} bytes in {:.2} s", n, t1.elapsed().as_secs_f64());
+        String::from_utf8(buf).map_err(|e| format!("head output is not UTF-8: {}", e))
+    }
+}
+
 /// Generate OPoI text via the in-process engine. None on any failure (caller falls back).
 pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
     let g = engine().lock().ok()?;

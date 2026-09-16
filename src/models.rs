@@ -278,6 +278,12 @@ pub const V4_FLASH_SHARDS: [&ModelSpec; 6] =
 /// First tier index of the network model — mirror of the node's `NETWORK_MODEL_TIER`.
 pub const NETWORK_MODEL_TIER: u8 = 5;
 
+/// Layer range `(first, last)` of each shard — mirror of the node's `NETWORK_MODEL_SHARDS`.
+pub const V4_FLASH_SHARD_LAYERS: [(u32, u32); 6] = [(0, 2), (3, 7), (8, 12), (13, 19), (20, 29), (30, 42)];
+
+/// Layer count of the network model; the output layer is index `V4_FLASH_N_LAYER` in llama.
+pub const V4_FLASH_N_LAYER: u32 = 43;
+
 /// Which of the two 12 GB shards (1 or 2) a `Tier::Light` GPU mines. Spread by the mining
 /// address at startup so the two are served without coordination; `--force-model shard-2`
 /// pins it.

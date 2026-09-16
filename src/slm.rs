@@ -792,10 +792,27 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
         return Vec::new();
     }
     let specs = *SUPPORTED_SPECS.read().unwrap();
-    specs.iter()
+    let mut ids: Vec<[u8; 32]> = specs
+        .iter()
         .filter(|s| model_dir(s).join(".ok").exists() && !model_is_unavailable(&s.model_id))
         .map(|s| s.model_id)
-        .collect()
+        .collect();
+    // A pipeline head announces the whole network model: the id requests target.
+    if crate::pipeline::head_ready() && !model_is_unavailable(&crate::models::V4_FLASH.model_id) {
+        ids.push(crate::models::V4_FLASH.model_id);
+    }
+    ids
+}
+
+/// The head GGUF of the network model (sparse: every tensor in the table, data for the head's
+/// own tensors only), under the whole model's directory.
+pub fn head_gguf_path() -> std::path::PathBuf {
+    model_dir(&crate::models::V4_FLASH).join("head.gguf")
+}
+
+/// The chat-templated form of `prompt` for the model named `name`.
+pub fn format_prompt_for(name: &str, prompt: &str) -> String {
+    format_prompt_by_name(name, prompt)
 }
 
 /// Downloaded (`.ok`) PoM model specs — the OOM-downgrade candidate set when a GPU can't hold its
@@ -815,6 +832,9 @@ pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     if publishing_blocked() {
         return false;
+    }
+    if *model_id == crate::models::V4_FLASH.model_id {
+        return crate::pipeline::head_ready() && !model_is_unavailable(model_id);
     }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };

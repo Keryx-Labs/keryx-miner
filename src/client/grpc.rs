@@ -107,7 +107,8 @@ pub struct KeryxdHandler {
 
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
-    inference_rx: Option<([u8; 32], oneshot::Receiver<Option<String>>)>,
+    /// A pipeline head also carries its live link sessions, which sign the response.
+    inference_rx: Option<([u8; 32], oneshot::Receiver<Option<(String, Vec<keryx_miner::shard_gateway::LinkSession>)>>)>,
 
     /// In-flight inference for a node-issued challenge.
     /// Tuple: (challenge_string, result_receiver) where challenge_string = "model_id_hex:nonce_hex".
@@ -593,14 +594,30 @@ impl KeryxdHandler {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
                 return;
             }
+            let (tx_done, rx_done) = oneshot::channel::<Option<(String, Vec<keryx_miner::shard_gateway::LinkSession>)>>();
+            if model_id == keryx_miner::models::V4_FLASH.model_id {
+                // Network model: this miner heads a pipeline over the drawn links (H14).
+                info!("OPoI: heading a pipeline for id={} (max_tokens={})", stable_id, max_tokens);
+                tokio::spawn(async move {
+                    let result = match keryx_miner::pipeline::run_head(request_hash, prompt, max_tokens).await {
+                        Ok(r) => Some((r.text, r.links)),
+                        Err(e) => {
+                            log::warn!("OPoI: pipeline head failed for id={} — {}; AiResponse skipped", stable_id, e);
+                            None
+                        }
+                    };
+                    let _ = tx_done.send(result);
+                });
+                self.inference_rx = Some((request_hash, rx_done));
+                return;
+            }
             info!("OPoI: spawning SLM inference (max_tokens={})", max_tokens);
-            let (tx_done, rx_done) = oneshot::channel::<Option<String>>();
             tokio::task::spawn_blocking(move || {
                 let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, max_tokens);
                 if result.is_none() {
                     log::warn!("OPoI: inference returned no result for id={} — AiResponse will be skipped", stable_id);
                 }
-                let _ = tx_done.send(result);
+                let _ = tx_done.send(result.map(|t| (t, Vec::new())));
             });
             self.inference_rx = Some((request_hash, rx_done));
         }
@@ -705,7 +722,7 @@ impl KeryxdHandler {
             self.inference_rx = Some((request_hash, rx));
             return false;
         };
-        let Some(result) = result_opt else {
+        let Some((result, links)) = result_opt else {
             // Inference returned None: model not ready or think block exhausted max_tokens.
             // Do NOT upload anything to IPFS — skip this AiResponse entirely.
             info!("OPoI: inference produced no result — AiResponse skipped");
@@ -742,6 +759,23 @@ impl KeryxdHandler {
         // era rule mirrors the node's: V2 is rejected before the gate, so v1 is kept below it.
         let v2 = self.last_known_daa >= keryx_miner::pom::pom_v3_activation_daa();
         let resp = match (&self.escrow_watcher, v2) {
+            (Some(w), true) if !links.is_empty() => {
+                // Pipeline response (V3): every link signs the same v1 bytes as the head.
+                let unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
+                let signed_bytes: [u8; 78] = unsigned.signed_bytes().try_into().expect("78 v1 bytes");
+                let responder = w.sign_responder(&signed_bytes);
+                let mut signed_links = Vec::with_capacity(links.len());
+                for link in &links {
+                    match link.sign(signed_bytes).await {
+                        Ok(l) => signed_links.push(l),
+                        Err(e) => {
+                            warn!("OPoI: link {} (tier {}) did not sign the response: {} — AiResponse skipped", link.remote, link.tier, e);
+                            return true;
+                        }
+                    }
+                }
+                keryx_inference::AiResponsePayload::new_v3(request_hash, challenge_window_end, cid, response_length, responder, signed_links)
+            }
             (Some(w), true) => {
                 let unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
                 let responder = w.sign_responder(&unsigned.signed_bytes());
@@ -754,7 +788,7 @@ impl KeryxdHandler {
             (_, false) => keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length),
         };
         info!("OPoI: uploading response CID={}, challenge_window_end={}{}", resp.cid_v0(), challenge_window_end,
-            if resp.responder.is_some() { " (signed, V2)" } else { "" });
+            if resp.is_v3() { " (signed, V3 pipeline)" } else if resp.responder.is_some() { " (signed, V2)" } else { "" });
 
         let rpc_tx = crate::proto::RpcTransaction {
             version: 0,
@@ -906,6 +940,8 @@ impl KeryxdHandler {
                 None => self.report_service_strikes(&resp),
             },
             Payload::GetBlockTemplateResponse(template) => {
+                // H14: the drawn links of every armed network-model audit.
+                keryx_miner::pipeline::note_assignments(&template.pipeline_assignments);
                 // Track DAA score for challenge_window_end computation.
                 if let Some(daa) = template.block.as_ref()
                     .and_then(|b| b.header.as_ref())

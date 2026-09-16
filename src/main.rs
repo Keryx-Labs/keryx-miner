@@ -1100,6 +1100,11 @@ async fn run() -> Result<(), Error> {
     // Escrow delegation cert: binds the escrow key to the payout address. From H6 a coinbase
     // without a valid pair is an invalid block, so a bad cert fails here instead of producing
     // rejected blocks.
+    // Pipeline identity (H14): the escrow key proves this miner to the links it connects to.
+    if let Some(privkey) = escrow_privkey.as_deref() {
+        let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(privkey)?);
+        keryx_miner::pipeline::set_identity(identity);
+    }
     // Shard gateway (H14): the authenticated, encrypted front of the served shards. Its
     // identity is the escrow key, so a link signature is the responder key the node verifies.
     if let (Some(listen), Some(privkey)) = (opt.shard_gateway.clone(), escrow_privkey.as_deref()) {
