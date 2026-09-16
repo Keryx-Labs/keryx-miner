@@ -1,0 +1,313 @@
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -71,6 +71,7 @@
+     RPC_CMD_HELLO,
+     RPC_CMD_DEVICE_COUNT,
+     RPC_CMD_GRAPH_RECOMPUTE,
++    RPC_CMD_KERYX_RESIDENT,
+     RPC_CMD_COUNT,
+ };
+ 
+@@ -190,6 +191,22 @@
+     uint32_t device;
+ };
+ 
++struct rpc_msg_keryx_resident_req {
++    uint32_t device;
++};
++
++struct rpc_msg_keryx_resident_hdr {
++    uint64_t remote_ptr;
++    uint64_t base_ptr;
++    uint64_t size;
++    uint32_t n_tensors;
++};
++
++struct rpc_msg_keryx_resident_tensor {
++    uint64_t data;
++    uint64_t nbytes;
++    char     name[GGML_MAX_NAME];
++};
+ #pragma pack(pop)
+ 
+ // RPC data structures
+@@ -227,6 +244,56 @@
+     uint64_t remote_ptr;
+ };
+ 
++// KERYX resident weights: a buffer this process loaded itself, exposed to clients per device.
++// A client binds its tensors to it by name (RPC_CMD_KERYX_RESIDENT) instead of allocating a
++// buffer and pushing the bytes; the buffer is never freed or written through the protocol.
++struct keryx_resident_tensor {
++    std::string name;
++    uint64_t    data;
++    uint64_t    nbytes;
++};
++
++struct keryx_resident_set {
++    uint32_t                          device = 0;
++    ggml_backend_buffer_t             buffer = nullptr;
++    std::vector<keryx_resident_tensor> tensors;
++};
++
++static std::mutex keryx_resident_mutex;
++static std::vector<keryx_resident_set> keryx_residents;
++
++static bool keryx_is_resident_buffer(ggml_backend_buffer_t buffer) {
++    std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++    for (const auto & r : keryx_residents) {
++        if (r.buffer == buffer) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void ggml_backend_rpc_set_resident(uint32_t device, ggml_backend_buffer_t buffer, size_t n_tensors,
++                                   const char ** names, const void ** datas, const size_t * nbytes) {
++    std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++    for (size_t i = 0; i < keryx_residents.size(); ) {
++        if (keryx_residents[i].device == device) {
++            keryx_residents.erase(keryx_residents.begin() + i);
++        } else {
++            i++;
++        }
++    }
++    if (buffer == nullptr) {
++        return;
++    }
++    keryx_resident_set set;
++    set.device = device;
++    set.buffer = buffer;
++    for (size_t i = 0; i < n_tensors; i++) {
++        set.tensors.push_back({std::string(names[i]), reinterpret_cast<uint64_t>(datas[i]), (uint64_t) nbytes[i]});
++    }
++    keryx_residents.push_back(std::move(set));
++}
++
+ // RPC helper functions
+ 
+ // Computes FNV-1a hash of the data
+@@ -620,6 +687,58 @@
+     }
+ }
+ 
++// KERYX: bind the tensors of `ctx` to the weights resident on the rpc device behind `buft`.
++// NULL when the server holds no resident weights for that device, or a tensor of `ctx` is
++// missing there or sized differently; the caller then allocates and loads as usual.
++ggml_backend_buffer_t ggml_backend_rpc_bind_resident(ggml_backend_buffer_type_t buft, struct ggml_context * ctx) {
++    if (buft == nullptr || buft->iface.get_name != ggml_backend_rpc_buffer_type_name) {
++        return nullptr;
++    }
++    ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
++    auto sock = get_socket(buft_ctx->endpoint);
++    if (sock == nullptr) {
++        return nullptr;
++    }
++    rpc_msg_keryx_resident_req request = {buft_ctx->device};
++    if (!send_rpc_cmd(sock, RPC_CMD_KERYX_RESIDENT, &request, sizeof(request))) {
++        return nullptr;
++    }
++    std::vector<uint8_t> response;
++    if (!recv_msg(sock, response) || response.size() < sizeof(rpc_msg_keryx_resident_hdr)) {
++        return nullptr;
++    }
++    rpc_msg_keryx_resident_hdr hdr;
++    memcpy(&hdr, response.data(), sizeof(hdr));
++    if (hdr.remote_ptr == 0 ||
++        response.size() != sizeof(hdr) + (size_t) hdr.n_tensors * sizeof(rpc_msg_keryx_resident_tensor)) {
++        return nullptr;
++    }
++    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> layout;
++    const uint8_t * p = response.data() + sizeof(hdr);
++    for (uint32_t i = 0; i < hdr.n_tensors; i++) {
++        rpc_msg_keryx_resident_tensor e;
++        memcpy(&e, p + (size_t) i * sizeof(e), sizeof(e));
++        e.name[GGML_MAX_NAME - 1] = 0;
++        layout.emplace(std::string(e.name), std::make_pair(e.data, e.nbytes));
++    }
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++        auto it = layout.find(ggml_get_name(t));
++        if (it == layout.end() || it->second.second != (uint64_t) ggml_nbytes(t)) {
++            GGML_LOG_ERROR("[%s] tensor %s is not resident on %s\n", __func__, ggml_get_name(t), buft_ctx->name.c_str());
++            return nullptr;
++        }
++    }
++    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
++        ggml_backend_rpc_buffer_interface,
++        new ggml_backend_rpc_buffer_context{sock, reinterpret_cast<void *>(hdr.base_ptr), hdr.remote_ptr},
++        hdr.size);
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++        t->buffer = buffer;
++        t->data   = reinterpret_cast<void *>(layout[ggml_get_name(t)].first);
++    }
++    return buffer;
++}
++
+ static size_t get_alignment(const std::shared_ptr<socket_t> & sock, uint32_t device) {
+     rpc_msg_get_alignment_req request = {device};
+     rpc_msg_get_alignment_rsp response;
+@@ -902,6 +1021,10 @@
+     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
+         : backends(std::move(all_backends)), cache_dir(cache_dir) {
+         stored_graphs.resize(backends.size());
++        std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++        for (const auto & r : keryx_residents) {
++            buffers.insert(r.buffer);
++        }
+     }
+     ~rpc_server();
+ 
+@@ -921,6 +1044,7 @@
+     bool init_tensor(const rpc_msg_init_tensor_req & request);
+     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
+     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
++    bool keryx_resident(const rpc_msg_keryx_resident_req & request, std::vector<uint8_t> & response);
+ 
+     struct stored_graph {
+         std::vector<uint8_t>   buffer;
+@@ -1054,6 +1178,9 @@
+         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+         return false;
+     }
++    if (keryx_is_resident_buffer(buffer)) {
++        return true;
++    }
+     ggml_backend_buffer_free(buffer);
+     buffers.erase(buffer);
+     return true;
+@@ -1066,6 +1193,9 @@
+         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+         return false;
+     }
++    if (keryx_is_resident_buffer(buffer)) {
++        return false;
++    }
+     ggml_backend_buffer_clear(buffer, request.value);
+     return true;
+ }
+@@ -1143,6 +1273,9 @@
+         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+         return false;
+     }
++    if (keryx_is_resident_buffer(tensor->buffer)) {
++        return false;
++    }
+     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu\n", __func__, (void*)tensor->buffer, tensor->data, offset, size);
+ 
+     // sanitize tensor->data
+@@ -1213,6 +1346,9 @@
+         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+         return false;
+     }
++    if (keryx_is_resident_buffer(tensor->buffer)) {
++        return false;
++    }
+     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
+             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
+ 
+@@ -1320,6 +1456,9 @@
+         GGML_LOG_ERROR("[%s] error deserializing tensors\n", __func__);
+         return false;
+     }
++    if (keryx_is_resident_buffer(dst->buffer)) {
++        return false;
++    }
+ 
+     uint64_t src_size   = (uint64_t) ggml_nbytes(src);
+     uint64_t dst_data   = (uint64_t) dst->data;
+@@ -1502,10 +1641,46 @@
+ 
+ rpc_server::~rpc_server() {
+     for (auto buffer : buffers) {
++        if (keryx_is_resident_buffer(buffer)) {
++            continue;
++        }
+         ggml_backend_buffer_free(buffer);
+     }
+ }
+ 
++bool rpc_server::keryx_resident(const rpc_msg_keryx_resident_req & request, std::vector<uint8_t> & response) {
++    rpc_msg_keryx_resident_hdr hdr = {0, 0, 0, 0};
++    std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++    const keryx_resident_set * set = nullptr;
++    for (const auto & r : keryx_residents) {
++        if (r.device == request.device) {
++            set = &r;
++            break;
++        }
++    }
++    if (set == nullptr) {
++        response.resize(sizeof(hdr));
++        memcpy(response.data(), &hdr, sizeof(hdr));
++        return true;
++    }
++    hdr.remote_ptr = reinterpret_cast<uint64_t>(set->buffer);
++    hdr.base_ptr   = reinterpret_cast<uint64_t>(ggml_backend_buffer_get_base(set->buffer));
++    hdr.size       = ggml_backend_buffer_get_size(set->buffer);
++    hdr.n_tensors  = (uint32_t) set->tensors.size();
++    response.resize(sizeof(hdr) + set->tensors.size() * sizeof(rpc_msg_keryx_resident_tensor));
++    memcpy(response.data(), &hdr, sizeof(hdr));
++    uint8_t * p = response.data() + sizeof(hdr);
++    for (size_t i = 0; i < set->tensors.size(); i++) {
++        rpc_msg_keryx_resident_tensor e;
++        memset(&e, 0, sizeof(e));
++        e.data   = set->tensors[i].data;
++        e.nbytes = set->tensors[i].nbytes;
++        snprintf(e.name, GGML_MAX_NAME, "%s", set->tensors[i].name.c_str());
++        memcpy(p + i * sizeof(e), &e, sizeof(e));
++    }
++    return true;
++}
++
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+                              socket_ptr sock) {
+     rpc_server server(backends, cache_dir);
+@@ -1751,6 +1926,20 @@
+                 }
+                 break;
+             }
++            case RPC_CMD_KERYX_RESIDENT: {
++                rpc_msg_keryx_resident_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                std::vector<uint8_t> response;
++                if (!server.keryx_resident(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, response.data(), response.size())) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_GET_DEVICE_MEMORY: {
+                 rpc_msg_get_device_memory_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+@@ -1968,6 +2157,12 @@
+     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
+         return (void *)ggml_backend_rpc_start_server;
+     }
++    if (std::strcmp(name, "ggml_backend_rpc_bind_resident") == 0) {
++        return (void *)ggml_backend_rpc_bind_resident;
++    }
++    if (std::strcmp(name, "ggml_backend_rpc_set_resident") == 0) {
++        return (void *)ggml_backend_rpc_set_resident;
++    }
+     return NULL;
+ 
+     GGML_UNUSED(reg);
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -30,6 +30,11 @@
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
++// KERYX: weights resident in the serving process, bound by clients instead of pushed.
++GGML_BACKEND_API void ggml_backend_rpc_set_resident(uint32_t device, ggml_backend_buffer_t buffer, size_t n_tensors,
++                                                    const char ** names, const void ** datas, const size_t * nbytes);
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_rpc_bind_resident(ggml_backend_buffer_type_t buft, struct ggml_context * ctx);
++
+ #ifdef  __cplusplus
+ }
+ #endif

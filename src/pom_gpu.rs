@@ -916,11 +916,23 @@ impl PomGpuMiner {
     /// index instead, so the walked blob is always the canonical one R_T pins.
     /// `model_id` selects the host possession index for the uploads and the consensus byte-gate.
     pub fn load_llama(gguf: &str, device_id: usize, model_id: &[u8; 32]) -> Result<Self> {
+        let ts = crate::llama_engine::tensors()
+            .ok_or_else(|| anyhow!("PoM GPU: llama engine tensors unavailable"))?;
+        Self::load_resident(gguf, device_id, model_id, ts)
+    }
+
+    /// Gather over the resident shard the in-process rpc server serves on this GPU (H14): the
+    /// same zero-dup contract as `load_llama`, over the shard engine's tensors.
+    pub fn load_shard(gguf: &str, device_id: usize, model_id: &[u8; 32]) -> Result<Self> {
+        let ts = crate::llama_engine::shard_tensors(device_id)
+            .ok_or_else(|| anyhow!("PoM GPU: shard engine tensors unavailable"))?;
+        Self::load_resident(gguf, device_id, model_id, ts)
+    }
+
+    fn load_resident(gguf: &str, device_id: usize, model_id: &[u8; 32], ts: Vec<(String, u64, usize, bool)>) -> Result<Self> {
         let ctx = CudaContext::new(device_id)?;
         ctx.bind_to_thread()?;
         let stream = ctx.default_stream();
-        let ts = crate::llama_engine::tensors()
-            .ok_or_else(|| anyhow!("PoM GPU: llama engine tensors unavailable"))?;
         let canonical = canonical_tensor_list(gguf)
             .ok_or_else(|| anyhow!("PoM GPU: canonical GGUF tensor list unreadable"))?;
         let plan = plan_canonical_gather(&canonical, &ts);
@@ -1723,7 +1735,25 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // model that doesn't fit this GPU.
     let inference_gpu = device_for_model(&model_id).unwrap_or(0);
     let mut use_llama = false;
-    if device_id == inference_gpu {
+    // H14 shard: resident on this GPU through the shard engine (walked in place, served to
+    // pipeline heads by the in-process rpc server); never the llama engine.
+    let is_shard = crate::models::shard_index(&model_id).is_some();
+    let mut use_shard = false;
+    if is_shard {
+        use_shard = match crate::llama_engine::ensure_shard_loaded(&gguf, device_id as usize) {
+            Ok(()) => {
+                crate::slm::mark_model_available(&model_id, "shard_engine_loaded");
+                true
+            }
+            Err(e) => {
+                warn!("PoM[gpu{}]: shard engine unavailable — {}", device_id, e);
+                let reason = if e.is_oom() { "shard_engine_oom" } else { "shard_engine_load_failed" };
+                crate::slm::mark_model_unavailable(&model_id, reason);
+                false
+            }
+        };
+    }
+    if !is_shard && device_id == inference_gpu {
         // Only this GPU can serve the model: no engine here means no inference anywhere.
         use_llama = match crate::llama_engine::ensure_loaded(&gguf, device_id as usize) {
             Ok(_) => {
@@ -1773,7 +1803,10 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         }
     }
     let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if use_llama {
+        if use_shard {
+            info!("PoM[gpu{}]: zero-dup — walking the resident shard served by this miner", device_id);
+            PomGpuMiner::load_shard(&gguf, device_id as usize, &model_id)
+        } else if use_llama {
             info!("PoM[gpu{}]: zero-dup — walking the llama.cpp engine's resident weights", device_id);
             PomGpuMiner::load_llama(&gguf, device_id as usize, &model_id)
         } else {
@@ -1833,7 +1866,24 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     }
     install(device_id, gm);
     info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
+    if use_shard {
+        let endpoint = format!("127.0.0.1:{}", shard_port() as u32 + device_id);
+        if let Err(e) = crate::llama_engine::serve_shard(device_id as usize, &endpoint) {
+            warn!("PoM[gpu{}]: shard not served — {}", device_id, e);
+        }
+    }
     true
+}
+
+static SHARD_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(50052);
+
+/// Base loopback port of the in-process shard servers (one per GPU: base + device id).
+pub fn set_shard_port(port: u16) {
+    SHARD_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn shard_port() -> u16 {
+    SHARD_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]

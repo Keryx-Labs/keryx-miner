@@ -26,8 +26,10 @@ type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
+type ShardLoadFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
+type ShardServeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
 
-const ABI: c_int = 4;
+const ABI: c_int = 5;
 
 /// Why a load attempt failed. `stage` says how far it got; the detail carries the engine's own
 /// message, including the VRAM figures when CUDA reported them.
@@ -103,6 +105,125 @@ unsafe impl Send for Engine {}
 fn engine() -> &'static Mutex<Option<Engine>> {
     static E: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
     E.get_or_init(|| Mutex::new(None))
+}
+
+/// A network-model shard resident on one mining GPU: walked in place and served to pipeline
+/// heads by the in-process rpc server. One per GPU, independent of the llama singleton.
+struct ShardEngine {
+    model: *mut c_void,
+    count: CountFn,
+    info: InfoFn,
+    serve: ShardServeFn,
+    free: FreeFn,
+    gguf: String,
+    endpoint: Option<String>,
+}
+unsafe impl Send for ShardEngine {}
+
+fn shards() -> &'static Mutex<std::collections::HashMap<usize, ShardEngine>> {
+    static S: OnceLock<Mutex<std::collections::HashMap<usize, ShardEngine>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Loads `gguf` as a resident shard on `gpu` (no-op when already resident there).
+pub fn ensure_shard_loaded(gguf: &str, gpu: usize) -> Result<(), LoadError> {
+    let attempt = next_attempt();
+    let failed = |stage: &'static str, detail: String, cuda_touched: bool| LoadError::new(attempt, stage, detail, cuda_touched);
+    let mut g = shards().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = g.get(&gpu) {
+        if e.gguf == gguf {
+            return Ok(());
+        }
+    }
+    if let Some(e) = g.remove(&gpu) {
+        unsafe { (e.free)(e.model) };
+    }
+    let Some(so) = so_path() else {
+        return Err(failed("library", "keryx-llama shared library not found".to_string(), false));
+    };
+    let lib: &'static libloading::Library = match unsafe { libloading::Library::new(&so) } {
+        Ok(l) => Box::leak(Box::new(l)),
+        Err(e) => return Err(failed("library", format!("load({}) failed: {}", so.display(), e), false)),
+    };
+    unsafe {
+        let (Some(abi), Some(load), Some(count), Some(info), Some(serve), Some(free)) = (
+            sym::<AbiFn>(lib, "keryx_llama_abi"),
+            sym::<ShardLoadFn>(lib, "keryx_shard_load"),
+            sym::<CountFn>(lib, "keryx_shard_tensor_count"),
+            sym::<InfoFn>(lib, "keryx_shard_tensor_info"),
+            sym::<ShardServeFn>(lib, "keryx_shard_serve"),
+            sym::<FreeFn>(lib, "keryx_shard_free"),
+        ) else {
+            return Err(failed("symbols", format!("{} is missing shard symbols", so.display()), false));
+        };
+        let got = abi();
+        if got != ABI {
+            return Err(failed("abi", format!("{} has ABI {}, this miner expects {}", so.display(), got, ABI), false));
+        }
+        let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
+        let cg = CString::new(gguf).map_err(|_| failed("path", "GGUF path contains a NUL byte".to_string(), false))?;
+        log::info!("shard engine: loading {} on GPU {} (resident, served in-process)…", gguf, gpu);
+        let model = load(cg.as_ptr(), gpu as c_int);
+        if model.is_null() {
+            let detail = last_error.map_or_else(
+                || "shard load failed (VRAM?)".to_string(),
+                |f| CStr::from_ptr(f()).to_string_lossy().into_owned(),
+            );
+            return Err(failed("native_load", detail, true));
+        }
+        g.insert(gpu, ShardEngine { model, count, info, serve, free, gguf: gguf.to_string(), endpoint: None });
+        Ok(())
+    }
+}
+
+/// Resident tensors of the shard on `gpu`, canonical order: (name, data_ptr, nbytes, is_device).
+pub fn shard_tensors(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
+    let g = shards().lock().ok()?;
+    let e = g.get(&gpu)?;
+    let n = unsafe { (e.count)(e.model) };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut name: *const c_char = std::ptr::null();
+        let mut data: *mut c_void = std::ptr::null_mut();
+        let mut nbytes: usize = 0;
+        let mut is_dev: c_int = 0;
+        let ok = unsafe { (e.info)(e.model, i, &mut name, &mut data, &mut nbytes, &mut is_dev) };
+        if !ok || name.is_null() || data.is_null() {
+            return None;
+        }
+        out.push((unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned(), data as u64, nbytes, is_dev != 0));
+    }
+    Some(out)
+}
+
+/// Starts serving the resident shard of `gpu` on `endpoint` (idempotent).
+pub fn serve_shard(gpu: usize, endpoint: &str) -> Result<(), String> {
+    let mut g = shards().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(e) = g.get_mut(&gpu) else { return Err(format!("no resident shard on GPU {}", gpu)) };
+    if e.endpoint.is_some() {
+        return Ok(());
+    }
+    let cep = CString::new(endpoint).map_err(|_| "endpoint contains a NUL byte".to_string())?;
+    let rc = unsafe { (e.serve)(e.model, cep.as_ptr(), 4) };
+    if rc < 0 {
+        return Err(format!("shard server failed to start on {}", endpoint));
+    }
+    e.endpoint = Some(endpoint.to_string());
+    log::info!("shard engine: serving GPU {} on {}", gpu, endpoint);
+    Ok(())
+}
+
+/// Whether a resident shard is active on `gpu` for exactly this GGUF.
+pub fn shard_active_for(gguf: &str, gpu: usize) -> bool {
+    shards().lock().ok().map_or(false, |g| g.get(&gpu).map_or(false, |e| e.gguf == gguf))
+}
+
+/// Frees the resident shard of `gpu`.
+pub fn unload_shard(gpu: usize) {
+    let mut g = shards().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = g.remove(&gpu) {
+        unsafe { (e.free)(e.model) };
+    }
 }
 
 /// `KERYX_LLAMA_SO=<path>` wins; else the platform-native shared library next to our own
@@ -487,10 +608,36 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
     None
 }
 
+/// Shard-server check: loads `gguf` resident on `gpu`, serves it on `endpoint` and stays up
+/// until killed. Exit code for the hidden `--shard-test` mode: 41 library, 42 load, 44 serve.
+pub fn run_shard_test(gguf: &str, gpu: usize, endpoint: &str) -> i32 {
+    match ensure_shard_loaded(gguf, gpu) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("shard test: {}", e);
+            return if e.stage == "library" || e.stage == "symbols" || e.stage == "abi" { 41 } else { 42 };
+        }
+    }
+    let ts = shard_tensors(gpu).unwrap_or_default();
+    let bytes: usize = ts.iter().map(|(_, _, n, _)| *n).sum();
+    println!("shard test: {} tensors, {:.2} GiB resident on GPU {}", ts.len(), bytes as f64 / (1u64 << 30) as f64, gpu);
+    if let Err(e) = serve_shard(gpu, endpoint) {
+        eprintln!("shard test: {}", e);
+        return 44;
+    }
+    println!("shard test: serving on {} — Ctrl-C to stop", endpoint);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 /// Pipeline-head check: loads `gguf` with its layers split across `rpc` shards and local GPU
 /// `gpu` per `tensor_split`, generates once, prints the text and the token rate. Exit code for
 /// the hidden `--split-test` mode: 0 ok, 41 library, 42 load, 43 generation.
-pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, manifest: &str, prompt: &str, max_tokens: usize) -> i32 {
+pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, manifest: &str, layer_map: &str, prompt: &str, max_tokens: usize) -> i32 {
+    if !layer_map.is_empty() {
+        std::env::set_var("KERYX_LAYER_MAP", layer_map);
+    }
     let Some(so) = so_path() else {
         eprintln!("split test: library not found next to the miner binary");
         return 41;

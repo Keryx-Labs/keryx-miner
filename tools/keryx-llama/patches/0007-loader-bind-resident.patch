@@ -1,0 +1,108 @@
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -14,6 +14,7 @@
+ #include <map>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+ 
+@@ -76,6 +77,9 @@
+     size_t   n_bytes    = 0;
+ 
+     bool use_mmap = false;
++    // Buffers bound to weights resident on a remote rpc server (KERYX_RPC_RESIDENT): their
++    // tensors already hold data and are skipped by load_all_data.
++    std::unordered_set<ggml_backend_buffer_t> resident_bufs;
+     bool use_direct_io = false;
+     bool check_tensors;
+     bool no_alloc;
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1542,6 +1542,11 @@
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        if (cur->buffer && resident_bufs.count(cur->buffer)) {
++            size_done += n_size;
++            continue;
++        }
++
+         if (use_mmap) {
+             const auto & mapping = mappings.at(weight->idx);
+             ggml_backend_buffer_t buf_mmap = nullptr;
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -25,6 +25,9 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <tuple>
+ #include <cstring>
+ #include <cmath>
+ #include <functional>
+@@ -1292,8 +1295,36 @@
+ 
+     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
+     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
++    // KERYX_LAYER_MAP="A-B:d,..." pins layer ranges to device indices (model device order);
++    // layers outside every range follow the split points. Exact placement for pipeline shards.
++    std::vector<std::tuple<int, int, int>> keryx_layer_map;
++    if (const char * lm = std::getenv("KERYX_LAYER_MAP")) {
++        std::string spec(lm);
++        size_t pos = 0;
++        while (pos < spec.size()) {
++            size_t comma = spec.find(',', pos);
++            std::string item = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
++            int a = -1, b = -1, d = -1;
++            if (sscanf(item.c_str(), "%d-%d:%d", &a, &b, &d) == 3 && a >= 0 && b >= a && d >= 0 && (size_t) d < n_devices()) {
++                keryx_layer_map.emplace_back(a, b, d);
++            } else {
++                LLAMA_LOG_WARN("%s: ignoring KERYX_LAYER_MAP item '%s'\n", __func__, item.c_str());
++            }
++            if (comma == std::string::npos) {
++                break;
++            }
++            pos = comma + 1;
++        }
++    }
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
++        for (const auto & [a, b, d] : keryx_layer_map) {
++            if (il >= a && il <= b) {
++                auto * dev = devices.at(d).dev;
++                LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s (KERYX_LAYER_MAP), is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
++                return {dev, &pimpl->gpu_buft_list.at(dev)};
++            }
++        }
+         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+             return {cpu_dev, &pimpl->cpu_buft_list};
+@@ -1570,7 +1601,23 @@
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                 }
+             } else {
+-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                buf = nullptr;
++                // KERYX_RPC_RESIDENT: an rpc device that already holds these weights hands out
++                // its resident buffer; the tensors are bound by name and never loaded here.
++                if (std::getenv("KERYX_RPC_RESIDENT")) {
++                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++                    auto bind = reg ? (ggml_backend_buffer_t (*)(ggml_backend_buffer_type_t, struct ggml_context *))
++                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_bind_resident") : nullptr;
++                    if (bind) {
++                        buf = bind(buft, ctx);
++                        if (buf) {
++                            ml.resident_bufs.insert(buf);
++                        }
++                    }
++                }
++                if (buf == nullptr) {
++                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                }
+             }
+             if (buf == nullptr) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

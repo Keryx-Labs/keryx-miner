@@ -33,3 +33,11 @@ on first use with gcc.
 - `gguf_truncate_layers.py MODEL.gguf OUT.gguf N` — the first N layers as a loadable model
   (per-layer metadata arrays cut to N). Output is meaningless; it is for measuring the per-token
   rpc protocol of a model too large for one machine.
+- `patches/0006-rpc-resident-weights.patch`: a serving process registers weights it loaded itself
+  as resident (`ggml_backend_rpc_set_resident`); clients bind their tensors to them by name
+  (`RPC_CMD_KERYX_RESIDENT`, `ggml_backend_rpc_bind_resident`) instead of allocating and pushing
+  bytes. Resident buffers are never freed or written through the protocol.
+- `patches/0007-loader-bind-resident.patch`: with `KERYX_RPC_RESIDENT=1` the model loader binds
+  each rpc device's tensors to that device's resident weights before allocating, and skips
+  loading them. The head then holds no shard bytes at all: one VRAM copy per shard, shared by the
+  shard miner's PoM walk and the pipeline.

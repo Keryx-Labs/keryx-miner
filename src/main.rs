@@ -440,6 +440,18 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "default" => Some(Tier::Default),
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
+        "shard-0" => Some(Tier::VeryLight),
+        "shard-1" => {
+            keryx_miner::models::set_light_shard(1);
+            Some(Tier::Light)
+        }
+        "shard-2" => {
+            keryx_miner::models::set_light_shard(2);
+            Some(Tier::Light)
+        }
+        "shard-3" => Some(Tier::Default),
+        "shard-4" => Some(Tier::High),
+        "shard-5" => Some(Tier::VeryHigh),
         _ => None,
     }
 }
@@ -767,17 +779,26 @@ fn main() -> Result<(), Error> {
         std::process::exit(keryx_miner::llama_engine::run_device_probe_child(gpu));
     }
     // Hidden pipeline-head check: --split-test <gguf> --split-rpc <host:port,...> --split-ts <f,...>
-    // [--split-manifest <tsv>] [--split-gpu <n>] [--split-prompt <text>] [--split-tokens <n>]
+    // [--split-manifest <tsv>] [--split-layers <A-B:d,...>] [--split-gpu <n>] [--split-prompt <text>] [--split-tokens <n>]
     if let Some(i) = argv.iter().position(|a| a == "--split-test") {
         let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
         let gguf = argv.get(i + 1).cloned().unwrap_or_default();
         let rpc = val("--split-rpc").unwrap_or_default();
         let ts = val("--split-ts").unwrap_or_default();
         let manifest = val("--split-manifest").unwrap_or_default();
+        let layer_map = val("--split-layers").unwrap_or_default();
         let gpu = val("--split-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
         let prompt = val("--split-prompt").unwrap_or_else(|| "The capital of France is".to_string());
         let tokens = val("--split-tokens").and_then(|s| s.parse().ok()).unwrap_or(64);
-        std::process::exit(keryx_miner::llama_engine::run_split_test(&gguf, gpu, &rpc, &ts, &manifest, &prompt, tokens));
+        std::process::exit(keryx_miner::llama_engine::run_split_test(&gguf, gpu, &rpc, &ts, &manifest, &layer_map, &prompt, tokens));
+    }
+    // Hidden shard-server check: --shard-test <shard.gguf> [--shard-gpu <n>] [--shard-endpoint <host:port>]
+    if let Some(i) = argv.iter().position(|a| a == "--shard-test") {
+        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
+        let gguf = argv.get(i + 1).cloned().unwrap_or_default();
+        let gpu = val("--shard-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let endpoint = val("--shard-endpoint").unwrap_or_else(|| "127.0.0.1:50052".to_string());
+        std::process::exit(keryx_miner::llama_engine::run_shard_test(&gguf, gpu, &endpoint));
     }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.worker_threads(tokio_worker_threads()).enable_all();
@@ -1106,6 +1127,12 @@ async fn run() -> Result<(), Error> {
     //   --high       → Qwen3.6-27B
     //   --very-high  → Kimi-Linear-48B
 
+    // 12 GB cards split between the two 12 GB shards by the mining address, so both are served
+    // without coordination; `--force-model shard-1|shard-2` (parsed next) overrides it.
+    if let Some(addr) = opt.mining_address.as_deref() {
+        let parity = addr.bytes().fold(0u8, |acc, b| acc ^ b) & 1;
+        keryx_miner::models::set_light_shard(1 + parity);
+    }
     // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
     // warning below and the per-GPU assignment both need them.
     let forced_tiers: Vec<Option<keryx_miner::models::Tier>> =
@@ -1145,6 +1172,7 @@ async fn run() -> Result<(), Error> {
     // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
     // ceiling). --force-model entries win per-card over both. VRAM is CUDA-driver-sourced so
     // device_ids match the devices the walk loads onto.
+    keryx_miner::pom_gpu::set_shard_port(opt.shard_port);
     let pom_assignments = assign_pom_tiers(tier, &forced_tiers);
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);

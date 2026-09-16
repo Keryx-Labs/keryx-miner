@@ -17,6 +17,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "ggml-rpc.h"
+#include "gguf.h"
 #ifdef __APPLE__
 // Metal: llama.cpp's ggml-metal backend stores quantized tensors in unified-memory MTLBuffers.
 // `t->data` is a CPU-readable pointer into that unified memory (also GPU-visible on Apple Silicon
@@ -31,6 +32,7 @@
 #include <cstring>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -97,7 +99,7 @@ static void keryx_install_log_filter() {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 4; }
+KERYX_EXPORT int keryx_llama_abi() { return 5; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -356,6 +358,166 @@ KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {
     if (h->smpl) llama_sampler_free(h->smpl);
     if (h->ctx) llama_free(h->ctx);
     if (h->model) llama_model_free(h->model);
+    delete h;
+}
+
+// ── Network-model shard (H14) ─────────────────────────────────────────────────────────────────
+// A shard GGUF holds a layer range of the network model and is not a model llama can run. The
+// miner loads it ONCE on its mining GPU: the PoM walk gathers over these tensors exactly like
+// over llama's (same info/device contract), and the in-process rpc server hands the same buffer
+// to a pipeline head that binds by name — one VRAM copy for walk and service.
+struct KeryxShard {
+    gguf_context*          gguf = nullptr;
+    ggml_context*          ctx  = nullptr;
+    ggml_backend_buffer_t  buf  = nullptr;
+    int                    gpu  = -1;
+    std::vector<std::string> names;              // canonical (byte-lexicographic) order
+    std::vector<ggml_tensor*> tensors;           // parallel to names
+    std::string            endpoint;             // set once serving
+};
+
+KERYX_EXPORT KeryxShard* keryx_shard_load(const char* gguf_path, int gpu) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+#ifdef __APPLE__
+    (void)gguf_path; (void)gpu;
+    keryx_set_error("shard", "shard serving is CUDA-only");
+    return nullptr;
+#else
+    llama_backend_init();
+    ggml_context* meta = nullptr;
+    gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ &meta };
+    gguf_context* g = gguf_init_from_file(gguf_path, gp);
+    if (!g || !meta) {
+        keryx_set_error("shard", std::string("gguf_init_from_file failed for ") + gguf_path);
+        if (g) gguf_free(g);
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(gpu);
+    if (!buft) {
+        keryx_set_error("shard", "no CUDA buffer type for gpu " + std::to_string(gpu));
+        ggml_free(meta); gguf_free(g);
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(meta, buft);
+    if (!buf) {
+        keryx_set_error("shard", "ggml_backend_alloc_ctx_tensors_from_buft failed (out of memory?)");
+        ggml_free(meta); gguf_free(g);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    FILE* f = fopen(gguf_path, "rb");
+    if (!f) {
+        keryx_set_error("shard", std::string("cannot open ") + gguf_path);
+        ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+        return nullptr;
+    }
+    const size_t data_off = gguf_get_data_offset(g);
+    std::vector<uint8_t> chunk(64u << 20);
+    const int64_t n = gguf_get_n_tensors(g);
+    for (int64_t i = 0; i < n; i++) {
+        const char* name = gguf_get_tensor_name(g, i);
+        ggml_tensor* t = ggml_get_tensor(meta, name);
+        if (!t || !t->data) {
+            keryx_set_error("shard", std::string("tensor without device storage: ") + name);
+            fclose(f); ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+            return nullptr;
+        }
+        const size_t nbytes = ggml_nbytes(t);
+        if (nbytes != gguf_get_tensor_size(g, i)) {
+            keryx_set_error("shard", std::string("tensor size mismatch: ") + name);
+            fclose(f); ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+            return nullptr;
+        }
+#if defined(_WIN32)
+        _fseeki64(f, (long long)(data_off + gguf_get_tensor_offset(g, i)), SEEK_SET);
+#else
+        fseeko(f, (off_t)(data_off + gguf_get_tensor_offset(g, i)), SEEK_SET);
+#endif
+        size_t done = 0;
+        while (done < nbytes) {
+            const size_t want = std::min(chunk.size(), nbytes - done);
+            if (fread(chunk.data(), 1, want, f) != want) {
+                keryx_set_error("shard", std::string("short read in ") + name);
+                fclose(f); ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+                return nullptr;
+            }
+            ggml_backend_tensor_set(t, chunk.data(), done, want);
+            done += want;
+        }
+    }
+    fclose(f);
+    auto* h = new KeryxShard();
+    h->gguf = g; h->ctx = meta; h->buf = buf; h->gpu = gpu;
+    for (int64_t i = 0; i < n; i++) h->names.push_back(gguf_get_tensor_name(g, i));
+    std::sort(h->names.begin(), h->names.end());
+    for (auto& nm : h->names) h->tensors.push_back(ggml_get_tensor(meta, nm.c_str()));
+    return h;
+#endif
+}
+
+KERYX_EXPORT size_t keryx_shard_tensor_count(KeryxShard* h) { return h ? h->names.size() : 0; }
+
+KERYX_EXPORT bool keryx_shard_tensor_info(KeryxShard* h, size_t i, const char** name, void** data,
+                                          size_t* nbytes, int* is_device) {
+    if (!h || i >= h->names.size()) return false;
+    const ggml_tensor* t = h->tensors[i];
+    if (!t || !t->data) return false;
+    *name = h->names[i].c_str();
+    *data = t->data;
+    *nbytes = ggml_nbytes(t);
+    *is_device = 1;
+    return true;
+}
+
+KERYX_EXPORT int keryx_shard_tensor_device(KeryxShard* h, size_t i) {
+    if (!h || i >= h->names.size()) return -1;
+    return h->gpu;
+}
+
+// Serve the resident shard on `endpoint` (host:port, loopback — the miner's gateway fronts it).
+// Registers the buffer as the rpc device 0 resident set and runs the server for the life of
+// the process. 0 ok, -1 error, 1 already serving.
+KERYX_EXPORT int keryx_shard_serve(KeryxShard* h, const char* endpoint, int n_threads) {
+#ifdef __APPLE__
+    (void)h; (void)endpoint; (void)n_threads;
+    return -1;
+#else
+    if (!h || !endpoint) return -1;
+    if (!h->endpoint.empty()) return 1;
+    std::string dev_name = "CUDA" + std::to_string(h->gpu);
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name.c_str());
+    if (!dev) {
+        keryx_set_error("shard", "no backend device " + dev_name);
+        return -1;
+    }
+    std::vector<const char*> names; std::vector<const void*> datas; std::vector<size_t> sizes;
+    for (size_t i = 0; i < h->names.size(); i++) {
+        names.push_back(h->names[i].c_str());
+        datas.push_back(h->tensors[i]->data);
+        sizes.push_back(ggml_nbytes(h->tensors[i]));
+    }
+    ggml_backend_rpc_set_resident(0, h->buf, names.size(), names.data(), datas.data(), sizes.data());
+    h->endpoint = endpoint;
+    std::string ep = h->endpoint;
+    int threads = n_threads > 0 ? n_threads : 4;
+    std::thread([ep, threads, dev]() {
+        ggml_backend_dev_t devs[1] = { dev };
+        ggml_backend_rpc_start_server(ep.c_str(), nullptr, (size_t)threads, 1, devs);
+    }).detach();
+    return 0;
+#endif
+}
+
+KERYX_EXPORT void keryx_shard_free(KeryxShard* h) {
+    if (!h) return;
+    if (!h->endpoint.empty()) {
+        // the server thread keeps running: drop the resident registration so no client can bind
+        ggml_backend_rpc_set_resident(0, nullptr, 0, nullptr, nullptr, nullptr);
+    }
+    if (h->buf) ggml_backend_buffer_free(h->buf);
+    if (h->ctx) ggml_free(h->ctx);
+    if (h->gguf) gguf_free(h->gguf);
     delete h;
 }
 

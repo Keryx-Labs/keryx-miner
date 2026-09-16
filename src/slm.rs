@@ -362,6 +362,13 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
              <|im_assistant|>assistant<|im_middle|>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
+        // DeepSeek V4 — the template emits BOS itself (add_bos_token is off in this GGUF); a
+        // closed think block in the generation prompt is its `thinking = false` branch. One
+        // arm for the whole model and its shards: only a pipeline head ever formats a prompt.
+        n if n.starts_with("v4-flash") => format!(
+            "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜></think>",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
         // Generic ChatML fallback (unreachable for the registered lineup).
         _ => format!(
             "<|im_start|>system\n{}<|im_end|>\n\

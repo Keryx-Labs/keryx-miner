@@ -1556,6 +1556,14 @@ pub fn h10_activation_daa() -> u64 {
     gate(87_360_000, 1)
 }
 
+/// H14 model-split gate. At/after this score (the TEMPLATE's daa_score) the lineup is paused:
+/// the miner walks and mines a shard of the network model (tiers 6-11) and never publishes a
+/// lineup tier. MUST equal the node's `model_split_activation` on both networks; `u64::MAX`
+/// until it is scheduled.
+pub fn h14_activation_daa() -> u64 {
+    gate(u64::MAX, u64::MAX)
+}
+
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of
 /// the AiRequest, not by the digest of its payload. MUST equal the node's
 /// `reward_routing_activation`: a miner deriving the other identity signs responses the node
