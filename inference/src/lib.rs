@@ -12,6 +12,7 @@ pub mod model_fixed;
 pub mod task;
 
 pub use ai_payload::{
+    avail_signed_bytes, AiAvailPayload, AI_AVAIL_PAYLOAD_LEN, AI_AVAIL_SIGNED_LEN, SUBNETWORK_ID_AI_AVAIL_HEX,
     AiRequestPayload, AiResponder, AiResponseLink, AiResponsePayload, AiChallengePayload,
     MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN,
     MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_V2_LEN,

@@ -92,6 +92,13 @@ pub struct KeryxdHandler {
     /// Used by poll_inference to register the escrow outpoint after a successful AiResponse.
     ai_request_txids: std::collections::HashMap<String, (String, u64)>,
 
+    /// Network-model requests this miner already declared itself available for (H14).
+    ai_declared: std::collections::HashSet<String>,
+
+    /// Network-model requests this head is not yet serving: waiting for the declarations, or
+    /// leaving the chosen head its turn. Mining goes on meanwhile.
+    ai_pipeline_waiting: Vec<((String, [u8; 32], [u8; 32], String, usize), std::time::Instant)>,
+
     /// In-flight AiResponse submissions not yet accepted by the mempool, keyed by txid.
     /// Value: (tx, submit attempts, last submit time). Resubmitted until accepted or expired —
     /// a transiently rejected response must keep trying while the service window is open.
@@ -282,6 +289,8 @@ impl KeryxdHandler {
             validation_queue: VecDeque::new(),
             ai_seen_prefixes: std::collections::HashSet::new(),
             ai_request_txids: std::collections::HashMap::new(),
+            ai_declared: std::collections::HashSet::new(),
+            ai_pipeline_waiting: Vec::new(),
             ai_response_inflight: std::collections::HashMap::new(),
             backfill_cutoff_daa: None,
             backfill_queue: VecDeque::new(),
@@ -429,6 +438,12 @@ impl KeryxdHandler {
             txs.iter().map(|t| t.subnetwork_id.as_str()).collect::<Vec<_>>()
         );
         for tx in txs {
+            if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX {
+                if let Some(resp) = hex::decode(&tx.payload).ok().and_then(|raw| keryx_inference::AiResponsePayload::deserialize(&raw)) {
+                    keryx_miner::pipeline::note_response_seen(resp.request_hash);
+                }
+                continue;
+            }
             // (raw, model_id, prompt, max_tokens, inference_reward)
             let extracted: Option<(Vec<u8>, [u8; 32], String, usize, u64)> =
                 if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
@@ -455,10 +470,6 @@ impl KeryxdHandler {
                 };
 
             if let Some((raw, model_id, prompt, max_tokens, inference_reward)) = extracted {
-                if !ready_ids.contains(&model_id) {
-                    log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
-                    continue;
-                }
                 let txid_hex = tx
                     .verbose_data
                     .as_ref()
@@ -477,6 +488,13 @@ impl KeryxdHandler {
                     blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
                 };
                 let stable_id = hex::encode(&request_hash[..8]);
+                if model_id == keryx_miner::models::network_model().whole.model_id {
+                    self.declare_available(request_hash, &stable_id, block_daa);
+                }
+                if !ready_ids.contains(&model_id) {
+                    log::debug!("OPoI: skipping AiRequest — model not supported or files not ready");
+                    continue;
+                }
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("OPoI: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
@@ -504,6 +522,43 @@ impl KeryxdHandler {
                 }
             }
         }
+    }
+
+    /// Declares this miner available for a network-model request on every shard tier it
+    /// serves: one signed AiAvail per tier, queued for submission on the next tick.
+    fn declare_available(&mut self, request_hash: [u8; 32], stable_id: &str, block_daa: u64) {
+        if block_daa < keryx_miner::pom::h14_activation_daa() || self.ai_declared.contains(stable_id) {
+            return;
+        }
+        let Some(w) = self.escrow_watcher.as_ref() else { return };
+        let tiers = keryx_miner::pipeline::served_tiers();
+        if tiers.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = now.checked_sub(std::time::Duration::from_secs(AI_RESPONSE_RETRY_SECS)).unwrap_or(now);
+        for tier in tiers.iter() {
+            let avail = w.sign_avail(request_hash, *tier);
+            let rpc_tx = crate::proto::RpcTransaction {
+                version: 0,
+                inputs: vec![],
+                outputs: vec![],
+                lock_time: 0,
+                subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_AVAIL_HEX.to_string(),
+                gas: 0,
+                payload: hex::encode(avail.serialize()),
+                mass: 0,
+                verbose_data: None,
+            };
+            if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
+                self.ai_response_inflight.insert(txid, (rpc_tx, 0, due));
+            }
+        }
+        info!("OPoI: declared available for id={} on tier(s) {:?}", stable_id, tiers);
+        if self.ai_declared.len() >= MAX_AI_SEEN_IDS {
+            self.ai_declared.clear();
+        }
+        self.ai_declared.insert(stable_id.to_string());
     }
 
     /// Compute the Kaspa transaction ID for a non-coinbase RpcTransaction.
@@ -584,19 +639,46 @@ impl KeryxdHandler {
         }
     }
 
+    /// Moves the waiting network-model requests whose turn has come back to the queue front,
+    /// and drops the ones nobody needs served any more.
+    fn promote_waiting_pipeline_requests(&mut self) {
+        let now_daa = self.last_known_daa;
+        let waiting = std::mem::take(&mut self.ai_pipeline_waiting);
+        for (req, since) in waiting {
+            match keryx_miner::pipeline::head_decision(&req.1, since, now_daa) {
+                keryx_miner::pipeline::HeadDecision::Serve => self.ai_request_queue.push_front(req),
+                keryx_miner::pipeline::HeadDecision::Wait => self.ai_pipeline_waiting.push((req, since)),
+                keryx_miner::pipeline::HeadDecision::Drop(why) => info!("OPoI: pipeline request id={} dropped — {}", req.0, why),
+            }
+        }
+    }
+
     fn try_start_inference(&mut self) {
         if self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || keryx_miner::slm::probe_in_flight() {
             return;
         }
-        if let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
+        while let Some((stable_id, request_hash, model_id, prompt, max_tokens)) = self.ai_request_queue.pop_front() {
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::slm::is_model_ready(&model_id) {
                 log::error!("OPoI: model became unavailable after queuing id={} — discarding request", stable_id);
-                return;
+                continue;
             }
             let (tx_done, rx_done) = oneshot::channel::<Option<(String, Vec<keryx_miner::shard_gateway::LinkSession>)>>();
             if model_id == keryx_miner::models::network_model().whole.model_id {
-                // Network model: this miner heads a pipeline over the drawn links (H14).
+                // Network model: this miner heads a pipeline over the declared links (H14),
+                // once it is its turn.
+                let since = std::time::Instant::now();
+                match keryx_miner::pipeline::head_decision(&request_hash, since, self.last_known_daa) {
+                    keryx_miner::pipeline::HeadDecision::Serve => {}
+                    keryx_miner::pipeline::HeadDecision::Wait => {
+                        self.ai_pipeline_waiting.push(((stable_id, request_hash, model_id, prompt, max_tokens), since));
+                        continue;
+                    }
+                    keryx_miner::pipeline::HeadDecision::Drop(why) => {
+                        info!("OPoI: pipeline request id={} dropped — {}", stable_id, why);
+                        continue;
+                    }
+                }
                 info!("OPoI: heading a pipeline for id={} (max_tokens={})", stable_id, max_tokens);
                 tokio::spawn(async move {
                     let result = match keryx_miner::pipeline::run_head(request_hash, prompt, max_tokens).await {
@@ -620,6 +702,7 @@ impl KeryxdHandler {
                 let _ = tx_done.send(result.map(|t| (t, Vec::new())));
             });
             self.inference_rx = Some((request_hash, rx_done));
+            return;
         }
     }
 
@@ -1008,6 +1091,7 @@ impl KeryxdHandler {
                 if let Some(ref block) = template.block {
                     self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                 }
+                self.promote_waiting_pipeline_requests();
                 if self.inference_rx.is_none()
                     && self.challenge_inference_rx.is_none()
                     && !self.ai_request_queue.is_empty()

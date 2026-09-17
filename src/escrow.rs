@@ -502,6 +502,20 @@ impl EscrowWatcher {
         keryx_inference::AiResponder { escrow_pubkey: self.pubkey_bytes, signature: *sig.as_ref() }
     }
 
+    /// Availability declaration for a network-model request: schnorr signature with the escrow
+    /// key over the domain-hashed `[request_hash] [tier]` bytes — MUST match the node's
+    /// `verify_avail_signature` (blake2b-256("KeryxServiceAvailV1" || signed_bytes)).
+    pub fn sign_avail(&self, request_hash: [u8; 32], tier: u8) -> keryx_inference::AiAvailPayload {
+        let signed = keryx_inference::avail_signed_bytes(&request_hash, tier);
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(b"KeryxServiceAvailV1");
+        hasher.update(&signed);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
+        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
+        keryx_inference::AiAvailPayload::new(request_hash, tier, self.pubkey_bytes, *sig.as_ref())
+    }
+
     /// Scan a confirmed block for the miner's escrow output and check for mature claims.
     /// Returns a claim TX to submit if one is ready; `None` otherwise.
     pub fn handle_block(&mut self, block: &crate::proto::RpcBlock) -> Option<RpcTransaction> {
