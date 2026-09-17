@@ -1871,6 +1871,10 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
         if let Err(e) = crate::llama_engine::serve_shard(device_id as usize, &endpoint) {
             warn!("PoM[gpu{}]: shard not served — {}", device_id, e);
         }
+        // The head shard's miner also needs the head GGUF to lead pipelines.
+        if crate::models::shard_index(&model_id) == Some(crate::models::network_model().shards.len() as u8 - 1) {
+            std::thread::spawn(crate::slm::ensure_head_file);
+        }
     }
     true
 }

@@ -339,7 +339,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.6-27b" | "qwen3.5-9b-abliterated" => format!(
+        "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "split9b-shard-0" | "split9b-shard-1" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -798,8 +798,9 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
         .map(|s| s.model_id)
         .collect();
     // A pipeline head announces the whole network model: the id requests target.
-    if crate::pipeline::head_ready() && !model_is_unavailable(&crate::models::V4_FLASH.model_id) {
-        ids.push(crate::models::V4_FLASH.model_id);
+    let whole = crate::models::network_model().whole.model_id;
+    if crate::pipeline::head_ready() && !model_is_unavailable(&whole) && !ids.contains(&whole) {
+        ids.push(whole);
     }
     ids
 }
@@ -807,7 +808,101 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
 /// The head GGUF of the network model (sparse: every tensor in the table, data for the head's
 /// own tensors only), under the whole model's directory.
 pub fn head_gguf_path() -> std::path::PathBuf {
-    model_dir(&crate::models::V4_FLASH).join("head.gguf")
+    model_dir(crate::models::network_model().whole).join("head.gguf")
+}
+
+const SPARSE_MAGIC: &[u8; 8] = b"KRXSPRS1";
+
+/// Rebuilds a sparse file from a `KRXSPRS1` container (see tools/model-split/gguf_head_pack.py):
+/// the file takes its full apparent length, only the packed segments are written, the rest
+/// stays holes.
+pub fn unpack_sparse(container: &std::path::Path, out: &std::path::Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::File::open(container).with_context(|| format!("open {}", container.display()))?;
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != SPARSE_MAGIC {
+        anyhow::bail!("{} is not a KRXSPRS1 container", container.display());
+    }
+    let mut u64buf = [0u8; 8];
+    f.read_exact(&mut u64buf)?;
+    let total = u64::from_le_bytes(u64buf);
+    f.read_exact(&mut u64buf)?;
+    let n = u64::from_le_bytes(u64buf) as usize;
+    if n > 1 << 20 {
+        anyhow::bail!("{}: implausible segment count {}", container.display(), n);
+    }
+    let mut segments = Vec::with_capacity(n);
+    for _ in 0..n {
+        f.read_exact(&mut u64buf)?;
+        let off = u64::from_le_bytes(u64buf);
+        f.read_exact(&mut u64buf)?;
+        let len = u64::from_le_bytes(u64buf);
+        if off.checked_add(len).map_or(true, |end| end > total) {
+            anyhow::bail!("{}: segment {}+{} beyond {}", container.display(), off, len, total);
+        }
+        segments.push((off, len));
+    }
+    let tmp = out.with_extension("gguf.part");
+    let mut o = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    o.set_len(total)?;
+    let mut buf = vec![0u8; 64 << 20];
+    for (off, len) in segments {
+        o.seek(SeekFrom::Start(off))?;
+        let mut left = len;
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            f.read_exact(&mut buf[..want])?;
+            o.write_all(&buf[..want])?;
+            left -= want as u64;
+        }
+    }
+    o.sync_all()?;
+    drop(o);
+    std::fs::rename(&tmp, out)?;
+    Ok(())
+}
+
+static HEAD_FETCH: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Brings the head GGUF of the network model into place for a head-shard miner: downloads the
+/// packed head by CID if needed, then unpacks it sparse. Blocking, idempotent, one attempt at a
+/// time; errors are logged (the miner keeps mining its shard without heading).
+pub fn ensure_head_file() {
+    let out = head_gguf_path();
+    if out.exists() {
+        return;
+    }
+    {
+        let mut busy = HEAD_FETCH.lock().unwrap_or_else(|p| p.into_inner());
+        if *busy {
+            return;
+        }
+        *busy = true;
+    }
+    let result: Result<()> = (|| {
+        let nm = crate::models::network_model();
+        let dir = model_dir(nm.whole);
+        std::fs::create_dir_all(&dir)?;
+        let packed = dir.join("head.krxh");
+        if !packed.exists() {
+            log::info!("pipeline head: downloading the packed head ({})", nm.head_cid);
+            download_file(&ipfs_url(nm.head_cid), &packed)?;
+        }
+        let digest = crate::integrity::unixfs_v0_digest_file(&packed, |_, _| {})?;
+        if hex::encode(digest) != nm.head_digest_hex {
+            let _ = std::fs::remove_file(&packed);
+            anyhow::bail!("packed head digest mismatch — file removed, will be downloaded again");
+        }
+        log::info!("pipeline head: unpacking {} → {} (sparse)", packed.display(), out.display());
+        unpack_sparse(&packed, &out)?;
+        log::info!("pipeline head: ready at {}", out.display());
+        Ok(())
+    })();
+    if let Err(e) = result {
+        log::warn!("pipeline head: not ready — {}", e);
+    }
+    *HEAD_FETCH.lock().unwrap_or_else(|p| p.into_inner()) = false;
 }
 
 /// The chat-templated form of `prompt` for the model named `name`.
@@ -833,8 +928,8 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     if publishing_blocked() {
         return false;
     }
-    if *model_id == crate::models::V4_FLASH.model_id {
-        return crate::pipeline::head_ready() && !model_is_unavailable(model_id);
+    if *model_id == crate::models::network_model().whole.model_id && crate::pipeline::head_ready() {
+        return !model_is_unavailable(model_id);
     }
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let Some(spec) = specs.iter().find(|s| &s.model_id == model_id) else { return false; };
@@ -945,6 +1040,36 @@ mod tests {
             dir_name,
             min_vram_mb: 0,
         }
+    }
+
+    #[test]
+    fn sparse_container_unpacks_to_holes_and_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let packed = dir.path().join("h.krxh");
+        let out = dir.path().join("h.gguf");
+        let mut c = Vec::new();
+        c.extend_from_slice(b"KRXSPRS1");
+        c.extend_from_slice(&1_000_000u64.to_le_bytes());
+        c.extend_from_slice(&2u64.to_le_bytes());
+        c.extend_from_slice(&0u64.to_le_bytes());
+        c.extend_from_slice(&3u64.to_le_bytes());
+        c.extend_from_slice(&999_990u64.to_le_bytes());
+        c.extend_from_slice(&4u64.to_le_bytes());
+        c.extend_from_slice(b"abc");
+        c.extend_from_slice(b"wxyz");
+        std::fs::write(&packed, &c).unwrap();
+        unpack_sparse(&packed, &out).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        assert_eq!(data.len(), 1_000_000);
+        assert_eq!(&data[..3], b"abc");
+        assert!(data[3..999_990].iter().all(|&b| b == 0));
+        assert_eq!(&data[999_990..999_994], b"wxyz");
+        assert!(data[999_994..].iter().all(|&b| b == 0));
+        // a segment past the end is refused
+        let mut bad = c.clone();
+        bad[16..24].copy_from_slice(&10u64.to_le_bytes());
+        std::fs::write(&packed, &bad).unwrap();
+        assert!(unpack_sparse(&packed, &dir.path().join("bad.gguf")).is_err());
     }
 
     #[test]

@@ -595,7 +595,7 @@ impl KeryxdHandler {
                 return;
             }
             let (tx_done, rx_done) = oneshot::channel::<Option<(String, Vec<keryx_miner::shard_gateway::LinkSession>)>>();
-            if model_id == keryx_miner::models::V4_FLASH.model_id {
+            if model_id == keryx_miner::models::network_model().whole.model_id {
                 // Network model: this miner heads a pipeline over the drawn links (H14).
                 info!("OPoI: heading a pipeline for id={} (max_tokens={})", stable_id, max_tokens);
                 tokio::spawn(async move {

@@ -271,18 +271,105 @@ pub const V4_FLASH_SHARD_5: ModelSpec = ModelSpec {
     min_vram_mb: 30_000,
 };
 
-/// The six shards, layer order (`V4_FLASH_SHARDS[k]` is tier `6 + k`).
+/// The six mainnet shards, layer order (`V4_FLASH_SHARDS[k]` is tier `6 + k`).
 pub const V4_FLASH_SHARDS: [&ModelSpec; 6] =
     [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5];
+
+// ── Testnet network model: Qwen3.5-9B in two shards ─────────────────────────────────────────────
+// Mirror of the node's `POM_TIERS_H14_TESTNET`: the whole pipeline on one 24 GB card.
+
+pub const SPLIT9B_SHARD_0: ModelSpec = ModelSpec {
+    name: "split9b-shard-0",
+    model_id: [
+        0x8d, 0xba, 0x34, 0xd0, 0x28, 0x5b, 0xe2, 0x87,
+        0xf0, 0x22, 0xda, 0xd0, 0xf3, 0x3e, 0xa5, 0x88,
+        0xc8, 0x36, 0x94, 0xd4, 0x83, 0x59, 0x60, 0x8c,
+        0xc8, 0xd4, 0x74, 0x24, 0x26, 0x76, 0xf2, 0x79,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmXstsoY2jeNkQhVgWceiLLkBxHD4uooicnTPYUjDNCkq6"],
+    dir_name: "Split9B-shard-0",
+    min_vram_mb: 3_000,
+};
+
+pub const SPLIT9B_SHARD_1: ModelSpec = ModelSpec {
+    name: "split9b-shard-1",
+    model_id: [
+        0xa1, 0x98, 0xfe, 0x36, 0x9a, 0x63, 0xde, 0x8d,
+        0x75, 0xc5, 0xeb, 0x4a, 0x46, 0xa8, 0x24, 0xe0,
+        0x20, 0x55, 0x4a, 0xc2, 0x65, 0x48, 0xad, 0x68,
+        0x8c, 0x90, 0xa9, 0x60, 0xdb, 0x52, 0x49, 0x2e,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmZDTf3KtGYjR7qUgD2PHfK3divUhNtYNcHvuSsbCNZYU5"],
+    dir_name: "Split9B-shard-1",
+    min_vram_mb: 3_000,
+};
+
+/// The network model of one network: the whole model requests target, its shards in tier
+/// order, their layer ranges, the layer count and the packed head.
+pub struct NetworkModelSpec {
+    pub whole: &'static ModelSpec,
+    pub shards: &'static [&'static ModelSpec],
+    pub layers: &'static [(u32, u32)],
+    pub n_layer: u32,
+    pub head_cid: &'static str,
+    pub head_digest_hex: &'static str,
+    /// Hardware tier → shard index.
+    pub shard_of_tier: fn(Tier) -> usize,
+}
+
+fn mainnet_shard_of_tier(tier: Tier) -> usize {
+    match tier {
+        Tier::VeryLight => 0,
+        Tier::Light => light_shard() as usize,
+        Tier::Default => 3,
+        Tier::High => 4,
+        Tier::VeryHigh => 5,
+    }
+}
+
+fn testnet_shard_of_tier(tier: Tier) -> usize {
+    match tier {
+        Tier::VeryLight | Tier::Light | Tier::Default => 0,
+        Tier::High | Tier::VeryHigh => 1,
+    }
+}
+
+pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
+    whole: &V4_FLASH,
+    shards: &[&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5],
+    layers: &[(0, 2), (3, 7), (8, 12), (13, 19), (20, 29), (30, 42)],
+    n_layer: 43,
+    head_cid: "QmZU3jvigYXpCVFSzfjJoJA3Yy27ryujyvp67gWhcq37iZ",
+    head_digest_hex: "a555a9dcb5dac4d7c8c2609781d7013d8a8d8b6416429ae50254a093c1181df2",
+    shard_of_tier: mainnet_shard_of_tier,
+};
+
+pub static NETWORK_MODEL_TESTNET: NetworkModelSpec = NetworkModelSpec {
+    whole: &QWEN3_5_9B_ABLITERATED,
+    shards: &[&SPLIT9B_SHARD_0, &SPLIT9B_SHARD_1],
+    layers: &[(0, 15), (16, 31)],
+    n_layer: 32,
+    head_cid: "QmQSC2sjKaAqZH4E6HGbtkowWqGKBrHx4JvAWmXsTpNdDC",
+    head_digest_hex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
+    shard_of_tier: testnet_shard_of_tier,
+};
+
+/// The network model of the selected network (`--testnet`).
+pub fn network_model() -> &'static NetworkModelSpec {
+    if crate::pom::is_testnet() {
+        &NETWORK_MODEL_TESTNET
+    } else {
+        &NETWORK_MODEL_MAINNET
+    }
+}
 
 /// First tier index of the network model — mirror of the node's `NETWORK_MODEL_TIER`.
 pub const NETWORK_MODEL_TIER: u8 = 5;
 
-/// Layer range `(first, last)` of each shard — mirror of the node's `NETWORK_MODEL_SHARDS`.
-pub const V4_FLASH_SHARD_LAYERS: [(u32, u32); 6] = [(0, 2), (3, 7), (8, 12), (13, 19), (20, 29), (30, 42)];
-
-/// Layer count of the network model; the output layer is index `V4_FLASH_N_LAYER` in llama.
-pub const V4_FLASH_N_LAYER: u32 = 43;
 
 /// Which of the two 12 GB shards (1 or 2) a `Tier::Light` GPU mines. Spread by the mining
 /// address at startup so the two are served without coordination; `--force-model shard-2`
@@ -297,20 +384,15 @@ pub fn light_shard() -> u8 {
     LIGHT_SHARD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The shard a hardware tier mines under H14.
+/// The shard a hardware tier mines under H14 on the selected network.
 pub fn shard_for_tier(tier: Tier) -> &'static ModelSpec {
-    match tier {
-        Tier::VeryLight => &V4_FLASH_SHARD_0,
-        Tier::Light => V4_FLASH_SHARDS[light_shard() as usize],
-        Tier::Default => &V4_FLASH_SHARD_3,
-        Tier::High => &V4_FLASH_SHARD_4,
-        Tier::VeryHigh => &V4_FLASH_SHARD_5,
-    }
+    let nm = network_model();
+    nm.shards[(nm.shard_of_tier)(tier)]
 }
 
-/// Shard index of a network-model shard id.
+/// Shard index of a network-model shard id on the selected network.
 pub fn shard_index(model_id: &[u8; 32]) -> Option<u8> {
-    V4_FLASH_SHARDS.iter().position(|s| s.model_id == *model_id).map(|k| k as u8)
+    network_model().shards.iter().position(|s| s.model_id == *model_id).map(|k| k as u8)
 }
 
 /// Whether `model_id` is one of the Proof-of-Model tier models. DAA-independent — used at startup
@@ -463,6 +545,8 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &V4_FLASH_SHARD_3,
     &V4_FLASH_SHARD_4,
     &V4_FLASH_SHARD_5,
+    &SPLIT9B_SHARD_0,
+    &SPLIT9B_SHARD_1,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -530,9 +614,22 @@ mod tests {
             assert!(pom_tier_index(&spec.model_id, daa).is_some(), "{} has no tier", spec.name);
         }
         assert!(!is_pom_model(&V4_FLASH.model_id));
-        for spec in V4_FLASH_SHARDS {
+        for spec in network_model().shards {
             assert!(is_pom_model(&spec.model_id));
             assert_eq!(pom_tier_index(&spec.model_id, daa), None);
+        }
+        // both layouts are internally consistent
+        for nm in [&NETWORK_MODEL_MAINNET, &NETWORK_MODEL_TESTNET] {
+            assert_eq!(nm.shards.len(), nm.layers.len());
+            assert_eq!(nm.layers[0].0, 0);
+            assert_eq!(nm.layers[nm.layers.len() - 1].1 + 1, nm.n_layer);
+            for w in nm.layers.windows(2) {
+                assert_eq!(w[0].1 + 1, w[1].0);
+            }
+            for t in [Tier::VeryLight, Tier::Light, Tier::Default, Tier::High, Tier::VeryHigh] {
+                assert!((nm.shard_of_tier)(t) < nm.shards.len());
+            }
+            assert_eq!((nm.shard_of_tier)(Tier::VeryHigh), nm.shards.len() - 1);
         }
 
         // Below the gate the miner produces nothing rather than a block the node would reject.
@@ -548,6 +645,9 @@ mod tests {
     /// network, scheduled or not.
     #[test]
     fn h14_era_mines_shards_only() {
+        if crate::pom::is_testnet() {
+            return;
+        }
         let daa = u64::MAX;
         for (k, spec) in V4_FLASH_SHARDS.iter().enumerate() {
             assert_eq!(pom_tier_index(&spec.model_id, daa), Some(NETWORK_MODEL_TIER + 1 + k as u8), "{}", spec.name);

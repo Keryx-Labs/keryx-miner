@@ -441,6 +441,7 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
         "shard-0" => Some(Tier::VeryLight),
+        "shard-1" if keryx_miner::pom::is_testnet() => Some(Tier::VeryHigh),
         "shard-1" => {
             keryx_miner::models::set_light_shard(1);
             Some(Tier::Light)
@@ -815,6 +816,20 @@ fn main() -> Result<(), Error> {
             });
         }
         std::process::exit(keryx_miner::llama_engine::run_shard_test(&gguf, gpu, &endpoint));
+    }
+    // Hidden sparse unpack: --unpack-head <head.krxh> <out.gguf>
+    if let Some(i) = argv.iter().position(|a| a == "--unpack-head") {
+        let (Some(src), Some(dst)) = (argv.get(i + 1), argv.get(i + 2)) else {
+            eprintln!("usage: --unpack-head <head.krxh> <out.gguf>");
+            std::process::exit(2);
+        };
+        match keryx_miner::slm::unpack_sparse(std::path::Path::new(src), std::path::Path::new(dst)) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("unpack: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
     // Hidden link-proxy check: --link-proxy <gateway host:port> [--link-model <hex64>] [--link-port <n>]
     // [--link-key <escrow.key>]: opens the tunnel, pings, self-tests SIGN, then proxies 127.0.0.1:<n>.

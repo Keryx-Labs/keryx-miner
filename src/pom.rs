@@ -1561,7 +1561,7 @@ pub fn h10_activation_daa() -> u64 {
 /// lineup tier. MUST equal the node's `model_split_activation` on both networks; `u64::MAX`
 /// until it is scheduled.
 pub fn h14_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, 133_000)
 }
 
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of

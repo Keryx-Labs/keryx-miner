@@ -41,3 +41,8 @@ on first use with gcc.
   each rpc device's tensors to that device's resident weights before allocating, and skips
   loading them. The head then holds no shard bytes at all: one VRAM copy per shard, shared by the
   shard miner's PoM walk and the pipeline.
+- `gguf_head_pack.py SOURCE.gguf OUT.krxh` — packs a pipeline head: the whole GGUF header (complete
+  tensor table, original offsets) plus the data of every non-layer tensor, in a `KRXSPRS1`
+  container (magic, total length, segments). The miner unpacks it (`slm::unpack_sparse`,
+  `--unpack-head`) into a sparse GGUF of the full apparent size: every layer tensor is a hole,
+  bound at load time to a shard's resident copy.
