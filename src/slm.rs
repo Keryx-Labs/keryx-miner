@@ -80,6 +80,15 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
         }
         let response = match req.call() {
             Ok(r) => r,
+            Err(ureq::Error::Status(416, _)) if resume_from > 0 => {
+                // Range not satisfiable: the file is already fully downloaded.
+                if ui_progress_to_stderr() {
+                    eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
+                } else {
+                    ui_download_info(&format!("[keryx-miner] already complete ({} MB).", resume_from / 1_000_000));
+                }
+                return Ok(());
+            }
             Err(e) => {
                 attempt += 1;
                 if attempt >= MAX_ATTEMPTS {
@@ -108,14 +117,6 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<()> {
                     .open(dest)
                     .with_context(|| format!("open append {}", dest.display()))?;
                 (f, resume_from, total)
-            } else if resume_from > 0 && status == 416 {
-                // Range not satisfiable ⇒ the file is already fully downloaded.
-                if ui_progress_to_stderr() {
-                    eprintln!("\r  already complete ({} MB).            ", resume_from / 1_000_000);
-                } else {
-                    ui_download_info(&format!("[keryx-miner] already complete ({} MB).", resume_from / 1_000_000));
-                }
-                return Ok(());
             } else {
                 // 200, or the server ignored Range. Never wipe a local file that already matches
                 // the remote size — IPFS gateways often ignore Range and answer 200 + full
