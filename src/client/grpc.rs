@@ -664,9 +664,12 @@ impl KeryxdHandler {
                 continue;
             }
             let (tx_done, rx_done) = oneshot::channel::<Option<(String, Vec<keryx_miner::shard_gateway::LinkSession>)>>();
-            if model_id == keryx_miner::models::network_model().whole.model_id {
+            if model_id == keryx_miner::models::network_model().whole.model_id
+                && self.last_known_daa >= keryx_miner::pom::h14_activation_daa()
+            {
                 // Network model: this miner heads a pipeline over the declared links (H14),
-                // once it is its turn.
+                // once it is its turn. Before the gate the same id may be a lineup model
+                // (testnet), served by the plain inference path below.
                 let since = std::time::Instant::now();
                 match keryx_miner::pipeline::head_decision(&request_hash, since, self.last_known_daa) {
                     keryx_miner::pipeline::HeadDecision::Serve => {}

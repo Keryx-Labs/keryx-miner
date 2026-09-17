@@ -441,7 +441,6 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
         "shard-0" => Some(Tier::VeryLight),
-        "shard-1" if keryx_miner::pom::is_testnet() => Some(Tier::VeryHigh),
         "shard-1" => {
             keryx_miner::models::set_light_shard(1);
             Some(Tier::Light)

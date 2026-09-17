@@ -275,39 +275,6 @@ pub const V4_FLASH_SHARD_5: ModelSpec = ModelSpec {
 pub const V4_FLASH_SHARDS: [&ModelSpec; 6] =
     [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5];
 
-// ── Testnet network model: Qwen3.5-9B in two shards ─────────────────────────────────────────────
-// Mirror of the node's `POM_TIERS_H14_TESTNET`: the whole pipeline on one 24 GB card.
-
-pub const SPLIT9B_SHARD_0: ModelSpec = ModelSpec {
-    name: "split9b-shard-0",
-    model_id: [
-        0x8d, 0xba, 0x34, 0xd0, 0x28, 0x5b, 0xe2, 0x87,
-        0xf0, 0x22, 0xda, 0xd0, 0xf3, 0x3e, 0xa5, 0x88,
-        0xc8, 0x36, 0x94, 0xd4, 0x83, 0x59, 0x60, 0x8c,
-        0xc8, 0xd4, 0x74, 0x24, 0x26, 0x76, 0xf2, 0x79,
-    ],
-    format: ModelFormat::GgufQwen35,
-    tokenizer_cid: "",
-    weight_cids: &["QmXstsoY2jeNkQhVgWceiLLkBxHD4uooicnTPYUjDNCkq6"],
-    dir_name: "Split9B-shard-0",
-    min_vram_mb: 3_000,
-};
-
-pub const SPLIT9B_SHARD_1: ModelSpec = ModelSpec {
-    name: "split9b-shard-1",
-    model_id: [
-        0xa1, 0x98, 0xfe, 0x36, 0x9a, 0x63, 0xde, 0x8d,
-        0x75, 0xc5, 0xeb, 0x4a, 0x46, 0xa8, 0x24, 0xe0,
-        0x20, 0x55, 0x4a, 0xc2, 0x65, 0x48, 0xad, 0x68,
-        0x8c, 0x90, 0xa9, 0x60, 0xdb, 0x52, 0x49, 0x2e,
-    ],
-    format: ModelFormat::GgufQwen35,
-    tokenizer_cid: "",
-    weight_cids: &["QmZDTf3KtGYjR7qUgD2PHfK3divUhNtYNcHvuSsbCNZYU5"],
-    dir_name: "Split9B-shard-1",
-    min_vram_mb: 3_000,
-};
-
 /// The network model of one network: the whole model requests target, its shards in tier
 /// order, their layer ranges, the layer count and the packed head.
 pub struct NetworkModelSpec {
@@ -331,13 +298,6 @@ fn mainnet_shard_of_tier(tier: Tier) -> usize {
     }
 }
 
-fn testnet_shard_of_tier(tier: Tier) -> usize {
-    match tier {
-        Tier::VeryLight | Tier::Light | Tier::Default => 0,
-        Tier::High | Tier::VeryHigh => 1,
-    }
-}
-
 pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
     whole: &V4_FLASH,
     shards: &[&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5],
@@ -348,23 +308,9 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
     shard_of_tier: mainnet_shard_of_tier,
 };
 
-pub static NETWORK_MODEL_TESTNET: NetworkModelSpec = NetworkModelSpec {
-    whole: &QWEN3_5_9B_ABLITERATED,
-    shards: &[&SPLIT9B_SHARD_0, &SPLIT9B_SHARD_1],
-    layers: &[(0, 15), (16, 31)],
-    n_layer: 32,
-    head_cid: "QmQSC2sjKaAqZH4E6HGbtkowWqGKBrHx4JvAWmXsTpNdDC",
-    head_digest_hex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
-    shard_of_tier: testnet_shard_of_tier,
-};
-
-/// The network model of the selected network (`--testnet`).
+/// The network model — the same split V4-Flash on both networks.
 pub fn network_model() -> &'static NetworkModelSpec {
-    if crate::pom::is_testnet() {
-        &NETWORK_MODEL_TESTNET
-    } else {
-        &NETWORK_MODEL_MAINNET
-    }
+    &NETWORK_MODEL_MAINNET
 }
 
 /// First tier index of the network model — mirror of the node's `NETWORK_MODEL_TIER`.
@@ -545,8 +491,6 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &V4_FLASH_SHARD_3,
     &V4_FLASH_SHARD_4,
     &V4_FLASH_SHARD_5,
-    &SPLIT9B_SHARD_0,
-    &SPLIT9B_SHARD_1,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -618,8 +562,8 @@ mod tests {
             assert!(is_pom_model(&spec.model_id));
             assert_eq!(pom_tier_index(&spec.model_id, daa), None);
         }
-        // both layouts are internally consistent
-        for nm in [&NETWORK_MODEL_MAINNET, &NETWORK_MODEL_TESTNET] {
+        // the layout is internally consistent
+        for nm in [&NETWORK_MODEL_MAINNET] {
             assert_eq!(nm.shards.len(), nm.layers.len());
             assert_eq!(nm.layers[0].0, 0);
             assert_eq!(nm.layers[nm.layers.len() - 1].1 + 1, nm.n_layer);
@@ -645,9 +589,6 @@ mod tests {
     /// network, scheduled or not.
     #[test]
     fn h14_era_mines_shards_only() {
-        if crate::pom::is_testnet() {
-            return;
-        }
         let daa = u64::MAX;
         for (k, spec) in V4_FLASH_SHARDS.iter().enumerate() {
             assert_eq!(pom_tier_index(&spec.model_id, daa), Some(NETWORK_MODEL_TIER + 1 + k as u8), "{}", spec.name);
