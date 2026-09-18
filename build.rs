@@ -285,14 +285,14 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
 /// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order;
 /// a patch that is already applied is skipped.
 fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let dir = std::path::Path::new("tools/keryx-llama/patches");
-    let mut patches: Vec<_> = std::fs::read_dir(dir)?
+    // Absolute without canonicalize: the `\\?\` form it yields on Windows is not a path git can open.
+    let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("tools/keryx-llama/patches");
+    let mut patches: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "patch").unwrap_or(false))
         .collect();
     patches.sort();
     for patch in patches {
-        let patch = std::fs::canonicalize(&patch)?;
         let applied = std::process::Command::new("git")
             .current_dir(src)
             .args(["apply", "--check", "--reverse"]).arg(&patch)
