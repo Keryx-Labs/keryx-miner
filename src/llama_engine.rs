@@ -31,6 +31,10 @@ type ShardServeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c
 
 const ABI: c_int = 5;
 
+/// A pipeline head gives up on a request that does not finish in time, so its links and its
+/// own GPU are freed for the next one; checked between tokens by the engine.
+const HEAD_GENERATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
+
 /// Why a load attempt failed. `stage` says how far it got; the detail carries the engine's own
 /// message, including the VRAM figures when CUDA reported them.
 #[derive(Debug, Clone)]
@@ -732,10 +736,15 @@ pub fn head_generate(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, laye
         log::info!("pipeline head: model assembled in {:.1} s over {}", t0.elapsed().as_secs_f64(), rpc);
         let mut buf = vec![0u8; 64 * 1024];
         let t1 = std::time::Instant::now();
+        std::env::set_var("KERYX_LLAMA_GEN_DEADLINE_MS", HEAD_GENERATION_DEADLINE.as_millis().to_string());
         let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
+        std::env::remove_var("KERYX_LLAMA_GEN_DEADLINE_MS");
         free(model);
-        if n <= 0 {
-            return Err("head generation failed".into());
+        if n < 0 {
+            return Err(format!("head generation failed: {}", CStr::from_ptr(last_error()).to_string_lossy()));
+        }
+        if n == 0 {
+            return Err("head generation failed: empty output".into());
         }
         buf.truncate(n as usize);
         log::info!("pipeline head: {} bytes in {:.2} s", n, t1.elapsed().as_secs_f64());

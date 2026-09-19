@@ -1199,8 +1199,24 @@ pub fn set_inference_paused(paused: bool) {
     INFERENCE_PAUSED.store(paused, Ordering::Release);
 }
 
+/// Open shard-gateway sessions: while a pipeline head drives a resident shard, the GPU must
+/// not be shared with PoW or PoM work.
+static SHARD_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn shard_session_begin() {
+    SHARD_SESSIONS.fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn shard_session_end() {
+    SHARD_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+}
+
+pub fn shard_sessions() -> usize {
+    SHARD_SESSIONS.load(Ordering::Acquire)
+}
+
 pub fn inference_paused() -> bool {
-    INFERENCE_PAUSED.load(Ordering::Acquire)
+    INFERENCE_PAUSED.load(Ordering::Acquire) || shard_sessions() > 0
 }
 
 /// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
@@ -1905,6 +1921,21 @@ mod tests {
 
     fn t(name: &str, ptr: u64, nbytes: usize, dev: bool) -> (String, u64, usize, bool) {
         (name.into(), ptr, nbytes, dev)
+    }
+
+    #[test]
+    fn shard_sessions_pause_the_gpu_until_the_last_one_ends() {
+        let before = shard_sessions();
+        shard_session_begin();
+        shard_session_begin();
+        assert!(inference_paused());
+        shard_session_end();
+        assert!(inference_paused());
+        shard_session_end();
+        assert_eq!(shard_sessions(), before);
+        if before == 0 {
+            assert!(!inference_paused() || INFERENCE_PAUSED.load(Ordering::Acquire));
+        }
     }
 
     #[test]

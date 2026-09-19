@@ -137,6 +137,7 @@ jobs:
           cp target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so dist/stage/
           libdir="$CUDA_PATH/targets/x86_64-linux/lib"
           cp -L "$libdir/libcudart.so.12" "$libdir/libcublas.so.12" "$libdir/libcublasLt.so.12" dist/stage/
+          cp -L "$(gcc -print-file-name=libgomp.so.1)" dist/stage/
           ls -la dist/stage
 
       - name: Package (Linux zip)

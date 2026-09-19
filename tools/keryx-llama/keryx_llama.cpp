@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #endif
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -170,6 +171,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load_split(const char* gguf_path, int gpu, 
                                                 const char* manifest) {
     keryx_last_error.clear();
     keryx_install_log_filter();
+    ggml_backend_rpc_reset_failure();
     if (manifest && *manifest) {
 #if defined(_WIN32)
         _putenv_s("KERYX_RPC_MANIFEST", manifest);
@@ -287,9 +289,27 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
 
     llama_memory_clear(llama_get_memory(h->ctx), true);
     llama_batch batch = llama_batch_get_one(toks.data(), (int32_t)toks.size());
+    // Deadline checked between tokens only: a decode in flight over rpc links cannot be interrupted.
+    long deadline_ms = 0;
+    if (const char* d = getenv("KERYX_LLAMA_GEN_DEADLINE_MS")) deadline_ms = atol(d);
+    const auto t0 = std::chrono::steady_clock::now();
     int written = 0;
     for (int i = 0; i < max_tokens; i++) {
-        if (llama_decode(h->ctx, batch) != 0) break;
+        if (deadline_ms > 0) {
+            const long elapsed = (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (elapsed > deadline_ms) {
+                keryx_last_error = "generation deadline exceeded after " + std::to_string(i) + " tokens";
+                return -1;
+            }
+        }
+        const int rc = llama_decode(h->ctx, batch);
+        if (rc < 0) {
+            keryx_last_error = ggml_backend_rpc_link_failed()
+                ? "a shard link failed after " + std::to_string(i) + " tokens"
+                : "llama_decode failed (" + std::to_string(rc) + ")";
+            return -1;
+        }
+        if (rc != 0) break; // context full
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
         if (llama_vocab_is_eog(vocab, tok)) break;
         char piece[256];

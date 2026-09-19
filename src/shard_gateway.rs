@@ -30,6 +30,25 @@ const HELLO_LEN: usize = 4 + 1 + 32 + 33 + 32 + 64;
 const REPLY_LEN: usize = 1 + 33 + 32 + 1 + 64;
 const MAX_FRAME: usize = 16 << 20;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A link that sends nothing for this long is dead: closing its loopback socket fails the head's
+/// current decode instead of leaving it blocked.
+const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Holds the GPU for the head for as long as the session lives: PoW and PoM stay paused.
+struct ShardSessionGuard;
+
+impl ShardSessionGuard {
+    fn new() -> Self {
+        crate::pom_gpu::shard_session_begin();
+        ShardSessionGuard
+    }
+}
+
+impl Drop for ShardSessionGuard {
+    fn drop(&mut self) {
+        crate::pom_gpu::shard_session_end();
+    }
+}
 /// Recent-coinbase memory of the peer directory, in DAA (the node's eligibility window).
 const PEER_MEMORY_DAA: u64 = 6_000;
 
@@ -273,6 +292,7 @@ pub async fn serve(listen: String, identity: Arc<GatewayIdentity>, resolve: Shar
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &identity, &resolve)).await {
                 Ok(Ok((stream, keys, local, client_pk))) => {
                     log::info!("shard gateway: session from {} (head {})", peer, hex::encode(client_pk));
+                    let _pause = ShardSessionGuard::new();
                     if let Err(e) = server_session(stream, keys, local, identity).await {
                         log::debug!("shard gateway: session {} ended: {}", peer, e);
                     }
@@ -589,7 +609,11 @@ async fn data_tunnel(local: TcpStream, t: Tunnel) -> std::io::Result<()> {
         }
     });
     let result = loop {
-        match read_frame(&mut rrd, &mut rx).await {
+        let frame = match tokio::time::timeout(LINK_IDLE_TIMEOUT, read_frame(&mut rrd, &mut rx)).await {
+            Ok(f) => f,
+            Err(_) => break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "link silent, dropped")),
+        };
+        match frame {
             Ok((FRAME_DATA, payload)) => {
                 if let Err(e) = lwr.write_all(&payload).await {
                     break Err(e);

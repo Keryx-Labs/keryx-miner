@@ -689,7 +689,8 @@ impl MinerManager {
             last_instant = Instant::now();
             // PoM model (re)load also intentionally pauses PoW — treat it like an inference pause.
             let challenge_active = opoi_challenge_active.load(Ordering::Relaxed)
-                || keryx_miner::pom_gpu::is_loading();
+                || keryx_miner::pom_gpu::is_loading()
+                || keryx_miner::pom_gpu::shard_sessions() > 0;
             stats.set_opoi_challenge_active(challenge_active);
             let total = hashes_tried.swap(0, Ordering::AcqRel);
 

@@ -41,6 +41,10 @@ on first use with gcc.
   each rpc device's tensors to that device's resident weights before allocating, and skips
   loading them. The head then holds no shard bytes at all: one VRAM copy per shard, shared by the
   shard miner's PoM walk and the pipeline.
+- `patches/0008-rpc-soft-link-failure.patch`: a failed rpc link no longer aborts the client
+  process. The failure is sticky (`ggml_backend_rpc_link_failed`, reset by
+  `ggml_backend_rpc_reset_failure` at each head load) and the next graph compute returns an
+  error, so llama reports it and the head drops the request.
 - `gguf_head_pack.py SOURCE.gguf OUT.krxh` — packs a pipeline head: the whole GGUF header (complete
   tensor table, original offsets) plus the data of every non-layer tensor, in a `KRXSPRS1`
   container (magic, total length, segments). The miner unpacks it (`slm::unpack_sparse`,
