@@ -1901,12 +1901,15 @@ static SHARD_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::
 /// mines and serves `model_id`.
 pub fn shard_local_endpoint(model_id: &[u8; 32]) -> Option<(String, u8)> {
     let k = crate::models::shard_index(model_id)?;
-    let dev = device_for_model(model_id)?;
-    let endpoint = crate::llama_engine::shard_endpoint(dev as usize)?;
+    device_for_model(model_id)?;
+    let spec = crate::models::network_model().shards.get(k as usize)?;
+    let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+    let endpoint = crate::llama_engine::serving_endpoint_for(&gguf)?;
     Some((endpoint, crate::models::NETWORK_MODEL_TIER + 1 + k))
 }
 
-/// Base loopback port of the in-process shard servers (one per GPU: base + device id).
+/// Base loopback port of the in-process shard server (base + id of the GPU that serves; one
+/// served shard per process).
 pub fn set_shard_port(port: u16) {
     SHARD_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
 }

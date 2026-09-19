@@ -203,6 +203,11 @@ pub fn shard_tensors(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
 /// Starts serving the resident shard of `gpu` on `endpoint` (idempotent).
 pub fn serve_shard(gpu: usize, endpoint: &str) -> Result<(), String> {
     let mut g = shards().lock().unwrap_or_else(|p| p.into_inner());
+    // The rpc resident set is process-wide: a second server would overwrite the first one's.
+    if let Some((other, _)) = g.iter().find(|(d, e)| **d != gpu && e.endpoint.is_some()) {
+        log::info!("shard engine: GPU {} keeps its copy for PoM only — the shard is served from GPU {}", gpu, other);
+        return Ok(());
+    }
     let Some(e) = g.get_mut(&gpu) else { return Err(format!("no resident shard on GPU {}", gpu)) };
     if e.endpoint.is_some() {
         return Ok(());
@@ -220,6 +225,11 @@ pub fn serve_shard(gpu: usize, endpoint: &str) -> Result<(), String> {
 /// Loopback endpoint the resident shard of `gpu` is served on, once serving.
 pub fn shard_endpoint(gpu: usize) -> Option<String> {
     shards().lock().ok()?.get(&gpu)?.endpoint.clone()
+}
+
+/// Loopback endpoint the process serves `gguf` on, whichever GPU holds the served copy.
+pub fn serving_endpoint_for(gguf: &str) -> Option<String> {
+    shards().lock().ok()?.values().find(|e| e.gguf == gguf).and_then(|e| e.endpoint.clone())
 }
 
 /// Whether a resident shard is active on `gpu` for exactly this GGUF.
