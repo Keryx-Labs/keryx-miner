@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // In-process llama.cpp engine: build `libkeryx-llama.so` next to the miner binary.
-    // llama.cpp is PINNED to b10015 — the SAME pin as hiveos/build-keryx-llama.sh and the
+    // llama.cpp is PINNED to b10032 — the SAME pin as hiveos/build-keryx-llama.sh and the
     // byte-identity proof in tools/llama_zerodup_spike. Bump all together, then re-verify.
     println!("cargo:rerun-if-changed=tools/keryx-llama/keryx_llama.cpp");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SKIP");
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const LLAMA_TAG: &str = "b10015";
+const LLAMA_TAG: &str = "b10032";
 const LLAMA_ESCAPE_HINT: &str = "set KERYX_LLAMA_SKIP=1 to build the miner without it (a prebuilt libkeryx-llama.so must then be placed next to the binary)";
 
 /// Builds `libkeryx-llama.so` into the cargo profile dir (next to the miner binary):

@@ -10,12 +10,12 @@
 #   pascal: /tmp/cuda124 (12.4), archs 60;61
 # Output: hiveos/dist-<line>/libkeryx-llama.so  (package-line.sh bundles it when present)
 #
-# llama.cpp PINNED to b10015 — the SAME pin as build-llama-server.sh and the byte-identity
+# llama.cpp PINNED to b10032 — the SAME pin as build-llama-server.sh and the byte-identity
 # proof in tools/llama_zerodup_spike. Bump all together, then re-verify the spike.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINE="$1"; JOBS="${2:-16}"
-TAG=b10015
+TAG=b10032
 case "$LINE" in
   modern) ARCHS="75;80;86;89;90;120"; CUDAMOUNT=(); KCUDA=/usr/local/cuda ;;
   legacy) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;

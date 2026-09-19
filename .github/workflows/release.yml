@@ -36,7 +36,7 @@ permissions:
   contents: write
 
 env:
-  LLAMA_TAG: b10015
+  LLAMA_TAG: b10032
   CUDA_VERSION: "12.9.1"
   PROTOC_VERSION: "23.4"
   KERYX_LLAMA_ARCHS: "70;75;80;86;89;90;100;120"
