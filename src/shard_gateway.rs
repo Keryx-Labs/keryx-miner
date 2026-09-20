@@ -33,6 +33,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A link that sends nothing for this long is dead: closing its loopback socket fails the head's
 /// current decode instead of leaving it blocked.
 const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const CONTROL_KEEPALIVE: Duration = Duration::from_secs(30);
+
+// server-side idle limit of a session (a head that vanished must not keep the GPU paused)
+static SESSION_IDLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(120_000);
+
+fn session_idle_timeout() -> Duration {
+    Duration::from_millis(SESSION_IDLE_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Holds the GPU for the head for as long as the session lives: PoW and PoM stay paused.
 struct ShardSessionGuard;
@@ -362,9 +370,10 @@ async fn server_session(stream: TcpStream, keys: SessionKeys, local: String, ide
     let mut local_wr: Option<tokio::net::tcp::OwnedWriteHalf> = None;
     let mut local_reader: Option<tokio::task::JoinHandle<()>> = None;
     let result: std::io::Result<()> = loop {
-        let (kind, payload) = match read_frame(&mut rd, &mut rx).await {
-            Ok(f) => f,
-            Err(e) => break Err(e),
+        let (kind, payload) = match tokio::time::timeout(session_idle_timeout(), read_frame(&mut rd, &mut rx)).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => break Err(e),
+            Err(_) => break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "head silent, session dropped")),
         };
         match kind {
             FRAME_DATA => {
@@ -530,9 +539,17 @@ async fn control_loop(t: Tunnel, mut ctl: mpsc::Receiver<Ctl>) {
     let mut rx = Sealer::new(&t.keys.s2c);
     let tier = t.tier;
     let mut pending_sign: std::collections::VecDeque<oneshot::Sender<Result<keryx_inference::AiResponseLink, String>>> = Default::default();
-    let mut pending_ping: std::collections::VecDeque<(std::time::Instant, oneshot::Sender<Result<Duration, String>>)> = Default::default();
+    let mut pending_ping: std::collections::VecDeque<(std::time::Instant, Option<oneshot::Sender<Result<Duration, String>>>)> = Default::default();
+    let mut keepalive = tokio::time::interval(CONTROL_KEEPALIVE);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if write_frame(&mut wr, &mut tx, FRAME_PING, &[]).await.is_err() {
+                    break;
+                }
+                pending_ping.push_back((std::time::Instant::now(), None));
+            }
             req = ctl.recv() => {
                 let Some(req) = req else { break };
                 match req {
@@ -548,7 +565,7 @@ async fn control_loop(t: Tunnel, mut ctl: mpsc::Receiver<Ctl>) {
                             let _ = reply.send(Err("control tunnel closed".into()));
                             break;
                         }
-                        pending_ping.push_back((std::time::Instant::now(), reply));
+                        pending_ping.push_back((std::time::Instant::now(), Some(reply)));
                     }
                 }
             }
@@ -556,7 +573,7 @@ async fn control_loop(t: Tunnel, mut ctl: mpsc::Receiver<Ctl>) {
                 let Ok((kind, payload)) = frame else { break };
                 match kind {
                     FRAME_PONG => {
-                        if let Some((t0, reply)) = pending_ping.pop_front() {
+                        if let Some((t0, Some(reply))) = pending_ping.pop_front() {
                             let _ = reply.send(Ok(t0.elapsed()));
                         }
                     }
@@ -689,6 +706,30 @@ mod tests {
         // old entries expire
         note_coinbase(format!("/escrow:{}/ai:ep:h:1", hex::encode([0x55u8; 32])).as_bytes(), 100 + PEER_MEMORY_DAA + 1);
         assert!(peer_endpoint(&pk).is_none());
+    }
+
+    #[tokio::test]
+    async fn silent_head_releases_the_shard_session() {
+        SESSION_IDLE_MS.store(300, std::sync::atomic::Ordering::Relaxed);
+        let shard = identity(3);
+        let head = identity(4);
+        let model = [0xCDu8; 32];
+        let gw = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = gw.local_addr().unwrap().to_string();
+        drop(gw);
+        let resolve: ShardResolver = Arc::new(move |id: &[u8; 32]| (*id == model).then(|| ("127.0.0.1:1".to_string(), 9u8)));
+        let listen = gw_addr.clone();
+        tokio::spawn(async move { serve(listen, shard, resolve).await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = crate::pom_gpu::shard_sessions();
+        // a raw tunnel with no control loop: nothing is ever sent, like a head whose box died
+        let tunnel = client_handshake(&gw_addr, &model, &head).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(crate::pom_gpu::shard_sessions(), before + 1);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(crate::pom_gpu::shard_sessions(), before);
+        drop(tunnel);
+        SESSION_IDLE_MS.store(120_000, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[tokio::test]
