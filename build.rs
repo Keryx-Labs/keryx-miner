@@ -282,8 +282,9 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
     Err(format!("cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}").into())
 }
 
-/// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order;
-/// a patch that is already applied is skipped.
+/// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order.
+/// The applied set is stamped in `.keryx-patches`; when it differs from the current set the
+/// checkout is reset to the tag first (patches overlap, so they cannot be undone one by one).
 fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // Absolute without canonicalize: the `\\?\` form it yields on Windows is not a path git can open.
     let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("tools/keryx-llama/patches");
@@ -292,20 +293,26 @@ fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::
         .filter(|p| p.extension().map(|x| x == "patch").unwrap_or(false))
         .collect();
     patches.sort();
-    for patch in patches {
-        let applied = std::process::Command::new("git")
-            .current_dir(src)
-            .args(["apply", "--check", "--reverse"]).arg(&patch)
-            .status()?
-            .success();
-        if applied {
-            continue;
-        }
+    let mut stamp = String::new();
+    for patch in &patches {
+        let hash = std::fs::read(patch)?.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+        stamp.push_str(&format!("{} {hash:016x}\n", patch.file_name().unwrap_or_default().to_string_lossy()));
+    }
+    let stamp_path = src.join(".keryx-patches");
+    if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
+        return Ok(());
+    }
+    run(
+        "git checkout of the pristine llama.cpp tree",
+        std::process::Command::new("git").current_dir(src).args(["checkout", "--", "."]),
+    )?;
+    for patch in &patches {
         run(
             &format!("git apply of {}", patch.display()),
-            std::process::Command::new("git").current_dir(src).arg("apply").arg(&patch),
+            std::process::Command::new("git").current_dir(src).arg("apply").arg(patch),
         )?;
     }
+    std::fs::write(&stamp_path, stamp)?;
     Ok(())
 }
 

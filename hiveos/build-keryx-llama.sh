@@ -36,8 +36,9 @@ SRC=/tmp/llama-src-$TAG
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
 fi
+git -C "$SRC" checkout -- .
 for P in "$REPO"/tools/keryx-llama/patches/*.patch; do
-  git -C "$SRC" apply --check --reverse "$P" 2>/dev/null || git -C "$SRC" apply "$P"
+  git -C "$SRC" apply "$P"
 done
 
 docker run --rm --network host \
