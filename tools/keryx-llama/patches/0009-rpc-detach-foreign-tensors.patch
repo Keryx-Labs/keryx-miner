@@ -1,0 +1,119 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 204d913..afa624e 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -485,7 +485,24 @@ static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
+     return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
+ }
+ 
+-static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
++// a tensor whose memory lives on this server (`sock`); with no socket, any rpc buffer counts
++static const ggml_backend_rpc_buffer_context * rpc_local_buffer(const ggml_tensor * tensor, const socket_t * sock) {
++    if (!tensor->buffer || !ggml_backend_buffer_is_rpc(tensor->buffer)) {
++        return nullptr;
++    }
++    auto * ctx = (const ggml_backend_rpc_buffer_context *)tensor->buffer->context;
++    if (ctx == nullptr || (sock != nullptr && ctx->sock.get() != sock)) {
++        return nullptr;
++    }
++    return ctx;
++}
++
++// allocated elsewhere: this server can only ever see it as a dead view source
++static bool rpc_tensor_is_foreign(const ggml_tensor * tensor, const socket_t * sock) {
++    return sock != nullptr && tensor->buffer != nullptr && rpc_local_buffer(tensor, sock) == nullptr;
++}
++
++static rpc_tensor serialize_tensor(const ggml_tensor * tensor, const socket_t * sock = nullptr) {
+     rpc_tensor result;
+     if (!tensor) {
+         memset(&result, 0, sizeof(result));
+@@ -494,15 +511,14 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
+ 
+     result.id = reinterpret_cast<uint64_t>(tensor);
+     result.type = tensor->type;
+-    if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
+-        ggml_backend_buffer_t buffer = tensor->buffer;
+-        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+-        result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
++    if (const ggml_backend_rpc_buffer_context * ctx = rpc_local_buffer(tensor, sock)) {
++        result.buffer = ctx->remote_ptr;
+         result.data = reinterpret_cast<uint64_t>(tensor->data);
+     } else {
+         result.buffer = 0;
+         result.data   = 0;
+     }
++    const bool detached = rpc_tensor_is_foreign(tensor, sock);
+     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
+         result.ne[i] = tensor->ne[i];
+         result.nb[i] = tensor->nb[i];
+@@ -513,9 +529,9 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
+     }
+     result.flags = tensor->flags;
+     for (uint32_t i = 0; i < GGML_MAX_SRC; i++) {
+-        result.src[i] = reinterpret_cast<uint64_t>(tensor->src[i]);
++        result.src[i] = detached ? 0 : reinterpret_cast<uint64_t>(tensor->src[i]);
+     }
+-    result.view_src = reinterpret_cast<uint64_t>(tensor->view_src);
++    result.view_src = detached ? 0 : reinterpret_cast<uint64_t>(tensor->view_src);
+     result.view_offs = tensor->view_offs;
+ 
+     // Avoid sending uninitialized data over the wire
+@@ -871,7 +887,7 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
+     // this is no-op because we don't have any async operations
+ }
+ 
+-static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
++static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited, const socket_t * sock) {
+     if (tensor == nullptr) {
+         return;
+     }
+@@ -879,19 +895,21 @@ static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors,
+         return;
+     }
+     visited.insert(tensor);
+-    for (int i = 0; i < GGML_MAX_SRC; i++) {
+-        add_tensor(tensor->src[i], tensors, visited);
++    if (!rpc_tensor_is_foreign(tensor, sock)) {
++        for (int i = 0; i < GGML_MAX_SRC; i++) {
++            add_tensor(tensor->src[i], tensors, visited, sock);
++        }
++        add_tensor(tensor->view_src, tensors, visited, sock);
+     }
+-    add_tensor(tensor->view_src, tensors, visited);
+-    tensors.push_back(serialize_tensor(tensor));
++    tensors.push_back(serialize_tensor(tensor, sock));
+ }
+ 
+-static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output) {
++static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::vector<uint8_t> & output, const socket_t * sock) {
+     uint32_t n_nodes = cgraph->n_nodes;
+     std::vector<rpc_tensor> tensors;
+     std::unordered_set<ggml_tensor*> visited;
+     for (uint32_t i = 0; i < n_nodes; i++) {
+-        add_tensor(cgraph->nodes[i], tensors, visited);
++        add_tensor(cgraph->nodes[i], tensors, visited, sock);
+     }
+     // serialization format:
+     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
+@@ -932,8 +950,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+     } else {
+         rpc_dev_ctx->last_graph_uid = cgraph->uid;
+         std::vector<uint8_t> input;
+-        serialize_graph(rpc_ctx->device, cgraph, input);
+         auto sock = get_socket(rpc_ctx->endpoint);
++        serialize_graph(rpc_ctx->device, cgraph, input, sock.get());
+         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+         RPC_STATUS_SOFT(status, GGML_STATUS_FAILED);
+     }
+@@ -1528,7 +1546,9 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
+         return nullptr;
+     }
+     if (result->buffer == nullptr && result->data != nullptr) {
+-        GGML_LOG_ERROR("[%s] invalid data ptr", __func__);
++        GGML_LOG_ERROR("[%s] invalid data ptr: name=%s op=%s buffer=%p data=%p view_src=%p view_offs=%zu ne=%ld,%ld,%ld,%ld\n", __func__,
++            tensor->name, ggml_op_name((ggml_op) tensor->op), (void*) tensor->buffer, (void*) tensor->data, (void*) tensor->view_src, (size_t) tensor->view_offs,
++            (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3]);
+         return nullptr;
+     }
+     tensor_map[id] = result;
