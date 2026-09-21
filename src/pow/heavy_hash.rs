@@ -16,10 +16,10 @@ const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
 ///
 /// Mainnet: 17_275_000 (2026-05-30 ~15:00 UTC emergency activation) — matches the node's
 /// MAINNET_PARAMS.pow_salt_v2_activation = new(17_275_000).
-/// Testnet: 0 (active from genesis — no mid-chain salt transition on testnet).
+/// Testnet and devnet: 0 (active from genesis — no mid-chain salt transition there).
 #[inline(always)]
 pub fn pow_salt_v2_activation_daa() -> u64 {
-    if keryx_miner::pom::is_testnet() {
+    if keryx_miner::pom::is_testnet() || keryx_miner::pom::is_devnet() {
         0
     } else {
         17_275_000
@@ -32,10 +32,10 @@ pub fn pow_salt_v2_activation_daa() -> u64 {
 ///
 /// Mainnet: 21_932_751 (same DAA as the old v3 gate; forks cleanly off the broken chain) —
 /// matches the node's MAINNET_PARAMS.pow_salt_v4_activation = new(21_932_751).
-/// Testnet: 0 (active from genesis) — node TESTNET_PARAMS.pow_salt_v4_activation = new(0).
+/// Testnet and devnet: 0 (active from genesis) — node params pow_salt_v4_activation = new(0).
 #[inline(always)]
 pub fn pow_salt_v4_activation_daa() -> u64 {
-    if keryx_miner::pom::is_testnet() {
+    if keryx_miner::pom::is_testnet() || keryx_miner::pom::is_devnet() {
         0
     } else {
         21_932_751
