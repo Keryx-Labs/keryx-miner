@@ -229,9 +229,14 @@ pub fn shard_endpoint(gpu: usize) -> Option<String> {
 
 /// Loopback endpoint the process serves `gguf` on, whichever GPU holds the served copy.
 pub fn serving_endpoint_for(gguf: &str) -> Option<String> {
-    // Only one GPU serves the shard, the others hold it for PoM alone: skip the entries that
-    // are not serving instead of stopping at the first GGUF match.
-    shards().lock().ok()?.values().find(|e| e.gguf == gguf && e.endpoint.is_some()).and_then(|e| e.endpoint.clone())
+    let g = shards().lock().ok()?;
+    pick_serving(g.values().map(|e| (e.gguf.as_str(), e.endpoint.as_deref())), gguf)
+}
+
+/// Endpoint of the copy of `gguf` that is served: on a multi-GPU rig only one holder serves it,
+/// the others keep theirs for PoM alone, so a holder without an endpoint must not end the search.
+fn pick_serving<'a>(entries: impl Iterator<Item = (&'a str, Option<&'a str>)>, gguf: &str) -> Option<String> {
+    entries.filter(|(g, _)| *g == gguf).find_map(|(_, ep)| ep.map(|e| e.to_string()))
 }
 
 /// Whether a resident shard is active on `gpu` for exactly this GGUF.
@@ -780,6 +785,19 @@ pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_multi_gpu_rig_resolves_the_copy_that_serves() {
+        let shard = "/models/V4-Flash-shard-0/model.gguf";
+        let rig = [(shard, None), (shard, None), (shard, Some("127.0.0.1:50054")), (shard, None)];
+        assert_eq!(super::pick_serving(rig.iter().copied(), shard), Some("127.0.0.1:50054".to_string()));
+
+        let none_serving = [(shard, None), (shard, None)];
+        assert_eq!(super::pick_serving(none_serving.iter().copied(), shard), None);
+
+        let other_serves = [("/models/other.gguf", Some("127.0.0.1:50052")), (shard, None)];
+        assert_eq!(super::pick_serving(other_serves.iter().copied(), shard), None);
+    }
     use super::*;
 
     #[test]
