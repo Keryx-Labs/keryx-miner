@@ -99,6 +99,11 @@ pub struct KeryxdHandler {
     /// leaving the chosen head its turn. Mining goes on meanwhile.
     ai_pipeline_waiting: Vec<((String, [u8; 32], [u8; 32], String, usize), std::time::Instant)>,
 
+    /// When this head first considered each network-model request. The head-decision deadlines
+    /// (serve without every declaration, stand in for a silent head) are measured from it, so it
+    /// must survive a request moving between the active queue and `ai_pipeline_waiting`.
+    ai_pipeline_since: std::collections::HashMap<[u8; 32], std::time::Instant>,
+
     /// In-flight AiResponse submissions not yet accepted by the mempool, keyed by txid.
     /// Value: (tx, submit attempts, last submit time). Resubmitted until accepted or expired —
     /// a transiently rejected response must keep trying while the service window is open.
@@ -291,6 +296,7 @@ impl KeryxdHandler {
             ai_request_txids: std::collections::HashMap::new(),
             ai_declared: std::collections::HashSet::new(),
             ai_pipeline_waiting: Vec::new(),
+            ai_pipeline_since: std::collections::HashMap::new(),
             ai_response_inflight: std::collections::HashMap::new(),
             backfill_cutoff_daa: None,
             backfill_queue: VecDeque::new(),
@@ -533,6 +539,10 @@ impl KeryxdHandler {
         let Some(w) = self.escrow_watcher.as_ref() else { return };
         let tiers = keryx_miner::pipeline::served_tiers();
         if tiers.is_empty() {
+            log::warn!(
+                "OPoI: network-model request id={} — no shard served by this miner, nothing declared (is the shard engine up?)",
+                stable_id
+            );
             return;
         }
         let now = std::time::Instant::now();
@@ -648,7 +658,10 @@ impl KeryxdHandler {
             match keryx_miner::pipeline::head_decision(&req.1, since, now_daa) {
                 keryx_miner::pipeline::HeadDecision::Serve => self.ai_request_queue.push_front(req),
                 keryx_miner::pipeline::HeadDecision::Wait => self.ai_pipeline_waiting.push((req, since)),
-                keryx_miner::pipeline::HeadDecision::Drop(why) => info!("OPoI: pipeline request id={} dropped — {}", req.0, why),
+                keryx_miner::pipeline::HeadDecision::Drop(why) => {
+                    self.ai_pipeline_since.remove(&req.1);
+                    info!("OPoI: pipeline request id={} dropped — {}", req.0, why);
+                }
             }
         }
     }
@@ -670,15 +683,29 @@ impl KeryxdHandler {
                 // Network model: this miner heads a pipeline over the declared links (H14),
                 // once it is its turn. Before the gate the same id may be a lineup model
                 // (testnet), served by the plain inference path below.
-                let since = std::time::Instant::now();
+                let first_seen = !self.ai_pipeline_since.contains_key(&request_hash);
+                let since = *self
+                    .ai_pipeline_since
+                    .entry(request_hash)
+                    .or_insert_with(std::time::Instant::now);
                 match keryx_miner::pipeline::head_decision(&request_hash, since, self.last_known_daa) {
-                    keryx_miner::pipeline::HeadDecision::Serve => {}
+                    keryx_miner::pipeline::HeadDecision::Serve => {
+                        self.ai_pipeline_since.remove(&request_hash);
+                    }
                     keryx_miner::pipeline::HeadDecision::Wait => {
+                        if first_seen {
+                            info!(
+                                "OPoI: pipeline request id={} waiting — shard tier(s) {:?} have not declared yet",
+                                stable_id,
+                                keryx_miner::pipeline::missing_shard_tiers(&request_hash)
+                            );
+                        }
                         self.ai_pipeline_waiting.push(((stable_id, request_hash, model_id, prompt, max_tokens), since));
                         continue;
                     }
                     keryx_miner::pipeline::HeadDecision::Drop(why) => {
                         info!("OPoI: pipeline request id={} dropped — {}", stable_id, why);
+                        self.ai_pipeline_since.remove(&request_hash);
                         continue;
                     }
                 }

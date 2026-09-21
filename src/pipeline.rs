@@ -62,6 +62,17 @@ pub fn parse_assignment(s: &str) -> Option<Assignment> {
     Some(Assignment { request_hash, accepted_daa, window_end_daa, links })
 }
 
+/// Shard tiers with no declaration yet in the published assignment (all of them when none is
+/// published): what a head is still waiting for.
+pub fn missing_shard_tiers(request_hash: &[u8; 32]) -> Vec<u8> {
+    let nm = network_model();
+    let a = assignment_for(request_hash);
+    (0..nm.shards.len())
+        .map(|k| NETWORK_MODEL_TIER + 1 + k as u8)
+        .filter(|t| a.as_ref().map_or(true, |a| a.chosen_key(*t).is_none()))
+        .collect()
+}
+
 fn assignments() -> &'static Mutex<HashMap<[u8; 32], Assignment>> {
     static A: OnceLock<Mutex<HashMap<[u8; 32], Assignment>>> = OnceLock::new();
     A.get_or_init(|| Mutex::new(HashMap::new()))
