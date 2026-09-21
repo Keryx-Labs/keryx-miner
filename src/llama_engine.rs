@@ -229,7 +229,9 @@ pub fn shard_endpoint(gpu: usize) -> Option<String> {
 
 /// Loopback endpoint the process serves `gguf` on, whichever GPU holds the served copy.
 pub fn serving_endpoint_for(gguf: &str) -> Option<String> {
-    shards().lock().ok()?.values().find(|e| e.gguf == gguf).and_then(|e| e.endpoint.clone())
+    // Only one GPU serves the shard, the others hold it for PoM alone: skip the entries that
+    // are not serving instead of stopping at the first GGUF match.
+    shards().lock().ok()?.values().find(|e| e.gguf == gguf && e.endpoint.is_some()).and_then(|e| e.endpoint.clone())
 }
 
 /// Whether a resident shard is active on `gpu` for exactly this GGUF.
