@@ -677,12 +677,16 @@ fn verify_model_file(gguf: &Path, ok_flag: &Path, expected: [u8; 32], name: &str
     .with_context(|| format!("verify IPFS identity for model '{}' at {}", name, gguf.display()))?;
 
     if digest != expected {
+        // Drop the file: a resumed download would append to bad bytes and stay corrupt for good,
+        // whatever the source. Only a digest mismatch removes it — a read error leaves it alone.
+        let removed = std::fs::remove_file(gguf).is_ok();
         return Err(anyhow!(
-            "model '{}' IPFS CID digest mismatch at {} (expected {}, got {})",
+            "model '{}' IPFS CID digest mismatch at {} (expected {}, got {}){}",
             name,
             gguf.display(),
             hex::encode(expected),
-            hex::encode(digest)
+            hex::encode(digest),
+            if removed { " — file removed, it will be downloaded again" } else { " — could not remove the file, delete it by hand" }
         ));
     }
 
