@@ -614,11 +614,22 @@ async fn data_tunnel(local: TcpStream, t: Tunnel) -> std::io::Result<()> {
     let mut rx = Sealer::new(&t.keys.s2c);
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; 256 * 1024];
+        // an idle data tunnel (the head loading its own weights) must outlive the server idle limit
+        let mut keepalive = tokio::time::interval(CONTROL_KEEPALIVE);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await;
         loop {
-            match lrd.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if write_frame(&mut rwr, &mut tx, FRAME_DATA, &buf[..n]).await.is_err() {
+            tokio::select! {
+                r = lrd.read(&mut buf) => match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if write_frame(&mut rwr, &mut tx, FRAME_DATA, &buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+                _ = keepalive.tick() => {
+                    if write_frame(&mut rwr, &mut tx, FRAME_PING, &[]).await.is_err() {
                         break;
                     }
                 }
