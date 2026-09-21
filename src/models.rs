@@ -275,6 +275,57 @@ pub const V4_FLASH_SHARD_5: ModelSpec = ModelSpec {
 pub const V4_FLASH_SHARDS: [&ModelSpec; 6] =
     [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5];
 
+// Devnet bench network model: Qwen3.5-9B in two shards ─ mirror of the node's
+// `POM_TIERS_H14_SPLIT9B`: the whole pipeline on one card.
+
+pub const SPLIT9B_SHARD_0: ModelSpec = ModelSpec {
+    name: "split9b-shard-0",
+    model_id: [
+        0x8d, 0xba, 0x34, 0xd0, 0x28, 0x5b, 0xe2, 0x87,
+        0xf0, 0x22, 0xda, 0xd0, 0xf3, 0x3e, 0xa5, 0x88,
+        0xc8, 0x36, 0x94, 0xd4, 0x83, 0x59, 0x60, 0x8c,
+        0xc8, 0xd4, 0x74, 0x24, 0x26, 0x76, 0xf2, 0x79,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmXstsoY2jeNkQhVgWceiLLkBxHD4uooicnTPYUjDNCkq6"],
+    dir_name: "Split9B-shard-0",
+    min_vram_mb: 3_000,
+};
+
+pub const SPLIT9B_SHARD_1: ModelSpec = ModelSpec {
+    name: "split9b-shard-1",
+    model_id: [
+        0xa1, 0x98, 0xfe, 0x36, 0x9a, 0x63, 0xde, 0x8d,
+        0x75, 0xc5, 0xeb, 0x4a, 0x46, 0xa8, 0x24, 0xe0,
+        0x20, 0x55, 0x4a, 0xc2, 0x65, 0x48, 0xad, 0x68,
+        0x8c, 0x90, 0xa9, 0x60, 0xdb, 0x52, 0x49, 0x2e,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmZDTf3KtGYjR7qUgD2PHfK3divUhNtYNcHvuSsbCNZYU5"],
+    dir_name: "Split9B-shard-1",
+    min_vram_mb: 3_000,
+};
+
+/// Bench network model: it must not share a `model_id` with any lineup tier, or the node maps a
+/// request to lineup tier 0 instead of the network model. Same directory as the 9B so the packed
+/// head is found there; never mined, so never downloaded.
+pub const SPLIT9B_WHOLE: ModelSpec = ModelSpec {
+    name: "split9b-whole",
+    model_id: [
+        0x1f, 0x22, 0xb2, 0x13, 0x3c, 0x40, 0xb1, 0x6d,
+        0x0b, 0xa1, 0x5d, 0xff, 0xb4, 0x82, 0x3f, 0x88,
+        0x9b, 0x76, 0xeb, 0x83, 0x4f, 0xe6, 0xc9, 0x0d,
+        0xed, 0xc6, 0xa3, 0x8d, 0x50, 0x4a, 0x46, 0xcb,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &[],
+    dir_name: "Qwen3.5-9B-abliterated",
+    min_vram_mb: 8_000,
+};
+
 /// The network model of one network: the whole model requests target, its shards in tier
 /// order, their layer ranges, the layer count and the packed head.
 pub struct NetworkModelSpec {
@@ -298,6 +349,13 @@ fn mainnet_shard_of_tier(tier: Tier) -> usize {
     }
 }
 
+fn devnet_shard_of_tier(tier: Tier) -> usize {
+    match tier {
+        Tier::VeryLight | Tier::Light | Tier::Default => 0,
+        Tier::High | Tier::VeryHigh => 1,
+    }
+}
+
 pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
     whole: &V4_FLASH,
     shards: &[&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5],
@@ -308,9 +366,24 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
     shard_of_tier: mainnet_shard_of_tier,
 };
 
-/// The network model — the same split V4-Flash on both networks.
+pub static NETWORK_MODEL_SPLIT9B: NetworkModelSpec = NetworkModelSpec {
+    whole: &SPLIT9B_WHOLE,
+    shards: &[&SPLIT9B_SHARD_0, &SPLIT9B_SHARD_1],
+    layers: &[(0, 15), (16, 31)],
+    n_layer: 32,
+    head_cid: "QmQSC2sjKaAqZH4E6HGbtkowWqGKBrHx4JvAWmXsTpNdDC",
+    head_digest_hex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
+    shard_of_tier: devnet_shard_of_tier,
+};
+
+/// The network model of the selected network: split V4-Flash, or the two-shard 9B bench
+/// on devnet (`--devnet`).
 pub fn network_model() -> &'static NetworkModelSpec {
-    &NETWORK_MODEL_MAINNET
+    if crate::pom::is_devnet() {
+        &NETWORK_MODEL_SPLIT9B
+    } else {
+        &NETWORK_MODEL_MAINNET
+    }
 }
 
 /// First tier index of the network model — mirror of the node's `NETWORK_MODEL_TIER`.
@@ -473,7 +546,26 @@ fn reachable_gates(mut gates: Vec<u64>, chain_daa: Option<u64>) -> Vec<u64> {
 /// Infallible by construction: the latest scheduled era always carries a model for all five
 /// tiers. Retiring a tier outright would have to shrink the VRAM ladder in the same change, and
 /// this panic is where a half-done retirement would surface.
+/// Chain DAA seen at startup, `u64::MAX` when unknown (node unreachable, pool mining).
+static CURRENT_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Records where the chain is, so the announced lineup is the era being mined rather than the
+/// staged one: a shard announced before its gate cannot be loaded by the inference engine, and
+/// the miner would withdraw it and park its tier.
+pub fn set_current_daa(daa: u64) {
+    CURRENT_DAA.store(daa, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
+    let daa = CURRENT_DAA.load(std::sync::atomic::Ordering::Relaxed);
+    if daa != u64::MAX {
+        // Below the first PoM gate the era carries no model at all; the lineup is what a miner
+        // can serve there, never a shard.
+        let era = daa.max(crate::pom::pom_v3_activation_daa());
+        if let Some(spec) = pom_model_for_tier(era, tier) {
+            return spec;
+        }
+    }
     pom_model_for_tier(staging_daa(), tier).expect("the staging era carries every tier")
 }
 

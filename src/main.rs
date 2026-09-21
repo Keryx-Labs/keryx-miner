@@ -441,6 +441,7 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
         "shard-0" => Some(Tier::VeryLight),
+        "shard-1" if keryx_miner::pom::is_devnet() => Some(Tier::VeryHigh),
         "shard-1" => {
             keryx_miner::models::set_light_shard(1);
             Some(Tier::Light)
@@ -1264,6 +1265,9 @@ async fn run() -> Result<(), Error> {
     // ceiling). --force-model entries win per-card over both. VRAM is CUDA-driver-sourced so
     // device_ids match the devices the walk loads onto.
     keryx_miner::pom_gpu::set_shard_port(opt.shard_port);
+    if let Some(daa) = chain_daa {
+        keryx_miner::models::set_current_daa(daa);
+    }
     let pom_assignments = assign_pom_tiers(tier, &forced_tiers);
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);

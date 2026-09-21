@@ -1457,10 +1457,25 @@ pub fn is_testnet() -> bool {
     TESTNET_GATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Picks the gate value for the selected network (`--testnet`).
+/// Devnet is the local bench: it starts in today's mainnet state, so it shares the testnet's
+/// compact gate values — only H14 is still ahead of it.
+static DEVNET_GATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switches the miner to the devnet bench. Called once at startup when `--devnet` is passed.
+pub fn set_devnet(enabled: bool) {
+    DEVNET_GATES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when the miner runs on the devnet bench (`--devnet`).
+#[inline(always)]
+pub fn is_devnet() -> bool {
+    DEVNET_GATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Picks the gate value for the selected network (`--testnet`, `--devnet`).
 #[inline(always)]
 fn gate(mainnet: u64, testnet: u64) -> u64 {
-    if is_testnet() {
+    if is_testnet() || is_devnet() {
         testnet
     } else {
         mainnet
@@ -1561,7 +1576,11 @@ pub fn h10_activation_daa() -> u64 {
 /// lineup tier. MUST equal the node's `model_split_activation` on both networks; `u64::MAX`
 /// until it is scheduled.
 pub fn h14_activation_daa() -> u64 {
-    gate(u64::MAX, 133_000)
+    if is_devnet() {
+        1_000
+    } else {
+        gate(u64::MAX, 133_000)
+    }
 }
 
 /// H8 request-identity gate. At/after this score a request is identified by the transaction id of

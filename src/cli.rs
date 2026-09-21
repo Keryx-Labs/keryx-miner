@@ -192,6 +192,12 @@ pub struct Opt {
     )]
     testnet: bool,
 
+    #[clap(
+        long,
+        help = "Use the devnet bench instead of mainnet: default port 22610, the testnet activation gates and the two-shard Qwen3.5-9B network model, H14 at 500 [default: false]"
+    )]
+    devnet: bool,
+
     #[clap(short = 't', long = "threads", help = "Amount of CPU miner threads to launch [default: 0]")]
     pub num_threads: Option<u16>,
 
@@ -239,6 +245,7 @@ impl Opt {
         // Switch every DAA activation gate (PoM + PoW salts) to its testnet value before any
         // mining state is built — see `pom::set_testnet`.
         keryx_miner::pom::set_testnet(self.testnet);
+        keryx_miner::pom::set_devnet(self.devnet);
         if self.recover_escrow {
             return Ok(());
         }
@@ -267,7 +274,13 @@ impl Opt {
     }
 
     fn port(&mut self) -> u16 {
-        *self.port.get_or_insert(if self.testnet { 22210 } else { 22110 })
+        *self.port.get_or_insert(if self.devnet {
+            22610
+        } else if self.testnet {
+            22210
+        } else {
+            22110
+        })
     }
 
     pub fn log_level(&self) -> LevelFilter {
