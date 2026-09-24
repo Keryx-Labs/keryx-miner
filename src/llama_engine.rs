@@ -28,8 +28,9 @@ type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 type ShardLoadFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
 type ShardServeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
+type TraceFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 
-const ABI: c_int = 5;
+const ABI: c_int = 6;
 
 /// A pipeline head gives up on a request that does not finish in time, so its links and its
 /// own GPU are freed for the next one; checked between tokens by the engine.
@@ -676,12 +677,13 @@ pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, man
         }
     };
     unsafe {
-        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error)) = (
+        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error), Some(trace)) = (
             sym::<AbiFn>(&lib, "keryx_llama_abi"),
             sym::<LoadSplitFn>(&lib, "keryx_llama_load_split"),
             sym::<GenFn>(&lib, "keryx_llama_generate"),
             sym::<FreeFn>(&lib, "keryx_llama_free"),
             sym::<ErrorFn>(&lib, "keryx_llama_last_error"),
+            sym::<TraceFn>(&lib, "keryx_llama_last_trace"),
         ) else {
             eprintln!("split test: {} is missing engine symbols", so.display());
             return 41;
@@ -708,6 +710,7 @@ pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, man
         let t1 = std::time::Instant::now();
         let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
         let dt = t1.elapsed().as_secs_f64();
+        eprint!("{}", CStr::from_ptr(trace(model)).to_string_lossy());
         free(model);
         if n <= 0 {
             eprintln!("split test: generation failed");
@@ -728,12 +731,13 @@ pub fn head_generate(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, laye
     let so = so_path().ok_or("keryx-llama shared library not found")?;
     let lib = unsafe { libloading::Library::new(&so) }.map_err(|e| format!("{} failed to load: {}", so.display(), e))?;
     unsafe {
-        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error)) = (
+        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error), Some(trace)) = (
             sym::<AbiFn>(&lib, "keryx_llama_abi"),
             sym::<LoadSplitFn>(&lib, "keryx_llama_load_split"),
             sym::<GenFn>(&lib, "keryx_llama_generate"),
             sym::<FreeFn>(&lib, "keryx_llama_free"),
             sym::<ErrorFn>(&lib, "keryx_llama_last_error"),
+            sym::<TraceFn>(&lib, "keryx_llama_last_trace"),
         ) else {
             return Err(format!("{} is missing engine symbols", so.display()));
         };
@@ -756,6 +760,9 @@ pub fn head_generate(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, laye
         std::env::set_var("KERYX_LLAMA_GEN_DEADLINE_MS", HEAD_GENERATION_DEADLINE.as_millis().to_string());
         let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
         std::env::remove_var("KERYX_LLAMA_GEN_DEADLINE_MS");
+        for line in CStr::from_ptr(trace(model)).to_string_lossy().lines() {
+            log::info!("pipeline head timing: {}", line);
+        }
         free(model);
         if n < 0 {
             return Err(format!("head generation failed: {}", CStr::from_ptr(last_error()).to_string_lossy()));

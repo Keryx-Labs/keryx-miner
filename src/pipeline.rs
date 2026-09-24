@@ -234,8 +234,17 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
         }
         let mut session = None;
         for (key, endpoint) in candidates {
+            let t_connect = std::time::Instant::now();
             match shard_gateway::connect_link(&endpoint, spec.model_id, identity.clone(), 0).await {
                 Ok(s) if s.peer_pubkey == key && s.tier == tier => {
+                    log::info!(
+                        "pipeline head timing: link shard {} (tier {}) {} → 127.0.0.1:{} connected in {} ms",
+                        k,
+                        tier,
+                        endpoint,
+                        s.local_port,
+                        t_connect.elapsed().as_millis()
+                    );
                     session = Some(s);
                     break;
                 }

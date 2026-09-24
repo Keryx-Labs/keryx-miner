@@ -77,7 +77,61 @@ struct KeryxLlama {
     llama_sampler* smpl  = nullptr;
     std::vector<std::string> names; // canonical (byte-lexicographic) order — matches pom.rs
     std::mutex gen_lock;
+    std::string trace; // timing report of the load and the last generation, one line per step
 };
+
+static double keryx_ms_since(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Blocked time per rpc endpoint, by command class (compute send / get_tensor / set_tensor / other).
+struct KeryxRpcSnap {
+    std::string endpoint;
+    uint64_t ns[4] = {0, 0, 0, 0};
+    uint64_t calls = 0;
+};
+
+static std::vector<KeryxRpcSnap> keryx_rpc_snapshot() {
+    std::vector<KeryxRpcSnap> out;
+    const size_t n = ggml_backend_rpc_stats_count();
+    for (size_t i = 0; i < n; i++) {
+        const char* ep = nullptr;
+        KeryxRpcSnap s;
+        if (!ggml_backend_rpc_stats_get(i, &ep, &s.ns[0], &s.ns[1], &s.ns[2], &s.ns[3], &s.calls)) break;
+        s.endpoint = ep ? ep : "?";
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// One " | ep get X set Y cmp Z" segment per endpoint for the interval between two snapshots (ms).
+static std::string keryx_rpc_delta_line(const std::vector<KeryxRpcSnap>& a, const std::vector<KeryxRpcSnap>& b) {
+    std::string line;
+    char buf[160];
+    for (size_t i = 0; i < b.size(); i++) {
+        const KeryxRpcSnap* prev = i < a.size() && a[i].endpoint == b[i].endpoint ? &a[i] : nullptr;
+        double ms[4];
+        for (int c = 0; c < 4; c++) ms[c] = (double)(b[i].ns[c] - (prev ? prev->ns[c] : 0)) / 1e6;
+        const uint64_t calls = b[i].calls - (prev ? prev->calls : 0);
+        snprintf(buf, sizeof(buf), " | %s get %.1f set %.1f cmp %.1f other %.1f (%llu calls)",
+                 b[i].endpoint.c_str(), ms[1], ms[2], ms[0], ms[3], (unsigned long long)calls);
+        line += buf;
+    }
+    return line;
+}
+
+static void keryx_trace_pings(KeryxLlama* h, const char* label) {
+    for (const KeryxRpcSnap& s : keryx_rpc_snapshot()) {
+        const int64_t us = ggml_backend_rpc_ping_us(s.endpoint.c_str());
+        char buf[160];
+        if (us < 0) {
+            snprintf(buf, sizeof(buf), "ping %s %s: failed\n", label, s.endpoint.c_str());
+        } else {
+            snprintf(buf, sizeof(buf), "ping %s %s: %.2f ms\n", label, s.endpoint.c_str(), us / 1000.0);
+        }
+        h->trace += buf;
+    }
+}
 
 // llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
 // device assignment, kv-cache map, sched-reserve…). The miner's own Rust logging already covers
@@ -100,22 +154,25 @@ static void keryx_install_log_filter() {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 5; }
+KERYX_EXPORT int keryx_llama_abi() { return 6; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
 
 static KeryxLlama* keryx_load_with(const char* gguf_path, int n_ctx, const llama_model_params& mp) {
+    const auto t_model = std::chrono::steady_clock::now();
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) {
         keryx_set_error("model", std::string("llama_model_load_from_file failed for ") + gguf_path);
         return nullptr;
     }
+    const double model_ms = keryx_ms_since(t_model);
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
     cp.n_batch = std::min(cp.n_batch, cp.n_ctx);
     cp.n_ubatch = std::min(cp.n_ubatch, std::max(1u, cp.n_ctx / 4));
+    const auto t_ctx = std::chrono::steady_clock::now();
     llama_context* ctx = llama_init_from_model(model, cp);
     if (!ctx) {
         keryx_set_error("context", "llama_init_from_model failed");
@@ -147,6 +204,9 @@ static KeryxLlama* keryx_load_with(const char* gguf_path, int n_ctx, const llama
     h->model = model; h->ctx = ctx; h->smpl = smpl;
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
+    char buf[128];
+    snprintf(buf, sizeof(buf), "load model %.0f ms, context %.0f ms\n", model_ms, keryx_ms_since(t_ctx));
+    h->trace += buf;
     return h;
 }
 
@@ -183,6 +243,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load_split(const char* gguf_path, int gpu, 
     static std::vector<ggml_backend_dev_t> devices; // llama keeps the pointer for the model's life
     static std::vector<float> split;
     devices.clear(); split.clear();
+    const auto t_servers = std::chrono::steady_clock::now();
     std::stringstream eps(rpc_endpoints ? rpc_endpoints : "");
     std::string ep;
     while (std::getline(eps, ep, ',')) {
@@ -197,6 +258,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load_split(const char* gguf_path, int gpu, 
             devices.push_back(ggml_backend_reg_dev_get(reg, i));
         }
     }
+    const double servers_ms = keryx_ms_since(t_servers);
 #ifdef __APPLE__
     const std::string local = "MTL" + std::to_string(gpu);
 #else
@@ -230,7 +292,13 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load_split(const char* gguf_path, int gpu, 
     mp.devices       = devices.data();
     mp.tensor_split  = split.data();
     mp.use_mmap      = true;
-    return keryx_load_with(gguf_path, n_ctx, mp);
+    KeryxLlama* h = keryx_load_with(gguf_path, n_ctx, mp);
+    if (h) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "load servers %.0f ms (%zu shards)\n", servers_ms, devices.size() - 2);
+        h->trace.insert(0, buf);
+    }
+    return h;
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
@@ -292,25 +360,55 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     // Deadline checked between tokens only: a decode in flight over rpc links cannot be interrupted.
     long deadline_ms = 0;
     if (const char* d = getenv("KERYX_LLAMA_GEN_DEADLINE_MS")) deadline_ms = atol(d);
+
+    // Keep the load lines, drop the previous generation's report.
+    const size_t load_end = h->trace.find("prompt ");
+    if (load_end != std::string::npos) h->trace.erase(load_end);
+    char line[256];
+    snprintf(line, sizeof(line), "prompt %d tokens, max %d\n", n, max_tokens);
+    h->trace += line;
+    keryx_trace_pings(h, "before");
+    ggml_backend_rpc_stats_reset();
+    std::vector<KeryxRpcSnap> snap = keryx_rpc_snapshot();
+    std::vector<double> step_ms;
+    double prefill_ms = 0.0;
+
     const auto t0 = std::chrono::steady_clock::now();
     int written = 0;
+    int tokens = 0;
     for (int i = 0; i < max_tokens; i++) {
         if (deadline_ms > 0) {
             const long elapsed = (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
             if (elapsed > deadline_ms) {
                 keryx_last_error = "generation deadline exceeded after " + std::to_string(i) + " tokens";
+                snprintf(line, sizeof(line), "deadline after %d tokens\n", i);
+                h->trace += line;
                 return -1;
             }
         }
+        const auto t_step = std::chrono::steady_clock::now();
         const int rc = llama_decode(h->ctx, batch);
+        const double ms = keryx_ms_since(t_step);
+        std::vector<KeryxRpcSnap> now = keryx_rpc_snapshot();
+        if (i == 0) {
+            prefill_ms = ms;
+            snprintf(line, sizeof(line), "prefill %.0f ms", ms);
+        } else {
+            step_ms.push_back(ms);
+            snprintf(line, sizeof(line), "tok %d %.0f ms", i, ms);
+        }
+        h->trace += line + keryx_rpc_delta_line(snap, now) + "\n";
+        snap = std::move(now);
         if (rc < 0) {
             keryx_last_error = ggml_backend_rpc_link_failed()
                 ? "a shard link failed after " + std::to_string(i) + " tokens"
                 : "llama_decode failed (" + std::to_string(rc) + ")";
+            h->trace += keryx_last_error + "\n";
             return -1;
         }
         if (rc != 0) break; // context full
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
+        tokens++;
         if (llama_vocab_is_eog(vocab, tok)) break;
         char piece[256];
         int pn = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
@@ -320,9 +418,30 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
         written += pn;
         batch = llama_batch_get_one(&tok, 1);
     }
+    const double total_ms = keryx_ms_since(t0);
+    keryx_trace_pings(h, "after");
+    if (!step_ms.empty()) {
+        std::vector<double> sorted = step_ms;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0.0;
+        for (double v : sorted) sum += v;
+        snprintf(line, sizeof(line), "summary %d tokens %d bytes in %.0f ms: prefill %.0f ms, per token mean %.0f median %.0f min %.0f max %.0f ms\n",
+                 tokens, written, total_ms, prefill_ms, sum / sorted.size(), sorted[sorted.size() / 2], sorted.front(), sorted.back());
+    } else {
+        snprintf(line, sizeof(line), "summary %d tokens %d bytes in %.0f ms: prefill %.0f ms\n", tokens, written, total_ms, prefill_ms);
+    }
+    h->trace += line;
+    for (const KeryxRpcSnap& s : snap) {
+        snprintf(line, sizeof(line), "total %s: get %.0f set %.0f cmp %.0f other %.0f ms, %llu calls\n", s.endpoint.c_str(),
+                 s.ns[1] / 1e6, s.ns[2] / 1e6, s.ns[0] / 1e6, s.ns[3] / 1e6, (unsigned long long)s.calls);
+        h->trace += line;
+    }
     out[written] = 0;
     return written;
 }
+
+// Timing report of the load and the last generation on `h`: one line per step, see the miner log.
+KERYX_EXPORT const char* keryx_llama_last_trace(KeryxLlama* h) { return h ? h->trace.c_str() : ""; }
 
 // Runs one tiny graph on `gpu` so a library without kernels for that device fails here rather
 // than on the first request. ggml aborts the process on a missing kernel image: call from a

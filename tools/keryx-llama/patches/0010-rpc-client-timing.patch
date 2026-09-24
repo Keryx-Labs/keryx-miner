@@ -1,0 +1,189 @@
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -37,6 +37,14 @@
+ // Client: a failed link is sticky until reset; graph computes fail instead of aborting the process.
+ GGML_BACKEND_API void ggml_backend_rpc_reset_failure(void);
+ GGML_BACKEND_API bool ggml_backend_rpc_link_failed(void);
++// Client: wall time blocked on each endpoint's socket, split by command class.
++GGML_BACKEND_API void    ggml_backend_rpc_stats_reset(void);
++GGML_BACKEND_API size_t  ggml_backend_rpc_stats_count(void);
++GGML_BACKEND_API bool    ggml_backend_rpc_stats_get(size_t i, const char ** endpoint, uint64_t * compute_ns,
++                                                    uint64_t * get_ns, uint64_t * set_ns, uint64_t * other_ns,
++                                                    uint64_t * calls);
++// Client: one small request/response round trip on an idle link, in microseconds; -1 on failure.
++GGML_BACKEND_API int64_t ggml_backend_rpc_ping_us(const char * endpoint);
+ 
+ #ifdef  __cplusplus
+ }
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -16,6 +16,8 @@
+ #include <cstring>
+ #include <fstream>
+ #include <atomic>
++#include <chrono>
++#include <deque>
+ #include <filesystem>
+ #include <algorithm>
+ 
+@@ -43,6 +45,81 @@
+ void ggml_backend_rpc_reset_failure(void) { keryx_rpc_link_failed = false; }
+ bool ggml_backend_rpc_link_failed(void) { return keryx_rpc_link_failed; }
+ 
++// Client side: wall time blocked in socket I/O per endpoint, by command class. A graph compute is
++// sent without waiting, so a shard's compute time shows up in the next get_tensor on its socket.
++enum keryx_rpc_class { KERYX_RPC_COMPUTE = 0, KERYX_RPC_GET = 1, KERYX_RPC_SET = 2, KERYX_RPC_OTHER = 3 };
++struct keryx_rpc_stat {
++    std::string endpoint;
++    std::atomic<uint64_t> ns[4]{};
++    std::atomic<uint64_t> calls{0};
++};
++static std::mutex keryx_rpc_stats_mutex;
++static std::deque<keryx_rpc_stat> keryx_rpc_stats;
++static std::unordered_map<const socket_t *, keryx_rpc_stat *> keryx_rpc_stat_by_sock;
++
++static void keryx_rpc_stats_track(const std::string & endpoint, const socket_t * sock) {
++    std::lock_guard<std::mutex> lock(keryx_rpc_stats_mutex);
++    keryx_rpc_stat * stat = nullptr;
++    for (auto & s : keryx_rpc_stats) {
++        if (s.endpoint == endpoint) { stat = &s; break; }
++    }
++    if (!stat) {
++        keryx_rpc_stats.emplace_back();
++        stat = &keryx_rpc_stats.back();
++        stat->endpoint = endpoint;
++    }
++    keryx_rpc_stat_by_sock[sock] = stat;
++}
++
++static keryx_rpc_stat * keryx_rpc_stat_for(const socket_t * sock) {
++    std::lock_guard<std::mutex> lock(keryx_rpc_stats_mutex);
++    auto it = keryx_rpc_stat_by_sock.find(sock);
++    return it == keryx_rpc_stat_by_sock.end() ? nullptr : it->second;
++}
++
++static int keryx_rpc_class_of(int cmd);
++
++struct keryx_rpc_timer {
++    keryx_rpc_stat * stat;
++    int cls;
++    std::chrono::steady_clock::time_point t0;
++    keryx_rpc_timer(const socket_t * sock, int cmd)
++        : stat(keryx_rpc_stat_for(sock)), cls(keryx_rpc_class_of(cmd)), t0(std::chrono::steady_clock::now()) {}
++    ~keryx_rpc_timer() {
++        if (!stat) return;
++        const auto dt = std::chrono::steady_clock::now() - t0;
++        stat->ns[cls] += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count();
++        stat->calls++;
++    }
++};
++
++void ggml_backend_rpc_stats_reset(void) {
++    std::lock_guard<std::mutex> lock(keryx_rpc_stats_mutex);
++    for (auto & s : keryx_rpc_stats) {
++        for (auto & n : s.ns) n = 0;
++        s.calls = 0;
++    }
++}
++
++size_t ggml_backend_rpc_stats_count(void) {
++    std::lock_guard<std::mutex> lock(keryx_rpc_stats_mutex);
++    return keryx_rpc_stats.size();
++}
++
++bool ggml_backend_rpc_stats_get(size_t i, const char ** endpoint, uint64_t * compute_ns, uint64_t * get_ns,
++                                uint64_t * set_ns, uint64_t * other_ns, uint64_t * calls) {
++    std::lock_guard<std::mutex> lock(keryx_rpc_stats_mutex);
++    if (i >= keryx_rpc_stats.size()) return false;
++    const keryx_rpc_stat & s = keryx_rpc_stats[i];
++    if (endpoint)   *endpoint   = s.endpoint.c_str();
++    if (compute_ns) *compute_ns = s.ns[KERYX_RPC_COMPUTE];
++    if (get_ns)     *get_ns     = s.ns[KERYX_RPC_GET];
++    if (set_ns)     *set_ns     = s.ns[KERYX_RPC_SET];
++    if (other_ns)   *other_ns   = s.ns[KERYX_RPC_OTHER];
++    if (calls)      *calls      = s.calls;
++    return true;
++}
++
+ // all RPC structures must be packed
+ #pragma pack(push, 1)
+ // ggml_tensor is serialized into rpc_tensor
+@@ -370,7 +447,18 @@
+ 
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++static int keryx_rpc_class_of(int cmd) {
++    switch (cmd) {
++        case RPC_CMD_GRAPH_COMPUTE:
++        case RPC_CMD_GRAPH_RECOMPUTE: return KERYX_RPC_COMPUTE;
++        case RPC_CMD_GET_TENSOR:      return KERYX_RPC_GET;
++        case RPC_CMD_SET_TENSOR:
++        case RPC_CMD_SET_TENSOR_HASH: return KERYX_RPC_SET;
++        default:                      return KERYX_RPC_OTHER;
++    }
++}
++
++static bool send_rpc_cmd_raw(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+     uint8_t cmd_byte = cmd;
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+         return false;
+@@ -386,8 +474,8 @@
+ 
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
++static bool send_rpc_cmd_raw(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
++    if (!send_rpc_cmd_raw(sock, cmd, input, input_size)) {
+         return false;
+     }
+     uint64_t out_size;
+@@ -403,6 +491,16 @@
+     return true;
+ }
+ 
++static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++    keryx_rpc_timer timer(sock.get(), cmd);
++    return send_rpc_cmd_raw(sock, cmd, input, input_size);
++}
++
++static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
++    keryx_rpc_timer timer(sock.get(), cmd);
++    return send_rpc_cmd_raw(sock, cmd, input, input_size, output, output_size);
++}
++
+ // RPC client-side implementation
+ 
+ // Performs HELLO handshake with transport auto-negotiation.
+@@ -457,6 +555,7 @@
+     }
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+     sockets[endpoint] = sock;
++    keryx_rpc_stats_track(endpoint, sock.get());
+     return sock;
+ }
+ 
+@@ -1057,6 +1156,22 @@
+     get_device_memory(sock, device, free, total);
+ }
+ 
++int64_t ggml_backend_rpc_ping_us(const char * endpoint) {
++    auto sock = get_socket(endpoint);
++    if (sock == nullptr) {
++        return -1;
++    }
++    rpc_msg_get_device_memory_req request;
++    request.device = 0;
++    rpc_msg_get_device_memory_rsp response;
++    const auto t0 = std::chrono::steady_clock::now();
++    if (!send_rpc_cmd_raw(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response))) {
++        keryx_rpc_mark_failed(__func__);
++        return -1;
++    }
++    return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++}
++
+ // RPC server-side implementation
+ 
+ class rpc_server {
