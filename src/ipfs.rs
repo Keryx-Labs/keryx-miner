@@ -109,8 +109,10 @@ const REACHABILITY_WINDOW_SECS: u64 = 120;
 const REACHABILITY_PROBE_TIMEOUT_SECS: u64 = 20;
 /// Pause between two startup reachability rounds.
 const REACHABILITY_RETRY_PAUSE_SECS: u64 = 5;
-/// Timeout of the single per-response probe.
+/// Per-request timeout of a response confirmation probe.
 const RESPONSE_PROBE_TIMEOUT_SECS: u64 = 20;
+/// Total time a response is retried on the gateways before it is dropped.
+const RESPONSE_CONFIRM_WINDOW_SECS: u64 = 60;
 /// Interval between two background reachability checks while the miner runs.
 const REACHABILITY_RECHECK_SECS: u64 = 3_600;
 
@@ -229,9 +231,30 @@ pub fn verify_public_reachability(api_url: &str) -> anyhow::Result<()> {
     ))
 }
 
-/// Ask the project gateway once for a freshly uploaded response.
-pub fn response_is_retrievable(cid: &str) -> GatewayProbe {
-    probe_gateway(PROJECT_GATEWAY, cid, Duration::from_secs(RESPONSE_PROBE_TIMEOUT_SECS))
+/// Make a public gateway fetch a freshly uploaded response, retrying until the window expires.
+/// Ok carries the gateway that served it; Err carries the last verdict.
+pub fn confirm_response_retrievable(cid: &str) -> Result<&'static str, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(RESPONSE_CONFIRM_WINDOW_SECS);
+    let mut last = String::from("no probe sent");
+    loop {
+        for gateway in [PROJECT_GATEWAY, FALLBACK_GATEWAY] {
+            let timeout = remaining_budget(deadline, std::time::Instant::now())
+                .min(Duration::from_secs(RESPONSE_PROBE_TIMEOUT_SECS));
+            if timeout.is_zero() {
+                break;
+            }
+            match probe_gateway(gateway, cid, timeout) {
+                GatewayProbe::Reachable => return Ok(gateway),
+                GatewayProbe::NotFound(status) => last = format!("{} answered HTTP {}", gateway, status),
+                GatewayProbe::Undetermined(e) => last = format!("{}: {}", gateway, e),
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(format!("not served within {}s (last: {})", RESPONSE_CONFIRM_WINDOW_SECS, last));
+        }
+        std::thread::sleep(remaining_budget(deadline, now).min(Duration::from_secs(REACHABILITY_RETRY_PAUSE_SECS)));
+    }
 }
 
 /// Check that the IPFS API at `api_url` is reachable.

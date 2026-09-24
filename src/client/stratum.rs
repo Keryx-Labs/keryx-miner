@@ -842,7 +842,13 @@ fn do_inference_and_upload(
         Ok(cid_bytes) => {
             // Convert raw 34-byte multihash to base58 CIDv0 string via AiResponsePayload helper.
             let cid = keryx_inference::AiResponsePayload::new([0u8; 32], 0, cid_bytes, 0).cid_v0();
-            info!("OPoI [{}]: inference complete, IPFS CID={}", stable_id, cid);
+            match crate::ipfs::confirm_response_retrievable(&cid) {
+                Ok(gateway) => info!("OPoI [{}]: inference complete, IPFS CID={} served by {}", stable_id, cid, gateway),
+                Err(e) => {
+                    warn!("OPoI [{}]: response CID {} unreadable from the public gateways ({}) — response skipped; check the pool's kubo port 4001", stable_id, cid, e);
+                    return None;
+                }
+            }
             Some(cid)
         }
         Err(e) => {

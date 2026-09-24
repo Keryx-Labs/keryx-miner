@@ -62,6 +62,13 @@ use tokio_util::sync::{PollSendError, PollSender};
 use tonic::{transport::Channel as TonicChannel, Streaming};
 
 static EXTRA_DATA: &str = concat!(env!("CARGO_PKG_VERSION"), "/", env!("PACKAGE_COMPILE_TIME"));
+
+/// A finished inference waiting for its CID to be confirmed readable.
+struct PendingPublish {
+    request_hash: [u8; 32],
+    result: String,
+    rx: oneshot::Receiver<Option<[u8; 34]>>,
+}
 type BlockHandle = JoinHandle<Result<(), PollSendError<KaspadMessage>>>;
 
 #[allow(dead_code)]
@@ -108,6 +115,10 @@ pub struct KeryxdHandler {
     /// In-flight SLM inference task: (request_raw_bytes, result_receiver).
     /// None result means inference failed (model not ready or empty output) — skip IPFS upload.
     inference_rx: Option<([u8; 32], oneshot::Receiver<Option<String>>)>,
+
+    /// Finished inference being uploaded and confirmed on the public gateways; its AiResponse
+    /// is built once the task hands back the CID (None: dropped).
+    publish_rx: Option<PendingPublish>,
 
     /// In-flight inference for a node-issued challenge.
     /// Tuple: (challenge_string, result_receiver) where challenge_string = "model_id_hex:nonce_hex".
@@ -187,7 +198,7 @@ impl Client for KeryxdHandler {
                 Some(None) => break, // stream closed by node
                 None => {
                     // Timer tick: if a regular inference just finished, get a fresh template.
-                    if self.inference_rx.is_some() && self.poll_inference().await {
+                    if (self.inference_rx.is_some() || self.publish_rx.is_some()) && self.poll_inference().await {
                         self.client_get_block_template().await?;
                     // If a challenge is in flight, keep pinging the node so the result is
                     // delivered as soon as the inference task completes. This is critical on
@@ -287,6 +298,7 @@ impl KeryxdHandler {
             backfill_pending: std::collections::HashSet::new(),
             backfill_visited: std::collections::HashSet::new(),
             inference_rx: None,
+            publish_rx: None,
             challenge_inference_rx: None,
             opoi_challenge_active: None,
             pending_block_submissions,
@@ -692,10 +704,28 @@ impl KeryxdHandler {
         Ok(())
     }
 
-    /// Polls the in-flight inference task. When complete, uploads the result to
-    /// IPFS and submits a zero-input/zero-output AiResponse transaction.
-    /// Returns `true` if inference just finished (regardless of tx success).
+    /// Polls the in-flight inference task, then the publish task. A finished inference hands
+    /// its text to a publish task (IPFS upload, then a gateway fetch of the CID); the
+    /// AiResponse is submitted only once a public gateway has served the content.
+    /// Returns `true` when a request just reached its end (tx submitted or dropped).
     async fn poll_inference(&mut self) -> bool {
+        if let Some(mut pending) = self.publish_rx.take() {
+            return match pending.rx.try_recv() {
+                Ok(Some(cid)) => {
+                    self.submit_ai_response(pending.request_hash, &pending.result, cid).await;
+                    true
+                }
+                Ok(None) => true,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    self.publish_rx = Some(pending);
+                    false
+                }
+                Err(_) => {
+                    warn!("OPoI: publish task dropped — AiResponse skipped");
+                    true
+                }
+            };
+        }
         let Some((request_hash, mut rx)) = self.inference_rx.take() else {
             return false;
         };
@@ -712,27 +742,45 @@ impl KeryxdHandler {
 
         info!("OPoI: inference complete, request_hash={}", hex::encode(&request_hash[..8]));
 
+        let (tx_cid, rx_cid) = oneshot::channel::<Option<[u8; 34]>>();
         let ipfs_url = self.ipfs_url.clone();
-        let result_clone = result.clone();
-        let cid = match tokio::task::spawn_blocking(move || crate::ipfs::upload_with_recovery(&result_clone, &ipfs_url)).await {
-            Ok(Ok(cid)) => cid,
-            Ok(Err(e)) => { warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e); return true; }
-            Err(e) => { warn!("OPoI: IPFS spawn_blocking failed: {} — AiResponse tx skipped", e); return true; }
-        };
-
-        // Off the submission path: makes the project gateway fetch the response and reports a
-        // node nobody can read from.
-        let probe_cid = crate::ipfs::multihash_to_cid_v0(&cid);
-        tokio::task::spawn_blocking(move || match crate::ipfs::response_is_retrievable(&probe_cid) {
-            crate::ipfs::GatewayProbe::Reachable => {}
-            crate::ipfs::GatewayProbe::NotFound(status) => {
-                warn!("OPoI: gateway refused response CID {} (HTTP {}) — this node's responses may be unreadable", probe_cid, status)
+        let text = result.clone();
+        tokio::task::spawn_blocking(move || {
+            let cid = match crate::ipfs::upload_with_recovery(&text, &ipfs_url) {
+                Ok(cid) => cid,
+                Err(e) => {
+                    warn!("OPoI: IPFS upload failed: {} — AiResponse tx skipped", e);
+                    let _ = tx_cid.send(None);
+                    return;
+                }
+            };
+            let probe_cid = crate::ipfs::multihash_to_cid_v0(&cid);
+            match crate::ipfs::confirm_response_retrievable(&probe_cid) {
+                Ok(gateway) => info!("OPoI: response CID {} served by {}", probe_cid, gateway),
+                Err(e) => {
+                    warn!(
+                        "OPoI: response CID {} unreadable from the public gateways ({}) — AiResponse skipped; re-checking this node's reachability (kubo port 4001)",
+                        probe_cid, e
+                    );
+                    let _ = tx_cid.send(None);
+                    match crate::ipfs::verify_public_reachability(&ipfs_url) {
+                        Ok(()) => keryx_miner::slm::set_publishing_blocked(false),
+                        Err(e) => {
+                            warn!("{}", e);
+                            keryx_miner::slm::set_publishing_blocked(true);
+                        }
+                    }
+                    return;
+                }
             }
-            crate::ipfs::GatewayProbe::Undetermined(e) => {
-                warn!("OPoI: gateway could not fetch response CID {} ({}) — check that kubo port 4001 is reachable", probe_cid, e)
-            }
+            let _ = tx_cid.send(Some(cid));
         });
+        self.publish_rx = Some(PendingPublish { request_hash, result, rx: rx_cid });
+        false
+    }
 
+    /// Builds and submits the zero-input/zero-output AiResponse for a confirmed CID.
+    async fn submit_ai_response(&mut self, request_hash: [u8; 32], result: &str, cid: [u8; 34]) {
         let challenge_window_end = self.last_known_daa + 1000;
         let response_length = result.split_whitespace().count() as u32;
         // H6 service-bond era: sign the response with the escrow key (payload V2) so it counts
@@ -779,8 +827,6 @@ impl KeryxdHandler {
                 w.track_inference_escrow(txid, self.last_known_daa, inference_reward);
             }
         }
-
-        true
     }
 
     /// Logs this miner's service-bond standing when it changes: strike count, burns awaiting
