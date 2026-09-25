@@ -116,9 +116,21 @@ const RESPONSE_CONFIRM_WINDOW_SECS: u64 = 60;
 /// Interval between two background reachability checks while the miner runs.
 const REACHABILITY_RECHECK_SECS: u64 = 3_600;
 
+/// First pause before re-checking a node that failed the reachability check.
+const REACHABILITY_BACKOFF_BASE_SECS: u64 = 30;
+/// Longest pause between two re-checks of a node that keeps failing.
+const REACHABILITY_BACKOFF_CAP_SECS: u64 = 600;
+
 /// How often a running miner re-runs `verify_public_reachability`.
 pub fn reachability_recheck_interval() -> Duration {
     Duration::from_secs(REACHABILITY_RECHECK_SECS)
+}
+
+/// Pause before the next re-check after `failures` consecutive failed checks: doubles from the
+/// base up to the cap.
+pub fn reachability_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    Duration::from_secs(REACHABILITY_BACKOFF_BASE_SECS.saturating_mul(1u64 << shift).min(REACHABILITY_BACKOFF_CAP_SECS))
 }
 
 /// Outcome of asking a public gateway for a CID.
@@ -223,7 +235,7 @@ pub fn verify_public_reachability(api_url: &str) -> anyhow::Result<()> {
     }
     Err(anyhow::anyhow!(
         "IPFS node at {} is not reachable from the public gateways after {}s (last: {}).\n\
-         Inference results published from this node could not be read by anyone, so mining is refused.\n\
+         Inference results published from this node could not be read by anyone, so mining is suspended until it is.\n\
          Fix: expose kubo's swarm port (TCP/UDP 4001) or enable a relay, then check that `ipfs id` lists a public address.",
         api_url,
         REACHABILITY_WINDOW_SECS,
@@ -757,6 +769,13 @@ fn extract_ipfs_binary(archive: &std::path::Path, dest_dir: &std::path::Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachability_backoff_doubles_up_to_the_cap() {
+        let secs: Vec<u64> = (0..=8).map(|f| reachability_backoff(f).as_secs()).collect();
+        assert_eq!(secs, vec![30, 30, 60, 120, 240, 480, 600, 600, 600]);
+        assert_eq!(reachability_backoff(u32::MAX).as_secs(), 600);
+    }
 
     #[test]
     fn multihash_round_trips_through_base58_cid_v0() {
