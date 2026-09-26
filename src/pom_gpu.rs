@@ -919,7 +919,7 @@ impl PomGpuMiner {
         let ctx = CudaContext::new(device_id)?;
         ctx.bind_to_thread()?;
         let stream = ctx.default_stream();
-        let ts = crate::llama_engine::tensors()
+        let ts = crate::llama_engine::tensors(device_id)
             .ok_or_else(|| anyhow!("PoM GPU: llama engine tensors unavailable"))?;
         let canonical = canonical_tensor_list(gguf)
             .ok_or_else(|| anyhow!("PoM GPU: canonical GGUF tensor list unreadable"))?;
@@ -1317,8 +1317,8 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         // GPU with a different GGUF so the next `ensure_installed` brings up the new model.
         // Drain this device's walk BEFORE freeing the tensors it may be gathering over.
         uninstall(dev); // force a resident reload of the new model on the next ensure_installed
-        if crate::llama_engine::active_gpu() == Some(dev as usize) && !crate::llama_engine::active_for(&gguf, dev as usize) {
-            crate::llama_engine::unload();
+        if !crate::llama_engine::active_for(&gguf, dev as usize) {
+            crate::llama_engine::unload(dev as usize);
         }
     }
     // The served lineup (`SUPPORTED_SPECS`) drives the coinbase `ai:cap` announcement + inference
@@ -1351,20 +1351,6 @@ fn device_lifecycle(device_id: u32) -> Arc<Mutex<()>> {
 
 static LLAMA_MODEL_SWAP: Mutex<()> = Mutex::new(());
 
-fn with_swap_lifecycle_locks<T>(host: Option<u32>, target_dev: u32, swap: impl FnOnce() -> T) -> T {
-    let mut devices = vec![target_dev];
-    if let Some(host) = host.filter(|host| *host != target_dev) {
-        devices.push(host);
-        devices.sort_unstable();
-    }
-    let locks: Vec<_> = devices.into_iter().map(device_lifecycle).collect();
-    let _guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap_or_else(|p| p.into_inner())).collect();
-    swap()
-}
-
-/// Replace the llama engine's resident model while the old and target GPU miners are unable to
-/// rebuild. Keeping both lifecycle locks through the new load closes the gap where the old miner
-/// could reload its model first and make `ensure_loaded` report a cross-GPU busy error.
 /// Where the walk reads one canonical tensor's bytes from.
 enum GatherSource {
     /// llama's resident device copy, walked in place (zero-dup).
@@ -1448,8 +1434,8 @@ fn canonical_tensor_list(gguf: &str) -> Option<Vec<(String, usize)>> {
 
 /// None when the llama-resident layout can back the canonical walk (with per-tensor index
 /// fallback), Some(reason) when the raw canonical copy must be walked instead.
-fn llama_gather_blocker(gguf: &str, model_id: &[u8; 32]) -> Option<String> {
-    let resident = match crate::llama_engine::tensors() {
+fn llama_gather_blocker(gguf: &str, model_id: &[u8; 32], device_id: u32) -> Option<String> {
+    let resident = match crate::llama_engine::tensors(device_id as usize) {
         Some(ts) => ts,
         None => return Some("llama engine tensors unavailable".into()),
     };
@@ -1472,16 +1458,10 @@ fn llama_gather_blocker(gguf: &str, model_id: &[u8; 32]) -> Option<String> {
 
 pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crate::llama_engine::LoadError> {
     let _swap_guard = LLAMA_MODEL_SWAP.lock().unwrap_or_else(|p| p.into_inner());
-    let host = crate::llama_engine::active_gpu().map(|g| g as u32);
-    with_swap_lifecycle_locks(host, target_dev, || {
-        if let Some(host) = host {
-            uninstall(host);
-        }
-        if host != Some(target_dev) {
-            uninstall(target_dev);
-        }
-        crate::llama_engine::replace_loaded(gguf, target_dev as usize)
-    })
+    let lock = device_lifecycle(target_dev);
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    uninstall(target_dev);
+    crate::llama_engine::ensure_loaded(gguf, target_dev as usize)
 }
 
 /// Ensure the GPU miner is installed; if an inference evicted the mining model, reload it
@@ -1713,8 +1693,8 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // One CUDA-resident PoM worker per GPU. This avoids all workers contending for a single
     // GPU0-bound miner object while still sharing the host-side index across the process.
     //
-    // The in-process llama.cpp engine hosts the model on the inference GPU (a process-global
-    // singleton — only that GPU brings it up): there the walk gathers over ITS resident tensors,
+    // The in-process llama.cpp engine hosts the model on its inference GPU (one engine per GPU —
+    // only that GPU brings it up): there the walk gathers over ITS resident tensors,
     // one VRAM copy serving inference + walk. Every other mining GPU uploads its own standalone
     // copy of the canonical GGUF bytes (`load_raw`). The N-guard below validates the gather
     // against the host index on every path, so a mismatch refuses to mine rather than producing
@@ -1730,9 +1710,6 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 crate::slm::mark_model_available(&model_id, "llama_engine_loaded");
                 true
             }
-            // A busy engine hosts another model and is swapped on demand, so the model stays
-            // announced: withdrawing here would silence every model but the first on a mixed rig.
-            Err(e) if e.is_busy() => false,
             Err(e) => {
                 warn!("PoM[gpu{}]: llama engine unavailable — {}", device_id, e);
                 let reason = if e.is_oom() { "llama_engine_oom" } else { "llama_engine_load_failed" };
@@ -1756,18 +1733,18 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                 "PoM[gpu{}]: llama placed '{}' on device {} — walking a raw canonical copy; inference for this model is unavailable.",
                 device_id, name, owner
             );
-            crate::llama_engine::unload();
+            crate::llama_engine::unload(device_id as usize);
             use_llama = false;
             crate::slm::mark_model_unavailable(&model_id, "llama_wrong_device");
         }
     }
     if use_llama {
-        if let Some(reason) = llama_gather_blocker(&gguf, &model_id) {
+        if let Some(reason) = llama_gather_blocker(&gguf, &model_id, device_id) {
             warn!(
                 "PoM[gpu{}]: {} — walking a raw canonical copy; inference for this model is unavailable.",
                 device_id, reason
             );
-            crate::llama_engine::unload();
+            crate::llama_engine::unload(device_id as usize);
             use_llama = false;
             crate::slm::mark_model_unavailable(&model_id, "llama_layout_incompatible");
         }
@@ -1989,46 +1966,6 @@ mod tests {
         assert!(is_sticky_gpu_runtime_fault("device-side assert triggered"));
         assert!(!is_sticky_gpu_runtime_fault("out of memory"));
         assert!(!is_sticky_gpu_runtime_fault("invalid device pointer"));
-    }
-
-    #[test]
-    fn model_swap_holds_both_gpu_lifecycles_until_replacement_load_finishes() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        const HOST: u32 = 10_000;
-        const TARGET: u32 = 10_001;
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let swap = std::thread::spawn(move || {
-            with_swap_lifecycle_locks(Some(HOST), TARGET, || {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-            });
-        });
-        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        let mut waiters = Vec::new();
-        for device in [HOST, TARGET] {
-            let (acquired_tx, acquired_rx) = mpsc::channel();
-            let waiter = std::thread::spawn(move || {
-                let lock = device_lifecycle(device);
-                let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-                acquired_tx.send(()).unwrap();
-            });
-            assert!(
-                acquired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-                "gpu{device} lifecycle escaped before the replacement model finished loading"
-            );
-            waiters.push((acquired_rx, waiter));
-        }
-
-        release_tx.send(()).unwrap();
-        swap.join().unwrap();
-        for (acquired_rx, waiter) in waiters {
-            acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-            waiter.join().unwrap();
-        }
     }
 }
 

@@ -814,8 +814,8 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     model_dir(spec).join(".ok").exists() && !model_is_unavailable(model_id)
 }
 
-/// Serve an inference request via the in-process llama.cpp engine, swapping it to the requested
-/// model first if it hosts a different one. Blocking — call from `spawn_blocking`.
+/// Serve an inference request via the in-process llama.cpp engine on the GPU that mines the
+/// model, loading it there first if needed. Blocking — call from `spawn_blocking`.
 ///
 /// The generated text is user-facing only — consensus checks the fixed-point `model_fixed`
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
@@ -835,13 +835,10 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
-        // The engine hosts another model (or nothing). Inference has priority: release the
-        // device's miner to make room, swap the engine to the requested model. The possession
-        // walk rebuilds over the mining model at the next `ensure_installed`.
-        log::info!("SlmEngine: swapping the llama engine to '{}' (gpu{})", spec.name, dev_id);
-        // The hosted model may live on ANOTHER device whose walk reads its tensors zero-dup:
-        // evict drains that device (installed walk AND in-flight build) before freeing anything.
-        // Draining only `dev_id` here poisoned the hosting GPU on every two-model rig.
+        // Not resident on its GPU yet (or displaced). Inference has priority: release the
+        // device's miner to make room and load the model. The possession walk rebuilds at the
+        // next `ensure_installed`.
+        log::info!("SlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
         if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
             log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
@@ -849,7 +846,7 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
         }
     }
 
-    match crate::llama_engine::generate(&templated, max_tokens) {
+    match crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens) {
         Some(text) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
             Some(text)
