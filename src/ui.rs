@@ -20,6 +20,17 @@ use crate::stats::MinerStats;
 const MAX_LOG_LINES: usize = 2000;
 const REDRAW_RATE: Duration = Duration::from_millis(300);
 const MIN_LOG_ROWS: u16 = 5;
+// Rows reserved for the top bar: the bar itself plus one overflow row that
+// wrapped top-left and top-right segments spill into (see wrap_segments).
+const TOP_BAR_ROWS: u16 = 2;
+// Hanging indent applied to top-bar overflow rows so wrapped content reads as
+// a continuation of the bar instead of a new line.
+const OVERFLOW_INDENT: usize = 2;
+// DEC private mode 2026: terminals that support it (kitty, foot, WezTerm, iTerm2,
+// Windows Terminal, tmux, recent xterm) defer rendering until the end marker, so a
+// frame appears atomically instead of tearing while it is being painted.
+const SYNC_UPDATE_BEGIN: &str = "\x1b[?2026h";
+const SYNC_UPDATE_END: &str = "\x1b[?2026l";
 #[cfg(feature = "block-celebration")]
 const BLOCK_CELEBRATION_DURATION: Duration = Duration::from_millis(2500);
 #[cfg(feature = "block-celebration")]
@@ -368,6 +379,10 @@ pub fn spawn_ui(
         let mut block_celebration_sound_enabled = block_celebration;
         #[cfg(feature = "block-celebration")]
         let mut block_sound = None;
+        // Reusable frame buffer. Rendering into this and writing it out in a single
+        // write avoids the many mid-frame flushes of line-buffered stdout, which
+        // painted partial frames and made the TUI visibly flash (worst over SSH).
+        let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
         while !stop_clone.load(Ordering::Acquire) {
             if handle_input(
@@ -459,7 +474,12 @@ pub fn spawn_ui(
             let periodic_refresh_due = block_coin_frame.is_none() && last_drawn_at.elapsed() >= Duration::from_secs(1);
             let full_redraw = should_clear || animation_ended || periodic_refresh_due || last_draw_key != Some(draw_key);
             if full_redraw {
-                draw_frame(&mut out, current_size, &snapshot, &ui_state, should_clear, block_coin_frame);
+                frame_buf.clear();
+                let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_BEGIN));
+                draw_frame(&mut frame_buf, current_size, &snapshot, &ui_state, should_clear, block_coin_frame);
+                let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_END));
+                let _ = out.write_all(&frame_buf);
+                let _ = out.flush();
                 last_draw_key = Some(draw_key);
                 last_drawn_at = Instant::now();
                 #[cfg(feature = "block-celebration")]
@@ -470,7 +490,11 @@ pub fn spawn_ui(
             #[cfg(feature = "block-celebration")]
             if !full_redraw && block_coin_frame != last_block_coin_frame {
                 if let Some(frame) = block_coin_frame {
-                    draw_block_celebration(&mut out, current_size.0, current_size.1, frame, snapshot.accepted_blocks);
+                    frame_buf.clear();
+                    let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_BEGIN));
+                    draw_block_celebration(&mut frame_buf, current_size.0, current_size.1, frame, snapshot.accepted_blocks);
+                    let _ = queue!(&mut frame_buf, Print(SYNC_UPDATE_END));
+                    let _ = out.write_all(&frame_buf);
                     let _ = out.flush();
                 }
                 last_block_coin_frame = block_coin_frame;
@@ -520,7 +544,7 @@ fn metric_row(label: &str, value: String, value_color: Color) -> PanelRow {
 }
 
 fn draw_frame(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     size: (u16, u16),
     snapshot: &crate::stats::MinerStatsSnapshot,
     ui_state: &UiState,
@@ -680,18 +704,35 @@ fn draw_frame(
         (load_value, load_color),
     ];
 
-    draw_colored_segments_cell(
-        out,
-        0,
-        0,
-        left_w,
-        &top_left,
-        palette().panel,
-    );
-    draw_colored_cell(out, divider_x, 0, 1, "|", palette().muted, palette().panel, false);
-    draw_colored_segments_cell(out, right_x, 0, right_w, &top_right, palette().panel);
+    // Wrap both panes up front and draw the bar from the wrapped output, so the
+    // bar and its overflow row share one layout: a token is either fully on the
+    // bar or fully on the overflow row, never half-clipped across both. Overflow
+    // rows get a hanging indent so wrapped content reads as a continuation.
+    let top_left_rows = wrap_segments(&top_left, left_w, OVERFLOW_INDENT);
+    let top_right_rows = wrap_segments(&top_right, right_w, OVERFLOW_INDENT);
 
-    let available_content_rows = h.saturating_sub(MIN_LOG_ROWS + 3) as usize;
+    draw_colored_segments_cell(out, 0, 0, left_w, &top_left_rows[0], palette().panel);
+    draw_colored_cell(out, divider_x, 0, 1, "|", palette().muted, palette().panel, false);
+    draw_colored_segments_cell(out, right_x, 0, right_w, &top_right_rows[0], palette().panel);
+
+    // Row 1 is the overflow row: word-wrapped continuation of the top-left
+    // segments (e.g. OPoI / Strike) and top-right segments (e.g. RAM / Load
+    // Avg) that did not fit on the bar itself.
+    let top_left_overflow = top_left_rows.get(1).cloned().unwrap_or_default();
+    let top_right_overflow = top_right_rows.get(1).cloned().unwrap_or_default();
+    if top_left_overflow.is_empty() {
+        draw_colored_cell(out, 0, 1, left_w, "", palette().text, palette().bg, false);
+    } else {
+        draw_colored_segments_cell(out, 0, 1, left_w, &top_left_overflow, palette().bg);
+    }
+    draw_colored_cell(out, divider_x, 1, 1, "|", palette().muted, palette().panel, false);
+    if top_right_overflow.is_empty() {
+        draw_colored_cell(out, right_x, 1, right_w, "", palette().text, palette().bg, false);
+    } else {
+        draw_colored_segments_cell(out, right_x, 1, right_w, &top_right_overflow, palette().bg);
+    }
+
+    let available_content_rows = h.saturating_sub(MIN_LOG_ROWS + TOP_BAR_ROWS + 2) as usize;
     let content_budget = available_content_rows.max(4);
 
     let mut left_rows: Vec<PanelRow> = vec![
@@ -798,14 +839,9 @@ fn draw_frame(
     } else {
         (right_w / 8).clamp(5, 11)
     };
-    let free_w = right_w.saturating_sub(id_w + model_w + rate_w + cc_w + cm_w + fan_w + bar_w + 12);
-    // Keep Loaded Model closer to Kernel: trim Kernel by ~5 chars when possible.
-    let kernel_min = if compact { 7 } else { 10 };
-    let kernel_w = ((free_w * 2 / 5).max(kernel_min)).saturating_sub(3).max(kernel_min);
-    let loaded_w = free_w.saturating_sub(kernel_w).max(if compact { 9 } else { 12 });
     right_rows.push(PanelRow::Plain {
         text: format!(
-            " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
+            " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$}",
             "ID",
             "Model",
             "Hashrate",
@@ -813,8 +849,6 @@ fn draw_frame(
             "Core/Mem",
             "Fan",
             "Load",
-            "Kernel",
-            "Loaded Model",
             id_w = id_w,
             model_w = model_w,
             rate_w = rate_w,
@@ -822,8 +856,6 @@ fn draw_frame(
             cm_w = cm_w,
             fan_w = fan_w,
             bar_w = bar_w,
-            kernel_w = kernel_w,
-            loaded_w = loaded_w,
         ),
         fg: palette().muted,
         bold: true,
@@ -837,7 +869,9 @@ fn draw_frame(
         .unwrap_or(1)
         .max(1);
 
-    let max_device_rows = ((content_budget.saturating_sub(2)) / 2).max(1);
+    // Devices get up to three content rows each: primary, detail, and a
+    // wrapped continuation of the detail row.
+    let max_device_rows = ((content_budget.saturating_sub(2)) / 3).max(1);
     let shown = snapshot.devices.len().min(max_device_rows);
     for d in snapshot.devices.iter().take(shown) {
         let dev_id = parse_device_id(&d.id);
@@ -873,8 +907,31 @@ fn draw_frame(
             .fan_percent
             .map(|v| format!("{}%", v))
             .unwrap_or_else(|| "--".to_string());
-        let kernel_short = trim_to_width(&kernel, kernel_w);
-        let loaded_short = trim_to_width(&loaded_model, loaded_w);
+        let kernel_short = kernel;
+        let loaded_short = loaded_model;
+        let brand_color = device_brand_color(&d.id);
+        right_rows.push(PanelRow::Segments(vec![
+            (
+                format!(
+                    " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$}",
+                    id_short,
+                    model_short,
+                    rate_short,
+                    compute,
+                    core_mem,
+                    fan,
+                    load_bar,
+                    id_w = id_w,
+                    model_w = model_w,
+                    rate_w = rate_w,
+                    cc_w = cc_w,
+                    cm_w = cm_w,
+                    fan_w = fan_w,
+                    bar_w = bar_w,
+                ),
+                brand_color,
+            ),
+        ]));
         let power_short = d
             .power_draw_w
             .map(format_power_draw)
@@ -888,49 +945,40 @@ fn draw_frame(
         } else {
             palette().ok
         };
-        let brand_color = device_brand_color(&d.id);
-        right_rows.push(PanelRow::Segments(vec![
-            (
-                format!(
-                    " {:<id_w$} {:<model_w$} {:<rate_w$} {:<cc_w$} {:<cm_w$} {:<fan_w$} {:<bar_w$} {:<kernel_w$} {:<loaded_w$}",
-                    id_short,
-                    model_short,
-                    rate_short,
-                    compute,
-                    core_mem,
-                    fan,
-                    load_bar,
-                    kernel_short,
-                    loaded_short,
-                    id_w = id_w,
-                    model_w = model_w,
-                    rate_w = rate_w,
-                    cc_w = cc_w,
-                    cm_w = cm_w,
-                    fan_w = fan_w,
-                    bar_w = bar_w,
-                    kernel_w = kernel_w,
-                    loaded_w = loaded_w,
-                ),
-                brand_color,
-            ),
-        ]));
         let blocks_accepted_color = if d.blocks_accepted > 0 { palette().bright } else { detail_color };
         let blocks_rejected_color = if d.blocks_rejected > 0 { palette().err } else { detail_color };
-        right_rows.push(PanelRow::Segments(vec![
-            ("   ".to_string(), palette().muted),
-            ("P: ".to_string(), palette().muted),
-            (format!("{:<8}", power_short), detail_color),
-            ("  ".to_string(), palette().muted),
-            ("Eff: ".to_string(), palette().muted),
+        // Detail line: power and efficiency sit tight together, then the kernel
+        // and loaded model moved down from the primary row, then block counts.
+        // Power values are short (e.g. "250W") so the field stays at 4 columns.
+        // When the row exceeds the pane width it word-wraps onto a third row,
+        // indented to the same 3 columns as this one.
+        let detail_segments = vec![
+            ("   P: ".to_string(), palette().muted),
+            (format!("{:<4}", power_short), detail_color),
+            (" Eff: ".to_string(), palette().muted),
             (efficiency_short, detail_color),
-            ("  ".to_string(), palette().muted),
-            ("Blocks Accepted: ".to_string(), palette().muted),
+            ("  Kernel: ".to_string(), palette().muted),
+            (kernel_short, brand_color),
+            ("  Loaded Model: ".to_string(), palette().muted),
+            (loaded_short, brand_color),
+            ("  Blocks Accepted: ".to_string(), palette().muted),
             (d.blocks_accepted.to_string(), blocks_accepted_color),
-            ("  ".to_string(), palette().muted),
-            ("Blocks Rejected: ".to_string(), palette().muted),
+            ("  Blocks Rejected: ".to_string(), palette().muted),
             (d.blocks_rejected.to_string(), blocks_rejected_color),
-        ]));
+        ];
+        let detail_rows = wrap_segments(&detail_segments, right_w, 3);
+        for (i, row) in detail_rows.into_iter().enumerate() {
+            if i == 0 {
+                right_rows.push(PanelRow::Segments(row));
+            } else {
+                right_rows.push(PanelRow::Segments(
+                    [("   ".to_string(), palette().muted)]
+                        .into_iter()
+                        .chain(row.into_iter().skip(1))
+                        .collect(),
+                ));
+            }
+        }
     }
 
     if snapshot.devices.len() > shown {
@@ -944,7 +992,7 @@ fn draw_frame(
     let content_rows = left_rows.len().max(right_rows.len());
 
     for row in 0..content_rows {
-        let y = row as u16 + 1;
+        let y = row as u16 + TOP_BAR_ROWS;
         let left_bg = if row == 0 {
             palette().panel
         } else if row % 2 == 0 {
@@ -983,7 +1031,7 @@ fn draw_frame(
         }
     }
 
-    let separator_y = content_rows as u16 + 1;
+    let separator_y = content_rows as u16 + TOP_BAR_ROWS;
     draw_colored_line(
         out,
         separator_y,
@@ -1050,7 +1098,6 @@ fn draw_frame(
     }
 
     let _ = queue!(out, ResetColor, SetAttribute(Attribute::Reset));
-    let _ = out.flush();
 }
 
 #[cfg(feature = "block-celebration")]
@@ -1068,7 +1115,7 @@ fn block_animation_frame(elapsed: Duration) -> Option<usize> {
 }
 
 #[cfg(feature = "block-celebration")]
-fn draw_block_celebration(out: &mut std::io::Stdout, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
+fn draw_block_celebration(out: &mut impl Write, w: u16, h: u16, frame: usize, accepted_blocks: u64) {
     let title = format!("KRX BLOCK ACCEPTED  #{}", accepted_blocks);
     let art_width = BLOCK_COIN_WIDTH;
     let art_height = BLOCK_COIN_HEIGHT / 2;
@@ -1151,7 +1198,7 @@ fn ansi_level(value: u8) -> u8 {
 }
 
 fn draw_colored_line(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     y: u16,
     text: &str,
     fg: Color,
@@ -1171,7 +1218,7 @@ fn draw_colored_line(
 }
 
 fn draw_colored_cell(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     x: u16,
     y: u16,
     width: usize,
@@ -1194,7 +1241,7 @@ fn draw_colored_cell(
 }
 
 fn draw_colored_segments_cell(
-    out: &mut std::io::Stdout,
+    out: &mut impl Write,
     x: u16,
     y: u16,
     width: usize,
@@ -1400,6 +1447,80 @@ fn trim_to_width(s: &str, width: usize) -> String {
         out.push(c);
     }
     out
+}
+
+// Word-wrap a segment list into display rows of at most `width` columns.
+// Whitespace between words is preserved exactly (so the wrapped rows render
+// identically to the raw segments), except spaces that land on a wrap boundary
+// are dropped. Tokens longer than the width are hard-cut with trim_to_width.
+// Index 0 of the result is what the caller draws on the primary row; further
+// entries are overflow rows, narrowed and shifted right by `indent` columns so
+// a wrapped continuation is visually offset from the line above it.
+fn wrap_segments(segments: &[(String, Color)], width: usize, indent: usize) -> Vec<Vec<(String, Color)>> {
+    let mut rows: Vec<Vec<(String, Color)>> = vec![Vec::new()];
+    // Row 0 spans the full width; overflow rows reserve the hanging indent.
+    let mut row_width = width;
+    let mut row_len = 0usize;
+
+    let start_row = |rows: &mut Vec<Vec<(String, Color)>>, row_width: &mut usize, row_len: &mut usize| {
+        rows.push(Vec::new());
+        *row_width = width.saturating_sub(indent);
+        *row_len = 0;
+        if indent > 0 {
+            rows
+                .last_mut()
+                .expect("row exists")
+                .push((" ".repeat(indent), Color::Reset));
+        }
+    };
+
+    for (text, color) in segments {
+        let mut word = String::new();
+        let mut chars = text.chars().peekable();
+        loop {
+            match chars.next() {
+                Some(c) if c.is_whitespace() => {
+                    // Keep the space while it fits; drop it at a wrap boundary.
+                    if row_len < row_width {
+                        rows.last_mut().expect("row exists").push((" ".to_string(), *color));
+                        row_len += 1;
+                    }
+                }
+                Some(c) => {
+                    word.push(c);
+                    while let Some(&next) = chars.peek() {
+                        if next.is_whitespace() {
+                            break;
+                        }
+                        word.push(next);
+                        chars.next();
+                    }
+                    // Whole word moves to the next row when it does not fit here.
+                    if row_len > 0 && row_len + word.len() > row_width {
+                        start_row(&mut rows, &mut row_width, &mut row_len);
+                    }
+                    // Hard-cut words that are longer than a full row.
+                    let mut rest = word.as_str();
+                    while !rest.is_empty() {
+                        let avail = row_width.saturating_sub(row_len);
+                        if avail == 0 {
+                            start_row(&mut rows, &mut row_width, &mut row_len);
+                            continue;
+                        }
+                        let piece = trim_to_width(rest, avail);
+                        let taken = piece.len();
+                        row_len += taken;
+                        rows.last_mut().expect("row exists").push((piece, *color));
+                        rest = &rest[taken..];
+                    }
+                    word.clear();
+                }
+                None => break,
+            }
+        }
+    }
+
+    rows
 }
 
 fn format_hashrate(hs: u64) -> String {
