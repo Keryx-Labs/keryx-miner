@@ -122,6 +122,8 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     // which grow with it and not with the context.
     cp.n_batch = std::min(2048u, cp.n_ctx);
     cp.n_ubatch = std::min(512u, cp.n_batch);
+    // The cache is cleared before every request, so sliding-window layers only need their window.
+    cp.swa_full = false;
     // 8-bit KV cache with flash attention: half the per-token VRAM of f16. Falls back to the
     // default cache for an architecture the fast path cannot serve.
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
