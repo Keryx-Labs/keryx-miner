@@ -16,6 +16,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "gguf.h"
 #ifdef __APPLE__
 // Metal: llama.cpp's ggml-metal backend stores quantized tensors in unified-memory MTLBuffers.
 // `t->data` is a CPU-readable pointer into that unified memory (also GPU-visible on Apple Silicon
@@ -93,6 +94,21 @@ static void keryx_install_log_filter() {
     ggml_log_set(keryx_llama_log_cb, nullptr);
 }
 
+// GLM-4-0414 rotates 64 of its 128 head dimensions; a GGUF missing the key rotates all of them.
+static bool keryx_needs_glm4_rope_fix(const char* gguf_path) {
+    gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context* g = gguf_init_from_file(gguf_path, params);
+    if (!g) return false;
+    bool fix = false;
+    const int64_t arch = gguf_find_key(g, "general.architecture");
+    if (arch >= 0 && gguf_get_kv_type(g, arch) == GGUF_TYPE_STRING
+        && std::strcmp(gguf_get_val_str(g, arch), "glm4") == 0) {
+        fix = gguf_find_key(g, "glm4.rope.dimension_count") < 0;
+    }
+    gguf_free(g);
+    return fix;
+}
+
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
@@ -110,6 +126,13 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
     mp.main_gpu     = gpu;
     mp.use_mmap     = true;
+    llama_model_kv_override overrides[2] = {};
+    if (keryx_needs_glm4_rope_fix(gguf_path)) {
+        overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
+        std::strncpy(overrides[0].key, "glm4.rope.dimension_count", sizeof(overrides[0].key) - 1);
+        overrides[0].val_i64 = 64;
+        mp.kv_overrides = overrides;
+    }
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
     if (!model) {
         keryx_set_error("model", std::string("llama_model_load_from_file failed for ") + gguf_path);
