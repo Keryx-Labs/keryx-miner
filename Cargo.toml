@@ -1,6 +1,6 @@
 [package]
 name = "keryx-miner"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/keryx-labs/keryx-miner"
