@@ -199,6 +199,11 @@ impl State {
         self.matrix.heavy_hash(hash)
     }
 
+    /// True when this job comes from a pool (shares), false for a solo node template.
+    pub fn is_pool_share(&self) -> bool {
+        matches!(*self.block, BlockSeed::PartialBlock { .. })
+    }
+
     #[inline(always)]
     pub fn check_pow(&self, nonce: u64) -> bool {
         let pow = self.calculate_pow(nonce);

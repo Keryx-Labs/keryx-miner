@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
 
-use cudarc::driver::{result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, LaunchConfig};
+use cudarc::driver::{result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig};
 
 const PTX_SM90: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm90.ptx"));
 const PTX_SM89: &str = include_str!(concat!(env!("OUT_DIR"), "/pom_mine_sm89.ptx"));
@@ -36,6 +36,7 @@ const POM_V3_DUMP_KERNEL_NAME: &str = "pom_mine_v3_dump";
 const POM_V4_KERNEL_NAME: &str = "pom_mine_v4";
 const POM_V4_SHARED_BYTES: u32 = 2048;
 const POM_V4_CHASE_KERNEL_NAME: &str = "pom_mine_v4_chase";
+const POM_SEED_H10_KERNEL_NAME: &str = "pom_seed_h10_batch";
 const POM_V4_TC_KERNEL_NAME: &str = "pom_mine_v4_tc";
 /// Must match V4_TC_WARPS / V4_TC_PIPE in cuda/pom_mine.cu.
 const V4_TC_WARPS: u64 = 4;
@@ -85,6 +86,31 @@ fn v4_offsets_buf(stream: &Arc<CudaStream>, len: usize) -> Result<Arc<CudaSlice<
         }
     }
     let s = Arc::new(unsafe { stream.alloc::<u32>(len) }?);
+    g.insert(ord, s.clone());
+    Ok(s)
+}
+
+/// Per-device v4 launch buffers reused across batches: winner slot, H10 sponge state, seeds.
+struct V4Scratch {
+    winner: CudaSlice<u64>,
+    state: CudaSlice<u64>,
+    seeds: CudaSlice<u64>,
+}
+
+static V4_SCRATCH: OnceLock<Mutex<HashMap<usize, Arc<Mutex<V4Scratch>>>>> = OnceLock::new();
+
+fn v4_scratch(stream: &Arc<CudaStream>, batch: usize) -> Result<Arc<Mutex<V4Scratch>>> {
+    let m = V4_SCRATCH.get_or_init(|| Mutex::new(HashMap::new()));
+    let ord = stream.context().ordinal();
+    let mut g = m.lock().unwrap();
+    if let Some(s) = g.get(&ord) {
+        return Ok(s.clone());
+    }
+    let s = Arc::new(Mutex::new(V4Scratch {
+        winner: stream.alloc_zeros::<u64>(1)?,
+        state: stream.alloc_zeros::<u64>(25)?,
+        seeds: stream.alloc_zeros::<u64>(batch.max(1))?,
+    }));
     g.insert(ord, s.clone());
     Ok(s)
 }
@@ -192,6 +218,8 @@ struct LoadedPomKernel {
     /// Chaseless v4 solver entry — preferred over chase+tc when armed (`arm_tc`).
     function_v4_ncf: Option<sys::CUfunction>,
     ncf_enabled: bool,
+    /// H10/H14 seed pre-pass; required whenever the walk runs with an H10 seed.
+    function_seed_h10: Option<sys::CUfunction>,
 }
 
 impl Drop for LoadedPomKernel {
@@ -224,7 +252,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
         let function_v4_ncf =
             unsafe { result::module::get_function(module, CString::new(POM_V4_NCF_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false })
+        let function_seed_h10 =
+            unsafe { result::module::get_function(module, CString::new(POM_SEED_H10_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, function_seed_h10 })
     }
 
     fn from_ptx(_label: &'static str, ptx: &'static str) -> Result<Self> {
@@ -239,7 +269,9 @@ impl LoadedPomKernel {
             unsafe { result::module::get_function(module, CString::new(POM_V4_TC_KERNEL_NAME).unwrap()) }.ok();
         let function_v4_ncf =
             unsafe { result::module::get_function(module, CString::new(POM_V4_NCF_KERNEL_NAME).unwrap()) }.ok();
-        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false })
+        let function_seed_h10 =
+            unsafe { result::module::get_function(module, CString::new(POM_SEED_H10_KERNEL_NAME).unwrap()) }.ok();
+        Ok(Self { module, function, function_v3, function_v3_dump, function_v4, function_v4_chase, function_v4_tc, tc_enabled: false, function_v4_ncf, ncf_enabled: false, function_seed_h10 })
     }
 
     fn launch(
@@ -461,12 +493,32 @@ impl LoadedPomKernel {
     #[allow(clippy::too_many_arguments)]
     fn launch_v4(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h10_state: Option<&[u64; 25]>) -> Result<Option<u64>> {
         let t = words4(target_le);
-        let v5_buf = stream.clone_htod(&h10_state.copied().unwrap_or([0u64; 25]))?;
-        let (v5_ptr, _vg) = v5_buf.device_ptr(stream);
-        let seed_h10: u32 = h10_state.is_some() as u32;
         let k = crate::pom_v4::POM_V4_K as u32;
-        let winner = stream.clone_htod(&[u64::MAX])?;
-        let (winner_ptr, _wg) = winner.device_ptr(stream);
+        let scratch = v4_scratch(stream, batch as usize)?;
+        let mut sc = scratch.lock().unwrap();
+        if (sc.seeds.len() as u64) < batch {
+            sc.seeds = stream.alloc_zeros::<u64>(batch as usize)?;
+        }
+        {
+            let (wp, _g) = sc.winner.device_ptr_mut(stream);
+            unsafe { result::memset_d8_async(wp, 0xFF, std::mem::size_of::<u64>(), stream.cu_stream()) }?;
+        }
+        let seed_h10: u32 = h10_state.is_some() as u32;
+        if let Some(st) = h10_state {
+            let seed_fn = self.function_seed_h10.ok_or_else(|| anyhow!("PoM GPU: no pom_seed_h10_batch entry"))?;
+            stream.memcpy_htod(&st[..], &mut sc.state)?;
+            let V4Scratch { state, seeds, .. } = &mut *sc;
+            let (state_ptr, _sg) = state.device_ptr(stream);
+            let (seeds_ptr, _dg) = seeds.device_ptr_mut(stream);
+            let cfg = LaunchConfig { grid_dim: (((batch + 255) / 256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let mut params: [*mut c_void; 4] = [
+                (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void),
+                (&state_ptr as *const _ as *mut c_void), (&seeds_ptr as *const _ as *mut c_void),
+            ];
+            unsafe { result::launch_kernel(seed_fn, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        }
+        let (v5_ptr, _vg) = sc.seeds.device_ptr(stream);
+        let (winner_ptr, _wg) = sc.winner.device_ptr(stream);
         let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
         let (prefix_ptr, _pg) = prefix_dev.device_ptr(stream);
 
@@ -501,8 +553,8 @@ impl LoadedPomKernel {
             ];
             unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
             stream.synchronize()?;
-            let w = stream.clone_dtoh(&winner)?[0];
-            return Ok(if w == u64::MAX { None } else { Some(w) });
+            let w = stream.clone_dtoh(&sc.winner)?[0];
+            return Ok((w != u64::MAX).then(|| start.wrapping_add(w)));
         }
 
         if self.tc_enabled {
@@ -549,8 +601,8 @@ impl LoadedPomKernel {
             ];
             unsafe { result::launch_kernel(walk, walk_cfg.grid_dim, walk_cfg.block_dim, walk_cfg.shared_mem_bytes, stream.cu_stream(), &mut walk_params) }?;
             stream.synchronize()?;
-            let w = stream.clone_dtoh(&winner)?[0];
-            return Ok(if w == u64::MAX { None } else { Some(w) });
+            let w = stream.clone_dtoh(&sc.winner)?[0];
+            return Ok((w != u64::MAX).then(|| start.wrapping_add(w)));
         }
 
         let function = self.function_v4.ok_or_else(|| anyhow!("PoM GPU: loaded kernel image has no pom_mine_v4 entry"))?;
@@ -567,8 +619,8 @@ impl LoadedPomKernel {
         ];
         unsafe { result::launch_kernel(function, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
-        let w = stream.clone_dtoh(&winner)?[0];
-        Ok(if w == u64::MAX { None } else { Some(w) })
+        let w = stream.clone_dtoh(&sc.winner)?[0];
+        Ok((w != u64::MAX).then(|| start.wrapping_add(w)))
     }
 
     /// v3 (H6) dump: re-walk ONE (winning) nonce and return (states S_0..=S_K concatenated,
@@ -688,12 +740,31 @@ fn v4_batch_for_sm_count(sm: u64) -> u64 {
     (sm * POM_V4_NONCES_PER_SM).max(POM_V4_BATCH_MIN)
 }
 
-/// The v4 grind batch to use on `device_id`.
-pub fn v4_batch_for_device(device_id: u32) -> u64 {
-    match gpu_sm_count(device_id) {
-        Some(sm) => v4_batch_for_sm_count(sm),
-        None => POM_V4_BATCH_FALLBACK,
-    }
+/// Free VRAM needed to run the doubled batch.
+const POM_V4_DOUBLE_BATCH_MIN_FREE_MIB: u64 = 1536;
+
+/// The v4 grind batch to use on `device_id`, or None until its PoM miner is installed. Twice the
+/// SM-derived batch when the card keeps enough free VRAM with its model resident.
+pub fn v4_batch_for_device(device_id: u32) -> Option<u64> {
+    let miner = miners().lock().ok()?.get(&device_id)?.clone();
+    let base = gpu_sm_count(device_id).map_or(POM_V4_BATCH_FALLBACK, v4_batch_for_sm_count);
+    let free_mib = miner
+        .ctx
+        .bind_to_thread()
+        .ok()
+        .and_then(|()| result::mem_get_info().ok())
+        .map(|(free, _)| free as u64 / (1024 * 1024));
+    let batch = match free_mib {
+        Some(free) if free >= POM_V4_DOUBLE_BATCH_MIN_FREE_MIB => base.saturating_mul(2),
+        _ => base,
+    };
+    info!(
+        "PoM[gpu{}]: v4 grind batch = {} nonces ({} MiB VRAM free).",
+        device_id,
+        batch,
+        free_mib.map_or_else(|| "unknown".to_string(), |f| f.to_string())
+    );
+    Some(batch)
 }
 
 fn gpu_compute_capability(device_id: usize) -> Option<(i32, i32)> {

@@ -14,6 +14,26 @@ use tokio::sync::mpsc::Sender;
 use crate::pow::BlockSeed;
 use keryx_miner::{PluginManager, WorkerSpec};
 
+const MAX_INFLIGHT_PROOFS: usize = 6;
+
+/// A slot among the PoM proofs being built off the mining thread; released on drop.
+struct InflightProofPermit(Arc<AtomicUsize>);
+
+impl InflightProofPermit {
+    fn try_acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < limit).then_some(n + 1))
+            .ok()
+            .map(|_| Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for InflightProofPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
 /// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
@@ -360,10 +380,13 @@ impl MinerManager {
                 let mut pom_nonce: u64 = thread_rng().next_u64();
                 const POM_BATCH: u64 = 1 << 20;
                 const POM_V3_BATCH: u64 = 512;
+                const POM_V4_BATCH_UNSIZED: u64 = 32768;
                 // Env override follows the ocminer (suprnova) fork; default scales with the card.
-                let pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0)
-                    .unwrap_or_else(|| keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id));
+                // Sized at the first v4 launch, once the model is resident and free VRAM is real.
+                let mut pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0);
+                let pom_proof_overlap = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0");
+                let inflight_proofs = Arc::new(AtomicUsize::new(0));
 
                 loop {
                     nonces[0] = 0;
@@ -443,7 +466,10 @@ impl MinerManager {
                         let h14 = h10 && daa >= keryx_miner::pom::private_inference_activation_daa();
                         // v3 walks are ~3-4 orders of magnitude heavier per nonce than the hash
                         // walk: small batches keep template latency low at 10 BPS.
-                        let batch = if v4 { pom_v4_batch } else if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        if v4 && pom_v4_batch.is_none() {
+                            pom_v4_batch = keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id);
+                        }
+                        let batch = if v4 { pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED) } else if v3 { POM_V3_BATCH } else { POM_BATCH };
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14);
                         if keryx_miner::pom_gpu::fatal_gpu_fault() {
                             mark_fatal_gpu_fault(&device_id, "sticky CUDA runtime fault while mining");
@@ -453,12 +479,38 @@ impl MinerManager {
                         hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         worker_hashes_tried.fetch_add(batch, Ordering::AcqRel);
                         if let Some(nonce) = found {
-                            let built = state.as_ref().and_then(|s| {
+                            let job = state.as_ref().and_then(|s| {
                                 let tier = keryx_miner::pom_gpu::current_tier(worker_device_id, s.daa_score)?;
                                 let model_id = keryx_miner::pom_gpu::mining_model_id(worker_device_id)?;
                                 let idx = keryx_miner::pom::active_index_for_model(&model_id)?;
-                                s.generate_block_if_pom(nonce, idx.as_ref(), tier, worker_device_id)
+                                Some((s, tier, idx))
                             });
+                            // Pool shares build their proof off the mining thread; solo blocks stay
+                            // inline so the card stops grinding a template it already won.
+                            let permit = job
+                                .as_ref()
+                                .filter(|(s, ..)| s.is_pool_share() && pom_proof_overlap)
+                                .and_then(|_| InflightProofPermit::try_acquire(&inflight_proofs, MAX_INFLIGHT_PROOFS));
+                            let built = match (job, permit) {
+                                (Some((s, tier, idx)), Some(permit)) => {
+                                    let s = s.clone();
+                                    let tx = send_channel.clone();
+                                    let device_id = device_id.clone();
+                                    let worker_id = gpu_work.id();
+                                    thread::spawn(move || {
+                                        let _permit = permit;
+                                        if let Some(mut block_seed) = s.generate_block_if_pom(nonce, idx.as_ref(), tier, worker_device_id) {
+                                            block_seed.set_device_id(&device_id);
+                                            match tx.blocking_send(block_seed.clone()) {
+                                                Ok(()) => block_seed.report_block(&worker_id),
+                                                Err(e) => error!("Failed submitting PoM block: ({})", e.to_string()),
+                                            };
+                                        }
+                                    });
+                                    None
+                                }
+                                (job, _) => job.and_then(|(s, tier, idx)| s.generate_block_if_pom(nonce, idx.as_ref(), tier, worker_device_id)),
+                            };
                             if let Some(mut block_seed) = built {
                                 block_seed.set_device_id(&device_id);
                                 match send_channel.blocking_send(block_seed.clone()) {
