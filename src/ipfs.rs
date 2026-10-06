@@ -603,10 +603,14 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     let archive_ext = if is_windows { "zip" } else { "tar.gz" };
     let archive_name = format!("kubo_v{}_{}-{}.{}", version, os, arch, archive_ext);
     let url = format!("https://dist.ipfs.tech/kubo/v{}/{}", version, archive_name);
+    let mirror = format!("https://github.com/ipfs/kubo/releases/download/v{}/{}", version, archive_name);
     let archive_path = exe_dir.join(&archive_name);
 
     log::info!("Downloading kubo {}...", version);
-    download_file(&url, &archive_path)?;
+    if let Err(e) = download_file(&url, &archive_path) {
+        log::warn!("{} — retrying from GitHub releases", e);
+        download_file(&mirror, &archive_path)?;
+    }
 
     extract_ipfs_binary(&archive_path, &exe_dir)?;
     std::fs::remove_file(&archive_path).ok();
