@@ -41,7 +41,7 @@ const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 
-// ── Phase 2 OPoI — inference cache & task types ─────────────────────────────
+// ── Phase 2 inference — inference cache & task types ─────────────────────────────
 
 /// AiRequest task dispatched by the bridge in a `mining.notify` 5th parameter (JSON).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -187,11 +187,11 @@ impl Client for StratumHandler {
             })
             .await?;
 
-        // Declare loaded SLM models so the bridge can challenge with the right model.
+        // Declare loaded LLM models so the bridge can challenge with the right model.
         let model_ids: Vec<String> =
-            keryx_miner::slm::loaded_model_ids().into_iter().map(|id| hex::encode(id)).collect();
+            keryx_miner::llm::loaded_model_ids().into_iter().map(|id| hex::encode(id)).collect();
         if !model_ids.is_empty() {
-            info!("OPoI: declaring {} model(s) to pool bridge", model_ids.len());
+            info!("Inference: declaring {} model(s) to pool bridge", model_ids.len());
             self.send_channel
                 .send(StratumLine {
                     id: None,
@@ -344,7 +344,7 @@ impl StratumHandler {
                         error: None,
                     }
                 } else if let Some(cid) = cid_opt {
-                    info!("OPoI Phase 2: submitting share with CID for job {}", job_id);
+                    info!("Inference: submitting share with CID for job {}", job_id);
                     StratumLine {
                         id: Some(msg_id),
                         payload: StratumLinePayload::StratumCommand(StratumCommand::MiningSubmit(
@@ -441,7 +441,7 @@ impl StratumHandler {
                         StratumCommand::MiningSetDifficulty((ref difficulty,)) => self.set_difficulty(difficulty),
                         StratumCommand::MiningNotify(notify) => {
                             let job = MiningJob::try_from(notify)?;
-                            if keryx_miner::slm::loaded_model_ids().is_empty() {
+                            if keryx_miner::llm::loaded_model_ids().is_empty() {
                                 return miner.process_block(None).await;
                             }
                             let target = effective_target(self.target_pool, job.block_bits)?;
@@ -449,7 +449,12 @@ impl StratumHandler {
                                 return miner.process_block(None).await;
                             }
                             if let Some(task_json) = job.task_json {
-                                if self.handle_ai_task(job.id.clone(), task_json, miner).await {
+                                // The task path publishes plaintext answers to IPFS; from the
+                                // private-inference gate on only the pool can build an answer.
+                                if job.daa_score >= keryx_miner::pom::private_inference_activation_daa() {
+                                    warn!("Inference: pool still dispatches inference tasks; private inference needs a v3 pool (mining.ai_request) — task ignored");
+                                    *self.current_task_slot.lock().await = None;
+                                } else if self.handle_ai_task(job.id.clone(), task_json, miner).await {
                                     return Ok(());
                                 }
                             } else {
@@ -597,12 +602,12 @@ impl StratumHandler {
                 return;
             }
         };
-        if !keryx_miner::slm::is_model_ready(&request.model_id) {
+        if !keryx_miner::llm::is_model_ready(&request.model_id) {
             warn!("AI request {}: model is not ready", request.task_id);
             return;
         }
         let probe_deadline = Instant::now() + Duration::from_secs(20);
-        while keryx_miner::slm::probe_in_flight() && Instant::now() < probe_deadline {
+        while keryx_miner::llm::probe_in_flight() && Instant::now() < probe_deadline {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         if self.ai_response.lock().await.is_some() || self.challenge_in_flight.swap(true, Ordering::SeqCst) {
@@ -621,7 +626,7 @@ impl StratumHandler {
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             let result =
-                keryx_miner::slm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
+                keryx_miner::llm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
                     .unwrap_or_default();
             let id = last_id.fetch_add(1, Ordering::SeqCst);
             match request.response(id, worker, &result) {
@@ -645,14 +650,14 @@ impl StratumHandler {
     async fn handle_challenge(&mut self, model_id_hex: String, nonce_hex: String, miner: &mut MinerManager) {
         // Only one challenge in flight at a time — bridge will re-challenge if needed.
         if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
-            warn!("OPoI challenge: already in flight, dropping new challenge for model {:.8}", model_id_hex);
+            warn!("Inference challenge: already in flight, dropping new challenge for model {:.8}", model_id_hex);
             return;
         }
 
         let model_id_bytes = match hex::decode(&model_id_hex) {
             Ok(b) if b.len() == 32 => b,
             _ => {
-                warn!("OPoI challenge: invalid model_id_hex '{}'", model_id_hex);
+                warn!("Inference challenge: invalid model_id_hex '{}'", model_id_hex);
                 self.challenge_in_flight.store(false, Ordering::SeqCst);
                 return;
             }
@@ -660,8 +665,8 @@ impl StratumHandler {
         let mut model_id = [0u8; 32];
         model_id.copy_from_slice(&model_id_bytes);
 
-        if !keryx_miner::slm::is_model_ready(&model_id) {
-            warn!("OPoI challenge: model {:.8} not ready — sending empty response", model_id_hex);
+        if !keryx_miner::llm::is_model_ready(&model_id) {
+            warn!("Inference challenge: model {:.8} not ready — sending empty response", model_id_hex);
             self.challenge_in_flight.store(false, Ordering::SeqCst);
             self.send_channel.send(make_challenge_response_line(&model_id_hex, &nonce_hex, "")).await.ok();
             return;
@@ -671,29 +676,29 @@ impl StratumHandler {
         let miner_flag = miner.opoi_challenge_flag();
         miner_flag.store(true, Ordering::SeqCst);
         miner.process_block(None).await.ok();
-        info!("OPoI challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
+        info!("Inference challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
 
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
         let send_channel = self.send_channel.clone();
         let challenge_flag = Arc::clone(&self.challenge_in_flight);
 
         tokio::task::spawn_blocking(move || {
-            let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
+            let result = keryx_miner::llm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
             let text = result.unwrap_or_default();
             // PoW resumes on the next mining.notify from the bridge.
             miner_flag.store(false, Ordering::SeqCst);
             if text.is_empty() {
-                warn!("OPoI challenge: inference returned empty text for model {:.8}", model_id_hex);
+                warn!("Inference challenge: inference returned empty text for model {:.8}", model_id_hex);
             } else {
                 info!(
-                    "OPoI challenge: done for model {:.8} ({} chars) — PoW resumes on next notify",
+                    "Inference challenge: done for model {:.8} ({} chars) — PoW resumes on next notify",
                     model_id_hex,
                     text.len()
                 );
             }
             let line = make_challenge_response_line(&model_id_hex, &nonce_hex, &text);
             if send_channel.blocking_send(line).is_err() {
-                warn!("OPoI challenge: send_channel closed, could not deliver response");
+                warn!("Inference challenge: send_channel closed, could not deliver response");
             }
             challenge_flag.store(false, Ordering::SeqCst);
         });
@@ -707,7 +712,7 @@ impl StratumHandler {
         let task: AiTask = match serde_json::from_str(&task_json) {
             Ok(t) => t,
             Err(e) => {
-                warn!("OPoI: failed to parse task JSON from bridge: {}", e);
+                warn!("Inference: failed to parse task JSON from bridge: {}", e);
                 *self.current_task_slot.lock().await = None;
                 return false;
             }
@@ -732,29 +737,29 @@ impl StratumHandler {
         let model_id_bytes = match hex::decode(&task.model_id_hex) {
             Ok(b) if b.len() == 32 => b,
             _ => {
-                warn!("OPoI [{}]: invalid model_id_hex '{}'", task.stable_id, task.model_id_hex);
+                warn!("Inference [{}]: invalid model_id_hex '{}'", task.stable_id, task.model_id_hex);
                 return false;
             }
         };
         let mut model_id = [0u8; 32];
         model_id.copy_from_slice(&model_id_bytes);
 
-        if !keryx_miner::slm::is_model_ready(&model_id) {
-            warn!("OPoI [{}]: model not ready — inference skipped", task.stable_id);
+        if !keryx_miner::llm::is_model_ready(&model_id) {
+            warn!("Inference [{}]: model not ready — inference skipped", task.stable_id);
             return false;
         }
 
         // Guard against two concurrent inferences (challenge may already hold the GPU).
         if self.challenge_in_flight.swap(true, Ordering::SeqCst) {
-            warn!("OPoI AiTask [{}]: inference already in flight, skipping", task.stable_id);
+            warn!("Inference task [{}]: inference already in flight, skipping", task.stable_id);
             return false;
         }
 
-        // Pause PoW — running kHeavyHash and SLM inference simultaneously crashes the GPU.
+        // Pause PoW — running kHeavyHash and LLM inference simultaneously crashes the GPU.
         let miner_flag = miner.opoi_challenge_flag();
         miner_flag.store(true, Ordering::SeqCst);
         miner.process_block(None).await.ok();
-        info!("OPoI AiTask [{}]: PoW suspended for GPU inference", task.stable_id);
+        info!("Inference task [{}]: PoW suspended for GPU inference", task.stable_id);
 
         // Mark in-progress and spawn the blocking inference + IPFS upload.
         {
@@ -788,9 +793,9 @@ impl Drop for StratumHandler {
     }
 }
 
-// ── Phase 2 OPoI — blocking inference helpers ────────────────────────────────
+// ── Phase 2 inference — blocking inference helpers ────────────────────────────────
 
-/// Runs SLM inference, uploads the result to IPFS, then stores the CID in the cache.
+/// Runs LLM inference, uploads the result to IPFS, then stores the CID in the cache.
 /// Called from `spawn_blocking` — must not call async functions.
 fn run_inference_and_upload(
     model_id: [u8; 32],
@@ -832,21 +837,27 @@ fn do_inference_and_upload(
     ipfs_url: &str,
     stable_id: &str,
 ) -> Option<String> {
-    info!("OPoI [{}]: starting SLM inference (max_tokens={})", stable_id, max_tokens);
-    let text = keryx_miner::slm::load_and_run_inference(model_id, prompt, max_tokens)?;
+    info!("Inference [{}]: starting LLM inference (max_tokens={})", stable_id, max_tokens);
+    let text = keryx_miner::llm::load_and_run_inference(model_id, prompt, max_tokens)?;
     if text.is_empty() {
-        warn!("OPoI [{}]: inference returned empty text — skipping IPFS upload", stable_id);
+        warn!("Inference [{}]: inference returned empty text — skipping IPFS upload", stable_id);
         return None;
     }
     match crate::ipfs::upload_with_recovery(&text, ipfs_url) {
         Ok(cid_bytes) => {
             // Convert raw 34-byte multihash to base58 CIDv0 string via AiResponsePayload helper.
             let cid = keryx_inference::AiResponsePayload::new([0u8; 32], 0, cid_bytes, 0).cid_v0();
-            info!("OPoI [{}]: inference complete, IPFS CID={}", stable_id, cid);
+            match crate::ipfs::confirm_response_retrievable(&cid) {
+                Ok(gateway) => info!("Inference [{}]: inference complete, IPFS CID={} served by {}", stable_id, cid, gateway),
+                Err(e) => {
+                    warn!("Inference [{}]: response CID {} unreadable from the public gateways ({}) — response skipped; check the pool's kubo port 4001", stable_id, cid, e);
+                    return None;
+                }
+            }
             Some(cid)
         }
         Err(e) => {
-            warn!("OPoI [{}]: IPFS upload failed: {}", stable_id, e);
+            warn!("Inference [{}]: IPFS upload failed: {}", stable_id, e);
             None
         }
     }

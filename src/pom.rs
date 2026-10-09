@@ -487,6 +487,24 @@ pub fn pom_block_seed_h10(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -
     st[0]
 }
 
+/// Domain tag XORed into `pre_pow_hash` for the H14 walk seed.
+pub const SEED_H14_TAG: [u8; 32] = *b"KERYX-H14-PRIVATE-INFERENCE-SEED";
+
+/// `pre_pow_hash` as fed to the H14 walk seed.
+pub fn seed_h14_pph(pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    let mut out = *pre_pow_hash;
+    for (b, t) in out.iter_mut().zip(SEED_H14_TAG.iter()) {
+        *b ^= t;
+    }
+    out
+}
+
+/// H14 block seed: the H10 seed over the H14-tagged `pre_pow_hash`.
+/// BYTE-IDENTICAL to the node's `pom_block_seed_h14`.
+pub fn pom_block_seed_h14(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_h10(&seed_h14_pph(pre_pow_hash), timestamp, nonce)
+}
+
 
 pub fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     assert!(!leaves.is_empty(), "merkle_root: empty leaves");
@@ -1571,11 +1589,11 @@ pub fn h10_activation_daa() -> u64 {
     gate(87_360_000, 1)
 }
 
-/// H14 model-split gate. At/after this score (the TEMPLATE's daa_score) the lineup is paused:
-/// the miner walks and mines a shard of the network model (tiers 6-11) and never publishes a
-/// lineup tier. MUST equal the node's `model_split_activation` on both networks; `u64::MAX`
-/// until it is scheduled.
-pub fn h14_activation_daa() -> u64 {
+/// Model-split gate. At/after this score (the TEMPLATE's daa_score) the lineup is paused: the
+/// miner walks and mines a shard of the network model (tiers 6-11) and never publishes a lineup
+/// tier. MUST equal the node's `model_split_activation` on every network; `u64::MAX` until it is
+/// scheduled.
+pub fn model_split_activation_daa() -> u64 {
     if is_devnet() {
         1_000
     } else {
@@ -1589,6 +1607,17 @@ pub fn h14_activation_daa() -> u64 {
 /// cannot credit, and is struck for work it actually did.
 pub fn reward_routing_activation_daa() -> u64 {
     gate(79_210_000, 0)
+}
+
+/// Private-inference gate. At/after this score an AiResponse carries its sealed answer inline;
+/// before it the sealed body goes to IPFS and the response stays body-less. MUST equal the
+/// node's `private_inference_activation`.
+pub fn private_inference_activation_daa() -> u64 {
+    if is_devnet() {
+        1
+    } else {
+        gate(121_985_000, 6_000)
+    }
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).
@@ -2130,6 +2159,27 @@ mod tests {
         assert_eq!(proof.tier, 1);
     }
 
+}
+
+#[cfg(test)]
+mod seed_h14_tests {
+    use super::*;
+
+    // Cross-implementation vectors: pinned in the node's `pom::seed_h10_tests::seed_h14_vectors`.
+    #[test]
+    fn seed_h14_matches_the_node() {
+        let pph = [0x5au8; 32];
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        assert_eq!(pom_block_seed_h14(&[0u8; 32], 0, 0), 0xacda16263d02e8a8);
+        assert_eq!(pom_block_seed_h14(&pph, ts, nonce), 0xcb49e5584c867af5);
+        assert_eq!(pom_block_seed_h14(&[0xa5u8; 32], ts, u64::MAX), 0xf198e8412c2f6255);
+        assert_ne!(pom_block_seed_h14(&pph, ts, nonce), pom_block_seed_h10(&pph, ts, nonce));
+        // The GPU path: host-built sponge state over the tagged pph, nonce absorbed in-kernel.
+        let mut st = pom_seed_h10_state(&seed_h14_pph(&pph), ts);
+        st[9] ^= nonce;
+        crate::keccak::f1600(&mut st);
+        assert_eq!(st[0], pom_block_seed_h14(&pph, ts, nonce));
+    }
 }
 
 #[cfg(test)]

@@ -4,14 +4,14 @@ use log::LevelFilter;
 use crate::Error;
 
 #[derive(Parser, Debug)]
-#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with OPoI inference\n\nUncensored model tiers — one model per tier (default: Gemma-4-12B):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B (Q6_K) — 12GB+ VRAM\n  (default)    Gemma-4-12B-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
+#[clap(name = "keryx-miner", version, about = "A Keryx high performance GPU miner with Proof-of-Model and on-chain inference\n\nUncensored model tiers — one model per tier (default: Gemma-4-12B):\n  --very-light Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ VRAM, smallest tier\n  --light      GLM-4-9B (Q6_K) — 12GB+ VRAM\n  (default)    Gemma-4-12B-abliterated (Q6_K) — 16GB+ VRAM\n  --high       Qwen3.8-27B (Q4_K) — 24GB+ VRAM (Qwen3.6-27B before H14)\n  --very-high  Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM", term_width = 0)]
 pub struct Opt {
-    // ── OPoI / Inference ─────────────────────────────────────────────────────
+    // ── Inference ─────────────────────────────────────────────────────
 
     #[clap(
         long = "very-light",
         help = "Model tier: Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ GPU, smallest tier",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         conflicts_with_all = &["light", "high", "very-high"]
     )]
     pub very_light: bool,
@@ -19,15 +19,15 @@ pub struct Opt {
     #[clap(
         long = "light",
         help = "Model tier: GLM-4-9B (Q6_K) — 12GB+ VRAM",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         conflicts_with_all = &["very-light", "high", "very-high"]
     )]
     pub light: bool,
 
     #[clap(
         long = "high",
-        help = "Model tier: Qwen3.6-27B (Q4_K_M) — 24GB+ VRAM",
-        help_heading = "OPoI / Inference",
+        help = "Model tier: Qwen3.8-27B (Q4_K) — 24GB+ VRAM (Qwen3.6-27B before H14)",
+        help_heading = "Inference",
         conflicts_with_all = &["very-light", "light", "very-high"]
     )]
     pub high: bool,
@@ -35,7 +35,7 @@ pub struct Opt {
     #[clap(
         long = "very-high",
         help = "Model tier: Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         conflicts_with_all = &["very-light", "light", "high"]
     )]
     pub very_high: bool,
@@ -47,7 +47,7 @@ pub struct Opt {
                 → GPU0=light, GPU1=very-high. Names: very-light|light|default|high|very-high, or a network-model \
                 shard shard-0..shard-5 (its card class is implied). Bypasses the per-card VRAM check (an \
                 undersized card will OOM); unlisted/extra cards keep auto best-fit.",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub force_model: Option<String>,
 
@@ -81,7 +81,7 @@ pub struct Opt {
     #[clap(
         long = "ipfs-url",
         help = "IPFS Kubo API URL for uploading inference results",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         default_value = "http://127.0.0.1:5001"
     )]
     pub ipfs_url: String,
@@ -89,28 +89,28 @@ pub struct Opt {
     #[clap(
         long = "models-dir",
         help = "Directory where model files are stored/downloaded (overrides default <exe_dir>/models)",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub models_dir: Option<String>,
 
     #[clap(
         long = "hiveos",
         help = "Enable HiveOS defaults (uses /hive/miners/custom/models when --models-dir is not set)",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub hiveos: bool,
 
     #[clap(
         long = "resident-tree",
         help = "Hold the full Merkle tree in RAM for faster proof build (needs ~2x model size of system RAM; falls back to disk if unavailable)",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub resident_tree: bool,
 
     #[clap(
         long = "escrow-key-file",
-        help = "Path to the OPoI escrow private key file (auto-generated if absent)",
-        help_heading = "OPoI / Inference",
+        help = "Path to the escrow private key file (auto-generated if absent)",
+        help_heading = "Inference",
         default_value = "escrow.key"
     )]
     pub escrow_key_file: String,
@@ -118,14 +118,14 @@ pub struct Opt {
     #[clap(
         long = "escrow-cert",
         help = "Escrow delegation cert as 128 hex chars, for setups that cannot drop a file (HiveOS). Wins over --escrow-cert-file",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub escrow_cert: Option<String>,
 
     #[clap(
         long = "escrow-cert-file",
         help = "Path to the escrow delegation cert produced by `keryx-cli delegate-escrow` (required from H6)",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         default_value = "escrow.cert"
     )]
     pub escrow_cert_file: String,
@@ -133,7 +133,7 @@ pub struct Opt {
     #[clap(
         long = "escrow-state-file",
         help = "Path to the escrow claim state file",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         default_value = "escrow_state.json"
     )]
     pub escrow_state_file: String,
@@ -141,14 +141,14 @@ pub struct Opt {
     #[clap(
         long = "recover-escrow",
         help = "Rebuild escrow_state.json by querying the Keryx public API. Exits after recovery.",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub recover_escrow: bool,
 
     #[clap(
         long = "skip-engine-probe",
         help = "Skip the startup check that the inference library has CUDA kernels for every mining GPU",
-        help_heading = "OPoI / Inference"
+        help_heading = "Inference"
     )]
     pub skip_engine_probe: bool,
 
@@ -161,7 +161,7 @@ pub struct Opt {
     #[clap(
         long = "recover-escrow-api",
         help = "Base URL of the Keryx API to use for escrow recovery",
-        help_heading = "OPoI / Inference",
+        help_heading = "Inference",
         default_value = "https://keryx-labs.com"
     )]
     pub recover_escrow_api: String,

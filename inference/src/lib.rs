@@ -9,18 +9,25 @@
 pub mod ai_payload;
 pub mod fraud_proof;
 pub mod model_fixed;
+pub mod private;
 pub mod task;
 
 pub use ai_payload::{
     avail_signed_bytes, AiAvailPayload, AI_AVAIL_PAYLOAD_LEN, AI_AVAIL_SIGNED_LEN, SUBNETWORK_ID_AI_AVAIL_HEX,
     AiRequestPayload, AiResponder, AiResponseLink, AiResponsePayload, AiChallengePayload,
-    MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN,
+    AI_REQUEST_HEADER_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN,
     MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_V2_LEN,
     AI_RESPONSE_LINK_LEN, MAX_AI_RESPONSE_LINKS,
+    AI_RESPONSE_EXT_PRIVATE_BODY, AI_RESPONSE_EXT_HEADER_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
     SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
 };
 pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
+pub use private::{
+    escrow_pubkey_of, max_private_prompt_len, open_request, open_response, seal_request, seal_request_with_rng, seal_response,
+    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret,
+    PrivateResponseEnvelope, MAX_PRIVATE_RECIPIENTS, PRIVATE_MAGIC, PRIVATE_VERSION,
+};
 
 pub use task::{InferenceResult, InferenceTask};
 

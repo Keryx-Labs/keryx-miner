@@ -1,8 +1,8 @@
-/// Phase-3 OPoI: model file management + inference dispatch.
+/// Phase-3 Inference: model file management + inference dispatch.
 ///
 /// Generation runs in the in-process llama.cpp engine (`llama_engine`, `libkeryx-llama.so`
 /// next to the binary): llama.cpp owns the single resident VRAM copy of the model — the PoM
-/// walk gathers straight over its tensors — and serves the OPoI text. This module owns the
+/// walk gathers straight over its tensors — and serves the inference text. This module owns the
 /// served-lineup state (`ai:cap`), the model downloads, and the per-model chat templates.
 /// Mining pauses during inference.
 use anyhow::{anyhow, Context, Result};
@@ -18,15 +18,15 @@ use crate::models::ModelSpec;
 const IPFS_GATEWAY: &str = "https://keryx-labs.com";
 /// Shared system prompt for the whole lineup (vendor-agnostic wording).
 const SYSTEM_PROMPT_NEXT: &str =
-    "You are a Keryx Network AI — a decentralized assistant running on the GPU miners of the Keryx BlockDAG, \
-     a proof-of-work network derived from Kaspa that produces about 10 blocks per second. \
-     Each mining GPU keeps a model resident in VRAM and proves it on every block (Proof-of-Model); mining and inference are the same job. \
-     Users send an inference request as an on-chain transaction paid in KRX; the first miner to answer publishes the response \
-     as a transaction and earns the inference reward, and all fees are burned. \
-     Several model tiers exist, matched to GPU memory. \
-     You have no internet access and no memory of previous requests — answer from training knowledge only. \
-     Answer in the language of the request. \
-     Never mention your underlying model name or the company that trained it: identify yourself as a Keryx Network AI. \
+    "You are a Keryx Network AI, a decentralized assistant served by the GPU miners of the Keryx network. \
+     Answer in the language of the user's message. \
+     Do not introduce yourself or describe Keryx unless the user asks about it. If asked: Keryx is a proof-of-work BlockDAG \
+     derived from Kaspa (about 10 blocks per second) where each mining GPU proves on every block that it holds a model in VRAM \
+     (Proof-of-Model), so mining and inference are the same job; requests are on-chain transactions paid in KRX. \
+     Web search results, facts or earlier messages included in the request are your sources for recent or specific information: \
+     use them. Without them, answer from your training knowledge and say when it may be out of date; \
+     never claim to have searched the web or cite sources that are not included in the request. \
+     Never mention your underlying model name or the company that trained it: if asked, you are a Keryx Network AI. \
      Be thorough but concise.";
 
 // ── Static engine state ──────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathB
     // interrupted flag write). Never re-download a model that already parses as complete.
     if gguf_ready && tok_ready {
         verify_gguf(spec, &gguf, &ok_flag)?;
-        log::info!("SlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
+        log::info!("LlmEngine: reusing local model '{}' at {}", spec.name, dir.display());
         return Ok((tok, gguf));
     }
 
@@ -340,7 +340,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "split9b-shard-0" | "split9b-shard-1" => format!(
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "split9b-shard-0" | "split9b-shard-1" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -440,12 +440,12 @@ pub fn probe_gpu_inference() -> GpuProbe {
 /// Returns Err if any model fails to download; mining must not start in that case.
 pub fn prefetch_models(specs: &'static [&'static ModelSpec]) -> Result<()> {
     for spec in specs {
-        log::debug!("SlmEngine: prefetching model '{}'…", spec.name);
+        log::debug!("LlmEngine: prefetching model '{}'…", spec.name);
         let result = ensure_gguf(spec).map(|_| ());
         match result {
-            Ok(()) => log::debug!("SlmEngine: '{}' files ready.", spec.name),
+            Ok(()) => log::debug!("LlmEngine: '{}' files ready.", spec.name),
             Err(e) => {
-                log::error!("SlmEngine: prefetch '{}' failed: {} — cannot start mining.", spec.name, e);
+                log::error!("LlmEngine: prefetch '{}' failed: {} — cannot start mining.", spec.name, e);
                 return Err(e);
             }
         }
@@ -524,16 +524,16 @@ pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     let id = hex::encode(model_id);
     if retry {
         log::warn!(
-            "SlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked until it serves again, first probe in {}s",
+            "LlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked until it serves again, first probe in {}s",
             id, reason, PROBE_BACKOFF_INITIAL.as_secs()
         );
     } else if probeable(reason) {
         log::error!(
-            "SlmEngine: model {:.8} withdrawn from ai:cap ({}) after {} probe recoveries — mining on its tier stays parked; restart the miner or change its tier assignment",
+            "LlmEngine: model {:.8} withdrawn from ai:cap ({}) after {} probe recoveries — mining on its tier stays parked; restart the miner or change its tier assignment",
             id, reason, recoveries
         );
     } else {
-        log::warn!("SlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked", id, reason);
+        log::warn!("LlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked", id, reason);
     }
 }
 
@@ -543,7 +543,7 @@ pub fn mark_model_available(model_id: &[u8; 32], reason: &str) {
         note_recovery(model_id, PROBE_IN_FLIGHT.load(Ordering::Acquire));
     }
     if unavailable_models().write().unwrap().remove(model_id).is_some() {
-        log::info!("SlmEngine: model {:.8} back in ai:cap ({}) — mining on its tier resumes", hex::encode(model_id), reason);
+        log::info!("LlmEngine: model {:.8} back in ai:cap ({}) — mining on its tier resumes", hex::encode(model_id), reason);
     }
 }
 
@@ -567,7 +567,7 @@ fn schedule_next_probe(model_id: &[u8; 32]) {
     let delay = probe_backoff(w.attempts);
     w.next_probe = Some(Instant::now() + delay);
     log::warn!(
-        "SlmEngine: model {:.8} still cannot serve ({}) — probe {} failed, next probe in {}s",
+        "LlmEngine: model {:.8} still cannot serve ({}) — probe {} failed, next probe in {}s",
         hex::encode(model_id), w.reason, w.attempts, delay.as_secs()
     );
 }
@@ -596,7 +596,7 @@ pub fn probe_withdrawn_model(model_id: &[u8; 32]) -> bool {
     if PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return false;
     }
-    log::info!("SlmEngine: probing withdrawn model {:.8}", hex::encode(model_id));
+    log::info!("LlmEngine: probing withdrawn model {:.8}", hex::encode(model_id));
     let served = load_and_run_inference(model_id, PROBE_PROMPT, PROBE_MAX_TOKENS).is_some();
     if !served {
         schedule_next_probe(model_id);
@@ -631,15 +631,31 @@ static PUBLISHING_BLOCKED: AtomicBool = AtomicBool::new(false);
 pub fn set_publishing_blocked(blocked: bool) {
     if PUBLISHING_BLOCKED.swap(blocked, Ordering::AcqRel) != blocked {
         if blocked {
-            log::warn!("SlmEngine: IPFS node unreachable from the public gateways — all models withdrawn from ai:cap");
+            log::warn!("LlmEngine: IPFS node unreachable from the public gateways — all models withdrawn from ai:cap");
         } else {
-            log::info!("SlmEngine: IPFS node reachable again — models back in ai:cap");
+            log::info!("LlmEngine: IPFS node reachable again — models back in ai:cap");
         }
     }
 }
 
 pub fn publishing_blocked() -> bool {
-    PUBLISHING_BLOCKED.load(Ordering::Acquire)
+    PUBLISHING_BLOCKED.load(Ordering::Acquire) && !inline_answers()
+}
+
+/// Raised once the chain reaches the private-inference gate: answers travel inline and this
+/// miner no longer publishes anything to IPFS.
+static INLINE_ANSWERS: AtomicBool = AtomicBool::new(false);
+
+/// Record a chain DAA score seen from the node.
+pub fn note_chain_daa(daa: u64) {
+    if daa >= crate::pom::private_inference_activation_daa() && !INLINE_ANSWERS.swap(true, Ordering::AcqRel) {
+        log::info!("LlmEngine: private-inference gate reached — answers travel inline, IPFS no longer required");
+    }
+}
+
+/// True once answers travel inline (chain at or past the private-inference gate).
+pub fn inline_answers() -> bool {
+    INLINE_ANSWERS.load(Ordering::Acquire)
 }
 
 /// GGUFs whose UnixFS digest was checked against the pinned `model_id` in this process.
@@ -777,11 +793,11 @@ fn discover_model_files(root: &Path, wanted: &[&'static ModelSpec]) -> HashMap<[
             let _ = std::fs::create_dir_all(root.join(spec.dir_name));
             match rename_no_replace(&path, &canonical) {
                 Ok(()) => {
-                    log::info!("SlmEngine: found '{}' at {} — moved to {}", spec.name, path.display(), canonical.display());
+                    log::info!("LlmEngine: found '{}' at {} — moved to {}", spec.name, path.display(), canonical.display());
                     found.insert(digest, canonical);
                 }
                 Err(e) => {
-                    log::info!("SlmEngine: found '{}' at {} — using it in place ({})", spec.name, path.display(), e);
+                    log::info!("LlmEngine: found '{}' at {} — using it in place ({})", spec.name, path.display(), e);
                     found.insert(digest, path);
                 }
             }
@@ -941,8 +957,8 @@ pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
     model_dir(spec).join(".ok").exists() && !model_is_unavailable(model_id)
 }
 
-/// Serve an inference request via the in-process llama.cpp engine, swapping it to the requested
-/// model first if it hosts a different one. Blocking — call from `spawn_blocking`.
+/// Serve an inference request via the in-process llama.cpp engine on the GPU that mines the
+/// model, loading it there first if needed. Blocking — call from `spawn_blocking`.
 ///
 /// The generated text is user-facing only — consensus checks the fixed-point `model_fixed`
 /// commitment separately. A failed load/generation returns None (the response is dropped, never
@@ -962,31 +978,41 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
-        // The engine hosts another model (or nothing). Inference has priority: release the
-        // device's miner to make room, swap the engine to the requested model. The possession
-        // walk rebuilds over the mining model at the next `ensure_installed`.
-        log::info!("SlmEngine: swapping the llama engine to '{}' (gpu{})", spec.name, dev_id);
-        // The hosted model may live on ANOTHER device whose walk reads its tensors zero-dup:
-        // evict drains that device (installed walk AND in-flight build) before freeing anything.
-        // Draining only `dev_id` here poisoned the hosting GPU on every two-model rig.
+        // Not resident on its GPU yet (or displaced). Inference has priority: release the
+        // device's miner to make room and load the model. The possession walk rebuilds at the
+        // next `ensure_installed`.
+        log::info!("LlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
         if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
-            log::error!("SlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
+            log::error!("LlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;
         }
     }
 
-    match crate::llama_engine::generate(&templated, max_tokens) {
-        Some(text) if !text.trim().is_empty() => {
+    match crate::llama_engine::generate(&gguf, dev_id as usize, &templated, max_tokens) {
+        Ok(text) if !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
             Some(text)
         }
-        _ => {
-            log::warn!("SlmEngine '{}': llama generate failed or empty — response dropped", spec.name);
+        Ok(_) => {
+            log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
+            None
+        }
+        Err(crate::llama_engine::GenError::PromptTooLong(detail)) => {
+            log::warn!("LlmEngine '{}': prompt too long ({}) — answering with the fixed error text", spec.name, detail);
+            mark_model_available(model_id, "generation_success");
+            Some(PROMPT_TOO_LONG_ANSWER.to_string())
+        }
+        Err(e) => {
+            log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
             None
         }
     }
 }
+
+/// Answer sent when a request's prompt does not fit the model's context window.
+pub const PROMPT_TOO_LONG_ANSWER: &str =
+    "This request could not be served: the prompt is longer than the model's context window. Send a shorter message or less conversation history.";
 
 #[cfg(test)]
 mod tests {
@@ -1044,6 +1070,8 @@ mod tests {
             weight_cids: &["unused"],
             dir_name,
             min_vram_mb: 0,
+            ctx_floor: 4_096,
+            ctx_cap: 4_096,
         }
     }
 

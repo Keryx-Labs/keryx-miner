@@ -1,4 +1,4 @@
-// Automated OPoI escrow claim module.
+// Automated escrow claim module.
 //
 // After each block, scans for coinbase outputs matching this miner's escrow script.
 // When the CSV window (36 000 blocks) expires, builds a Schnorr-signed claim TX and
@@ -259,7 +259,7 @@ const MAX_IN_FLIGHT_CLAIMS: usize = 4;
 
 /// Result of matching a SubmitTransactionResponse against the in-flight claim TXs.
 pub enum SubmitResponseOutcome {
-    /// The response belongs to other traffic (OPoI submissions) — not a claim of ours.
+    /// The response belongs to other traffic (inference submissions) — not a claim of ours.
     NotOurs,
     /// A claim was matched (rejected/retried); no outputs were finalized.
     Handled,
@@ -487,6 +487,16 @@ impl EscrowWatcher {
     /// Return the 64-char hex x-only public key of the mining key.
     pub fn pubkey_hex(&self) -> String {
         hex::encode(self.pubkey_bytes)
+    }
+
+    /// The x-only public key of the escrow key.
+    pub fn pubkey_bytes(&self) -> [u8; 32] {
+        self.pubkey_bytes
+    }
+
+    /// The escrow secret, for opening private-inference envelopes sealed to this key.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret_key.secret_bytes()
     }
 
     /// V2 responder identity for an AiResponse: schnorr signature with the escrow key over the
@@ -893,7 +903,7 @@ impl EscrowWatcher {
     /// error responses carry an empty transaction_id (the node's error path returns a
     /// default message), so the rejection text, which embeds the offending txid, is
     /// matched against in-flight claim txids instead. Returns `NotOurs` for responses
-    /// that belong to other traffic (OPoI submissions), so the caller can log those
+    /// that belong to other traffic (inference submissions), so the caller can log those
     /// itself, and `Accepted` with the claimed totals so the caller can feed stats.
     pub fn on_submit_response(&mut self, response_txid: &str, error: Option<&str>) -> SubmitResponseOutcome {
         let matched_txid = if self.in_flight.contains_key(response_txid) {
@@ -1359,7 +1369,7 @@ pub fn save_state_atomic(path: &Path, state: &EscrowState) -> Result<(), String>
     Ok(())
 }
 
-/// Load the OPoI escrow private key from `path`. Fails if the file does not exist.
+/// Load the escrow private key from `path`. Fails if the file does not exist.
 /// Used by --recover-escrow where generating a new key would silently query with the wrong pubkey.
 pub fn load_key(path: &str) -> Result<String, String> {
     let p = std::path::Path::new(path);
@@ -1382,7 +1392,7 @@ pub fn load_key(path: &str) -> Result<String, String> {
     Ok(privkey)
 }
 
-/// Load the OPoI escrow private key from `path`, generating a new one if absent.
+/// Load the escrow private key from `path`, generating a new one if absent.
 /// The file contains exactly 64 lowercase hex characters (32-byte Schnorr private key).
 pub fn load_or_generate_key(path: &str) -> Result<String, String> {
     use rand::RngCore;
@@ -1423,9 +1433,9 @@ pub fn load_or_generate_key(path: &str) -> Result<String, String> {
         Err(e) => return Err(format!("Failed to install escrow key file '{}': {}", path, e)),
     }
 
-    info!("OPoI escrow keypair generated — saved to '{}'", path);
+    info!("Escrow keypair generated — saved to '{}'", path);
     info!("  Escrow pubkey : {}", pubkey_hex);
-    info!("  Keep '{}' safe — needed to claim your OPoI escrow rewards.", path);
+    info!("  Keep '{}' safe — needed to claim your escrow rewards.", path);
     Ok(privkey_hex)
 }
 
@@ -1906,6 +1916,43 @@ mod tests {
         hasher.update(&bad);
         let bad_msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
         assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &bad_msg, &pk).is_err());
+    }
+
+    /// With an inline private body the signed message grows to cover the extension, so a
+    /// relayer swapping the body under a signed head fails verification.
+    #[test]
+    fn responder_signature_covers_the_private_body() {
+        let dir = std::env::temp_dir().join(format!("keryx-escrow-body-test-{}", std::process::id()));
+        let privkey = "1111111111111111111111111111111111111111111111111111111111111111";
+        let w = EscrowWatcher::new(
+            privkey,
+            "keryx:qrxpcusyrxjxghfdumcxm2rqw4dhe3n9hyqpvgn2wfyldltf99w2xhnajuhte",
+            dir,
+        )
+        .unwrap();
+
+        let body = vec![0xABu8; 40];
+        let unsigned = keryx_inference::AiResponsePayload::new([9u8; 32], 123, [7u8; 34], 5).with_private_body(body.clone());
+        let signed_bytes = unsigned.signed_bytes();
+        assert_eq!(signed_bytes.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN + keryx_inference::AI_RESPONSE_EXT_HEADER_LEN + 40);
+        let r = w.sign_responder(&signed_bytes);
+        let resp = keryx_inference::AiResponsePayload::new_v2([9u8; 32], 123, [7u8; 34], 5, r).with_private_body(body);
+        let parsed = keryx_inference::AiResponsePayload::deserialize(&resp.serialize()).unwrap();
+        assert_eq!(parsed.signed_bytes(), signed_bytes);
+
+        let verify = |msg_bytes: &[u8]| {
+            let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+            hasher.update(b"KeryxServiceResponderV1");
+            hasher.update(msg_bytes);
+            let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+            let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).unwrap();
+            let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).unwrap();
+            secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok()
+        };
+        assert!(verify(&signed_bytes));
+        let mut swapped = parsed.clone();
+        swapped.private_body = Some(vec![0xCDu8; 40]);
+        assert!(!verify(&swapped.signed_bytes()));
     }
 
     /// Both escrow scripts must match what the node's `ScriptBuilder::add_sequence` emits:

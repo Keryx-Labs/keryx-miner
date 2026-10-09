@@ -424,8 +424,9 @@ mod tests {
             v4: None,
         };
         let bytes = with_v3.to_wire_bytes();
-        // A v3 proof decodes only through the full (v3-aware) layout.
-        assert!(borsh::from_slice::<crate::pom::PomProof>(&bytes).is_ok());
+        // A v3 proof travels in the pre-v4 layout: the v4-aware and pre-v3 layouts both reject it.
+        assert!(borsh::from_slice::<crate::pom::PomProofPreV4>(&bytes).is_ok());
+        assert!(borsh::from_slice::<crate::pom::PomProof>(&bytes).is_err());
         assert!(borsh::from_slice::<crate::pom::PomProofPreV3>(&bytes).is_err());
 
         // Without v3 the wire re-encodes through the pre-H6 layout byte-identically.

@@ -2,24 +2,27 @@
 //!
 //! The .so sits next to the miner binary (or `KERYX_LLAMA_SO` points at it) — `cargo build`
 //! produces it there. It is THE inference engine: llama.cpp owns the single resident VRAM copy
-//! of the model on the inference GPU, the PoM walk gathers straight over its tensor pointers
-//! (zero-dup — byte-identity proven by tools/llama_zerodup_spike), and OPoI text generation
+//! of each served model on that model's inference GPU (one engine per GPU), the PoM walk
+//! gathers straight over its tensor pointers (zero-dup — byte-identity proven by
+//! tools/llama_zerodup_spike), and inference text generation
 //! runs in-process. Absent .so = no inference (responses are dropped); mining still works via
 //! the standalone raw-upload walk (`pom_gpu::load_raw`).
 //!
 //! Consensus safety: this module only changes WHO HOSTS the model bytes and WHO GENERATES the
-//! user-facing OPoI text. The walk kernel, the host possession index, proofs and `tag_fixed` are
+//! user-facing inference text. The walk kernel, the host possession index, proofs and `tag_fixed` are
 //! untouched; `ensure_installed_inner`'s N-guard cross-checks the gather against the host index.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type ErrorFn = unsafe extern "C" fn() -> *const c_char;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
 type LoadSplitFn = unsafe extern "C" fn(*const c_char, c_int, c_int, *const c_char, *const c_char, *const c_char) -> *mut c_void;
+type ContextInfoFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
 type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char, c_int) -> c_int;
@@ -30,7 +33,7 @@ type ShardLoadFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
 type ShardServeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
 type TraceFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 
-const ABI: c_int = 6;
+const ABI: c_int = 7;
 
 /// A pipeline head gives up on a request that does not finish in time, so its links and its
 /// own GPU are freed for the next one; checked between tokens by the engine.
@@ -53,12 +56,6 @@ impl LoadError {
 
     pub fn attempt(&self) -> u64 {
         self.attempt
-    }
-
-    /// The engine is simply hosting another model right now — it is swapped on demand when an
-    /// inference request arrives, so this is not an inability to serve.
-    pub fn is_busy(&self) -> bool {
-        self.stage == "busy"
     }
 
     /// The card could not fit the model — retrying the same tier on this GPU is pointless.
@@ -87,12 +84,6 @@ fn next_attempt() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The attempt id of the currently resident load, if any. Lets a caller tell "still the load I
-/// asked for" from "someone swapped the engine underneath me".
-pub fn active_attempt() -> Option<u64> {
-    engine().lock().ok()?.as_ref().map(|e| e.attempt)
-}
-
 struct Engine {
     model: *mut c_void,
     count: CountFn,
@@ -100,16 +91,40 @@ struct Engine {
     generate: GenFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
-    gpu: usize,
+    last_error: Option<ErrorFn>,
     gguf: String,
     attempt: u64,
+    /// Context window the engine allocated, in tokens.
+    n_ctx: c_int,
+}
+
+/// Why a generation produced no text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenError {
+    /// No engine hosts this GGUF on this GPU.
+    Unavailable,
+    /// The prompt does not fit the engine's context window.
+    PromptTooLong(String),
+    /// Any other native failure, with the engine's detail when it gave one.
+    Failed(String),
 }
 // The wrapper serializes generation internally; tensor info is read-only after load.
 unsafe impl Send for Engine {}
 
-fn engine() -> &'static Mutex<Option<Engine>> {
-    static E: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
-    E.get_or_init(|| Mutex::new(None))
+type Slot = Arc<Mutex<Option<Engine>>>;
+
+/// Serializes every call into the native library (load, generate, free). Take it after a slot.
+static NATIVE: Mutex<()> = Mutex::new(());
+
+fn native() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// One engine slot per CUDA ordinal.
+fn slot(gpu: usize) -> Slot {
+    static SLOTS: OnceLock<Mutex<HashMap<usize, Slot>>> = OnceLock::new();
+    let mut g = SLOTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
+    g.entry(gpu).or_default().clone()
 }
 
 /// A network-model shard resident on one mining GPU: walked in place and served to pipeline
@@ -293,7 +308,7 @@ unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
 ///
 /// The engine is only ever dlopened lazily, on the first inference request. A deleted, renamed or
 /// stale library therefore leaves PoW/PoM fully working — the possession walk uploads the
-/// canonical GGUF itself and never needs this library — while every OPoI response is silently
+/// canonical GGUF itself and never needs this library — while every inference response is silently
 /// dropped hours into a session. Resolve the library up front, load it, and check the ABI and
 /// every symbol the engine calls. Returns the resolved path, or a human-readable reason.
 ///
@@ -438,43 +453,24 @@ pub fn probe_device(gpu: usize) -> DeviceProbe {
     }
 }
 
-/// Load the .so + the model once (idempotent, blocking — a model load takes seconds). Returns the
-/// attempt id of the resident load, or why it failed. Safe to call from multiple threads.
+/// Load the .so + the model on `gpu` (idempotent, blocking — a model load takes seconds). A
+/// different model already on `gpu` is freed first: the caller must have drained that GPU's
+/// walk. Returns the attempt id of the resident load, or why it failed.
 pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
-    load(gguf, gpu, false)
-}
-
-/// Atomically replace the resident model, including across GPUs. The caller must first drain the
-/// hosting GPU's tensor readers. The engine mutex prevents another GPU from claiming the singleton
-/// between freeing the old model and loading the replacement.
-pub fn replace_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
-    load(gguf, gpu, true)
-}
-
-fn load(gguf: &str, gpu: usize, allow_gpu_change: bool) -> Result<u64, LoadError> {
     let attempt = next_attempt();
     let failed = |stage: &'static str, detail: String, cuda_touched: bool| {
         LoadError::new(attempt, stage, detail, cuda_touched)
     };
-    let mut g = match engine().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
+    let slot = slot(gpu);
+    let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(e) = g.as_ref() {
-        if e.gguf == gguf && e.gpu == gpu {
+        if e.gguf == gguf {
             return Ok(e.attempt);
         }
-        // Only a SAME-GPU model swap may free-and-reload: the caller reaches here from
-        // `ensure_installed_inner` with its own walk uninstalled. A different GPU must not
-        // steal the engine — the hosting GPU's zero-dup walk still gathers over these
-        // resident tensors, so freeing them here would be a device use-after-free (and the
-        // two GPUs would thrash full model loads stealing the singleton back and forth).
-        if e.gpu != gpu && !allow_gpu_change {
-            return Err(failed("busy", format!("engine hosts a model on GPU {} — not stealing it", e.gpu), false));
-        }
-        if let Some(e) = g.take() {
-            unsafe { (e.free)(e.model) };
-        }
+    }
+    let _native = native();
+    if let Some(e) = g.take() {
+        unsafe { (e.free)(e.model) };
     }
     let Some(so) = so_path() else {
         return Err(failed("library", "keryx-llama shared library not found".to_string(), false));
@@ -509,86 +505,64 @@ fn load(gguf: &str, gpu: usize, allow_gpu_change: bool) -> Result<u64, LoadError
             Err(_) => return Err(failed("path", "GGUF path contains a NUL byte".to_string(), false)),
         };
         log::info!("llama engine: loading {} on GPU {} via {} (in-process, zero-dup)…", gguf, gpu, so.display());
-        let configured_ctx = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
-        let n_ctx: c_int = configured_ctx.unwrap_or(4096);
-        let mut model = load(cg.as_ptr(), gpu as c_int, n_ctx);
-        if model.is_null() {
-            let mut detail = last_error.map_or_else(
+        let (floor, cap) = crate::models::spec_for_gguf(gguf).map_or((4096, 4096), |m| (m.ctx_floor as c_int, m.ctx_cap as c_int));
+        let configured_ctx: Option<c_int> = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok());
+        let ladder = configured_ctx.map_or_else(|| context_ladder(cap, floor), |c| vec![c]);
+        let mut model = std::ptr::null_mut();
+        let mut n_ctx: c_int = 0;
+        let mut detail = String::new();
+        for &candidate in &ladder {
+            model = load(cg.as_ptr(), gpu as c_int, candidate);
+            if !model.is_null() {
+                n_ctx = candidate;
+                break;
+            }
+            detail = last_error.map_or_else(
                 || "model load failed (VRAM? arch?)".to_string(),
                 |f| {
                     let msg = CStr::from_ptr(f()).to_string_lossy().into_owned();
                     if msg.is_empty() { "model load failed (VRAM? arch?)".to_string() } else { msg }
                 },
             );
-            if context_retry_size(n_ctx, configured_ctx.is_some(), &detail).is_some() {
-                log::warn!("llama engine: 4096-token context did not fit; retrying with 1024 tokens");
-                model = load(cg.as_ptr(), gpu as c_int, 1024);
-                if model.is_null() {
-                    detail = last_error.map_or_else(
-                        || "model load failed (VRAM? arch?)".to_string(),
-                        |f| CStr::from_ptr(f()).to_string_lossy().into_owned(),
-                    );
-                }
+            if !context_allocation_failed(&detail) {
+                break;
             }
-            if model.is_null() {
-                return Err(failed("native_load", detail, true));
-            }
+            log::warn!("llama engine: {}-token context did not fit ({})", candidate, detail);
         }
-        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, gpu, gguf: gguf.to_string(), attempt });
-        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves OPoI inference.");
+        if model.is_null() {
+            return Err(failed("native_load", detail, true));
+        }
+        if n_ctx < floor {
+            log::warn!("llama engine: context {} tokens is below the {}-token floor clients assume for this model", n_ctx, floor);
+        }
+        let context_info = sym::<ContextInfoFn>(lib, "keryx_llama_context_info")
+            .map(|f| CStr::from_ptr(f(model)).to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("n_ctx={}", n_ctx));
+        *g = Some(Engine { model, count, info, generate: gen, free, tensor_device, last_error, gguf: gguf.to_string(), attempt, n_ctx });
+        log::info!("llama engine: ✓ active — llama.cpp hosts the model + serves inference ({}).", context_info);
         Ok(attempt)
     }
 }
 
-/// Engine active for exactly this (gguf, gpu)?
+/// Engine on `gpu` hosts exactly `gguf`?
 pub fn active_for(gguf: &str, gpu: usize) -> bool {
-    match engine().lock() {
-        Ok(g) => g.as_ref().map_or(false, |e| e.gguf == gguf && e.gpu == gpu),
-        Err(_) => false,
+    slot(gpu).lock().map_or(false, |g| g.as_ref().is_some_and(|e| e.gguf == gguf))
+}
+
+/// Free the model resident on `gpu`, if any. The caller must have drained that GPU's walk.
+pub fn unload(gpu: usize) {
+    let slot = slot(gpu);
+    let mut g = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = g.take() {
+        let _native = native();
+        unsafe { (e.free)(e.model) };
     }
 }
 
-/// The CUDA ordinal hosting the engine's resident model, if the engine is active.
-pub fn active_gpu() -> Option<usize> {
-    engine().lock().ok()?.as_ref().map(|e| e.gpu)
-}
-
-pub fn available() -> bool {
-    match engine().lock() {
-        Ok(g) => g.is_some(),
-        Err(_) => false,
-    }
-}
-
-/// Free the resident model and disable the engine (available() -> false). Used when swapping
-/// the engine to another model (inference request / era crossing), and when llama's resident
-/// layout is NOT byte-compatible with the canonical possession index (e.g. repacked tied
-/// embeddings) — the walk must gather the canonical GGUF bytes, so we free llama's VRAM and
-/// the caller walks a raw canonical upload instead.
-pub fn unload() {
-    if let Ok(mut g) = engine().lock() {
-        if let Some(e) = g.take() {
-            unsafe { (e.free)(e.model) };
-        }
-    }
-}
-
-/// Free the resident model and disable the engine only if the given GPU currently hosts it.
-/// This is used for stale-GPU recovery after a transient fault on that specific device.
-pub fn unload_for_gpu(gpu: usize) {
-    if let Ok(mut g) = engine().lock() {
-        if g.as_ref().is_some_and(|e| e.gpu != gpu) {
-            return;
-        }
-        if let Some(e) = g.take() {
-            unsafe { (e.free)(e.model) };
-        }
-    }
-}
-
-/// Resident tensors in CANONICAL (name-sorted) order: (name, data_ptr, nbytes, is_device).
-pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
-    let g = engine().lock().ok()?;
+/// Tensors resident on `gpu` in CANONICAL (name-sorted) order: (name, data_ptr, nbytes, is_device).
+pub fn tensors(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
+    let slot = slot(gpu);
+    let g = slot.lock().ok()?;
     let e = g.as_ref()?;
     let n = unsafe { (e.count)(e.model) };
     let mut out = Vec::with_capacity(n);
@@ -613,7 +587,8 @@ pub fn tensors() -> Option<Vec<(String, u64, usize, bool)>> {
 /// that does not own them dereferences unmapped memory, which raises a sticky
 /// CUDA_ERROR_ILLEGAL_ADDRESS and poisons the whole primary context — inference included.
 pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
-    let g = engine().lock().ok()?;
+    let slot = slot(expected_gpu);
+    let g = slot.lock().ok()?;
     let e = g.as_ref()?;
     let tensor_device = e.tensor_device?;
     let n = unsafe { (e.count)(e.model) };
@@ -776,18 +751,24 @@ pub fn head_generate(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, laye
     }
 }
 
-/// Generate OPoI text via the in-process engine. None on any failure (caller falls back).
-pub fn generate(prompt: &str, max_tokens: usize) -> Option<String> {
-    let g = engine().lock().ok()?;
-    let e = g.as_ref()?;
-    let cp = CString::new(prompt).ok()?;
+/// Generate inference text with the engine on `gpu`, which must host `gguf`.
+pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Result<String, GenError> {
+    let slot = slot(gpu);
+    let g = slot.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
+    let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let mut buf = vec![0u8; 64 * 1024];
+    let _native = native();
     let n = unsafe { (e.generate)(e.model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
-    if n <= 0 {
-        return None;
+    if n < 0 {
+        let detail = e
+            .last_error
+            .map(|f| unsafe { CStr::from_ptr(f()) }.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        return Err(if n == -2 { GenError::PromptTooLong(detail) } else { GenError::Failed(detail) });
     }
     buf.truncate(n as usize);
-    String::from_utf8(buf).ok()
+    String::from_utf8(buf).map_err(|_| GenError::Failed("generated text is not UTF-8".to_string()))
 }
 
 #[cfg(test)]
@@ -817,11 +798,6 @@ mod tests {
         assert!(!broken.is_oom());
         assert!(broken.cuda_context_may_be_invalid());
 
-        let busy = LoadError::new(4, "busy", "engine hosts a model on GPU 0 — not stealing it", false);
-        assert!(busy.is_busy());
-        assert!(!busy.is_oom());
-        assert!(!LoadError::new(5, "native_load", "out of memory", true).is_busy());
-
         // Nothing touched the device yet: the context cannot be blamed.
         let missing = LoadError::new(3, "library", "keryx-llama shared library not found", false);
         assert!(!missing.is_oom());
@@ -830,38 +806,33 @@ mod tests {
     }
 
     #[test]
-    fn retries_default_context_only_after_context_allocation_failure() {
-        let context_oom = "context: llama_init_from_model failed [vram: 0 MiB free / 16302 MiB total]";
-        assert_eq!(context_retry_size(4096, false, context_oom), Some(1024));
-        assert_eq!(context_retry_size(4096, true, context_oom), None);
-        assert_eq!(context_retry_size(1024, false, context_oom), None);
-        assert_eq!(context_retry_size(4096, false, "model: unsupported architecture"), None);
-        assert_eq!(
-            context_retry_size(
-                4096,
-                false,
-                "context: llama_init_from_model failed [vram: unavailable (cudaMemGetInfo failed: CUDA_ERROR_INVALID_CONTEXT)]",
-            ),
-            None,
-        );
+    fn context_ladder_runs_from_the_cap_down_to_the_floor() {
+        assert_eq!(context_ladder(131_072, 32_768), vec![131_072, 65_536, 32_768]);
+        assert_eq!(context_ladder(32_768, 32_768), vec![32_768]);
+        assert_eq!(context_ladder(4_096, 8_192), vec![8_192]);
+        assert!(context_allocation_failed("context: llama_init_from_model failed [vram: 0 MiB free / 16302 MiB total]"));
+        assert!(!context_allocation_failed("model: unsupported architecture"));
     }
 
     #[test]
     #[ignore = "requires two CUDA GPUs, libkeryx-llama, and KERYX_TEST_MODEL_GPU0/GPU1 GGUF paths"]
-    fn cross_gpu_replace_moves_the_singleton_without_busy() {
+    fn two_gpus_keep_their_models_resident_side_by_side() {
         let gpu0 = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
         let gpu1 = std::env::var("KERYX_TEST_MODEL_GPU1").expect("set KERYX_TEST_MODEL_GPU1");
 
-        ensure_loaded(&gpu1, 1).unwrap();
+        let first1 = ensure_loaded(&gpu1, 1).unwrap();
+        let first0 = ensure_loaded(&gpu0, 0).unwrap();
         assert!(active_for(&gpu1, 1));
-        assert!(generate("Reply with only OK.", 16).is_some());
-        replace_loaded(&gpu0, 0).unwrap();
         assert!(active_for(&gpu0, 0));
-        assert!(generate("Reply with only OK.", 16).is_some());
-        replace_loaded(&gpu1, 1).unwrap();
+        assert!(generate(&gpu1, 1, "Reply with only OK.", 16).is_ok());
+        assert!(generate(&gpu0, 0, "Reply with only OK.", 16).is_ok());
+        assert!(generate(&gpu1, 0, "Reply with only OK.", 16).is_err());
+        assert_eq!(ensure_loaded(&gpu1, 1).unwrap(), first1);
+        assert_eq!(ensure_loaded(&gpu0, 0).unwrap(), first0);
+        unload(0);
+        assert!(!active_for(&gpu0, 0));
         assert!(active_for(&gpu1, 1));
-        assert!(generate("Reply with only OK.", 16).is_some());
-        unload();
+        unload(1);
     }
 
     #[test]
@@ -871,15 +842,29 @@ mod tests {
 
         ensure_loaded(&model, 0).unwrap();
         assert!(active_for(&model, 0));
-        assert!(generate("Reply with only OK.", 16).is_some());
-        unload();
+        assert!(generate(&model, 0, "Reply with only OK.", 16).is_ok());
+        unload(0);
     }
 }
 
-fn context_retry_size(n_ctx: c_int, explicitly_configured: bool, detail: &str) -> Option<c_int> {
-    (!explicitly_configured
-        && n_ctx > 1024
-        && detail.contains("context: llama_init_from_model failed")
-        && detail.contains(" MiB free / "))
-    .then_some(1024)
+/// Context sizes to try, largest first: the cap, then halves of it down to the floor.
+fn context_ladder(cap: c_int, floor: c_int) -> Vec<c_int> {
+    let mut out = Vec::new();
+    let mut n = cap.max(floor);
+    while n > floor {
+        out.push(n);
+        n /= 2;
+    }
+    out.push(floor);
+    out
+}
+
+/// The load failed while allocating the context, not while loading the weights.
+fn context_allocation_failed(detail: &str) -> bool {
+    detail.contains("context: llama_init_from_model failed")
+}
+
+/// Context window (tokens) of the engine resident on `gpu`, if any.
+pub fn context_tokens(gpu: usize) -> Option<u32> {
+    slot(gpu).lock().ok().and_then(|g| g.as_ref().map(|e| e.n_ctx as u32))
 }

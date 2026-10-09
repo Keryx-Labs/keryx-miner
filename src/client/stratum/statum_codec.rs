@@ -116,14 +116,14 @@ pub(crate) enum StratumCommand {
     MiningKeepalive([(); 0]),
     #[serde(rename = "mining.submit")]
     MiningSubmit(MiningSubmit),
-    // Phase 2 OPoI: miner → bridge — declare loaded SLM model IDs (sent after authorize)
+    // Phase 2 Inference: miner → bridge — declare loaded LLM model IDs (sent after authorize)
     #[serde(rename = "mining.declare_capabilities")]
     MiningDeclareCapabilities(Vec<String>),
     #[serde(rename = "mining.ai_request")]
     MiningAiRequest((String, String, String, String, String, u32, String)),
     #[serde(rename = "mining.ai_response")]
     MiningAiResponse((String, String, String, String, String)),
-    // Phase 2 OPoI: bridge → miner — "model_id_hex:nonce_hex" capability challenge
+    // Phase 2 Inference: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
     // Capability response: [model_id_hex, nonce_hex, result_b64].

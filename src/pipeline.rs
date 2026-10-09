@@ -139,7 +139,7 @@ pub fn head_ready() -> bool {
     let nm = network_model();
     identity().is_some()
         && crate::pom_gpu::shard_local_endpoint(&nm.shards[nm.shards.len() - 1].model_id).is_some()
-        && crate::slm::head_gguf_path().exists()
+        && crate::llm::head_gguf_path().exists()
 }
 
 /// `KERYX_LAYER_MAP` for a head whose rpc devices are the shards in tier order and whose local
@@ -257,12 +257,12 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
         links.push(session);
     }
     let gpu = crate::pom_gpu::device_for_model(&nm.shards[nm.shards.len() - 1].model_id).unwrap_or(0) as usize;
-    let head = crate::slm::head_gguf_path().to_string_lossy().into_owned();
+    let head = crate::llm::head_gguf_path().to_string_lossy().into_owned();
     let rpc = endpoints.join(",");
     let ts: Vec<&str> = std::iter::repeat("1").take(endpoints.len() + 1).collect();
     let ts = ts.join(",");
     let map = layer_map();
-    let templated = crate::slm::format_prompt_for(nm.whole.name, &prompt);
+    let templated = crate::llm::format_prompt_for(nm.whole.name, &prompt);
     log::info!("pipeline: heading request {} over {} links", hex::encode(&request_hash[..8]), links.len());
     let text = tokio::task::spawn_blocking(move || crate::llama_engine::head_generate(&head, gpu, &rpc, &ts, &map, &templated, max_tokens))
         .await

@@ -30,26 +30,28 @@ fn normalize_api_url(api_url: &str) -> String {
     }
 }
 
-/// Upload `text` to the IPFS node at `api_url` and return the raw 34-byte multihash.
+/// Upload `data` to the IPFS node at `api_url` and return the raw 34-byte multihash.
 /// The multihash format is: [0x12, 0x20, <32-byte sha2-256 digest>].
-pub fn upload(text: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
-    upload_with_pin(text, api_url, true)
+pub fn upload_bytes(data: &[u8], api_url: &str) -> anyhow::Result<[u8; 34]> {
+    upload_with_pin(data, api_url, true)
 }
 
-fn upload_with_pin(text: &str, api_url: &str, pin: bool) -> anyhow::Result<[u8; 34]> {
+fn upload_with_pin(data: &[u8], api_url: &str, pin: bool) -> anyhow::Result<[u8; 34]> {
     let api_url = normalize_api_url(api_url);
     let url = format!("{}/api/v0/add?pin={}&quieter=true", api_url.trim_end_matches('/'), pin);
     let boundary = "keryxboundary1234567890";
-    let body = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: text/plain\r\n\r\n{text}\r\n--{boundary}--\r\n",
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"result.txt\"\r\nContent-Type: application/octet-stream\r\n\r\n",
         boundary = boundary,
-        text = text,
-    );
+    )
+    .into_bytes();
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n", boundary = boundary).as_bytes());
     let content_type = format!("multipart/form-data; boundary={}", boundary);
     let response = ureq::post(&url)
         .set("Content-Type", &content_type)
         .timeout(Duration::from_secs(30))
-        .send_bytes(body.as_bytes())
+        .send_bytes(&body)
         .map_err(|e| anyhow::anyhow!("IPFS upload failed: {}", e))?;
     let body = response.into_string().map_err(|e| anyhow::anyhow!("IPFS response read error: {}", e))?;
     let json: serde_json::Value =
@@ -103,22 +105,12 @@ fn base58btc_decode(input: &str) -> Option<Vec<u8>> {
 pub const PROJECT_GATEWAY: &str = "https://keryx-labs.com";
 /// Independent gateway consulted only when the project gateway gives no verdict.
 const FALLBACK_GATEWAY: &str = "https://ipfs.io";
-/// Total time the startup reachability check keeps retrying.
-const REACHABILITY_WINDOW_SECS: u64 = 120;
-/// Per-request timeout of a startup reachability probe.
-const REACHABILITY_PROBE_TIMEOUT_SECS: u64 = 20;
-/// Pause between two startup reachability rounds.
+/// Pause between two gateway probe rounds.
 const REACHABILITY_RETRY_PAUSE_SECS: u64 = 5;
-/// Timeout of the single per-response probe.
+/// Per-request timeout of a response confirmation probe.
 const RESPONSE_PROBE_TIMEOUT_SECS: u64 = 20;
-/// Interval between two background reachability checks while the miner runs.
-const REACHABILITY_RECHECK_SECS: u64 = 3_600;
-
-/// How often a running miner re-runs `verify_public_reachability`.
-pub fn reachability_recheck_interval() -> Duration {
-    Duration::from_secs(REACHABILITY_RECHECK_SECS)
-}
-
+/// Total time a response is retried on the gateways before it is dropped.
+const RESPONSE_CONFIRM_WINDOW_SECS: u64 = 60;
 /// Outcome of asking a public gateway for a CID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayProbe {
@@ -128,6 +120,16 @@ pub enum GatewayProbe {
     NotFound(u16),
     /// No verdict: timeout, transport error or gateway-side error.
     Undetermined(String),
+}
+
+/// The sha2-256 multihash of `data`: `[0x12, 0x20, digest]`.
+pub fn sha256_multihash(data: &[u8]) -> [u8; 34] {
+    use sha2::Digest;
+    let mut out = [0u8; 34];
+    out[0] = 0x12;
+    out[1] = 0x20;
+    out[2..].copy_from_slice(&sha2::Sha256::digest(data));
+    out
 }
 
 /// Encode a raw 34-byte multihash as a base58btc CIDv0 string.
@@ -182,56 +184,30 @@ pub fn probe_gateway(gateway: &str, cid: &str, timeout: Duration) -> GatewayProb
     }
 }
 
-/// Refuse to run on a kubo the public gateways cannot fetch from: a probe file is added locally
-/// and requested through the project gateway (then the fallback) until the window expires.
-pub fn verify_public_reachability(api_url: &str) -> anyhow::Result<()> {
-    let unix_now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let probe = format!("keryx-miner reachability probe {} {}", unix_now, rand::random::<u64>());
-    let cid = multihash_to_cid_v0(&upload_with_pin(&probe, api_url, false)?);
-    log::info!("IPFS reachability check: asking {} for probe {}", PROJECT_GATEWAY, cid);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(REACHABILITY_WINDOW_SECS);
+/// Make a public gateway fetch a freshly uploaded response, retrying until the window expires.
+/// Ok carries the gateway that served it; Err carries the last verdict.
+pub fn confirm_response_retrievable(cid: &str) -> Result<&'static str, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(RESPONSE_CONFIRM_WINDOW_SECS);
     let mut last = String::from("no probe sent");
-    let mut attempt = 0u32;
     loop {
-        attempt += 1;
         for gateway in [PROJECT_GATEWAY, FALLBACK_GATEWAY] {
             let timeout = remaining_budget(deadline, std::time::Instant::now())
-                .min(Duration::from_secs(REACHABILITY_PROBE_TIMEOUT_SECS));
+                .min(Duration::from_secs(RESPONSE_PROBE_TIMEOUT_SECS));
             if timeout.is_zero() {
                 break;
             }
-            match probe_gateway(gateway, &cid, timeout) {
-                GatewayProbe::Reachable => {
-                    log::info!("IPFS reachability check passed via {} (attempt {})", gateway, attempt);
-                    return Ok(());
-                }
+            match probe_gateway(gateway, cid, timeout) {
+                GatewayProbe::Reachable => return Ok(gateway),
                 GatewayProbe::NotFound(status) => last = format!("{} answered HTTP {}", gateway, status),
                 GatewayProbe::Undetermined(e) => last = format!("{}: {}", gateway, e),
             }
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            break;
+            return Err(format!("not served within {}s (last: {})", RESPONSE_CONFIRM_WINDOW_SECS, last));
         }
         std::thread::sleep(remaining_budget(deadline, now).min(Duration::from_secs(REACHABILITY_RETRY_PAUSE_SECS)));
     }
-    Err(anyhow::anyhow!(
-        "IPFS node at {} is not reachable from the public gateways after {}s (last: {}).\n\
-         Inference results published from this node could not be read by anyone, so mining is refused.\n\
-         Fix: expose kubo's swarm port (TCP/UDP 4001) or enable a relay, then check that `ipfs id` lists a public address.",
-        api_url,
-        REACHABILITY_WINDOW_SECS,
-        last
-    ))
-}
-
-/// Ask the project gateway once for a freshly uploaded response.
-pub fn response_is_retrievable(cid: &str) -> GatewayProbe {
-    probe_gateway(PROJECT_GATEWAY, cid, Duration::from_secs(RESPONSE_PROBE_TIMEOUT_SECS))
 }
 
 /// Check that the IPFS API at `api_url` is reachable.
@@ -251,7 +227,12 @@ fn probe_running(api_url: &str, timeout: Duration) -> bool {
 /// retry exactly once. Remote endpoints are never auto-managed: their failures propagate
 /// unchanged.
 pub fn upload_with_recovery(data: &str, api_url: &str) -> anyhow::Result<[u8; 34]> {
-    match upload(data, api_url) {
+    upload_bytes_with_recovery(data.as_bytes(), api_url)
+}
+
+/// [`upload_with_recovery`] for an opaque body.
+pub fn upload_bytes_with_recovery(data: &[u8], api_url: &str) -> anyhow::Result<[u8; 34]> {
+    match upload_bytes(data, api_url) {
         Ok(cid) => Ok(cid),
         Err(first_err) => match recovery_action(api_url) {
             RecoveryAction::FailImmediately => Err(first_err),
@@ -260,7 +241,7 @@ pub fn upload_with_recovery(data: &str, api_url: &str) -> anyhow::Result<[u8; 34
                 if let Err(restore_err) = ensure_daemon(api_url) {
                     return Err(recovery_failed_error(first_err, restore_err));
                 }
-                upload(data, api_url).map_err(|e| retry_failed_error(first_err, e))
+                upload_bytes(data, api_url).map_err(|e| retry_failed_error(first_err, e))
             }
         },
     }
@@ -622,10 +603,14 @@ fn find_or_download_kubo() -> anyhow::Result<std::path::PathBuf> {
     let archive_ext = if is_windows { "zip" } else { "tar.gz" };
     let archive_name = format!("kubo_v{}_{}-{}.{}", version, os, arch, archive_ext);
     let url = format!("https://dist.ipfs.tech/kubo/v{}/{}", version, archive_name);
+    let mirror = format!("https://github.com/ipfs/kubo/releases/download/v{}/{}", version, archive_name);
     let archive_path = exe_dir.join(&archive_name);
 
     log::info!("Downloading kubo {}...", version);
-    download_file(&url, &archive_path)?;
+    if let Err(e) = download_file(&url, &archive_path) {
+        log::warn!("{} — retrying from GitHub releases", e);
+        download_file(&mirror, &archive_path)?;
+    }
 
     extract_ipfs_binary(&archive_path, &exe_dir)?;
     std::fs::remove_file(&archive_path).ok();
