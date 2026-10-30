@@ -139,8 +139,7 @@ fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, _handle: &MinerHandler) 
     std::thread::spawn(move || {
         sleep(Duration::from_millis(30_000));
         if kill_switch.load(Ordering::SeqCst) {
-            error!("GPU worker did not stop within 30s; terminating the process instead of the thread");
-            std::process::exit(70);
+            keryx_miner::exit_visibly(70, "GPU worker did not stop within 30s; terminating the process instead of the thread");
         }
     })
 }

@@ -914,8 +914,7 @@ pub fn load_and_run_traced_inference(
 
 /// A traced tier that cannot be served as the consensus requires stops the miner.
 fn fatal(detail: &str) -> ! {
-    log::error!("LlmEngine: {} — stopping, a traced tier cannot be served", detail);
-    std::process::exit(3)
+    crate::exit_visibly(3, &format!("LlmEngine: {} — stopping, a traced tier cannot be served", detail))
 }
 
 /// Cuts `text` to the longest answer the request's token budget allows, on a char boundary.

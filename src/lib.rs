@@ -147,6 +147,29 @@ fn should_emit_startup_stderr() -> bool {
     !std::io::stdout().is_terminal()
 }
 
+/// Logs `msg`, leaves the full-screen UI and prints `msg` on the console, then exits with `code`.
+pub fn exit_visibly(code: i32, msg: &str) -> ! {
+    use std::io::Write;
+    log::error!("{}", msg);
+    log::logger().flush();
+    let mut out = std::io::stdout();
+    if out.is_terminal() {
+        let _ = crossterm::execute!(out, crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    let banner = format!("\nkeryx-miner stopped: {}\n", msg);
+    // Under the UI, stderr is redirected to a file on Unix.
+    #[cfg(unix)]
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        if tty.write_all(banner.as_bytes()).is_ok() {
+            let _ = tty.flush();
+            std::process::exit(code);
+        }
+    }
+    let _ = std::io::stderr().write_all(banner.as_bytes());
+    std::process::exit(code)
+}
+
 pub trait Plugin: Any + Send + Sync {
     fn name(&self) -> &'static str;
     fn enabled(&self) -> bool;

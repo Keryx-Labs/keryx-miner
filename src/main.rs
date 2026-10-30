@@ -899,15 +899,21 @@ async fn run() -> Result<(), Error> {
         });
     }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
-    let plain_log_path = opt.plain_log_file.clone().or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok());
-    let plain_log_file =
-        plain_log_path.and_then(|path| match OpenOptions::new().create(true).append(true).open(&path) {
+    // An empty path turns the plain log file off.
+    let plain_log_path = opt
+        .plain_log_file
+        .clone()
+        .or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok())
+        .unwrap_or_else(|| logging::DEFAULT_PLAIN_LOG_FILE.to_string());
+    let plain_log_file = Some(plain_log_path).filter(|path| !path.is_empty()).and_then(|path| {
+        match logging::PlainLogFile::open(&path) {
             Ok(file) => Some(file),
             Err(e) => {
                 eprintln!("Failed to open plain log file '{}': {}", path, e);
                 None
             }
-        });
+        }
+    });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
     plugin_manager.set_log_sink(Some(plugin_log_sink));
     for warning in plugin_manager.drain_startup_warnings() {

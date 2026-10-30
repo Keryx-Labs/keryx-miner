@@ -200,7 +200,7 @@ pub struct Opt {
 
     #[clap(
         long = "plain-log-file",
-        help = "Write plain text logs to this file path",
+        help = "Write plain text logs to this file path (default keryx-miner.log, rotated at 64 MiB; empty to disable)",
         help_heading = "Monitoring"
     )]
     pub plain_log_file: Option<String>,
