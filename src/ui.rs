@@ -1274,7 +1274,8 @@ fn draw_colored_segments_cell(
 
 fn color_for_log_line(line: &str) -> Color {
     let lower = line.to_ascii_lowercase();
-    if lower.contains("[error") || lower.contains(" error ") {
+    let without_error_false = strip_error_false(&lower);
+    if without_error_false.contains("[error") || without_error_false.contains(" error ") {
         palette().err
     } else if lower.contains("[warn") || lower.contains(" warning ") {
         palette().warn
@@ -1291,6 +1292,37 @@ fn color_for_log_line(line: &str) -> Color {
     } else {
         palette().text
     }
+}
+
+/// Removes "error false" style phrases (e.g. `error false`, `error=false`, `"error": false`)
+/// from an already-lowercased line so they don't trigger error coloring.
+fn strip_error_false(lower: &str) -> String {
+    let bytes = lower.as_bytes();
+    let mut out = String::with_capacity(lower.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if lower[i..].starts_with("error") {
+            let mut j = i + "error".len();
+            if lower[j..].starts_with('s') {
+                j += 1;
+            }
+            let sep_start = j;
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'' | b'`') {
+                j += 1;
+            }
+            let end = j + "false".len();
+            let word_ends = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if j > sep_start && lower[j..].starts_with("false") && word_ends {
+                out.push(' ');
+                i = end;
+                continue;
+            }
+        }
+        let ch = lower[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn seconds_since(epoch_s: u64) -> u64 {
@@ -1681,5 +1713,24 @@ mod wrap_tests {
             assert!(!rows.is_empty());
         }
         assert_eq!(wrap_segments(&[("Strike: —".to_string(), Color::Reset)], 40, 2).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod error_false_color_tests {
+    use super::*;
+
+    #[test]
+    fn error_false_is_not_red() {
+        for l in ["[INFO] status error false done", "[INFO] got error=false ok", "[INFO] {\"error\": false}", "[INFO] Error: FALSE x", "[INFO] errors = false"] {
+            assert_ne!(color_for_log_line(l), palette().err, "{l}");
+        }
+    }
+
+    #[test]
+    fn real_errors_still_red() {
+        for l in ["[ERROR] boom", "[INFO] an error occurred", "[ERROR] error=false but failed", "[INFO] error true then error x"] {
+            assert_eq!(color_for_log_line(l), palette().err, "{l}");
+        }
     }
 }
