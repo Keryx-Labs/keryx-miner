@@ -236,4 +236,25 @@ mod tests {
         assert_eq!(fs, 5_477_356_865_520_795_736);
         assert_eq!(verify_proof_v5(0x55AA, &proof, &index.r_t, index.n_chunks, &seed, 61).unwrap(), fs);
     }
+
+    #[test]
+    fn pad_tables_are_frozen() {
+        assert_eq!(POM_V5_PAD_TILES_H14, [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432]);
+        assert_eq!(POM_V5_PAD_TILES_H16, [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632]);
+        for t in 0..POM_V5_PAD_TILES_H14.len() {
+            assert_eq!(POM_V5_PAD_TILES_H16[t], POM_V5_PAD_TILES_H14[t] - 204_800);
+            assert!(POM_V5_PAD_TILES_H16[t] > 0);
+        }
+    }
+
+    #[test]
+    fn pad_tiles_switch_at_the_gate() {
+        let gate = crate::pom::pad_margin_activation_daa();
+        assert!(gate > crate::pom::pom_v5_activation_daa());
+        for t in 0..POM_V5_PAD_TILES_H14.len() {
+            assert_eq!(pom_v5_pad_tiles(t as u8, gate - 1), POM_V5_PAD_TILES_H14[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, gate), POM_V5_PAD_TILES_H16[t]);
+        }
+        assert_eq!(pom_v5_pad_tiles(POM_V5_PAD_TILES_H14.len() as u8, gate), 0);
+    }
 }
