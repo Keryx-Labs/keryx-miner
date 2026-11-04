@@ -17,6 +17,14 @@ pub const POM_V5_TILE_ENTRIES: u64 = (POM_V4_TILE_BYTES / POM_V5_P_ENTRY_BYTES) 
 pub const POM_V5_P_ROUNDS: u32 = 1_920;
 /// Context pad tiles of each H14 tier; 0 = no pad. Mirror of the node's `POM_V5_PAD_TILES_H14`.
 pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
+/// Context pad tiles of each H14 tier from the node `pad_margin_activation`. Mirror of `POM_V5_PAD_TILES_H16`.
+pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
+
+/// Context pad tiles of `tier` at `daa`; 0 = no pad.
+pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
+    let table = if daa >= crate::pom::pad_margin_activation_daa() { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
+    table.get(tier as usize).copied().unwrap_or(0)
+}
 
 const PAD_DOMAIN: &[u8] = b"KERYX-POM-V5-PAD";
 /// IV folded into the pad seed words.

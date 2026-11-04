@@ -1632,6 +1632,11 @@ pub fn pom_v5_activation_daa() -> u64 {
     gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
+/// Node `pad_margin_activation`: the context pad uses `POM_V5_PAD_TILES_H16`.
+pub fn pad_margin_activation_daa() -> u64 {
+    u64::MAX
+}
+
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
 /// MUST equal the node's `block_task_activation`.
 pub fn block_task_activation_daa() -> u64 {
