@@ -1533,8 +1533,8 @@ pub fn is_testnet() -> bool {
 pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 /// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
 const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
-/// Mainnet H16 gate (not dated yet). MUST equal the node's H16 activations.
-pub const H16_ACTIVATION_DAA: u64 = u64::MAX;
+/// Mainnet H16 gate. MUST equal the node's `H16_ACTIVATION_DAA`.
+pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
 /// Testnet H16 gate. MUST equal the node's `TESTNET_H16_ACTIVATION_DAA`.
 const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
@@ -2323,7 +2323,8 @@ mod h16_gate_tests {
     fn h16_gates_match_the_node() {
         assert!(!is_testnet());
         assert_eq!(pad_margin_activation_daa(), H16_ACTIVATION_DAA);
-        assert_eq!(H16_ACTIVATION_DAA, u64::MAX);
+        assert_eq!(H16_ACTIVATION_DAA, 147_000_000);
+        assert!(H16_ACTIVATION_DAA > H15_ACTIVATION_DAA);
         assert_eq!(TESTNET_H16_ACTIVATION_DAA, 180_000);
         assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
     }
