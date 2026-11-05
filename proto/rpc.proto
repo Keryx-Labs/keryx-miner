@@ -774,6 +774,7 @@ message GetAwaitedOpeningsResponseMessage {
   repeated AwaitedOpeningMessage openings = 2;
   repeated AwaitedRequestMessage awaitedRequests = 3;
   bool requestsChecked = 4;
+  repeated string closedRequests = 5;
 
   RPCError error = 1000;
 }
