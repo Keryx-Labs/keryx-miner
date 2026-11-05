@@ -734,6 +734,9 @@ message ServicePendingBurnMessage {
   uint32 consecutiveMisses = 3;
   uint32 burnedClaims = 4;
   uint64 burnedSompi = 5;
+  // Audited request that was missed — lets a multi-rig operator tell which rig caused the
+  // strike. Empty from nodes that predate the field. Field numbers mirror the node's rpc.proto.
+  string requestHash = 6;
 }
 
 // Lifetime strike tally per miner — never reset, unlike consecutiveMisses. Field numbers mirror

@@ -96,6 +96,8 @@ pub struct MinerStatsSnapshot {
     pub service_status: Option<String>,
     pub api_port: Option<u16>,
     pub total_hashrate_hs: u64,
+    /// Rig-wide power draw: sum of the per-GPU readings, `None` when no GPU reports one.
+    pub total_power_draw_w: Option<f32>,
     pub accepted_blocks: u64,
     pub rejected_blocks: u64,
     pub claimed_outputs: u64,
@@ -401,6 +403,8 @@ impl MinerStats {
             }
         });
 
+        let total_power_draw_w = devices.iter().filter_map(|d| d.power_draw_w).reduce(|a, b| a + b);
+
         MinerStatsSnapshot {
             started_epoch_s,
             uptime_s,
@@ -413,6 +417,7 @@ impl MinerStats {
                 p => Some(p as u16),
             },
             total_hashrate_hs: self.total_hashrate_hs.load(Ordering::Acquire),
+            total_power_draw_w,
             accepted_blocks: self.accepted_blocks.load(Ordering::Acquire),
             rejected_blocks: self.rejected_blocks.load(Ordering::Acquire),
             claimed_outputs: self.claimed_outputs.load(Ordering::Acquire),

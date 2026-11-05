@@ -135,6 +135,73 @@ const CHAIN_LOG_TAIL: usize = 512;
 /// Built opening bodies kept per response, one per seed block.
 const BUILT_OPENINGS_KEPT: usize = 4;
 
+/// Served request hashes kept for strike attribution — a burn arrives within a few minutes of
+/// the miss, so this only has to cover a busy rig's recent answers, not its whole history.
+const SERVED_REQUESTS_KEPT: usize = 1024;
+
+/// Reported strike burns remembered so the 60-second strike poll logs each miss once.
+const STRIKE_BURNS_REPORTED_KEPT: usize = 4096;
+
+/// Who a missed request belonged to, from this instance's point of view.
+#[derive(Debug, PartialEq, Eq)]
+enum StrikeCause {
+    /// This instance answered the request (response txid) — the answer never settled on-chain.
+    AnsweredHere(String),
+    /// This instance queued the request but never answered it.
+    DroppedHere,
+    /// This instance saw the request but had no ready model to serve it.
+    ModelUnreadyHere,
+    /// The request never reached this instance.
+    Elsewhere,
+}
+
+/// Attributes a pending burn to this instance through the burn's request hash; `None` when the
+/// node predates the field and sends it empty, so no attribution is claimed either way.
+fn attribute_strike(
+    served_requests: &std::collections::HashMap<String, String>,
+    seen_prefixes: &std::collections::HashSet<String>,
+    skipped_unready: &std::collections::HashSet<String>,
+    request_hash: &str,
+) -> Option<StrikeCause> {
+    let hash = request_hash.to_ascii_lowercase();
+    if hash.is_empty() {
+        return None;
+    }
+    if let Some(txid) = served_requests.get(&hash) {
+        return Some(StrikeCause::AnsweredHere(txid.clone()));
+    }
+    let sid: String = hash.chars().take(16).collect();
+    if seen_prefixes.contains(&sid) {
+        return Some(StrikeCause::DroppedHere);
+    }
+    if skipped_unready.contains(&sid) {
+        return Some(StrikeCause::ModelUnreadyHere);
+    }
+    Some(StrikeCause::Elsewhere)
+}
+
+/// Remembers that this instance answered `request_hash` with `response_txid`, so a later strike
+/// poll can tell whether a missed request was this rig's job. FIFO-bounded: strikes land within
+/// minutes of the miss, deep history would only grow the map.
+fn record_served_request(
+    served: &mut std::collections::HashMap<String, String>,
+    order: &mut VecDeque<String>,
+    request_hash: [u8; 32],
+    response_txid: &str,
+) {
+    let key = hex::encode(request_hash);
+    if served.contains_key(&key) {
+        return;
+    }
+    served.insert(key.clone(), response_txid.to_string());
+    order.push_back(key);
+    while order.len() > SERVED_REQUESTS_KEPT {
+        if let Some(old) = order.pop_front() {
+            served.remove(&old);
+        }
+    }
+}
+
 /// Node silence after which a template request probes the connection.
 const NODE_SILENCE_PROBE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Node silence after which the connection is dropped and reopened.
@@ -644,6 +711,19 @@ pub struct KeryxdHandler {
     /// served response clears it too. Each miss carries its own daa, so a set of those is exact
     /// for as long as the process runs.
     misses_seen: std::collections::HashSet<u64>,
+
+    /// Request hash (hex) → response txid of every AiResponse this instance submitted, plus the
+    /// restored ones. Strikes are per payout address, so a rig learns whether a missed request
+    /// was its own job only from local evidence like this.
+    served_requests: std::collections::HashMap<String, String>,
+    /// FIFO eviction order of `served_requests`.
+    served_requests_order: VecDeque<String>,
+    /// Request hashes of pending burns already attributed in the log.
+    strike_burns_reported: std::collections::HashSet<String>,
+
+    /// Stable IDs of requests skipped because no ready model could serve them. Such a rig is
+    /// still in the tier cohort, so these requests come back as strikes against it.
+    ai_skipped_unready: std::collections::HashSet<String>,
 }
 
 #[async_trait(?Send)]
@@ -791,6 +871,13 @@ impl KeryxdHandler {
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
         let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
+        // Restored traces count as served by this instance: after a restart a strike for one of
+        // them must still be attributed to this rig.
+        let mut served_requests = std::collections::HashMap::new();
+        let mut served_requests_order = VecDeque::new();
+        for (txid, trace) in &restored_traces {
+            record_served_request(&mut served_requests, &mut served_requests_order, trace.request_hash, txid);
+        }
         let mut handler = Box::new(Self {
             client,
             task_chain: ChainCache::new(),
@@ -844,6 +931,10 @@ impl KeryxdHandler {
             strike_status: None,
             stats: None,
             misses_seen: std::collections::HashSet::new(),
+            served_requests,
+            served_requests_order,
+            strike_burns_reported: std::collections::HashSet::new(),
+            ai_skipped_unready: std::collections::HashSet::new(),
         });
         handler.restore_parked();
         Ok(handler)
@@ -1042,10 +1133,6 @@ impl KeryxdHandler {
                 };
 
             if let Some((raw, model_id, prompt, prompt_len, max_tokens, inference_reward, private)) = extracted {
-                if !ready_ids.contains(&model_id) {
-                    log::debug!("Inference: skipping AiRequest — model not supported or files not ready");
-                    continue;
-                }
                 let txid_hex = tx
                     .verbose_data
                     .as_ref()
@@ -1064,6 +1151,17 @@ impl KeryxdHandler {
                     blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
                 };
                 let stable_id = hex::encode(&request_hash[..8]);
+                if !ready_ids.contains(&model_id) {
+                    log::debug!("Inference: skipping AiRequest id={} — model not supported or files not ready", stable_id);
+                    // Remember the skip: the rig stays in the tier cohort, so this request can
+                    // come back as a strike that this rig caused.
+                    self.ai_skipped_unready.insert(stable_id);
+                    if self.ai_skipped_unready.len() > MAX_AI_SEEN_IDS {
+                        self.ai_skipped_unready.clear();
+                        self.ai_skipped_unready.shrink_to_fit();
+                    }
+                    continue;
+                }
                 if self.ai_answered_by_me.contains(&stable_id) {
                     log::debug!("Inference: skipping AiRequest id={} — already answered by this miner", stable_id);
                     continue;
@@ -2624,6 +2722,7 @@ impl KeryxdHandler {
             verbose_data: None,
         };
         if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
+            record_served_request(&mut self.served_requests, &mut self.served_requests_order, request_hash, &txid);
             if let Some(t) = trace.filter(|_| resp.trace.is_some()) {
                 let pending = PendingTrace {
                     model_id: t.model_id,
@@ -2700,6 +2799,41 @@ impl KeryxdHandler {
         for burn in &burns {
             self.misses_seen.insert(burn.miss_daa_score);
         }
+        // Attribute each pending burn to a rig. Strikes are recorded per payout address, so with
+        // several rigs on one address the node cannot say which of them missed the request —
+        // but the burn's request hash (empty from nodes predating the field) matched against
+        // this instance's own served/seen sets can. Each burn is logged once; the `local_cause`
+        // flag feeds the status bar on every poll.
+        let mut local_cause = false;
+        for burn in &burns {
+            let Some(cause) = attribute_strike(&self.served_requests, &self.ai_seen_prefixes, &self.ai_skipped_unready, &burn.request_hash) else { continue };
+            local_cause |= !matches!(cause, StrikeCause::Elsewhere);
+            if self.strike_burns_reported.len() >= STRIKE_BURNS_REPORTED_KEPT {
+                self.strike_burns_reported.clear();
+            }
+            if !self.strike_burns_reported.insert(burn.request_hash.clone()) {
+                continue;
+            }
+            let request = &burn.request_hash[..burn.request_hash.len().min(16)];
+            match cause {
+                StrikeCause::AnsweredHere(txid) => warn!(
+                    "service-bond: miss #{} on request {}… — THIS rig answered it (response {}) but the answer never settled on-chain",
+                    burn.consecutive_misses, request, txid
+                ),
+                StrikeCause::DroppedHere => warn!(
+                    "service-bond: miss #{} on request {}… — THIS rig queued the request and never answered it; this rig caused the strike",
+                    burn.consecutive_misses, request
+                ),
+                StrikeCause::ModelUnreadyHere => warn!(
+                    "service-bond: miss #{} on request {}… — THIS rig saw the request but had no model ready to serve it; check the model files — this rig caused the strike",
+                    burn.consecutive_misses, request
+                ),
+                StrikeCause::Elsewhere => warn!(
+                    "service-bond: miss #{} on request {}… — this rig never saw the request; another rig sharing the payout address (or this rig while offline) caused the strike",
+                    burn.consecutive_misses, request
+                ),
+            }
+        }
         let total = resp
             .lifetime_strikes
             .iter()
@@ -2716,7 +2850,13 @@ impl KeryxdHandler {
             let bar = if suspension.is_some() {
                 format!("SUSPENDED · {} total", total)
             } else if pending > 0 {
-                format!("{} active · {} pending · {} total", active, pending, total)
+                format!(
+                    "{} active · {} pending{} · {} total",
+                    active,
+                    pending,
+                    if local_cause { " (this rig)" } else { "" },
+                    total
+                )
             } else {
                 format!("{} active · {} total", active, total)
             };
@@ -3412,6 +3552,60 @@ mod tests {
         assert!(super::version_at_least("1.7.0-PoM", (1, 6, 6)));
         assert!(!super::version_at_least("1.6.5", (1, 6, 6)));
         assert!(!super::version_at_least("", (1, 6, 6)));
+    }
+
+    /// A burn's request hash attributes the strike: answered here, queued but never answered,
+    /// skipped for a missing model, or never seen at all. An empty hash (node predates the
+    /// field) claims nothing.
+    #[test]
+    fn strike_attribution_matches_local_evidence() {
+        use super::{attribute_strike, StrikeCause};
+        let mut served = std::collections::HashMap::new();
+        served.insert(hex::encode([1u8; 32]), "txid-answered".to_string());
+        served.insert(hex::encode([0xABu8; 32]), "txid-letters".to_string());
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(hex::encode([2u8; 8]));
+        let mut unready = std::collections::HashSet::new();
+        unready.insert(hex::encode([4u8; 8]));
+
+        assert_eq!(
+            attribute_strike(&served, &seen, &unready, &hex::encode([1u8; 32])),
+            Some(StrikeCause::AnsweredHere("txid-answered".to_string()))
+        );
+        assert_eq!(attribute_strike(&served, &seen, &unready, &hex::encode([2u8; 32])), Some(StrikeCause::DroppedHere));
+        assert_eq!(attribute_strike(&served, &seen, &unready, &hex::encode([4u8; 32])), Some(StrikeCause::ModelUnreadyHere));
+        assert_eq!(attribute_strike(&served, &seen, &unready, &hex::encode([3u8; 32])), Some(StrikeCause::Elsewhere));
+        assert_eq!(attribute_strike(&served, &seen, &unready, ""), None);
+        // Node hashes are hex regardless of case; use a hash with letters so the check is real.
+        assert_eq!(
+            attribute_strike(&served, &seen, &unready, &hex::encode([0xABu8; 32]).to_uppercase()),
+            Some(StrikeCause::AnsweredHere("txid-letters".to_string()))
+        );
+    }
+
+    /// The served set is FIFO-bounded: the oldest answer leaves once the cap is exceeded, and a
+    /// duplicate hash refreshes nothing.
+    #[test]
+    fn served_requests_evict_oldest_beyond_the_cap() {
+        use super::{record_served_request, SERVED_REQUESTS_KEPT};
+        let mut served = std::collections::HashMap::new();
+        let mut order = std::collections::VecDeque::new();
+        for i in 0..SERVED_REQUESTS_KEPT + 1 {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            record_served_request(&mut served, &mut order, hash, &format!("txid-{i}"));
+        }
+        assert_eq!(served.len(), SERVED_REQUESTS_KEPT);
+        assert!(!served.contains_key(&hex::encode([0u8; 32])));
+        let mut last = [0u8; 32];
+        last[..8].copy_from_slice(&(SERVED_REQUESTS_KEPT as u64).to_le_bytes());
+        let last_key = hex::encode(last);
+        assert_eq!(served.get(&last_key).unwrap(), &format!("txid-{SERVED_REQUESTS_KEPT}"));
+
+        let len = order.len();
+        record_served_request(&mut served, &mut order, last, "txid-dup");
+        assert_eq!(order.len(), len);
+        assert_eq!(served.get(&last_key).unwrap(), &format!("txid-{SERVED_REQUESTS_KEPT}"));
     }
 
     use super::PrivateRequest;
