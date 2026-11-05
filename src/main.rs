@@ -232,6 +232,26 @@ fn adjust_console() -> Result<(), Error> {
 }
 
 #[cfg(test)]
+mod cuda_device_tests {
+    use super::cuda_devices_from_args;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cuda_devices_follow_the_command_line() {
+        assert_eq!(cuda_devices_from_args(&args(&["miner", "--testnet"])), None);
+        assert_eq!(cuda_devices_from_args(&args(&["miner", "--cuda-device", "4"])), Some(vec![4]));
+        assert_eq!(cuda_devices_from_args(&args(&["miner", "--cuda-device=0,2"])), Some(vec![0, 2]));
+        assert_eq!(
+            cuda_devices_from_args(&args(&["miner", "--cuda-device", "1", "--cuda-device", "3"])),
+            Some(vec![1, 3])
+        );
+    }
+}
+
+#[cfg(test)]
 mod recovery_tests {
     use super::*;
 
@@ -471,6 +491,23 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
     }
 }
 
+/// CUDA devices named by `--cuda-device` in `args`; `None` when the option is absent.
+fn cuda_devices_from_args(args: &[String]) -> Option<Vec<usize>> {
+    let mut out: Option<Vec<usize>> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value = if arg == "--cuda-device" {
+            it.next().cloned()
+        } else {
+            arg.strip_prefix("--cuda-device=").map(str::to_string)
+        };
+        if let Some(v) = value {
+            out.get_or_insert_with(Vec::new).extend(v.split(',').filter_map(|d| d.trim().parse::<usize>().ok()));
+        }
+    }
+    out
+}
+
 /// Assign each CUDA device the highest PoM tier that (a) is ≤ the `ceiling` flag and (b) fits its
 /// VRAM — so a heterogeneous rig mines a different tier per GPU instead of the lowest common
 /// denominator, small cards downgrade instead of failing, and big cards are not pushed past the
@@ -501,7 +538,19 @@ fn assign_pom_tiers(
         candidates.iter().copied().find(|(floor, _, _)| *floor <= vram_mb).map(|(_, t, s)| (t, s))
     };
 
-    let devices = keryx_miner::pom_gpu::query_all_gpus_vram();
+    let mut devices = keryx_miner::pom_gpu::query_all_gpus_vram();
+    if let Some(selected) = cuda_devices_from_args(&std::env::args().collect::<Vec<_>>()) {
+        for id in selected.iter().filter(|id| !devices.iter().any(|(d, _)| d == *id)) {
+            log::error!("PoM: --cuda-device {}: no such CUDA device on this machine.", id);
+        }
+        for (id, _) in forced.iter().enumerate().filter(|(id, f)| f.is_some() && !selected.contains(id)) {
+            log::warn!("PoM: --force-model entry for GPU {} ignored — --cuda-device does not select that GPU.", id);
+        }
+        devices.retain(|(id, _)| selected.contains(id));
+        if devices.is_empty() {
+            return Vec::new();
+        }
+    }
     if devices.is_empty() {
         // No enumeration: a forced first entry still wins for the fallback device-0 tier.
         if let Some(t) = forced.first().copied().flatten() {
@@ -1187,6 +1236,13 @@ async fn run() -> Result<(), Error> {
     // VRAM holds (small cards downgrade instead of failing; big cards are not pushed past the
     // ceiling). --force-model entries win per-card over both. VRAM is CUDA-driver-sourced so
     // device_ids match the devices the walk loads onto.
+    if let Some(selected) = cuda_devices_from_args(&std::env::args().collect::<Vec<_>>()) {
+        let present = keryx_miner::pom_gpu::query_all_gpus_vram();
+        if let Some(id) = selected.iter().find(|id| !present.iter().any(|(d, _)| d == *id)) {
+            error!("--cuda-device {}: no such CUDA device on this machine.", id);
+            return Err(format!("no CUDA device {}", id).into());
+        }
+    }
     let pom_assignments = assign_pom_tiers(tier, &forced_tiers);
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);

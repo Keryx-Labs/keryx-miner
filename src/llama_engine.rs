@@ -173,6 +173,8 @@ struct Engine {
     attempt: u64,
     /// Context window the engine allocated, in tokens.
     n_ctx: c_int,
+    /// Largest full context that last fitted with room for compute buffers.
+    ctx_fit: c_int,
     /// Context currently allocated, in tokens (0: none).
     ctx_now: c_int,
     /// The current context is the load-size one (or its floor fallback).
@@ -559,6 +561,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             gguf: gguf.to_string(),
             attempt,
             n_ctx,
+            ctx_fit: n_ctx,
             ctx_now: n_ctx,
             ctx_full: true,
             trace_leaves: 0,
@@ -639,23 +642,44 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
 
 /// Generate inference text with the engine on `gpu`, which must host `gguf`.
 /// Brings back the load-size context, releasing the context pad of `gpu` first.
-fn ensure_full_context(e: &mut Engine, gpu: usize) -> Result<(), String> {
-    if e.ctx_full && e.ctx_now > 0 {
+fn ensure_full_context(e: &mut Engine, gpu: usize, need: usize) -> Result<(), String> {
+    if e.ctx_full && e.ctx_now > 0 && e.ctx_now as usize >= need {
         return Ok(());
     }
     crate::pom_gpu::release_pad(gpu as u32);
     let _native = native();
-    let mut got = unsafe { (e.ctx_acquire)(e.model, e.n_ctx) };
+    let floor = crate::models::spec_for_gguf(&e.gguf).map_or(e.n_ctx, |m| (m.ctx_floor as c_int).min(e.n_ctx));
+    let min_n = floor.max(need.min(c_int::MAX as usize) as c_int).min(e.n_ctx);
+    let start = if min_n > e.ctx_fit { e.n_ctx } else { e.ctx_fit.max(min_n) };
+    // Largest size that fits and leaves room for compute buffers; the smallest one only has to fit.
+    let mut got = -1;
+    let mut fitted: Option<c_int> = None;
+    for n in context_ladder(start, min_n) {
+        got = unsafe { (e.ctx_acquire)(e.model, n) };
+        if got < 0 {
+            continue;
+        }
+        if n == min_n || crate::pom_gpu::free_vram_mib(gpu).is_none_or(|f| f >= COMPUTE_HEADROOM_MIB) {
+            break;
+        }
+        fitted.get_or_insert(n);
+    }
     if got < 0 {
-        if let Some(floor) = crate::models::spec_for_gguf(&e.gguf).map(|m| m.ctx_floor as c_int).filter(|f| *f < e.n_ctx) {
-            log::warn!("llama engine: {}-token context did not fit on GPU {} — retrying at the {}-token floor", e.n_ctx, gpu, floor);
-            got = unsafe { (e.ctx_acquire)(e.model, floor) };
+        if let Some(n) = fitted {
+            got = unsafe { (e.ctx_acquire)(e.model, n) };
         }
     }
     e.ctx_now = got.max(0);
     e.ctx_full = got >= 0;
     if got < 0 {
         return Err(engine_error(e, "context allocation failed"));
+    }
+    if got < e.n_ctx && got < e.ctx_fit {
+        log::warn!("llama engine: {}-token context too large for GPU {} — using {} tokens", e.n_ctx, gpu, got);
+    }
+    e.ctx_fit = got;
+    if (got as usize) < need {
+        return Err(format!("llama engine: {}-token context cannot hold {} positions on GPU {}", got, need, gpu));
     }
     log::info!("llama engine: {}-token context restored on GPU {}", got, gpu);
     Ok(())
@@ -675,7 +699,7 @@ fn ensure_context_for(e: &mut Engine, gpu: usize, n_pos: usize) -> Result<(), St
             return Ok(());
         }
     }
-    ensure_full_context(e, gpu)
+    ensure_full_context(e, gpu, n_pos)
 }
 
 /// Shrinks the engine context of `gpu` to the block-task size; a no-op when it already is.
@@ -701,7 +725,7 @@ pub fn generate(gguf: &str, gpu: usize, prompt: &str, max_tokens: usize) -> Resu
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| GenError::Unavailable)?;
     let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or(GenError::Unavailable)?;
-    ensure_full_context(e, gpu).map_err(GenError::Failed)?;
+    ensure_full_context(e, gpu, 0).map_err(GenError::Failed)?;
     let e = &*e;
     let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let mut buf = vec![0u8; 64 * 1024];
@@ -730,7 +754,7 @@ pub fn trace_configure(gguf: &str, gpu: usize, manifest: &[u8]) -> Result<usize,
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, 0)?;
     let _native = native();
     let rc = unsafe { (e.trace_configure)(e.model, manifest.as_ptr() as *const c_void, manifest.len(), 0) };
     if rc != 0 {
@@ -774,7 +798,7 @@ pub fn generate_traced(
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| GenError::Unavailable)?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
-    ensure_full_context(e, gpu).map_err(GenError::Failed)?;
+    ensure_full_context(e, gpu, 0).map_err(GenError::Failed)?;
     let e = &*e;
     let cp = CString::new(prompt).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
     let rest = CString::new(prefix.as_ref().map_or("", |p| p.rest)).map_err(|_| GenError::Failed("prompt contains a NUL byte".to_string()))?;
@@ -866,7 +890,7 @@ pub fn seq_configure(gguf: &str, gpu: usize, layers: &[SeqLayer], n_attn: u32, n
     if e.seq_layout == key && e.seq_leaves == n_leaves {
         return Ok(n_leaves);
     }
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, 0)?;
     let _native = native();
     let rc = unsafe { (e.seq_configure)(e.model, layers.as_ptr() as *const u32, layers.len() as u32, n_attn, n_recur, seq_heads, interval) };
     if rc != 0 {
@@ -890,7 +914,7 @@ pub fn seq_replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, spans: 
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0 && e.seq_leaves > 0).ok_or_else(|| "no sequenced engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, tokens.len())?;
     let _native = native();
     let stream: Vec<u32> = spans.iter().map(|s| s.0).collect();
     let lo: Vec<u64> = spans.iter().map(|s| s.1).collect();
@@ -938,7 +962,7 @@ pub fn replay(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, pos: u32, l
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, tokens.len())?;
     let e = &*e;
     let mut x = vec![0u8; CAPTURE_CAP];
     let mut y = vec![0u8; CAPTURE_CAP];
@@ -1009,7 +1033,7 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
     let slot = slot(gpu);
     let mut g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
     let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or_else(|| "no traced engine hosts this model".to_string())?;
-    ensure_full_context(e, gpu)?;
+    ensure_full_context(e, gpu, tokens.len())?;
     let e = &*e;
     let pos: Vec<u32> = caps.iter().map(|c| c.0).collect();
     let leaf: Vec<u32> = caps.iter().map(|c| c.1).collect();
@@ -1036,6 +1060,9 @@ pub fn replay_multi(gguf: &str, gpu: usize, tokens: &[i32], n_prompt: u32, caps:
     }
     Ok(out.chunks(slot_bytes).zip(&lens).map(|(c, &l)| c[..(l as usize).min(slot_bytes)].to_vec()).collect())
 }
+
+/// Free VRAM a restored context must leave for compute buffers.
+const COMPUTE_HEADROOM_MIB: u64 = 1024;
 
 /// Context sizes to try, largest first: the cap, then halves of it down to the floor.
 fn context_ladder(cap: c_int, floor: c_int) -> Vec<c_int> {

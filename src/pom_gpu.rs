@@ -906,6 +906,13 @@ fn words4(b: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// Free VRAM of CUDA device `device_id`, in MiB.
+pub fn free_vram_mib(device_id: usize) -> Option<u64> {
+    let ctx = CudaContext::new(device_id).ok()?;
+    ctx.bind_to_thread().ok()?;
+    result::mem_get_info().ok().map(|(free, _)| free as u64 >> 20)
+}
+
 /// Total VRAM (MB) of every CUDA device, in **CUDA device order** — the same ordering
 /// `CudaContext::new(id)` uses — so an entry `(id, mb)` is the VRAM of the device the miner would
 /// mine/serve on for that `id`. Sourced from the CUDA driver, NOT nvidia-smi: nvidia-smi orders by
