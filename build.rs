@@ -143,12 +143,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     apply_llama_patches(&src)?;
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
-    // A cache written at another absolute path (e.g. the repo bind-mounted into a container at
-    // a new mountpoint while target/ is shared with the host) makes cmake fail hard on the
-    // path mismatch. Detect it and reconfigure from scratch instead of erroring out. Compare
-    // both the raw and the canonicalized path: cmake canonicalizes what it writes into the
-    // cache, while OUT_DIR keeps any symlink components — matching only one form would call a
-    // symlinked target dir stale on every build.
+    // Reconfigure from scratch when the cache was written at another path (raw or canonical).
     let cache = build_dir.join("CMakeCache.txt");
     if let Ok(content) = fs::read_to_string(&cache) {
         let canon = |p: &std::path::Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());

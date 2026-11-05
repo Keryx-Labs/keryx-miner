@@ -135,17 +135,16 @@ const CHAIN_LOG_TAIL: usize = 512;
 /// Built opening bodies kept per response, one per seed block.
 const BUILT_OPENINGS_KEPT: usize = 4;
 
-/// Served request hashes kept for strike attribution — a burn arrives within a few minutes of
-/// the miss, so this only has to cover a busy rig's recent answers, not its whole history.
+/// Served request hashes kept for strike attribution.
 const SERVED_REQUESTS_KEPT: usize = 1024;
 
-/// Reported strike burns remembered so the 60-second strike poll logs each miss once.
+/// Reported strike burns remembered so each miss is logged once.
 const STRIKE_BURNS_REPORTED_KEPT: usize = 4096;
 
 /// Who a missed request belonged to, from this instance's point of view.
 #[derive(Debug, PartialEq, Eq)]
 enum StrikeCause {
-    /// This instance answered the request (response txid) — the answer never settled on-chain.
+    /// This instance answered the request (response txid).
     AnsweredHere(String),
     /// This instance queued the request but never answered it.
     DroppedHere,
@@ -155,8 +154,7 @@ enum StrikeCause {
     Elsewhere,
 }
 
-/// Attributes a pending burn to this instance through the burn's request hash; `None` when the
-/// node predates the field and sends it empty, so no attribution is claimed either way.
+/// Attributes a pending burn to this instance; `None` when the burn carries no request hash.
 fn attribute_strike(
     served_requests: &std::collections::HashMap<String, String>,
     seen_prefixes: &std::collections::HashSet<String>,
@@ -180,9 +178,7 @@ fn attribute_strike(
     Some(StrikeCause::Elsewhere)
 }
 
-/// Remembers that this instance answered `request_hash` with `response_txid`, so a later strike
-/// poll can tell whether a missed request was this rig's job. FIFO-bounded: strikes land within
-/// minutes of the miss, deep history would only grow the map.
+/// Records that this instance answered `request_hash` with `response_txid` (FIFO-bounded).
 fn record_served_request(
     served: &mut std::collections::HashMap<String, String>,
     order: &mut VecDeque<String>,
@@ -712,17 +708,14 @@ pub struct KeryxdHandler {
     /// for as long as the process runs.
     misses_seen: std::collections::HashSet<u64>,
 
-    /// Request hash (hex) → response txid of every AiResponse this instance submitted, plus the
-    /// restored ones. Strikes are per payout address, so a rig learns whether a missed request
-    /// was its own job only from local evidence like this.
+    /// Request hash (hex) → response txid of the AiResponses this instance submitted or restored.
     served_requests: std::collections::HashMap<String, String>,
     /// FIFO eviction order of `served_requests`.
     served_requests_order: VecDeque<String>,
     /// Request hashes of pending burns already attributed in the log.
     strike_burns_reported: std::collections::HashSet<String>,
 
-    /// Stable IDs of requests skipped because no ready model could serve them. Such a rig is
-    /// still in the tier cohort, so these requests come back as strikes against it.
+    /// Stable IDs of requests skipped because no ready model could serve them.
     ai_skipped_unready: std::collections::HashSet<String>,
 }
 
@@ -871,8 +864,7 @@ impl KeryxdHandler {
         let stream = client.message_stream(ReceiverStream::new(recv)).await?.into_inner();
         let pending_block_submissions = Arc::new(Mutex::new(VecDeque::new()));
         let (block_channel, block_handle) = Self::create_block_channel(send_channel.clone(), Arc::clone(&pending_block_submissions));
-        // Restored traces count as served by this instance: after a restart a strike for one of
-        // them must still be attributed to this rig.
+        // Restored traces count as served by this instance.
         let mut served_requests = std::collections::HashMap::new();
         let mut served_requests_order = VecDeque::new();
         for (txid, trace) in &restored_traces {
@@ -1153,8 +1145,6 @@ impl KeryxdHandler {
                 let stable_id = hex::encode(&request_hash[..8]);
                 if !ready_ids.contains(&model_id) {
                     log::debug!("Inference: skipping AiRequest id={} — model not supported or files not ready", stable_id);
-                    // Remember the skip: the rig stays in the tier cohort, so this request can
-                    // come back as a strike that this rig caused.
                     self.ai_skipped_unready.insert(stable_id);
                     if self.ai_skipped_unready.len() > MAX_AI_SEEN_IDS {
                         self.ai_skipped_unready.clear();
@@ -2799,11 +2789,7 @@ impl KeryxdHandler {
         for burn in &burns {
             self.misses_seen.insert(burn.miss_daa_score);
         }
-        // Attribute each pending burn to a rig. Strikes are recorded per payout address, so with
-        // several rigs on one address the node cannot say which of them missed the request —
-        // but the burn's request hash (empty from nodes predating the field) matched against
-        // this instance's own served/seen sets can. Each burn is logged once; the `local_cause`
-        // flag feeds the status bar on every poll.
+        // Attribute each pending burn to this rig or another one; each burn is logged once.
         let mut local_cause = false;
         for burn in &burns {
             let Some(cause) = attribute_strike(&self.served_requests, &self.ai_seen_prefixes, &self.ai_skipped_unready, &burn.request_hash) else { continue };
@@ -2817,7 +2803,7 @@ impl KeryxdHandler {
             let request = &burn.request_hash[..burn.request_hash.len().min(16)];
             match cause {
                 StrikeCause::AnsweredHere(txid) => warn!(
-                    "service-bond: miss #{} on request {}… — THIS rig answered it (response {}) but the answer never settled on-chain",
+                    "service-bond: miss #{} on request {}… — THIS rig answered it (response {}); check this rig's audit openings for that response",
                     burn.consecutive_misses, request, txid
                 ),
                 StrikeCause::DroppedHere => warn!(

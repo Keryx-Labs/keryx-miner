@@ -1619,7 +1619,6 @@ fn format_efficiency(hashrate_hs: u64, power_w: f32) -> String {
         (efficiency / 1_000_000_000_000.0, "TH/W")
     };
 
-    // Always two decimals: tuning margins between driver versions and overclocks are sub-1%.
     format!("{:.2} {}", scaled_value, unit)
 }
 
