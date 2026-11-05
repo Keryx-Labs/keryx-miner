@@ -578,6 +578,8 @@ fn draw_frame(
     let compact = total_width < 132;
 
     let hashrate_value = format_hashrate(snapshot.total_hashrate_hs);
+    // Rig-wide power draw across all GPUs; "--" until any GPU reports a reading.
+    let power_total_value = snapshot.total_power_draw_w.map(|w| format!("{:.0} W", w.round())).unwrap_or_else(|| "--".to_string());
     let opoi_pause_value = if snapshot.opoi_challenge_active { "Active" } else { "Idle" };
     let accepted_blocks_value = snapshot.accepted_blocks;
     let rejected_value = snapshot.rejected_blocks;
@@ -743,6 +745,11 @@ fn draw_frame(
             bold: true,
         },
         metric_row("Hashrate", hashrate_value.clone(), palette().ok),
+        metric_row(
+            "Power Draw",
+            power_total_value.clone(),
+            if snapshot.total_power_draw_w.is_some() { palette().text } else { palette().dim },
+        ),
         metric_row("Uptime", uptime_value.clone(), palette().text),
         PanelRow::Segments(vec![
             (format!(" {:<16}", "Address"), palette().dim),
@@ -1612,7 +1619,8 @@ fn format_efficiency(hashrate_hs: u64, power_w: f32) -> String {
         (efficiency / 1_000_000_000_000.0, "TH/W")
     };
 
-    format!("{:.0} {}", scaled_value, unit)
+    // Always two decimals: tuning margins between driver versions and overclocks are sub-1%.
+    format!("{:.2} {}", scaled_value, unit)
 }
 
 fn parse_device_id(worker_id: &str) -> Option<u32> {
