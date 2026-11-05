@@ -760,11 +760,38 @@ message AwaitedOpeningMessage {
 
 message GetAwaitedOpeningsRequestMessage {
   repeated string responseTxids = 1;
+  string escrowPubkey = 2;
+  repeated string requestHashes = 3;
+}
+
+message AwaitedRequestMessage {
+  string requestHash = 1;
+  uint64 windowEndDaa = 2;
 }
 
 message GetAwaitedOpeningsResponseMessage {
   uint64 virtualDaaScore = 1;
   repeated AwaitedOpeningMessage openings = 2;
+  repeated AwaitedRequestMessage awaitedRequests = 3;
+  bool requestsChecked = 4;
+
+  RPCError error = 1000;
+}
+
+message ServiceProviderMessage {
+  uint32 tier = 1;
+  string modelId = 2;
+  string identity = 3;
+  string escrowPubkey = 4;
+}
+
+message GetServiceProvidersRequestMessage {
+  uint64 windowDaa = 1;
+}
+
+message GetServiceProvidersResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated ServiceProviderMessage providers = 2;
 
   RPCError error = 1000;
 }

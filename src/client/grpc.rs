@@ -5,7 +5,7 @@ use crate::proto::kaspad_message::Payload;
 use crate::proto::rpc_client::RpcClient;
 use crate::proto::{
     GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage, GetInfoRequestMessage,
-    GetAwaitedOpeningsRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    GetAwaitedOpeningsRequestMessage, GetServiceProvidersRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
     NotifyNewBlockTemplateRequestMessage, NotifyVirtualSelectedParentChainChangedRequestMessage,
 };
 use crate::{miner::MinerManager, Error};
@@ -495,6 +495,27 @@ const AUDIT_PHASES_RESERVED: u64 = 3;
 const AWAITED_POLL_SECS: u64 = 10;
 /// Response txids per `GetAwaitedOpenings` poll; the node accepts up to 1 024.
 const AWAITED_POLL_MAX: usize = 1_024;
+/// Seconds between two `GetServiceProviders` polls.
+const PROVIDERS_POLL_SECS: u64 = 60;
+/// Seconds added to the estimated generation time per sibling rank.
+const SIBLING_MARGIN_SECS: u64 = 15;
+/// Longest wait for a node check before starting a request anyway.
+const REQUEST_CHECK_WAIT_SECS: u64 = 15;
+/// DAA kept between the end of an estimated generation and the answer window end.
+const WINDOW_SAFETY_DAA: u64 = 300;
+
+/// Rank of `own` among the escrow keys of its identity for `request_hash`: the rigs of one
+/// address agree on it without talking to each other.
+fn sibling_rank(request_hash: &[u8; 32], own: &[u8; 32], siblings: &[[u8; 32]]) -> usize {
+    let key = |e: &[u8; 32]| {
+        let mut b = [0u8; 64];
+        b[..32].copy_from_slice(request_hash);
+        b[32..].copy_from_slice(e);
+        *blake2b_simd::blake2b(&b).as_bytes().first_chunk::<32>().unwrap()
+    };
+    let mine = key(own);
+    siblings.iter().filter(|e| *e != own && key(e) < mine).count()
+}
 
 /// Whether the leading `major.minor.patch` of `version` is at least `min`.
 fn version_at_least(version: &str, min: (u32, u32, u32)) -> bool {
@@ -692,6 +713,21 @@ pub struct KeryxdHandler {
     last_awaited_poll: std::time::Instant,
     /// Responses asked about at the last awaited-openings poll.
     awaited_polled: Vec<String>,
+    /// Queued requests asked about at the last awaited-openings poll (stable id, hash).
+    awaited_requests_polled: Vec<(String, [u8; 32])>,
+    /// An awaited-openings poll is unanswered.
+    awaited_poll_pending: bool,
+    /// Poll the node at the next tick (a request was just queued).
+    force_awaited_poll: bool,
+    /// The node checks queued requests against this rig's identity.
+    node_checks_requests: bool,
+    /// Last node check per queued request: still awaited, window end, when.
+    request_checks: std::collections::HashMap<String, (bool, u64, std::time::Instant)>,
+    /// When each request was queued.
+    request_queued_at: std::collections::HashMap<String, std::time::Instant>,
+    /// Escrow keys of this rig's identity per tier, own key included.
+    sibling_escrows: std::collections::HashMap<u32, Vec<[u8; 32]>>,
+    last_providers_poll: std::time::Instant,
     /// Last message received from the node, and last probe sent while it is silent.
     last_message: std::time::Instant,
     last_probe: std::time::Instant,
@@ -773,7 +809,13 @@ impl Client for KeryxdHandler {
                         self.last_strike_poll = std::time::Instant::now();
                         self.client_send(GetServiceStrikesRequestMessage {}).await?;
                     }
-                    if self.node_awaited_openings && self.last_awaited_poll.elapsed().as_secs() >= AWAITED_POLL_SECS {
+                    if self.node_awaited_openings && self.escrow_pubkey.is_some() && self.last_providers_poll.elapsed().as_secs() >= PROVIDERS_POLL_SECS {
+                        self.last_providers_poll = std::time::Instant::now();
+                        self.client_send(GetServiceProvidersRequestMessage { window_daa: 0 }).await?;
+                    }
+                    let poll_due = self.last_awaited_poll.elapsed().as_secs() >= AWAITED_POLL_SECS;
+                    if self.node_awaited_openings && (poll_due || (self.force_awaited_poll && !self.awaited_poll_pending)) {
+                        self.force_awaited_poll = false;
                         self.last_awaited_poll = std::time::Instant::now();
                         self.poll_awaited_openings().await?;
                     }
@@ -918,6 +960,14 @@ impl KeryxdHandler {
             node_awaited_openings: false,
             last_awaited_poll: std::time::Instant::now(),
             awaited_polled: Vec::new(),
+            awaited_requests_polled: Vec::new(),
+            awaited_poll_pending: false,
+            force_awaited_poll: false,
+            node_checks_requests: false,
+            request_checks: std::collections::HashMap::new(),
+            request_queued_at: std::collections::HashMap::new(),
+            sibling_escrows: std::collections::HashMap::new(),
+            last_providers_poll: std::time::Instant::now() - std::time::Duration::from_secs(PROVIDERS_POLL_SECS),
             last_message: std::time::Instant::now(),
             last_probe: std::time::Instant::now(),
             strike_status: None,
@@ -1159,6 +1209,8 @@ impl KeryxdHandler {
                 if !self.ai_seen_prefixes.contains(&stable_id) {
                     info!("Inference: queued AiRequest id={}", stable_id);
                     self.ai_seen_prefixes.insert(stable_id.clone());
+                    self.request_queued_at.insert(stable_id.clone(), std::time::Instant::now());
+                    self.force_awaited_poll = true;
                     self.ai_request_queue.push_back((stable_id.clone(), request_hash, model_id, prompt, prompt_len, max_tokens, private));
                     while self.ai_request_queue.len() > MAX_AI_QUEUE_SIZE {
                         self.ai_request_queue.pop_back();
@@ -1394,6 +1446,68 @@ impl KeryxdHandler {
         })
     }
 
+    /// Keeps, per tier, the escrow keys sharing this rig's identity.
+    fn apply_service_providers(&mut self, resp: &crate::proto::GetServiceProvidersResponseMessage) {
+        let Some(own) = self.escrow_pubkey.as_deref().map(str::to_ascii_lowercase) else { return };
+        let mut siblings: std::collections::HashMap<u32, Vec<[u8; 32]>> = std::collections::HashMap::new();
+        for mine in resp.providers.iter().filter(|p| p.escrow_pubkey.eq_ignore_ascii_case(&own)) {
+            let keys = siblings.entry(mine.tier).or_default();
+            for p in resp.providers.iter().filter(|p| p.tier == mine.tier && p.identity == mine.identity) {
+                if let Some(k) = hash32(&p.escrow_pubkey) {
+                    keys.push(k);
+                }
+            }
+            keys.sort_unstable();
+            keys.dedup();
+        }
+        self.sibling_escrows = siblings;
+    }
+
+    /// Drops the queued requests the node no longer awaits from this rig's identity.
+    fn drop_unawaited_requests(&mut self) {
+        let (checks, queued_at) = (&self.request_checks, &self.request_queued_at);
+        let mut dropped = Vec::new();
+        self.ai_request_queue.retain(|(sid, ..)| {
+            let gone = checks.get(sid).is_some_and(|(awaited, _, at)| !awaited && queued_at.get(sid).is_none_or(|q| at >= q));
+            if gone {
+                dropped.push(sid.clone());
+            }
+            !gone
+        });
+        for sid in dropped {
+            info!("Inference: request id={} no longer awaited from this address — skipped", sid);
+            self.request_checks.remove(&sid);
+            self.request_queued_at.remove(&sid);
+        }
+    }
+
+    /// Whether the queued request at `index` may start now: after a node check when the node
+    /// offers one, and after the wait of this rig's rank among the rigs of its address.
+    fn request_startable(&self, index: usize, now: std::time::Instant) -> bool {
+        if !self.node_checks_requests {
+            return true;
+        }
+        let Some((sid, request_hash, model_id, _, _, max_tokens, _)) = self.ai_request_queue.get(index) else { return false };
+        let queued = self.request_queued_at.get(sid).copied().unwrap_or(now);
+        let gen_daa = speeds::generation_daa(model_id, *max_tokens as u32);
+        let own = self.escrow_pubkey.as_deref().and_then(hash32);
+        let rank = keryx_miner::models::pom_tier_index(model_id, self.last_known_daa)
+            .and_then(|t| self.sibling_escrows.get(&(t as u32)))
+            .zip(own)
+            .map_or(0, |(siblings, own)| sibling_rank(request_hash, &own, siblings));
+        let delay = std::time::Duration::from_secs(rank as u64 * (gen_daa.map_or(60, |d| d / 10) + SIBLING_MARGIN_SECS));
+        let check = self.request_checks.get(sid);
+        let window_end = check.map_or(0, |c| c.1);
+        let deadline_near = window_end > 0 && self.last_known_daa + gen_daa.unwrap_or(600) + WINDOW_SAFETY_DAA >= window_end;
+        let waited = now.saturating_duration_since(queued);
+        if waited < delay && !deadline_near {
+            return false;
+        }
+        deadline_near
+            || check.is_some_and(|(awaited, _, at)| *awaited && *at >= queued + delay)
+            || waited >= delay + std::time::Duration::from_secs(REQUEST_CHECK_WAIT_SECS)
+    }
+
     fn try_start_inference(&mut self) {
         if self.inference_busy() || keryx_miner::llm::probe_in_flight() || self.urgent_replay(self.next_request_work()) {
             return;
@@ -1403,7 +1517,12 @@ impl KeryxdHandler {
                 info!("Inference: request id={} already answered by this miner — skipped", sid);
             }
         }
-        if let Some((stable_id, request_hash, model_id, prompt, prompt_len, max_tokens, private)) = self.ai_request_queue.pop_front() {
+        self.drop_unawaited_requests();
+        let now = std::time::Instant::now();
+        let Some(index) = (0..self.ai_request_queue.len()).find(|&i| self.request_startable(i, now)) else { return };
+        if let Some((stable_id, request_hash, model_id, prompt, prompt_len, max_tokens, private)) = self.ai_request_queue.remove(index) {
+            self.request_queued_at.remove(&stable_id);
+            self.request_checks.remove(&stable_id);
             let (tx_done, rx_done) = oneshot::channel::<(Option<keryx_miner::llm::Generated>, f64)>();
             let traced = self.last_known_daa >= keryx_miner::pom::verifiable_inference_activation_daa();
             let tier = traced.then(|| keryx_miner::models::pom_tier_index(&model_id, self.last_known_daa)).flatten();
@@ -2289,16 +2408,37 @@ impl KeryxdHandler {
             .collect();
         due.sort_unstable();
         let response_txids: Vec<String> = due.into_iter().take(AWAITED_POLL_MAX).map(|(_, t)| t.clone()).collect();
-        self.awaited_polled = response_txids.clone();
-        if !response_txids.is_empty() {
-            self.client_send(GetAwaitedOpeningsRequestMessage { response_txids }).await?;
+        let escrow_pubkey = self.escrow_pubkey.clone().unwrap_or_default();
+        let requests: Vec<(String, [u8; 32])> = if escrow_pubkey.is_empty() {
+            Vec::new()
+        } else {
+            self.ai_request_queue.iter().take(AWAITED_POLL_MAX).map(|(sid, rh, ..)| (sid.clone(), *rh)).collect()
+        };
+        if response_txids.is_empty() && requests.is_empty() {
+            return Ok(());
         }
+        self.awaited_polled = response_txids.clone();
+        let request_hashes = requests.iter().map(|(_, rh)| hex::encode(rh)).collect();
+        self.awaited_requests_polled = requests;
+        self.awaited_poll_pending = true;
+        self.client_send(GetAwaitedOpeningsRequestMessage { response_txids, escrow_pubkey, request_hashes }).await?;
         Ok(())
     }
 
     /// Takes the node's seed and deadline for each opening it awaits: the miner's own draw is
     /// only an estimate of the node's ledger.
     fn apply_awaited_openings(&mut self, resp: &crate::proto::GetAwaitedOpeningsResponseMessage) {
+        self.awaited_poll_pending = false;
+        if resp.requests_checked {
+            self.node_checks_requests = true;
+            let awaited: std::collections::HashMap<String, u64> =
+                resp.awaited_requests.iter().map(|r| (r.request_hash.to_ascii_lowercase(), r.window_end_daa)).collect();
+            let now = std::time::Instant::now();
+            for (sid, rh) in std::mem::take(&mut self.awaited_requests_polled) {
+                let window_end = awaited.get(&hex::encode(rh)).copied();
+                self.request_checks.insert(sid, (window_end.is_some(), window_end.unwrap_or(0), now));
+            }
+        }
         let mut changed: Vec<String> = Vec::new();
         let mut resend: Vec<(String, keryx_miner::trace_store::StoredOpening, u64)> = Vec::new();
         let listed: std::collections::HashSet<&str> = resp.openings.iter().map(|o| o.response_txid.as_str()).collect();
@@ -2908,6 +3048,10 @@ impl KeryxdHandler {
             Payload::GetAwaitedOpeningsResponse(resp) => match resp.error.as_ref() {
                 Some(e) => log::debug!("Trace: awaited openings unavailable: {}", e.message),
                 None => self.apply_awaited_openings(&resp),
+            },
+            Payload::GetServiceProvidersResponse(resp) => match resp.error.as_ref() {
+                Some(e) => log::debug!("Inference: service providers unavailable: {}", e.message),
+                None => self.apply_service_providers(&resp),
             },
             Payload::GetServiceStrikesResponse(resp) => match resp.error.as_ref() {
                 Some(e) => warn!("service-bond status unavailable: {}", e.message),
@@ -3538,6 +3682,21 @@ mod tests {
         assert!(super::version_at_least("1.7.0-PoM", (1, 6, 6)));
         assert!(!super::version_at_least("1.6.5", (1, 6, 6)));
         assert!(!super::version_at_least("", (1, 6, 6)));
+    }
+
+    /// Every rig of an address ranks the same way, and each rank is held once.
+    #[test]
+    fn sibling_ranks_are_a_permutation() {
+        use super::sibling_rank;
+        let keys: Vec<[u8; 32]> = (1u8..=5).map(|i| [i; 32]).collect();
+        for r in 0u8..20 {
+            let rh = [r; 32];
+            let mut ranks: Vec<usize> = keys.iter().map(|k| sibling_rank(&rh, k, &keys)).collect();
+            ranks.sort_unstable();
+            assert_eq!(ranks, vec![0, 1, 2, 3, 4]);
+        }
+        assert_eq!(sibling_rank(&[9; 32], &[1; 32], &[[1; 32]]), 0);
+        assert_eq!(sibling_rank(&[9; 32], &[1; 32], &[]), 0);
     }
 
     /// A burn's request hash attributes the strike: answered here, queued but never answered,
