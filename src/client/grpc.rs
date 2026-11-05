@@ -1558,8 +1558,8 @@ impl KeryxdHandler {
         })
     }
 
-    /// Whether the queued request at `index` may start now: after a node check when the node
-    /// offers one, and after the wait of this rig's rank among the rigs of its address.
+    /// Whether the queued request at `index` may start now: at once for the first rig of its
+    /// address, after the wait of its rank and a node check for the others.
     fn request_startable(&self, index: usize, now: std::time::Instant) -> bool {
         if !self.node_checks_requests {
             return true;
@@ -1571,6 +1571,9 @@ impl KeryxdHandler {
         let delay = std::time::Duration::from_secs(rank as u64 * (gen_daa.map_or(60, |d| d / 10) + SIBLING_MARGIN_SECS));
         if self.request_closed(sid) {
             return false;
+        }
+        if rank == 0 {
+            return true;
         }
         let check = self.request_checks.get(sid);
         let window_end = check.map_or(0, |c| c.1);
