@@ -1533,6 +1533,10 @@ pub fn is_testnet() -> bool {
 pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 /// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
 const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+/// Mainnet H16 gate (not dated yet). MUST equal the node's H16 activations.
+pub const H16_ACTIVATION_DAA: u64 = u64::MAX;
+/// Testnet H16 gate. MUST equal the node's `TESTNET_H16_ACTIVATION_DAA`.
+const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
 /// Picks the gate value for the selected network (`--testnet`).
 #[inline(always)]
@@ -1634,7 +1638,7 @@ pub fn pom_v5_activation_daa() -> u64 {
 
 /// Node `pad_margin_activation`: the context pad uses `POM_V5_PAD_TILES_H16`.
 pub fn pad_margin_activation_daa() -> u64 {
-    u64::MAX
+    gate(H16_ACTIVATION_DAA, TESTNET_H16_ACTIVATION_DAA)
 }
 
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
@@ -2308,6 +2312,20 @@ mod seed_h10_tests {
         st[9] ^= nonce;
         crate::keccak::f1600(&mut st);
         assert_eq!(h10, st[0]);
+    }
+}
+
+#[cfg(test)]
+mod h16_gate_tests {
+    use super::*;
+
+    #[test]
+    fn h16_gates_match_the_node() {
+        assert!(!is_testnet());
+        assert_eq!(pad_margin_activation_daa(), H16_ACTIVATION_DAA);
+        assert_eq!(H16_ACTIVATION_DAA, u64::MAX);
+        assert_eq!(TESTNET_H16_ACTIVATION_DAA, 180_000);
+        assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
     }
 }
 
