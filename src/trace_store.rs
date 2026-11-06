@@ -366,6 +366,11 @@ impl TraceStore {
         let _ = writer().send(Job::Flush(done));
     }
 
+    /// Whether the trace file of `txid` is on disk.
+    pub fn contains(&self, txid: &str) -> bool {
+        self.path(txid).exists()
+    }
+
     /// Queues the removal of a record behind the writes already queued.
     pub fn remove(&self, txid: &str) {
         let _ = writer().send(Job::Remove(self.path(txid)));

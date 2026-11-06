@@ -16,6 +16,8 @@ pub enum ErrorCode {
     LowDifficultyShare = 23,
     Unauthorized = 24,
     NotSubscribed = 25,
+    UnknownResponse = 41,
+    Busy = 46,
 }
 
 impl Display for ErrorCode {
@@ -27,6 +29,8 @@ impl Display for ErrorCode {
             ErrorCode::LowDifficultyShare => write!(f, "LowDifficultyShare"),
             ErrorCode::Unauthorized => write!(f, "Unauthorized"),
             ErrorCode::NotSubscribed => write!(f, "NotSubscribed"),
+            ErrorCode::UnknownResponse => write!(f, "UnknownResponse"),
+            ErrorCode::Busy => write!(f, "Busy"),
         }
     }
 }
@@ -127,8 +131,18 @@ pub(crate) enum StratumCommand {
     MiningDeclareCapabilities(Vec<String>),
     #[serde(rename = "mining.ai_request")]
     MiningAiRequest((String, String, String, String, String, u32, String)),
+    // worker, task_id, request_hash, model, result b64, trace commitment hex ("" if untraced)
     #[serde(rename = "mining.ai_response")]
-    MiningAiResponse((String, String, String, String, String)),
+    MiningAiResponse((String, String, String, String, String, String)),
+    /// An inference command whose params did not parse; answered with an error.
+    #[serde(skip)]
+    MalformedAi,
+    // request_hash, response_txid, seed, deadline_daa, accepted_daa, pieces owed, attention path
+    #[serde(rename = "mining.ai_draw")]
+    MiningAiDraw((String, String, String, u64, u64, u32, Vec<u64>)),
+    // worker, request_hash, response_txid, seed, unsigned opening body b64
+    #[serde(rename = "mining.ai_opening")]
+    MiningAiOpening((String, String, String, String, String)),
     // Phase 2 Inference: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
@@ -166,6 +180,28 @@ pub(crate) struct StratumLine {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) jsonrpc: Option<String>,
     pub(crate) error: Option<StratumError>,
+}
+
+impl StratumLine {
+    /// Success reply to the pool's command `id`.
+    pub(crate) fn ok_reply(id: u32) -> Self {
+        Self {
+            id: Some(id),
+            payload: StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) },
+            jsonrpc: Some("2.0".into()),
+            error: None,
+        }
+    }
+
+    /// Error reply to the pool's command `id`.
+    pub(crate) fn error_reply(id: u32, code: ErrorCode, message: &str) -> Self {
+        Self {
+            id: Some(id),
+            payload: StratumLinePayload::StratumResult { result: StratumResult::Plain(None) },
+            jsonrpc: Some("2.0".into()),
+            error: Some(StratumError(code, message.into(), None)),
+        }
+    }
 }
 
 /// An error occurred while encoding or decoding a line.
@@ -212,20 +248,53 @@ impl Decoder for NewLineJsonCodec {
     type Error = NewLineJsonCodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match self.lines_codec.decode(src) {
-            Ok(Some(s)) => {
-                serde_json::from_str::<StratumLine>(s.as_str()).map_err(|e| (e.to_string(), s).into()).map(Some)
+        loop {
+            match self.lines_codec.decode(src) {
+                Ok(Some(s)) => match parse_line(s)? {
+                    Some(line) => return Ok(Some(line)),
+                    None => continue,
+                },
+                Err(_) => return Err(NewLineJsonCodecError::LineSplitError),
+                _ => return Ok(None),
             }
-            Err(_) => Err(NewLineJsonCodecError::LineSplitError),
-            _ => Ok(None),
         }
     }
 
     fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        match self.lines_codec.decode_eof(buf) {
-            Ok(Some(s)) => serde_json::from_str(s.as_str()).map_err(|e| (e.to_string(), s).into()),
-            Err(_) => Err(NewLineJsonCodecError::LineSplitError),
-            _ => Ok(None),
+        loop {
+            match self.lines_codec.decode_eof(buf) {
+                Ok(Some(s)) => match parse_line(s)? {
+                    Some(line) => return Ok(Some(line)),
+                    None => continue,
+                },
+                Err(_) => return Err(NewLineJsonCodecError::LineSplitError),
+                _ => return Ok(None),
+            }
+        }
+    }
+}
+
+/// Parses one line; a malformed `mining.ai_*` command becomes `MalformedAi`, or is skipped when it
+/// has no id.
+fn parse_line(s: String) -> Result<Option<StratumLine>, NewLineJsonCodecError> {
+    match serde_json::from_str::<StratumLine>(&s) {
+        Ok(line) => Ok(Some(line)),
+        Err(e) => {
+            let value = serde_json::from_str::<Value>(&s).ok();
+            let method = value.as_ref().and_then(|v| v.get("method")).and_then(Value::as_str);
+            match method.filter(|m| m.starts_with("mining.ai_")) {
+                Some(m) => {
+                    log::warn!("Stratum: malformed {} ignored: {}", m, e);
+                    let id = value.as_ref().and_then(|v| v.get("id")).and_then(Value::as_u64).and_then(|i| u32::try_from(i).ok());
+                    Ok(id.map(|id| StratumLine {
+                        id: Some(id),
+                        payload: StratumLinePayload::StratumCommand(StratumCommand::MalformedAi),
+                        jsonrpc: None,
+                        error: None,
+                    }))
+                }
+                None => Err((e.to_string(), s).into()),
+            }
         }
     }
 }
@@ -247,5 +316,34 @@ impl Encoder<StratumLine> for NewLineJsonCodec {
 impl Default for NewLineJsonCodec {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_ai_command_is_skipped() {
+        let mut codec = NewLineJsonCodec::new();
+        let mut buf = BytesMut::from(
+            &b"{\"method\":\"mining.ai_draw\",\"params\":[\"x\"]}\n{\"id\":8,\"result\":true,\"error\":null}\n"[..],
+        );
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().id, Some(8));
+        let mut buf = BytesMut::from(&b"{\"id\":7,\"method\":\"mining.ai_draw\",\"params\":[\"x\"]}\n"[..]);
+        let line = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(line.id, Some(7));
+        assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MalformedAi)));
+        let mut buf = BytesMut::from(&b"{\"id\":9,\"method\":\"mining.notify\",\"params\":[1]}\n"[..]);
+        assert!(codec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn error_reply_is_a_result() {
+        let line = StratumLine::error_reply(5, ErrorCode::Busy, "busy");
+        let json = serde_json::to_value(&line).unwrap();
+        assert_eq!(json["id"], 5);
+        assert!(json["result"].is_null());
+        assert_eq!(json["error"][0], 46);
     }
 }

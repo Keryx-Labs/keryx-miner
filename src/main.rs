@@ -659,6 +659,7 @@ async fn get_client(
             ipfs_url.clone(),
             keepalive_seconds,
             keepalive_timeout_seconds,
+            escrow_state_file,
         )
         .await?)
     } else if keryxd_address.starts_with("grpc://") {
