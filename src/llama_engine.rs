@@ -28,6 +28,8 @@ type GenFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut c_char
 type FreeFn = unsafe extern "C" fn(*mut c_void);
 type CtxAcquireFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type TensorDeviceFn = unsafe extern "C" fn(*mut c_void, usize) -> c_int;
+type CanonBlobFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> usize;
+type WantCanonFn = unsafe extern "C" fn(c_int);
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 type GenTracedFn = unsafe extern "C" fn(
     *mut c_void,
@@ -168,6 +170,7 @@ struct Engine {
     ctx_acquire: CtxAcquireFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
+    canonical_blob: Option<CanonBlobFn>,
     last_error: Option<ErrorFn>,
     gguf: String,
     attempt: u64,
@@ -424,6 +427,11 @@ pub fn probe_device(gpu: usize) -> DeviceProbe {
 /// different model already on `gpu` is freed first: the caller must have drained that GPU's
 /// walk. Returns the attempt id of the resident load, or why it failed.
 pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
+    ensure_loaded_with(gguf, gpu, true)
+}
+
+/// [`ensure_loaded`]; `canonical` false keeps llama's own weight layout for a fresh load.
+pub fn ensure_loaded_with(gguf: &str, gpu: usize, canonical: bool) -> Result<u64, LoadError> {
     let attempt = next_attempt();
     let failed = |stage: &'static str, detail: String, cuda_touched: bool| {
         LoadError::new(attempt, stage, detail, cuda_touched)
@@ -488,6 +496,10 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
         };
         let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
         let tensor_device = sym::<TensorDeviceFn>(lib, "keryx_llama_tensor_device");
+        let canonical_blob = sym::<CanonBlobFn>(lib, "keryx_llama_canonical_blob");
+        if let Some(want) = sym::<WantCanonFn>(lib, "keryx_llama_want_canonical") {
+            want(canonical as c_int);
+        }
         let cg = match CString::new(gguf) {
             Ok(c) => c,
             Err(_) => return Err(failed("path", "GGUF path contains a NUL byte".to_string(), false)),
@@ -557,6 +569,7 @@ pub fn ensure_loaded(gguf: &str, gpu: usize) -> Result<u64, LoadError> {
             ctx_acquire,
             free,
             tensor_device,
+            canonical_blob,
             last_error,
             gguf: gguf.to_string(),
             attempt,
@@ -609,6 +622,18 @@ pub fn tensors(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
         out.push((nm, data as u64, nbytes, is_dev != 0));
     }
     Some(out)
+}
+
+/// Device base and byte length of the canonical weight stream of the engine on `gpu`, when its
+/// weights were loaded in the walk's canonical layout.
+pub fn canonical_blob_for(gpu: usize) -> Option<(u64, u64)> {
+    let slot = slot(gpu);
+    let g = slot.lock().ok()?;
+    let e = g.as_ref()?;
+    let f = e.canonical_blob?;
+    let mut base: *mut c_void = std::ptr::null_mut();
+    let n = unsafe { f(e.model, &mut base) };
+    (n > 0 && !base.is_null()).then_some((base as u64, n as u64))
 }
 
 /// First resident tensor whose bytes do NOT live on `expected_gpu`, as (name, owning ordinal).

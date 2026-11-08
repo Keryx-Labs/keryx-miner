@@ -899,7 +899,179 @@ extern "C" __global__ void pom_mine_v4_ncf(
     }
 }
 
+// PoM v5 lock-step walk over a contiguous weight blob (sm_80+), ported from keryx-miner-supr
+// (MIT/Apache-2.0, ocminer / Suprnova). Several nonces share a warp; tile t is read at
+// wbase + t KiB, pad tile p at pbase + p KiB. Requires the H10 seed array and a context pad.
+#define V5LS_L 4
+__device__ __forceinline__ unsigned int v5ls_sw(unsigned int r, unsigned int w) { return r * 8u + (w ^ (((r >> 2) & 1u) * 4u)); }
+
+__device__ __forceinline__ void v5ls_load(unsigned int* tile_dst, const unsigned char* tile_src, unsigned int x) {
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+        const unsigned int p = x + 32u * k, col = p >> 1, half = p & 1u;
+        const unsigned int word = col * 8u + ((half ^ ((col >> 2) & 1u)) * 4u);
+        const unsigned long long sd = __cvta_generic_to_shared(tile_dst + word);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "l"(sd), "l"(tile_src + p * 16u));
+    }
+}
+
+__device__ __forceinline__ void v5ls_step(unsigned int* s_state, const unsigned int* s_tile, unsigned int step, unsigned int x) {
+    const unsigned int gid = x >> 2, tig = x & 3u;
+    unsigned int a[2][4];
+    #pragma unroll
+    for (unsigned int g = 0; g < 2; g++) {
+        const unsigned int r0 = g * 16u + gid, r1 = r0 + 8u;
+        a[g][0] = s_state[v5ls_sw(r0, tig)];      a[g][1] = s_state[v5ls_sw(r1, tig)];
+        a[g][2] = s_state[v5ls_sw(r0, tig + 4u)]; a[g][3] = s_state[v5ls_sw(r1, tig + 4u)];
+    }
+    __syncwarp();
+    unsigned short* s16 = (unsigned short*)s_state;
+    const unsigned int step_base = step * 0x9E3779B9u;
+    #pragma unroll
+    for (unsigned int cg = 0; cg < 4; cg++) {
+        const unsigned int col = cg * 8u + gid;
+        const unsigned int b0 = s_tile[v5ls_sw(col, tig)];
+        const unsigned int b1 = s_tile[v5ls_sw(col, tig + 4u)];
+        #pragma unroll
+        for (unsigned int g = 0; g < 2; g++) {
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                : "r"(a[g][0]), "r"(a[g][1]), "r"(a[g][2]), "r"(a[g][3]), "r"(b0), "r"(b1));
+            const unsigned int r0 = g * 16u + gid, r1 = r0 + 8u;
+            const unsigned int j0 = cg * 8u + tig * 2u;
+            const unsigned int tw0 = step_base + r0 * 0xC2B2AE35u + j0 * 0x85EBCA6Bu;
+            const unsigned int tw1 = step_base + r1 * 0xC2B2AE35u + j0 * 0x85EBCA6Bu;
+            s16[2u * v5ls_sw(r0, j0 >> 2) + (tig & 1u)] = (unsigned short)(v3_rho8(c0, tw0) | (v3_rho8(c1, tw0 + 0x85EBCA6Bu) << 8));
+            s16[2u * v5ls_sw(r1, j0 >> 2) + (tig & 1u)] = (unsigned short)(v3_rho8(c2, tw1) | (v3_rho8(c3, tw1 + 0x85EBCA6Bu) << 8));
+        }
+    }
+    __syncwarp();
+}
+
+template <int NL>
+__device__ __forceinline__ void v5ls_walk(
+    const unsigned char* wbase, unsigned long long n_tiles, const unsigned char* pbase, unsigned long long n_pad,
+    unsigned int K, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long n_nonces, unsigned long long inv_n, unsigned long long inv_p, unsigned int k_pad,
+    const unsigned long long* h10_seeds, unsigned long long* winner) {
+    extern __shared__ unsigned int s_ls[];
+    constexpr unsigned int GS = 32u / NL;
+    const unsigned int x = threadIdx.x & 31u, g = x / GS;
+    const unsigned long long i0 = (unsigned long long)blockIdx.x * NL;
+    if (i0 >= n_nonces) return;
+    const unsigned long long my_i = min(i0 + g, n_nonces - 1);
+    const unsigned long long my_seed = h10_seeds[my_i];
+    unsigned long long my_off = v4_barrett_mod(mix64(my_seed ^ V4_OFFSET_FIRST_SALT), n_tiles, inv_n);
+    #pragma unroll
+    for (int l = 0; l < NL; l++) {
+        const unsigned long long off = __shfl_sync(0xffffffffu, my_off, l * GS);
+        v5ls_load(s_ls + l * 768u + 512u, wbase + off * 1024ULL, x);       // tile 1 -> buffer 1
+    }
+    asm volatile("cp.async.commit_group;");
+    #pragma unroll
+    for (int l = 0; l < NL; l++) {
+        unsigned int* st = s_ls + l * 768u;
+        const unsigned long long sd = __shfl_sync(0xffffffffu, my_seed, l * GS);
+        unsigned long long h = mix64(sd ^ (V4_S0_ROW_SALT + (unsigned long long)x));
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) { h = mix64(h); st[v5ls_sw(x, k4)] = (unsigned int)h; }
+    }
+    __syncwarp();
+    for (unsigned int step = 1; step <= K; step++) {
+        asm volatile("cp.async.wait_group 0;");
+        __syncwarp();
+        const unsigned int cb = (step & 1u) * 256u;
+        if (step < K) {
+            // S_{step-1} state folds of all four nonces (row x on lane x, warp-reduced).
+            unsigned long long hs_mine = 0;
+            const unsigned int f0 = v5ls_sw(x, 0);
+            #pragma unroll
+            for (int l = 0; l < NL; l++) {
+                const unsigned int* st = s_ls + l * 768u;
+                const unsigned long long hs = v5_state_fold_sm80(st[f0], st[f0 + 1u], x);
+                if (g == (unsigned)l) hs_mine = hs;
+            }
+            const unsigned int* cur = s_ls + g * 768u + 256u + cb;   // column 0 is never swizzled
+            unsigned long long sf = 0;
+            #pragma unroll
+            for (int wd = 0; wd < 8; wd++) sf = mix64(sf ^ (unsigned long long)cur[wd]);
+            const unsigned long long raw = mix64(my_seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf ^ hs_mine);
+            const bool pad = v5_is_pad_step_fast(step + 1u, K, k_pad);
+            my_off = pad ? n_tiles + v4_barrett_mod(raw, n_pad, inv_p) : v4_barrett_mod(raw, n_tiles, inv_n);
+            #pragma unroll
+            for (int l = 0; l < NL; l++) {
+                const unsigned long long off = __shfl_sync(0xffffffffu, my_off, l * GS);
+                const unsigned char* src = off < n_tiles ? wbase + off * 1024ULL : pbase + (off - n_tiles) * 1024ULL;
+                v5ls_load(s_ls + l * 768u + 256u + (cb ^ 256u), src, x);
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+        #pragma unroll
+        for (int l = 0; l < NL; l++) v5ls_step(s_ls + l * 768u, s_ls + l * 768u + 256u + cb, step, x);
+    }
+    asm volatile("cp.async.wait_group 0;");
+    __syncwarp();
+    #pragma unroll
+    for (int l = 0; l < NL; l++) {
+        unsigned int* st = s_ls + l * 768u;
+        unsigned int row4[V4_D4];
+        #pragma unroll
+        for (int k4 = 0; k4 < V4_D4; k4++) row4[k4] = st[v5ls_sw(x, k4)];
+        unsigned int* s_tile = st + 256u;               // both tile buffers are free now
+        b3_hash_row32(row4, s_tile + x * 8);
+        __syncwarp();
+        unsigned int* src = s_tile; unsigned int* dst = s_tile + V4_D * 8;
+        for (unsigned int n = V4_D; n > 1; n >>= 1) {
+            if (x < n / 2) b3_hash_pair(src + x * 16, dst + x * 8);
+            __syncwarp();
+            unsigned int* tmp = src; src = dst; dst = tmp;
+        }
+        if (x == 0 && i0 + l < n_nonces) {
+            const unsigned long long fin = (unsigned long long)src[0] | ((unsigned long long)src[1] << 32);
+            unsigned long long pv[4];
+            pom_pow_fold(fin, p0, p1, p2, p3, pv);
+            if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, i0 + l);
+        }
+        __syncwarp();
+    }
+}
+
+// Four nonces per 32-thread block (best measured on RTX 5090).
+extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep_seeded(
+    const unsigned char* wbase, unsigned long long n_tiles, const unsigned char* pbase, unsigned long long n_pad,
+    unsigned int K, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long n_nonces, unsigned long long inv_n, unsigned long long inv_p, unsigned int k_pad,
+    const unsigned long long* h10_seeds, unsigned long long* winner) {
+    v5ls_walk<4>(wbase, n_tiles, pbase, n_pad, K, p0, p1, p2, p3, t0, t1, t2, t3, n_nonces, inv_n, inv_p, k_pad, h10_seeds, winner);
+}
+// Two nonces per 32-thread block (best measured on RTX 3070 / RTX 5080); 6 KiB shared memory.
+extern "C" __global__ void __launch_bounds__(32) pom_mine_v5_lockstep2_seeded(
+    const unsigned char* wbase, unsigned long long n_tiles, const unsigned char* pbase, unsigned long long n_pad,
+    unsigned int K, unsigned long long p0, unsigned long long p1, unsigned long long p2, unsigned long long p3,
+    unsigned long long t0, unsigned long long t1, unsigned long long t2, unsigned long long t3,
+    unsigned long long n_nonces, unsigned long long inv_n, unsigned long long inv_p, unsigned int k_pad,
+    const unsigned long long* h10_seeds, unsigned long long* winner) {
+    v5ls_walk<2>(wbase, n_tiles, pbase, n_pad, K, p0, p1, p2, p3, t0, t1, t2, t3, n_nonces, inv_n, inv_p, k_pad, h10_seeds, winner);
+}
+
 #else   // __CUDA_ARCH__ < 800: stub so the module still loads on old archs.
+extern "C" __global__ void pom_mine_v5_lockstep_seeded(
+    const unsigned char*, unsigned long long, const unsigned char*, unsigned long long,
+    unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned int,
+    const unsigned long long*, unsigned long long*) {}
+extern "C" __global__ void pom_mine_v5_lockstep2_seeded(
+    const unsigned char*, unsigned long long, const unsigned char*, unsigned long long,
+    unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, unsigned int,
+    const unsigned long long*, unsigned long long*) {}
 extern "C" __global__ void pom_mine_v4_ncf(
     const unsigned long long*, const unsigned long long*, unsigned int,
     unsigned long long, unsigned int,

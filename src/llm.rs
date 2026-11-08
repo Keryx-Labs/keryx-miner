@@ -949,7 +949,8 @@ fn resident_engine(spec: &ModelSpec) -> Option<(String, u32)> {
         // device's miner to make room and load the model. The possession walk rebuilds at the
         // next `ensure_installed`.
         log::info!("LlmEngine: loading the llama engine for '{}' (gpu{})", spec.name, dev_id);
-        if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id) {
+        let mined_here = crate::pom_gpu::mining_model_id(dev_id) == Some(spec.model_id);
+        if let Err(e) = crate::pom_gpu::load_llama_for_inference(&gguf, dev_id, mined_here) {
             log::error!("LlmEngine: cannot load '{}' — {}; response dropped", spec.name, e);
             mark_model_unavailable(&spec.model_id, if e.is_oom() { "llama_load_oom" } else { "llama_load_failed" });
             return None;

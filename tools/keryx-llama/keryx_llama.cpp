@@ -343,7 +343,25 @@ static void keryx_trace_close(KeryxTrace* tr) {
     delete tr;
 }
 
+// Patch 0007: canonical weight layout switch and the canonical buffer the last load produced.
+#ifdef __APPLE__
+static thread_local bool keryx_llama_canonical_weights = false;
+static thread_local void * keryx_llama_canonical_base = nullptr;
+static thread_local size_t keryx_llama_canonical_bytes = 0;
+#else
+extern "C" { extern thread_local bool keryx_llama_canonical_weights; extern thread_local void * keryx_llama_canonical_base; extern thread_local size_t keryx_llama_canonical_bytes; }
+#endif
+
+static thread_local bool keryx_want_canonical = true;
+
+// Whether the next load on this thread may use the canonical layout (on by default).
+extern "C" KERYX_EXPORT void keryx_llama_want_canonical(int on) {
+    keryx_want_canonical = on != 0;
+}
+
 struct KeryxLlama {
+    void*          canon_base  = nullptr;
+    size_t         canon_bytes = 0;
     llama_model*   model = nullptr;
     llama_context* ctx   = nullptr;
     llama_sampler* smpl  = nullptr;
@@ -460,7 +478,17 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
         overrides[0].val_i64 = 64;
         mp.kv_overrides = overrides;
     }
+    {
+        // On by default; KERYX_CANONICAL_WEIGHTS=0 keeps llama's own layout.
+        const char* cw = std::getenv("KERYX_CANONICAL_WEIGHTS");
+        keryx_llama_canonical_weights = keryx_want_canonical && !(cw && cw[0] == '0');
+        keryx_llama_canonical_base = nullptr;
+        keryx_llama_canonical_bytes = 0;
+    }
     llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    void* const canon_base = keryx_llama_canonical_base;
+    const size_t canon_bytes = keryx_llama_canonical_bytes;
+    keryx_llama_canonical_weights = false;
     if (!model) {
         keryx_set_error("model", std::string("llama_model_load_from_file failed for ") + gguf_path);
         return nullptr;
@@ -532,6 +560,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace; h->gpu = gpu;
+    h->canon_base = canon_base; h->canon_bytes = canon_bytes;
     h->cparams = cp; h->kv = kv;
     h->ctx_info = keryx_ctx_info(h);
     if (trace) keryx_trace_meta(gpu, gguf_path, h->ctx_info, trace);
@@ -541,6 +570,13 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
+// Device address and byte length of the model's canonical weight stream, 0 when the weights were
+// allocated the ordinary way. Holes (tensors kept elsewhere) are zero until filled.
+KERYX_EXPORT size_t keryx_llama_canonical_blob(KeryxLlama* h, void** base) {
+    if (!h || !base) return 0;
+    *base = h->canon_base;
+    return h->canon_base ? h->canon_bytes : 0;
+}
 
 // Replaces the context with one of `n_ctx` tokens (the load size when <= 0); the model and its
 // weights stay. Returns the context size, or -1 with no context left.

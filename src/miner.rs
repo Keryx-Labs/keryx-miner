@@ -406,6 +406,7 @@ impl MinerManager {
                 // Sized at the first v4 launch, once the model is resident and free VRAM is real.
                 let mut pom_v4_batch = std::env::var("KERYX_POM_V4_BATCH").ok()
                     .and_then(|s| s.trim().parse::<u64>().ok()).filter(|&b| b > 0);
+                let pom_v4_batch_env = pom_v4_batch.is_some();
                 let pom_proof_overlap = std::env::var("KERYX_POM_PROOF_OVERLAP").ok().as_deref() != Some("0");
                 let inflight_proofs = Arc::new(AtomicUsize::new(0));
                 type TaskState = (usize, [u8; 32], Box<pow::State>, Arc<keryx_miner::block_task::DeviceTask>);
@@ -536,7 +537,12 @@ impl MinerManager {
                         if v4 && pom_v4_batch.is_none() {
                             pom_v4_batch = keryx_miner::pom_gpu::v4_batch_for_device(worker_device_id);
                         }
-                        let batch = if v4 { pom_v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED) } else if v3 { POM_V3_BATCH } else { POM_BATCH };
+                        let v4_batch = if v4 && !pom_v4_batch_env {
+                            keryx_miner::pom_gpu::lockstep_batch_for(worker_device_id).or(pom_v4_batch)
+                        } else {
+                            pom_v4_batch
+                        };
+                        let batch = if v4 { v4_batch.unwrap_or(POM_V4_BATCH_UNSIZED) } else if v3 { POM_V3_BATCH } else { POM_BATCH };
                         let v5 = v4 && daa >= keryx_miner::pom::pom_v5_activation_daa();
                         let pad = if v5 { pom_v5_pad(worker_device_id, daa) } else { None };
                         if v5 && pad.is_none() {
