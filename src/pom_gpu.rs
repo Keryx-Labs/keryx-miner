@@ -1521,16 +1521,61 @@ pub fn mining_device_count() -> usize {
     mining_tiers().lock().map(|g| g.len()).unwrap_or(0)
 }
 
-/// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
+/// Set once a sticky CUDA fault leaves a model this rig mines with no live device; only a new
+/// process recovers.
 static FATAL_GPU_FAULT: AtomicBool = AtomicBool::new(false);
+/// Devices abandoned after a sticky CUDA fault in their context, one bit per device.
+static DEAD_DEVICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn fatal_gpu_fault() -> bool {
     FATAL_GPU_FAULT.load(Ordering::Acquire)
 }
 
+/// Removes `device_id` from the tier assignment; true when another device that `can_mine` the
+/// model still mines it.
+fn drop_and_still_covered(tiers: &mut HashMap<u32, MiningTier>, device_id: u32, can_mine: impl Fn(u32, &[u8; 32]) -> bool) -> bool {
+    let model = tiers.remove(&device_id).map(|(id, _)| id);
+    model.is_some_and(|m| tiers.iter().any(|(d, (id, _))| *id == m && can_mine(*d, &m)))
+}
+
+/// Whether `device_id` was abandoned after a sticky CUDA fault.
+pub fn device_dead(device_id: u32) -> bool {
+    device_id < 64 && DEAD_DEVICES.load(Ordering::Acquire) & (1 << device_id) != 0
+}
+
+/// A sticky fault poisons the CUDA context of `device_id` only: the device is abandoned and the
+/// others keep mining, unless no other live device mines its model, which needs a restart.
 fn mark_fatal_gpu_fault(device_id: u32, message: &str) {
-    if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
-        error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. Full process restart required.", device_id, message);
+    if device_id >= 64 {
+        if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
+            error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. Full process restart required.", device_id, message);
+        }
+        return;
+    }
+    if DEAD_DEVICES.fetch_or(1 << device_id, Ordering::AcqRel) & (1 << device_id) != 0 {
+        return;
+    }
+    // The device leaves every assignment, so no era crossing, pin or routing ever reaches it.
+    if let Ok(mut g) = device_tiers().lock() {
+        g.remove(&device_id);
+    }
+    {
+        let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+        if serving.is_some_and(|(_, d)| d == device_id) {
+            *serving = None;
+        }
+    }
+    let covered = mining_tiers()
+        .lock()
+        .map(|mut g| drop_and_still_covered(&mut g, device_id, |d, m| !device_dead(d) && !is_oom_banlisted(d, m)))
+        .unwrap_or(false);
+    if covered {
+        error!(
+            "PoM[gpu{}]: sticky CUDA fault: {}. This GPU is abandoned until the next restart; the other GPUs keep mining.",
+            device_id, message
+        );
+    } else if !FATAL_GPU_FAULT.swap(true, Ordering::AcqRel) {
+        error!("PoM[gpu{}]: fatal sticky CUDA fault: {}. No other GPU mines its model — full process restart required.", device_id, message);
     }
 }
 
@@ -1574,6 +1619,9 @@ pub fn release_pad(device_id: u32) {
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<u64> {
+    if device_dead(device_id) {
+        return None;
+    }
     if inference_paused_for(device_id) {
         log_throttled(device_id, "paused", || info!("PoM[gpu{}]: mining paused while an inference runs", device_id));
         return None;
@@ -1629,7 +1677,9 @@ fn mining_tiers() -> &'static Mutex<HashMap<u32, MiningTier>> {
 /// Record a GPU's mining tier so its miner can be rebuilt after an inference swapped the model away.
 pub fn set_mining_tier(device_id: u32, model_id: [u8; 32], gguf_path: String) {
     if let Ok(mut g) = mining_tiers().lock() {
-        g.insert(device_id, (model_id, gguf_path));
+        if !device_dead(device_id) {
+            g.insert(device_id, (model_id, gguf_path));
+        }
     }
 }
 
@@ -1664,6 +1714,9 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     };
     let mut swapped = false;
     for &(dev, tier) in &devices {
+        if device_dead(dev) {
+            continue;
+        }
         // No model for this tier in the era being entered: nothing to swap to, the device simply
         // has nothing valid to mine until its own gate.
         let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
@@ -1837,6 +1890,9 @@ pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crat
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
+    if device_dead(device_id) {
+        return false;
+    }
     if inference_paused_for(device_id) {
         return false;
     }
@@ -2185,6 +2241,23 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_faulted_device_is_dropped_and_restart_needed_only_when_its_model_is_lost() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut tiers: HashMap<u32, MiningTier> = HashMap::new();
+        tiers.insert(0, (a, "a".into()));
+        tiers.insert(1, (a, "a".into()));
+        tiers.insert(2, (b, "b".into()));
+        let any = |_: u32, _: &[u8; 32]| true;
+        let mut banned = tiers.clone();
+        assert!(!super::drop_and_still_covered(&mut banned, 0, |d, _| d != 1));
+        assert!(super::drop_and_still_covered(&mut tiers, 0, any));
+        assert!(!tiers.contains_key(&0));
+        assert!(!super::drop_and_still_covered(&mut tiers, 2, any));
+        assert!(!super::drop_and_still_covered(&mut tiers, 1, any));
+        assert!(!super::drop_and_still_covered(&mut tiers, 9, any));
+    }
+
     #[test]
     fn inference_pause_is_per_device_or_whole_rig() {
         let m = [7u8; 32];

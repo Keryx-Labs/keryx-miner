@@ -936,6 +936,10 @@ fn resident_engine(spec: &ModelSpec) -> Option<(String, u32)> {
     // GPU pauses PoW and the walk shares the resident weights (zero-dup). Falls back to device 0
     // (single-GPU / unassigned model).
     let dev_id = crate::pom_gpu::pinned_device(&spec.model_id).or_else(|| crate::pom_gpu::device_for_model(&spec.model_id)).unwrap_or(0);
+    if crate::pom_gpu::device_dead(dev_id) {
+        log::warn!("LlmEngine: '{}' would run on gpu{}, abandoned after a CUDA fault — response dropped", spec.name, dev_id);
+        return None;
+    }
     let gguf = gguf_path_for(spec).to_string_lossy().into_owned();
 
     if !crate::llama_engine::active_for(&gguf, dev_id as usize) {
