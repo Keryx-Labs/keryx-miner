@@ -1290,13 +1290,11 @@ impl KeryxdHandler {
             return None;
         };
         match keryx_inference::open_request(req, secret) {
-            Ok(opened) => match decode_private_prompt(&opened.prompt) {
-                Some(prompt) => Some((prompt, opened.prompt.len() as u32, Some(PrivateRequest::Opened(opened.response_key.clone())))),
-                None => {
-                    warn!("Inference: private AiRequest opened but its compressed prompt is invalid — answering with an error body");
-                    Some((String::new(), 0, Some(PrivateRequest::Unreadable)))
-                }
-            },
+            Ok(opened) => Some((
+                decode_private_prompt(&opened.prompt),
+                opened.prompt.len() as u32,
+                Some(PrivateRequest::Opened(opened.response_key.clone())),
+            )),
             Err(keryx_inference::PrivateError::NotARecipient) => {
                 log::debug!("Inference: skipping private AiRequest — this escrow key is not a recipient");
                 None
@@ -3650,19 +3648,19 @@ static LAST_KNOWN_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 const COMPRESSED_PROMPT_MAGIC: [u8; 4] = [0x00, b'K', b'Z', 0x01];
 const MAX_DECOMPRESSED_PROMPT_LEN: u64 = 1 << 20;
 
-/// Plaintext of an opened private prompt: inflated when it carries the compression magic.
-/// `None` for a compressed prompt that is corrupt or inflates past the cap.
-fn decode_private_prompt(bytes: &[u8]) -> Option<String> {
+/// Plaintext of an opened private prompt: inflated when it carries the compression magic, cut at
+/// the cap. A stream that fails to inflate yields its partial output, else the raw bytes.
+pub(crate) fn decode_private_prompt(bytes: &[u8]) -> String {
     use std::io::Read;
     let Some(deflated) = bytes.strip_prefix(&COMPRESSED_PROMPT_MAGIC[..]) else {
-        return Some(String::from_utf8_lossy(bytes).into_owned());
+        return String::from_utf8_lossy(bytes).into_owned();
     };
     let mut inflated = Vec::new();
-    flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN + 1).read_to_end(&mut inflated).ok()?;
-    if inflated.len() as u64 > MAX_DECOMPRESSED_PROMPT_LEN {
-        return None;
+    let read = flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN).read_to_end(&mut inflated);
+    if read.is_err() && inflated.is_empty() {
+        return String::from_utf8_lossy(deflated).into_owned();
     }
-    Some(String::from_utf8_lossy(&inflated).into_owned())
+    String::from_utf8_lossy(&inflated).into_owned()
 }
 
 /// Generation and replay speeds measured on this rig, by model, for the life of the process.
@@ -3928,17 +3926,22 @@ mod tests {
             out
         };
 
-        assert_eq!(decode_private_prompt("Bonjour, ça va ?".as_bytes()).as_deref(), Some("Bonjour, ça va ?"));
+        assert_eq!(decode_private_prompt("Bonjour, ça va ?".as_bytes()), "Bonjour, ça va ?");
         let text = "Entrée 41 — le code est ORCHIDÉE-7319. ".repeat(500);
         let packed = deflate(text.as_bytes());
         assert!(packed.len() < text.len() / 10);
-        assert_eq!(decode_private_prompt(&packed).as_deref(), Some(text.as_str()));
+        assert_eq!(decode_private_prompt(&packed), text);
 
         let mut corrupt = COMPRESSED_PROMPT_MAGIC.to_vec();
         corrupt.extend([0xFF; 32]);
-        assert_eq!(decode_private_prompt(&corrupt), None);
+        assert_eq!(decode_private_prompt(&corrupt), "\u{FFFD}".repeat(32));
+        let ascii: String = (0..4000).map(|i| char::from(b'a' + (i * 7 % 26) as u8)).collect();
+        let mut truncated = deflate(ascii.as_bytes());
+        truncated.truncate(truncated.len() / 2);
+        let partial = decode_private_prompt(&truncated);
+        assert!(!partial.is_empty() && ascii.starts_with(&partial));
         let bomb = deflate(&vec![b'a'; MAX_DECOMPRESSED_PROMPT_LEN as usize + 1]);
-        assert_eq!(decode_private_prompt(&bomb), None);
+        assert_eq!(decode_private_prompt(&bomb), "a".repeat(MAX_DECOMPRESSED_PROMPT_LEN as usize));
     }
 
     /// Round-trip against a live node. Ignored by default — run with

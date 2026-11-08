@@ -821,7 +821,7 @@ impl StratumHandler {
                 .filter(|_| hex::decode_to_slice(&request.request_hash, &mut request_hash).is_ok())
             {
                 Some(tier) => {
-                    let prompt_len = request.prompt.len().min(u32::MAX as usize) as u32;
+                    let prompt_len = request.prompt_len;
                     let Some(generated) = keryx_miner::llm::load_and_run_traced_inference(
                         &request.model_id,
                         &request.prompt,

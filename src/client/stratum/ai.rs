@@ -14,6 +14,8 @@ pub(super) struct AiRequest {
     pub model_hex: String,
     pub model_id: [u8; 32],
     pub prompt: String,
+    /// Byte length of the prompt as the pool sent it.
+    pub prompt_len: u32,
     pub max_tokens: usize,
     /// Id of the pool's `mining.ai_request`, for an error reply.
     pub reply_id: Option<u32>,
@@ -34,13 +36,15 @@ impl AiRequest {
         if prompt_b64.len() > MAX_PAYLOAD_BYTES.div_ceil(3) * 4 {
             return Err("AI prompt is too large".into());
         }
-        let prompt = String::from_utf8(BASE64.decode(prompt_b64)?)?;
-        if prompt.len() > MAX_PAYLOAD_BYTES || prompt.contains('\0') {
+        let raw = BASE64.decode(prompt_b64)?;
+        if raw.len() > MAX_PAYLOAD_BYTES {
             return Err("Invalid AI prompt".into());
         }
+        let prompt = crate::client::grpc::decode_private_prompt(&raw);
+        let prompt_len = raw.len().min(keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN) as u32;
         let mut model_id = [0; 32];
         hex::decode_to_slice(&model_hex, &mut model_id)?;
-        Ok(Self { task_id, request_hash, model_hex, model_id, prompt, max_tokens: max_tokens as usize, reply_id: None })
+        Ok(Self { task_id, request_hash, model_hex, model_id, prompt, prompt_len, max_tokens: max_tokens as usize, reply_id: None })
     }
 
     /// Busy reply refusing this request, when the pool gave it an id.
@@ -89,5 +93,48 @@ impl Drop for InferenceGuard {
         self.miner.store(false, Ordering::SeqCst);
         self.busy.store(false, Ordering::SeqCst);
         super::audit::shared().wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields(prompt: &[u8]) -> (String, String, String, String, String, u32, String) {
+        let h = "ab".repeat(32);
+        (h.clone(), h.clone(), h.clone(), h, BASE64.encode(prompt), 64, "0".into())
+    }
+
+    #[test]
+    fn parse_keeps_odd_prompts_and_the_sent_length() {
+        let r = AiRequest::parse(fields(b"Say hel\0lo")).unwrap();
+        assert_eq!((r.prompt.as_str(), r.prompt_len), ("Say hel\0lo", 10));
+        let r = AiRequest::parse(fields(&[b'h', b'i', 0xFF])).unwrap();
+        assert_eq!((r.prompt.as_str(), r.prompt_len), ("hi\u{FFFD}", 3));
+    }
+
+    #[test]
+    fn parse_inflates_a_compressed_prompt_but_keeps_its_sent_length() {
+        use std::io::Write;
+        let text = "abc ".repeat(2_000);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(text.as_bytes()).unwrap();
+        let mut packed = vec![0x00, b'K', b'Z', 0x01];
+        packed.extend(enc.finish().unwrap());
+        let r = AiRequest::parse(fields(&packed)).unwrap();
+        assert_eq!(r.prompt, text);
+        assert_eq!(r.prompt_len as usize, packed.len());
+    }
+
+    #[test]
+    fn parse_caps_the_sent_length_and_rejects_bad_input() {
+        let big = vec![b'a'; keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN * 2];
+        let r = AiRequest::parse(fields(&big)).unwrap();
+        assert_eq!(r.prompt_len as usize, keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
+        assert_eq!(r.prompt.len(), big.len());
+        assert!(AiRequest::parse(fields(&vec![b'a'; MAX_PAYLOAD_BYTES + 1])).is_err());
+        let mut f = fields(b"hi");
+        f.4 = "not base64!".into();
+        assert!(AiRequest::parse(f).is_err());
     }
 }
