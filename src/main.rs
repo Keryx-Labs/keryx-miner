@@ -747,6 +747,39 @@ fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::E
     Ok((escrow::EscrowState { entries, journal_seq: 0 }, total_sompi))
 }
 
+const PUBLIC_API_INFO: &str = "https://keryx-labs.com/api/v1/info";
+const PUBLIC_API_DAA_MARGIN: u64 = 864_000;
+
+/// Mainnet virtual DAA as reported by the public API.
+fn public_api_daa() -> Option<u64> {
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+    let body = agent.get(PUBLIC_API_INFO).call().ok()?.into_string().ok()?;
+    parse_public_info(&body)
+}
+
+/// Extracts the DAA from a `/api/v1/info` body; `None` unless it describes mainnet.
+fn parse_public_info(body: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("network")?.as_str()? != "keryx-mainnet" {
+        return None;
+    }
+    v.get("last_daa_score")?.as_u64().filter(|daa| *daa > 0)
+}
+
+#[cfg(test)]
+mod public_api_tests {
+    use super::parse_public_info;
+
+    #[test]
+    fn reads_mainnet_daa_only() {
+        assert_eq!(parse_public_info(r#"{"network":"keryx-mainnet","last_daa_score":148034866}"#), Some(148034866));
+        assert_eq!(parse_public_info(r#"{"network":"keryx-testnet","last_daa_score":5}"#), None);
+        assert_eq!(parse_public_info(r#"{"network":"keryx-mainnet","last_daa_score":0}"#), None);
+        assert_eq!(parse_public_info(r#"{"last_daa_score":148034866}"#), None);
+        assert_eq!(parse_public_info("<html>"), None);
+    }
+}
+
 async fn client_main(
     opt: &Opt,
     plugin_manager: &PluginManager,
@@ -1094,6 +1127,22 @@ async fn run() -> Result<(), Error> {
                 None
             }
         }
+    } else if opt.keryxd_address.starts_with("stratum+tcp://") && !keryx_miner::pom::is_testnet() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(public_api_daa),
+        )
+        .await
+        {
+            Ok(Ok(Some(daa))) => {
+                info!("Public API at DAA {}.", daa);
+                Some(daa.saturating_sub(PUBLIC_API_DAA_MARGIN))
+            }
+            _ => {
+                warn!("Could not read the chain DAA from the public API — prefetching every scheduled era.");
+                None
+            }
+        }
     } else {
         None
     };
@@ -1253,7 +1302,7 @@ async fn run() -> Result<(), Error> {
     keryx_miner::llm::init_supported(specs);
     log::debug!("Inference active — {} model(s) staged.", specs.len());
     // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
-    // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
+    // fail-open: an unknown height just falls back to prefetching every era.
     // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a
     // mid-run download stall. Block until every such model is downloaded before mining: never start
     // hashing while a model is still downloading.

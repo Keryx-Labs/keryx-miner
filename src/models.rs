@@ -265,7 +265,7 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
 ///
 /// `chain_daa` is the network's virtual DAA score. An era spans `[gate, next_gate)`, and nothing
 /// below the tip can still be mined, so an era the chain has already left needs no model. `None`
-/// (node unreachable, or pool mining) keeps every scheduled era.
+/// (height unknown) keeps every scheduled era.
 pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
     let mut gates = vec![crate::pom::pom_v3_activation_daa(), staging_daa()];
     if crate::pom::private_inference_activation_daa() != u64::MAX {
