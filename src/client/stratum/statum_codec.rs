@@ -5,7 +5,7 @@ use serde_json::Value;
 use serde_repr::*;
 use std::fmt::{Display, Formatter};
 use std::{fmt, io};
-use tokio_util::codec::{Decoder, Encoder, LinesCodec};
+use tokio_util::codec::{Decoder, Encoder, LinesCodec, LinesCodecError};
 
 #[derive(Serialize_repr, Deserialize_repr, Debug, Clone)]
 #[repr(u8)]
@@ -263,8 +263,10 @@ impl Decoder for NewLineJsonCodec {
                     Some(line) => return Ok(Some(line)),
                     None => continue,
                 },
+                // The codec skips the rest of an oversized line; the connection stays up.
+                Err(LinesCodecError::MaxLineLengthExceeded) => log::warn!("Stratum: oversized line from the pool skipped"),
                 Err(_) => return Err(NewLineJsonCodecError::LineSplitError),
-                _ => return Ok(None),
+                Ok(None) => return Ok(None),
             }
         }
     }
@@ -276,8 +278,9 @@ impl Decoder for NewLineJsonCodec {
                     Some(line) => return Ok(Some(line)),
                     None => continue,
                 },
+                Err(LinesCodecError::MaxLineLengthExceeded) => log::warn!("Stratum: oversized line from the pool skipped"),
                 Err(_) => return Err(NewLineJsonCodecError::LineSplitError),
-                _ => return Ok(None),
+                Ok(None) => return Ok(None),
             }
         }
     }
@@ -365,6 +368,13 @@ mod tests {
         assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MalformedAi)));
         let mut buf = BytesMut::from(&b"{\"id\":9,\"method\":\"mining.notify\",\"params\":[1]}\n"[..]);
         assert!(codec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn an_oversized_line_is_skipped() {
+        let mut codec = NewLineJsonCodec { lines_codec: LinesCodec::new_with_max_length(64) };
+        let mut buf = BytesMut::from(format!("{}\n{{\"id\":4,\"result\":true,\"error\":null}}\n", "x".repeat(200)).as_bytes());
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().id, Some(4));
     }
 
     #[test]

@@ -434,7 +434,7 @@ impl MinerManager {
                                     None => None,
                                 };
                             }
-                            std::thread::yield_now();
+                            std::thread::sleep(std::time::Duration::from_millis(25));
                             continue;
                         }
                         let daa = state.as_ref().unwrap().daa_score;

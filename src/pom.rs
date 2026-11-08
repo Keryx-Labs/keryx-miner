@@ -870,6 +870,26 @@ struct StoredLevel {
     count: u64,  // node count at this level
 }
 
+/// Exclusive lock on a model's tree build, held through an OS file lock that a dying process
+/// releases on its own.
+struct TreeLock(#[allow(dead_code)] File);
+
+impl TreeLock {
+    /// Takes the lock at `path`, waiting while another process holds it.
+    fn acquire(path: &std::path::Path) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                log::info!("PoM: another process is building this weight index — waiting");
+                file.lock()?;
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        Ok(Self(file))
+    }
+}
+
 /// Sidecar written next to `pom-tree.bin`: identifies the model the tree was built from and
 /// authenticates the tree bytes, so a stale or truncated cache is rebuilt instead of trusted.
 #[derive(Debug, Deserialize, Serialize)]
@@ -1130,6 +1150,9 @@ impl WeightIndex {
             }
         }
 
+        // One process builds a model's tree at a time; the others wait and reuse it.
+        let _lock = TreeLock::acquire(&dir.join("pom-tree.bin.lock"))?;
+
         // Reuse existing checkpoint tree if valid.
         if tree_path.exists() {
             match open_existing_tree(&tree_path, path, model_id) {
@@ -1155,14 +1178,18 @@ impl WeightIndex {
         let k = CHECKPOINT_INTERVAL;
         let batch_size = 1u64 << k; // 64 for K=6
 
+        // Built aside and renamed once complete, so an interrupted build leaves no partial tree.
+        let building_path = dir.join("pom-tree.bin.building");
         let mut writer = BufWriter::new(
             OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&tree_path)?,
+                .open(&building_path)?,
         );
+        let total_bytes: u64 = names.iter().map(|n| meta.tensors[n].nbytes).sum::<u64>().max(1);
+        let (mut hashed_bytes, mut last_log) = (0u64, std::time::Instant::now());
 
         let mut table: Vec<(u64, u64)> = Vec::with_capacity(names.len());
         let mut n_chunks: u64 = 0;
@@ -1195,6 +1222,11 @@ impl WeightIndex {
                     }
                 }
                 done += take;
+                hashed_bytes += take * 32;
+                if last_log.elapsed() >= std::time::Duration::from_secs(10) {
+                    last_log = std::time::Instant::now();
+                    log::info!("PoM: building the weight index — {}%", hashed_bytes * 100 / total_bytes);
+                }
             }
         }
         // Final partial batch: fold_levels carries the partial tail the full K levels (duplicate-last).
@@ -1211,7 +1243,8 @@ impl WeightIndex {
         // Build higher checkpoint levels (2K, 3K, ..., root) from level-K nodes.
         writer.flush()?;
         drop(writer);
-        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&tree_path, n_chunks)?;
+        let (checkpoints, total_levels, r_t) = finalize_checkpoint_upper(&building_path, n_chunks)?;
+        std::fs::rename(&building_path, &tree_path)?;
 
         let tree_size = std::fs::metadata(&tree_path)?.len();
         let tree_sha256 = crate::integrity::sha256_file(&tree_path, |_, _| {})?;
@@ -1788,6 +1821,17 @@ pub(crate) fn index_from_ram(data: Vec<u8>) -> WeightIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_lock_is_exclusive_and_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pom-tree.bin.lock");
+        let lock = TreeLock::acquire(&path).unwrap();
+        let other = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        assert!(matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(lock);
+        assert!(other.try_lock().is_ok());
+    }
 
     fn synth_chunk(off: u64) -> [u64; CHUNK_WORDS] {
         let mut c = [0u64; CHUNK_WORDS];

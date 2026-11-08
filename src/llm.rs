@@ -1287,13 +1287,27 @@ fn head_tail_cut(prompt: &str, cap: usize) -> Option<String> {
     Some(if cap < SEP.len() { String::new() } else { format!("{}{SEP}{}", &prompt[..head], &prompt[tail..]) })
 }
 
+thread_local! {
+    static LAST_FAILURE_TRANSIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the last inference that produced nothing on this thread failed for a passing reason
+/// (no engine resident or available yet), so a later try may succeed.
+pub fn last_failure_transient() -> bool {
+    LAST_FAILURE_TRANSIENT.with(|c| c.get())
+}
+
 fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: Option<Traced>) -> Option<Generated> {
+    LAST_FAILURE_TRANSIENT.with(|c| c.set(false));
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
     let prompt = engine_prompt(prompt);
 
-    let (gguf, dev_id) = resident_engine(spec)?;
+    let Some((gguf, dev_id)) = resident_engine(spec) else {
+        LAST_FAILURE_TRANSIENT.with(|c| c.set(true));
+        return None;
+    };
     let traced = traced.filter(|t| arm_trace(spec, &gguf, dev_id, t.tier, t.chain, t.attention));
     let plan = match traced.as_ref() {
         Some(t) => {
@@ -1384,6 +1398,9 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
             None
         }
         Err(e) => {
+            if matches!(e, crate::llama_engine::GenError::Unavailable) {
+                LAST_FAILURE_TRANSIENT.with(|c| c.set(true));
+            }
             log::warn!("LlmEngine '{}': llama generate failed ({:?}) — response dropped", spec.name, e);
             None
         }

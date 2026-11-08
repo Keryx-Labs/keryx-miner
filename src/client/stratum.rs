@@ -43,6 +43,8 @@ const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
 /// Reply ids tracked at once for AI responses and openings.
 const MAX_PENDING_IDS: usize = 64;
+/// Longest a pool may go without sending a job before the connection is renewed.
+const JOB_TIMEOUT: Duration = Duration::from_secs(300);
 /// Longest interval between two model declarations.
 const REDECLARE_EVERY: Duration = Duration::from_secs(90);
 /// AI requests a worker holds while its GPU is busy.
@@ -178,6 +180,10 @@ pub struct StratumHandler {
     declared: Option<(Vec<String>, Instant)>,
     /// Ids of the `mining.hello` and `mining.telemetry` lines; their replies are never acted upon.
     info_ids: HashSet<u32>,
+    /// When the last job arrived (or the connection opened).
+    last_job: Instant,
+    /// Password sent with `mining.authorize`.
+    pool_password: String,
 }
 
 #[async_trait(?Send)]
@@ -205,7 +211,7 @@ impl Client for StratumHandler {
                 id,
                 payload: StratumLinePayload::StratumCommand(StratumCommand::Authorize((
                     pay_address.clone(),
-                    "x".into(),
+                    self.pool_password.clone(),
                 ))),
                 jsonrpc: None,
                 error: None,
@@ -282,10 +288,12 @@ impl StratumHandler {
         keepalive_seconds: u64,
         keepalive_timeout_seconds: u64,
         escrow_state_file: String,
+        pool_password: String,
     ) -> Result<Box<Self>, Error> {
         audit::init_store(&escrow_state_file).await;
         info!("Connecting to {}", address);
         let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await??;
+        socket.set_nodelay(true)?;
 
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);
@@ -346,6 +354,8 @@ impl StratumHandler {
             last_daa: 0,
             declared: None,
             info_ids: HashSet::new(),
+            last_job: Instant::now(),
+            pool_password,
         }))
     }
 
@@ -550,6 +560,7 @@ impl StratumHandler {
                         StratumCommand::MiningSetDifficulty((ref difficulty,)) => self.set_difficulty(difficulty),
                         StratumCommand::MiningNotify(notify) => {
                             let job = MiningJob::try_from(notify)?;
+                            self.last_job = Instant::now();
                             audit::observe_daa(job.daa_score);
                             self.last_daa = job.daa_score;
                             self.declare_models().await?;
@@ -747,6 +758,9 @@ impl StratumHandler {
 
     async fn maintain_keepalive(&mut self) -> Result<(), Error> {
         let now = Instant::now();
+        if now.duration_since(self.last_job) >= JOB_TIMEOUT {
+            return Err(format!("No job from the pool for {} s", JOB_TIMEOUT.as_secs()).into());
+        }
         self.ai_response.lock().await.retain(|_, (since, _)| now.duration_since(*since) < self.keepalive_timeout);
         if let Some((_, since)) = self.keepalive_pending {
             if now.duration_since(since) >= self.keepalive_timeout {
