@@ -515,6 +515,8 @@ const UNCHECKED_POLL_SECS: u64 = 2;
 const REQUEST_CHECK_WAIT_SECS: u64 = 15;
 /// DAA kept between the end of an estimated generation and the answer window end.
 const WINDOW_SAFETY_DAA: u64 = 600;
+/// Estimated works a later-ranked rig keeps before the window end when it takes over.
+const SIBLING_SLACK_WORKS: u64 = 2;
 
 /// Rank of `own` among the escrow keys of its identity for `request_hash`: the rigs of one
 /// address agree on it without talking to each other.
@@ -1634,7 +1636,7 @@ impl KeryxdHandler {
         let check = self.request_checks.get(sid);
         let window_end = check.map_or(0, |c| c.1);
         let work = self.ai_request_queue.get(index).map_or(0, |q| self.request_work_daa(q));
-        let deadline_near = window_end > 0 && self.last_known_daa + work + WINDOW_SAFETY_DAA >= window_end;
+        let deadline_near = window_end > 0 && self.last_known_daa + SIBLING_SLACK_WORKS * work + WINDOW_SAFETY_DAA >= window_end;
         let waited = now.saturating_duration_since(queued);
         if waited < delay && !deadline_near {
             return false;
@@ -3154,7 +3156,7 @@ impl KeryxdHandler {
                     burn.consecutive_misses, request, txid
                 ),
                 StrikeCause::DroppedHere => warn!(
-                    "service-bond: miss #{} on request {}… — THIS rig queued the request and never answered it; this rig caused the strike",
+                    "service-bond: miss #{} on request {}… — THIS rig queued the request but did not answer it (it may have been waiting behind another rig of the same payout address)",
                     burn.consecutive_misses, request
                 ),
                 StrikeCause::ModelUnreadyHere => warn!(
