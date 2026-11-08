@@ -773,6 +773,29 @@ extern "C" __global__ void pom_mine_v4_tc(
 
 #if __CUDA_ARCH__ >= 800
 
+// Tile loads cached in L1 on sm_80/86 (measured faster there); other archs keep .cg.
+__device__ __forceinline__ void v5_cp_async16(void* dst, const void* src) {
+#if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 860
+    unsigned long long sm = __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "l"(sm), "l"(src));
+#else
+    v4_cp_async16(dst, src);
+#endif
+}
+
+// Same value as v5_state_fold: the XOR over the warp, by two 32-bit warp reductions.
+__device__ __forceinline__ unsigned long long v5_state_fold_sm80(unsigned int w0, unsigned int w1, unsigned int x) {
+    const unsigned long long h = mix64((((unsigned long long)w1 << 32) | w0) ^ (unsigned long long)x);
+    const unsigned int lo = __reduce_xor_sync(0xFFFFFFFFu, (unsigned int)h);
+    const unsigned int hi = __reduce_xor_sync(0xFFFFFFFFu, (unsigned int)(h >> 32));
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+// Same value as v5_is_pad_step, with the division by K = 256 as a shift.
+__device__ __forceinline__ bool v5_is_pad_step_fast(unsigned int step, unsigned int K, unsigned int k_pad) {
+    return K == 256u ? ((step * k_pad) >> 8) != (((step - 1u) * k_pad) >> 8) : v5_is_pad_step(step, K, k_pad);
+}
+
 __device__ __forceinline__ unsigned long long v4_barrett_mod(
     unsigned long long x, unsigned long long n, unsigned long long inv_n) {
     unsigned long long q = __umul64hi(x, inv_n);
@@ -824,7 +847,7 @@ extern "C" __global__ void pom_mine_v4_ncf(
     {
         const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
         ulonglong2* dst = (ulonglong2*)(s_tiles + 256u + x * 8);   // tile 1 -> buffer (1&1)=1
-        v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
+        v5_cp_async16(dst, q); v5_cp_async16(dst + 1, q + 1);
         asm volatile("cp.async.commit_group;");
     }
     { unsigned long long h = mix64(seed ^ (V4_S0_ROW_SALT + (unsigned long long)x));
@@ -840,14 +863,14 @@ extern "C" __global__ void pom_mine_v4_ncf(
             unsigned long long sf = 0;
             #pragma unroll
             for (int wd = 0; wd < 8; wd++) sf = mix64(sf ^ (unsigned long long)cur[wd]);
-            const unsigned long long hs = k_pad != 0u ? v5_state_fold(s_state[x * 8u], s_state[x * 8u + 1u], x) : 0ULL;
+            const unsigned long long hs = k_pad != 0u ? v5_state_fold_sm80(s_state[x * 8u], s_state[x * 8u + 1u], x) : 0ULL;
             const unsigned long long raw = mix64(seed ^ (unsigned long long)(step + 1) * V4_OFFSET_STEP_SALT ^ sf ^ hs);
-            off = v5_is_pad_step(step + 1u, K, k_pad)
+            off = v5_is_pad_step_fast(step + 1u, K, k_pad)
                 ? n_tiles + v4_barrett_mod(raw, n_pad, inv_p)
                 : v4_barrett_mod(raw, n_tiles, inv_n);
             const ulonglong2* q = v4_chunk_addr_lut(bases, prefix, T, lut, lut_sh, off, x);
             ulonglong2* dst = (ulonglong2*)(s_tiles + ((step + 1u) & 1u) * 256u + x * 8);
-            v4_cp_async16(dst, q); v4_cp_async16(dst + 1, q + 1);
+            v5_cp_async16(dst, q); v5_cp_async16(dst + 1, q + 1);
         }
         asm volatile("cp.async.commit_group;");
         v4_imma_step(s_state, cur, step, x);

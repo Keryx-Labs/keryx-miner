@@ -447,7 +447,7 @@ impl LoadedPomKernel {
                 true
             }
             Ok(false) => {
-                warn!("PoM v4: chaseless solver probe found nothing for an always-win target on GPU {} (stub image?) — falling back to chase+tc / plain kernel", ord);
+                warn!("PoM v4: chaseless solver failed its startup check on GPU {} — falling back to chase+tc / plain kernel", ord);
                 false
             }
             Err(e) => {
@@ -501,7 +501,80 @@ impl LoadedPomKernel {
         unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
         stream.synchronize()?;
         let w = stream.clone_dtoh(&winner)?[0];
-        Ok(w != u64::MAX)
+        if w == u64::MAX {
+            return Ok(false);
+        }
+        self.v4_ncf_agrees(stream, bases_dev, prefix_dev, t_count, n_tiles, n_pad, k_pad, p_words, s_words, timestamp)
+    }
+
+    /// Runs the chaseless solver and the reference kernel over the same nonces with a loose
+    /// target; true when both find the same lowest winner.
+    #[allow(clippy::too_many_arguments)]
+    fn v4_ncf_agrees(&self, stream: &Arc<CudaStream>, bases_dev: &CudaSlice<u64>, prefix_dev: &CudaSlice<u64>, t_count: u32, n_tiles: u64, n_pad: u64, k_pad: u32, p_words: &[u64; 4], s_words: &[u64; 4], timestamp: u64) -> Result<bool> {
+        let Some(reference) = self.function_v4 else { return Ok(true) };
+        let walk = self.function_v4_ncf.ok_or_else(|| anyhow!("PoM GPU: no pom_mine_v4_ncf entry"))?;
+        let (start, batch) = (0x5EED_0000_0000u64, 4096u64);
+        let t = [u64::MAX, u64::MAX, u64::MAX, u64::MAX >> 4];
+        let k = crate::pom_v4::POM_V4_K as u32;
+        let seed_h10: u32 = 0;
+        let seeds = stream.clone_htod(&[0u64; 25])?;
+        let ncf_winner = stream.clone_htod(&[u64::MAX])?;
+        let ref_winner = stream.clone_htod(&[u64::MAX])?;
+        let (lut, lut_sh) = v4_ncf_lut(stream, prefix_dev, t_count, n_tiles + n_pad)?;
+        let inv_n = u64::MAX / n_tiles;
+        let inv_p = u64::MAX.checked_div(n_pad).unwrap_or(0);
+        let (bases_ptr, _bg) = bases_dev.device_ptr(stream);
+        let (prefix_ptr, _pg) = prefix_dev.device_ptr(stream);
+        let (lut_ptr, _lg) = lut.device_ptr(stream);
+        let (seeds_ptr, _sg) = seeds.device_ptr(stream);
+        let (ncf_ptr, _ng) = ncf_winner.device_ptr(stream);
+        let (ref_ptr, _rg) = ref_winner.device_ptr(stream);
+        let cfg = LaunchConfig {
+            grid_dim: (batch.div_ceil(V4_NCF_WARPS) as u32, 1, 1),
+            block_dim: ((V4_NCF_WARPS * 32) as u32, 1, 1),
+            shared_mem_bytes: (V4_NCF_WARPS as u32) * POM_V4_NCF_SHARED_PER_WARP,
+        };
+        let mut params: [*mut c_void; 29] = [
+            (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void),
+            (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void),
+            (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void),
+            (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void),
+            (&lut_ptr as *const _ as *mut c_void), (&lut_sh as *const _ as *mut c_void),
+            (&inv_n as *const _ as *mut c_void),
+            (&ncf_ptr as *const _ as *mut c_void),
+            (&seeds_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+            (&n_pad as *const _ as *mut c_void), (&inv_p as *const _ as *mut c_void), (&k_pad as *const _ as *mut c_void),
+        ];
+        unsafe { result::launch_kernel(walk, cfg.grid_dim, cfg.block_dim, cfg.shared_mem_bytes, stream.cu_stream(), &mut params) }?;
+        let ref_cfg = LaunchConfig { grid_dim: (batch as u32, 1, 1), block_dim: (crate::pom_v4::POM_V4_D as u32, 1, 1), shared_mem_bytes: POM_V4_SHARED_BYTES };
+        let mut ref_params: [*mut c_void; 25] = [
+            (&bases_ptr as *const _ as *mut c_void), (&prefix_ptr as *const _ as *mut c_void),
+            (&t_count as *const _ as *mut c_void), (&n_tiles as *const _ as *mut c_void), (&k as *const _ as *mut c_void),
+            (&p_words[0] as *const _ as *mut c_void), (&p_words[1] as *const _ as *mut c_void), (&p_words[2] as *const _ as *mut c_void), (&p_words[3] as *const _ as *mut c_void),
+            (&s_words[0] as *const _ as *mut c_void), (&s_words[1] as *const _ as *mut c_void), (&s_words[2] as *const _ as *mut c_void), (&s_words[3] as *const _ as *mut c_void),
+            (&timestamp as *const _ as *mut c_void),
+            (&t[0] as *const _ as *mut c_void), (&t[1] as *const _ as *mut c_void), (&t[2] as *const _ as *mut c_void), (&t[3] as *const _ as *mut c_void),
+            (&start as *const _ as *mut c_void), (&batch as *const _ as *mut c_void), (&ref_ptr as *const _ as *mut c_void),
+            (&seeds_ptr as *const _ as *mut c_void), (&seed_h10 as *const _ as *mut c_void),
+            (&n_pad as *const _ as *mut c_void), (&k_pad as *const _ as *mut c_void),
+        ];
+        unsafe { result::launch_kernel(reference, ref_cfg.grid_dim, ref_cfg.block_dim, ref_cfg.shared_mem_bytes, stream.cu_stream(), &mut ref_params) }?;
+        stream.synchronize()?;
+        let (a, b) = (stream.clone_dtoh(&ncf_winner)?[0], stream.clone_dtoh(&ref_winner)?[0]);
+        let ord = stream.context().ordinal();
+        if a != u64::MAX && a == b {
+            info!("PoM: chaseless solver matches the reference kernel on GPU {} (lowest winner {} of {})", ord, a, batch);
+            Ok(true)
+        } else {
+            warn!("PoM: chaseless solver disagrees with the reference kernel on GPU {} ({:?} vs {:?})", ord, (a != u64::MAX).then_some(a), (b != u64::MAX).then_some(b));
+            Ok(false)
+        }
     }
 
     /// v4 (re-walk) grind: one block of 32 threads per nonce over `[start, start + batch)`.

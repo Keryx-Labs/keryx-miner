@@ -35,6 +35,7 @@ Toolkit choice is not interchangeable — see the warnings on each build step be
   -gencode arch=compute_89,code=sm_89 \
   -gencode arch=compute_90,code=sm_90 \
   -gencode arch=compute_100,code=sm_100 \
+  -gencode arch=compute_103,code=sm_103 \
   -gencode arch=compute_120,code=sm_120 \
   -gencode arch=compute_89,code=compute_89 \
   cuda/pom_mine.cu \
@@ -101,7 +102,7 @@ PYEOF
 
 Expected:
 
-- nextgen — `PTX sm_89 ISA 8.8` plus SASS `sm_89`, `sm_90`, `sm_100`, `sm_120`
+- nextgen — `PTX sm_89 ISA 8.8` plus SASS `sm_89`, `sm_90`, `sm_100`, `sm_103`, `sm_120`
 - legacy — SASS `sm_61`, `sm_70`, `sm_75`, `sm_80`, `sm_86`, `PTX sm_89 ISA 8.2`, SASS `sm_89`, `sm_90`
 
 If nextgen reports ISA 8.2 or has no `sm_120`, it was built with the wrong toolkit: redo step 1.
