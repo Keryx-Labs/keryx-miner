@@ -13,12 +13,12 @@ mod audit;
 mod protocol;
 mod statum_codec;
 
-use ai::{AiRequest, InferenceGuard};
+use ai::{AiOpening, AiRequest, InferenceGuard};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use protocol::{difficulty_to_target, effective_target, nonce_range, MiningJob};
 
-use crate::client::stratum::statum_codec::{ErrorCode, MiningSubmit, NewLineJsonCodecError, StratumLine};
+use crate::client::stratum::statum_codec::{AiRequestParams, ErrorCode, MiningSubmit, NewLineJsonCodecError, StratumLine};
 use crate::client::stratum::statum_codec::{
     MiningSubscribe, SetExtranonce, StratumCommand, StratumError, StratumLinePayload, StratumResult,
 };
@@ -41,6 +41,10 @@ use tokio_stream::wrappers::ReceiverStream;
 const KERYX_STRATUM_DAA_CAPABILITY: &str = "keryx-stratum-v3";
 const LOG_RATE: Duration = Duration::from_secs(30);
 const CHALLENGE_MAX_TOKENS: usize = 128;
+/// Reply ids tracked at once for AI responses and openings.
+const MAX_PENDING_IDS: usize = 64;
+/// Longest interval between two model declarations.
+const REDECLARE_EVERY: Duration = Duration::from_secs(90);
 /// AI requests a worker holds while its GPU is busy.
 const MAX_QUEUED_REQUESTS: usize = 64;
 /// DAA after which a queued AI request is dropped.
@@ -140,8 +144,8 @@ pub struct StratumHandler {
     last_stratum_id: Arc<AtomicU32>,
 
     shares_stats: Arc<ShareStats>,
-    /// The AI response awaiting the pool's ack: its id, when it was sent, and its trace key.
-    ai_response: Arc<Mutex<Option<(u32, Instant, Option<String>)>>>,
+    /// AI responses awaiting the pool's ack, by id: when each was sent and its trace key.
+    ai_response: Arc<Mutex<HashMap<u32, (Instant, Option<String>)>>>,
     shares_pending: PendingShares,
     keepalive_interval: Duration,
     keepalive_timeout: Duration,
@@ -170,6 +174,10 @@ pub struct StratumHandler {
     openings_pending: Arc<Mutex<HashSet<u32>>>,
     /// DAA score of the last pool job.
     last_daa: u64,
+    /// Models last declared to the pool, and when.
+    declared: Option<(Vec<String>, Instant)>,
+    /// Ids of the `mining.hello` and `mining.telemetry` lines; their replies are never acted upon.
+    info_ids: HashSet<u32>,
 }
 
 #[async_trait(?Send)]
@@ -204,20 +212,33 @@ impl Client for StratumHandler {
             })
             .await?;
 
-        // Declare loaded LLM models so the bridge can challenge with the right model.
-        let model_ids: Vec<String> =
-            keryx_miner::llm::loaded_model_ids().into_iter().map(hex::encode).collect();
-        if !model_ids.is_empty() {
-            info!("Inference: declaring {} model(s) to pool bridge", model_ids.len());
-            self.send_channel
-                .send(StratumLine {
-                    id: None,
-                    payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(model_ids)),
-                    jsonrpc: Some("2.0".into()),
-                    error: None,
-                })
-                .await?;
-        }
+        self.declared = None;
+        self.declare_models().await?;
+        let ready = traceable_model();
+        let model = match ready {
+            Some(id) => serde_json::json!({
+                "loaded": true,
+                "tier": keryx_miner::models::pom_tier_index(&id, u64::MAX),
+                "model_id": hex::encode(id),
+            }),
+            None => serde_json::json!({ "loaded": false }),
+        };
+        let hello = serde_json::json!({
+            "v": 1,
+            "miner": { "name": env!("CARGO_PKG_NAME"), "version": env!("CARGO_PKG_VERSION"), "build": "cuda" },
+            "trace": u8::from(ready.is_some()),
+            "model": model,
+        });
+        let hello_id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        note_pending(&mut self.info_ids, hello_id);
+        self.send_channel
+            .send(StratumLine {
+                id: Some(hello_id),
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningHello(vec![hello])),
+                jsonrpc: None,
+                error: None,
+            })
+            .await?;
         Ok(())
     }
 
@@ -305,7 +326,7 @@ impl StratumHandler {
             extranonce: None,
             last_stratum_id,
             shares_stats: share_state,
-            ai_response: Arc::new(Mutex::new(None)),
+            ai_response: Arc::new(Mutex::new(HashMap::new())),
             shares_pending,
             keepalive_interval: Duration::from_secs(keepalive_seconds.max(1)),
             keepalive_timeout: Duration::from_secs(keepalive_timeout_seconds.max(1)),
@@ -323,6 +344,8 @@ impl StratumHandler {
             pending_challenge: None,
             openings_pending,
             last_daa: 0,
+            declared: None,
+            info_ids: HashSet::new(),
         }))
     }
 
@@ -443,12 +466,11 @@ impl StratumHandler {
                 return Ok(());
             }
         }
-        let acked = {
-            let mut pending = self.ai_response.lock().await;
-            let acked = result_id.is_some() && pending.as_ref().map(|(id, _, _)| Some(*id)) == Some(result_id);
-            if acked { pending.take() } else { None }
+        let acked = match result_id {
+            Some(id) => self.ai_response.lock().await.remove(&id),
+            None => None,
         };
-        if let Some((_, _, traced)) = acked {
+        if let Some((_, traced)) = acked {
             match (&msg.payload, &msg.error) {
                 (StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) }, None) => {
                     info!("AI response accepted")
@@ -463,12 +485,21 @@ impl StratumHandler {
             self.pump(miner).await;
             return Ok(());
         }
+        if result_id.is_some_and(|id| self.info_ids.remove(&id)) {
+            debug!("Stratum: pool reply to hello/telemetry ignored: {:?}", msg.error);
+            return Ok(());
+        }
         if result_id.is_some() && self.keepalive_pending.map(|(id, _)| Some(id)) == Some(result_id) {
+            // Any answer proves the connection alive, a refusal of the method included.
             self.keepalive_pending = None;
-            return match (&msg.payload, &msg.error) {
-                (StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) }, None) => Ok(()),
-                _ => Err("Stratum keepalive rejected".into()),
-            };
+            return Ok(());
+        }
+        if msg.id.is_none() && matches!(msg.payload, StratumLinePayload::StratumResult { .. }) {
+            match &msg.error {
+                None => debug!("Stratum: id-less result ignored"),
+                Some(e) => warn!("Stratum: id-less error from the pool ignored: {:?}", e),
+            }
+            return Ok(());
         }
         match msg.clone() {
             StratumLine { id, payload, error: None, .. } => {
@@ -499,7 +530,16 @@ impl StratumHandler {
                                 }
                                 Ok(())*/
                             }
-                            _ => Err(format!("Inconsistent stratum message: {:?}", msg).into()),
+                            _ => {
+                                let id = id.expect("We checked id is not none");
+                                if let Some(jobid) = self.shares_pending.lock().await.remove(&id) {
+                                    self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
+                                    warn!("Share rejected by pool (Job id: {:?})", jobid);
+                                } else {
+                                    debug!("Stratum: negative result for request {} ignored", id);
+                                }
+                                Ok(())
+                            }
                         }
                     }
                     StratumLinePayload::StratumCommand(command) => match command {
@@ -512,6 +552,7 @@ impl StratumHandler {
                             let job = MiningJob::try_from(notify)?;
                             audit::observe_daa(job.daa_score);
                             self.last_daa = job.daa_score;
+                            self.declare_models().await?;
                             self.pump(miner).await;
                             if keryx_miner::llm::loaded_model_ids().is_empty() {
                                 return miner.process_block(None).await;
@@ -580,9 +621,37 @@ impl StratumHandler {
                             }
                             Ok(())
                         }
-                        StratumCommand::MiningAiDraw(fields) => {
-                            self.handle_ai_draw(id, fields).await;
+                        StratumCommand::MiningInferenceRequest(request) => {
+                            let req_id = request.get("reqId").cloned().unwrap_or_else(|| serde_json::json!(""));
+                            let reply = serde_json::json!({ "reqId": req_id, "ok": false, "error": "busy" });
+                            let _ = self
+                                .send_channel
+                                .send(StratumLine {
+                                    id: None,
+                                    payload: StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceResult(reply)),
+                                    jsonrpc: Some("2.0".into()),
+                                    error: None,
+                                })
+                                .await;
+                            Ok(())
+                        }
+                        StratumCommand::MiningAiOpening(params) => {
+                            self.handle_ai_opening(id, params).await;
                             self.pump(miner).await;
+                            Ok(())
+                        }
+                        StratumCommand::Subscribe(_)
+                        | StratumCommand::Authorize(_)
+                        | StratumCommand::MiningKeepalive(_)
+                        | StratumCommand::MiningSubmit(_)
+                        | StratumCommand::MiningDeclareCapabilities(_)
+                        | StratumCommand::MiningAiResponse(_)
+                        | StratumCommand::MiningAiOpeningResult(_)
+                        | StratumCommand::MiningHello(_)
+                        | StratumCommand::MiningTelemetry(_)
+                        | StratumCommand::MiningInferenceResult(_)
+                        | StratumCommand::MiningChallengeResponse(_) => {
+                            debug!("Stratum: worker-side command echoed by the pool ignored");
                             Ok(())
                         }
                         _ => Err(format!("Unexpected stratum message: {:?}", msg).into()),
@@ -597,10 +666,14 @@ impl StratumHandler {
                 ..
             } => {
                 let Some(jobid) = self.shares_pending.lock().await.remove(&id) else {
-                    return Err(format!("Stratum request {} rejected: {}", id, error).into());
+                    if matches!(code, ErrorCode::Unauthorized | ErrorCode::NotSubscribed) {
+                        return Err(format!("Stratum request {} rejected: {}", id, error).into());
+                    }
+                    warn!("Stratum: error for request {} ignored: {}", id, error);
+                    return Ok(());
                 };
                 match code {
-                    ErrorCode::Unknown | ErrorCode::UnknownResponse | ErrorCode::Busy => {
+                    ErrorCode::Unknown | ErrorCode::Busy => {
                         // A rejected share/block is logged, never fatal.
                         self.shares_stats.low_diff.fetch_add(1, Ordering::SeqCst);
                         warn!("Share rejected by pool (Job id: {:?}): {}", jobid, error);
@@ -635,17 +708,46 @@ impl StratumHandler {
         }
     }
 
+    /// Declares the loaded models when they changed, when none were declared on this connection,
+    /// or every `REDECLARE_EVERY`; an empty list clears what the pool holds for this worker.
+    async fn declare_models(&mut self) -> Result<(), Error> {
+        let mut ids: Vec<String> = keryx_miner::llm::loaded_model_ids().into_iter().map(hex::encode).collect();
+        ids.sort();
+        let changed = self.declared.as_ref().is_none_or(|(prev, _)| *prev != ids);
+        if !changed && self.declared.as_ref().is_some_and(|(_, at)| at.elapsed() < REDECLARE_EVERY) {
+            return Ok(());
+        }
+        if changed {
+            info!("Inference: declaring {} model(s) to the pool", ids.len());
+        }
+        self.send_channel
+            .send(StratumLine {
+                id: None,
+                payload: StratumLinePayload::StratumCommand(StratumCommand::MiningDeclareCapabilities(ids.clone())),
+                jsonrpc: Some("2.0".into()),
+                error: None,
+            })
+            .await?;
+        if self.declared.is_some() {
+            let telemetry = serde_json::json!({ "v": 1, "trace": u8::from(traceable_model().is_some()), "models": ids });
+            let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+            note_pending(&mut self.info_ids, id);
+            self.send_channel
+                .send(StratumLine {
+                    id: Some(id),
+                    payload: StratumLinePayload::StratumCommand(StratumCommand::MiningTelemetry(vec![telemetry])),
+                    jsonrpc: None,
+                    error: None,
+                })
+                .await?;
+        }
+        self.declared = Some((ids, Instant::now()));
+        Ok(())
+    }
+
     async fn maintain_keepalive(&mut self) -> Result<(), Error> {
         let now = Instant::now();
-        if self
-            .ai_response
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|(_, since, _)| now.duration_since(*since) >= self.keepalive_timeout)
-        {
-            return Err("AI response acknowledgement timed out".into());
-        }
+        self.ai_response.lock().await.retain(|_, (since, _)| now.duration_since(*since) < self.keepalive_timeout);
         if let Some((_, since)) = self.keepalive_pending {
             if now.duration_since(since) >= self.keepalive_timeout {
                 return Err("Stratum keepalive timed out".into());
@@ -691,8 +793,8 @@ impl StratumHandler {
     }
 
     /// Queues an AI request for the GPU.
-    async fn handle_ai_request(&mut self, id: Option<u32>, fields: (String, String, String, String, String, u32, String)) {
-        let mut request = match AiRequest::parse(fields) {
+    async fn handle_ai_request(&mut self, id: Option<u32>, params: AiRequestParams) {
+        let mut request = match AiRequest::parse(params) {
             Ok(request) => request,
             Err(error) => {
                 warn!("Invalid AI request: {}", error);
@@ -707,11 +809,51 @@ impl StratumHandler {
             self.refuse(&request, "model is not ready");
             return;
         }
+        if self.resend_answer(&request).await {
+            return;
+        }
+        if let Some(why) = self.early_refusal(&request).await {
+            self.refuse(&request, why);
+            return;
+        }
         if self.request_queue.len() >= MAX_QUEUED_REQUESTS {
             self.refuse(&request, "worker queue is full");
             return;
         }
         self.request_queue.push_back((request, audit::current_daa()));
+    }
+
+    /// Resends the answer kept for `request` when this worker answered it already; true if sent.
+    async fn resend_answer(&self, request: &AiRequest) -> bool {
+        let key = request.request_hash.to_ascii_lowercase();
+        let Some(answer) = self.pool_traces.lock().await.get(&key).and_then(|t| t.response.clone()) else { return false };
+        let id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        let Ok(line) = request.response(id, self.miner_address.clone(), &answer.text, answer.traced) else { return false };
+        {
+            let mut pending = self.ai_response.lock().await;
+            if pending.len() >= MAX_PENDING_IDS {
+                pending.clear();
+            }
+            pending.insert(id, (Instant::now(), None));
+        }
+        info!("AI request {}: answered already — same answer resent", request.task_id);
+        self.send_channel.send(line).await.is_ok()
+    }
+
+    /// Why `request` cannot be served whatever the GPU state, checked before it waits in the queue.
+    async fn early_refusal(&self, request: &AiRequest) -> Option<&'static str> {
+        let t = request.trace?;
+        if !t.chain {
+            return Some("untraced-chain answers are not served");
+        }
+        if keryx_miner::models::pom_tier_index(&request.model_id, u64::MAX) != Some(t.tier) {
+            return Some("trace tier does not match the model");
+        }
+        let traces = self.pool_traces.lock().await;
+        if traces.contains_key(&request.request_hash.to_ascii_lowercase()) {
+            return Some("already answered by this worker");
+        }
+        (traces.len() >= audit::MAX_TRACES).then_some("too many answers still under audit")
     }
 
     /// Tells the pool `request` will not be answered.
@@ -768,9 +910,6 @@ impl StratumHandler {
         if self.request_queue.is_empty() || self.last_daa == 0 || keryx_miner::llm::probe_in_flight() {
             return;
         }
-        if self.ai_response.lock().await.is_some() {
-            return;
-        }
         if let Some((request, at)) = self.request_queue.pop_front() {
             self.start_ai_request(request, at, miner).await;
         }
@@ -778,8 +917,19 @@ impl StratumHandler {
 
     async fn start_ai_request(&mut self, request: AiRequest, queued_at: u64, miner: &mut MinerManager) {
         let daa = self.last_daa;
-        let traced = daa >= keryx_miner::pom::verifiable_inference_activation_daa();
-        let tier = traced.then(|| keryx_miner::models::pom_tier_index(&request.model_id, daa)).flatten();
+        // The pool decides the tracing: no trace object means an untraced answer.
+        let (tier, chain, attention) = match request.trace {
+            Some(t) if !t.chain => {
+                self.refuse(&request, "untraced-chain answers are not served");
+                return;
+            }
+            Some(t) if keryx_miner::models::pom_tier_index(&request.model_id, u64::MAX) != Some(t.tier) => {
+                self.refuse(&request, "trace tier does not match the model");
+                return;
+            }
+            Some(t) => (Some(t.tier), t.chain, t.attention),
+            None => (None, false, false),
+        };
         if tier.is_some() {
             let traces = self.pool_traces.lock().await;
             let why = if traces.contains_key(&request.request_hash.to_ascii_lowercase()) {
@@ -809,15 +959,13 @@ impl StratumHandler {
         let worker = self.miner_address.clone();
         let pending = self.ai_response.clone();
         let last_id = self.last_stratum_id.clone();
-        let chain = keryx_miner::trace::chain_active(daa);
-        let attention = chain && keryx_miner::trace::attention_active(daa);
         let traces = self.pool_traces.clone();
         let created_daa = audit::current_daa().min(daa);
         tokio::task::spawn_blocking(move || {
-            let _guard = guard;
+            let guard = guard;
             let mut request_hash = [0u8; 32];
             let mut traced_key = None;
-            let (result, trace_hex) = match tier
+            let (text, traced) = match tier
                 .filter(|_| hex::decode_to_slice(&request.request_hash, &mut request_hash).is_ok())
             {
                 Some(tier) => {
@@ -838,14 +986,15 @@ impl StratumHandler {
                         }
                         return;
                     };
+                    let text = generated.text;
                     match generated.trace {
                         Some(trace) => {
                             let answer = if trace.record.stage == keryx_miner::trace::STAGE_CHAIN {
                                 let ids: Vec<u32> =
                                     trace.tokens[trace.record.n_prompt as usize..].iter().map(|&v| v as u32).collect();
-                                keryx_verifiable_inference::answer::encode(generated.text.as_bytes(), &ids)
+                                keryx_verifiable_inference::answer::encode(text.as_bytes(), &ids)
                             } else {
-                                generated.text.into_bytes()
+                                text.clone().into_bytes()
                             };
                             let commitment = hex::encode(trace.commitment().to_bytes());
                             let key = request.request_hash.to_ascii_lowercase();
@@ -864,100 +1013,137 @@ impl StratumHandler {
                                 }
                                 return;
                             }
+                            let mut t = t;
+                            t.response = Some(audit::SentAnswer { text: text.clone(), traced: Some((commitment.clone(), answer.clone())) });
                             traces.blocking_lock().insert(key.clone(), t);
                             traced_key = Some(key);
-                            (answer, commitment)
+                            (text, Some((commitment, answer)))
                         }
-                        None => (generated.text.into_bytes(), String::new()),
+                        None => {
+                            warn!("AI request {}: no trace produced — no answer", request.task_id);
+                            if let Some(line) = request.refusal("no trace produced") {
+                                let _ = sender.try_send(line);
+                            }
+                            return;
+                        }
                     }
                 }
                 None => (
                     keryx_miner::llm::load_and_run_inference(&request.model_id, &request.prompt, request.max_tokens)
-                        .unwrap_or_default()
-                        .into_bytes(),
-                    String::new(),
+                        .unwrap_or_default(),
+                    None,
                 ),
             };
-            let id = last_id.fetch_add(1, Ordering::SeqCst);
-            let sent = match request.response(id, worker, &result, trace_hex) {
+            drop(guard);
+            // The answer goes out on the live connection, which may have replaced the one the
+            // request came on; a traced answer kept with its trace is resent if the pool asks again.
+            let link = audit::shared().link.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let (out, ids) = match &link {
+                Some(l) => (l.sender.clone(), l.last_id.clone()),
+                None => (sender.clone(), last_id.clone()),
+            };
+            let id = ids.fetch_add(1, Ordering::SeqCst);
+            match request.response(id, worker, &text, traced) {
                 Ok(line) => {
-                    *pending.blocking_lock() = Some((id, Instant::now(), traced_key.clone()));
-                    let sent = sender.blocking_send(line).is_ok();
-                    if !sent {
-                        *pending.blocking_lock() = None;
-                        warn!("AI response {}: connection closed", request.task_id);
+                    {
+                        let mut pending = pending.blocking_lock();
+                        if pending.len() >= MAX_PENDING_IDS {
+                            pending.clear();
+                        }
+                        pending.insert(id, (Instant::now(), traced_key.clone()));
                     }
-                    sent
+                    if out.blocking_send(line).is_err() {
+                        pending.blocking_lock().remove(&id);
+                        warn!("AI response {}: connection closed — kept for a resend", request.task_id);
+                    }
                 }
                 Err(error) => {
                     warn!("AI request {}: {}", request.task_id, error);
                     if let Some(line) = request.refusal("no valid answer") {
                         let _ = sender.try_send(line);
                     }
-                    false
+                    if let Some(key) = traced_key {
+                        audit::remove(&mut traces.blocking_lock(), &key);
+                    }
                 }
-            };
-            if let Some(key) = traced_key.filter(|_| !sent) {
-                audit::remove(&mut traces.blocking_lock(), &key);
             }
         });
     }
 
-    /// Records a draw relayed by the pool for one of this worker's traced answers.
-    async fn handle_ai_draw(&mut self, id: Option<u32>, fields: (String, String, String, u64, u64, u32, Vec<u64>)) {
-        let (request_hash, response_txid, seed, deadline_daa, accepted_daa, pieces, path) = fields;
-        let request_hash = request_hash.to_ascii_lowercase();
-        let (mut txid, mut seed_bytes, mut hash_bytes) = ([0u8; 32], [0u8; 32], [0u8; 32]);
-        let valid = hex::decode_to_slice(&request_hash, &mut hash_bytes).is_ok()
-            && hex::decode_to_slice(&response_txid, &mut txid).is_ok()
-            && hex::decode_to_slice(&seed, &mut seed_bytes).is_ok();
-        let known = valid && self.pool_traces.lock().await.contains_key(&request_hash);
-        let error = if !valid {
-            Some((ErrorCode::Unknown, "invalid draw"))
-        } else if let Some(e) = audit::draw_bounds_error(audit::current_daa(), deadline_daa, pieces, path.len()) {
-            Some((ErrorCode::Unknown, e))
-        } else if !known {
-            Some((ErrorCode::UnknownResponse, "unknown response"))
-        } else {
-            None
-        };
-        if let Some(id) = id {
-            let line = match &error {
-                Some((code, e)) => StratumLine::error_reply(id, code.clone(), e),
-                None => StratumLine::ok_reply(id),
-            };
-            let _ = self.send_channel.send(line).await;
-        }
-        if let Some((_, e)) = error {
-            let shown = if valid { &request_hash[..16] } else { "?" };
-            warn!("Trace: draw for request {} ignored ({})", shown, e);
-            return;
-        }
-        let mut queue = self.replay_queue.lock().await;
-        let backoff = queue
-            .iter()
-            .find(|d| d.response_txid == txid && d.seed == seed_bytes && d.path == path)
-            .map(|d| (d.attempts, d.retry_at));
-        queue.retain(|d| d.response_txid != txid && d.request_hash != request_hash);
-        let mut traces = self.pool_traces.lock().await;
-        if pieces == 0 {
-            audit::remove(&mut traces, &request_hash);
-            return;
-        }
-        if let Some(t) = traces.get_mut(&request_hash) {
-            if t.note_draw(deadline_daa, accepted_daa) {
-                audit::persist(&request_hash, t);
+    /// Queues the audit opening the pool asks for one of this worker's traced answers; one that
+    /// cannot be served is answered at once with the reason.
+    async fn handle_ai_opening(&mut self, id: Option<u32>, params: Vec<serde_json::Value>) {
+        let opening = match AiOpening::parse(&params) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("Trace: invalid ai_opening ignored ({}, id {:?})", e, id);
+                return;
             }
+        };
+        let daa = audit::current_daa();
+        let pieces = if opening.path.is_empty() { audit::PIECES_ALL } else { audit::PIECE_ATTN };
+        let deadline_daa = daa.saturating_add(audit::AUDIT_SPAN_DAA);
+        let draw_key = audit::draw_key(&opening.seed, &opening.path);
+        let error = {
+            let mut queue = self.replay_queue.lock().await;
+            let mut traces = self.pool_traces.lock().await;
+            match audit::draw_bounds_error(daa, deadline_daa, pieces, opening.path.len()) {
+                Some(e) => Some(e),
+                None => match traces.get_mut(&opening.request_hash) {
+                    None => Some("no kept trace for this request"),
+                    Some(t) => {
+                        let AiOpening { request_hash, response_txid, seed, path } = opening.clone();
+                        let probe = audit::PoolDraw::new(request_hash.clone(), response_txid, seed, deadline_daa, 0, pieces, path.clone());
+                        let action = if t.cached(&probe).is_some() { audit::OpeningAction::Replay } else { t.opening_action(&draw_key) };
+                        if action == audit::OpeningAction::Ignore {
+                            return;
+                        }
+                        if action == audit::OpeningAction::Reply {
+                            drop(traces);
+                            drop(queue);
+                            warn!("Trace: opening for request {} given up for now", &opening.request_hash[..16]);
+                            self.send_opening_error(&opening, "replay failed").await;
+                            return;
+                        }
+                        let backoff = queue
+                            .iter()
+                            .find(|d| d.response_txid == response_txid && d.seed == seed && d.path == path)
+                            .map(|d| (d.attempts, d.retry_at));
+                        queue.retain(|d| !audit::same_or_superseded(d, &request_hash, &response_txid, &seed, &path));
+                        let accepted_daa = t.created_daa();
+                        if backoff.is_none() && t.note_draw(deadline_daa, accepted_daa) {
+                            audit::persist(&request_hash, t);
+                        }
+                        let mut draw =
+                            audit::PoolDraw::new(request_hash, response_txid, seed, deadline_daa, accepted_daa, pieces, path);
+                        if let Some((attempts, retry_at)) = backoff {
+                            draw.attempts = attempts;
+                            draw.retry_at = retry_at;
+                        }
+                        queue.push(draw);
+                        None
+                    }
+                },
+            }
+        };
+        if let Some(e) = error {
+            warn!("Trace: opening for request {} not served ({})", &opening.request_hash[..16], e);
+            if daa == 0 {
+                // Before the first job the pool resends; an answer now would read as final.
+                return;
+            }
+            self.send_opening_error(&opening, e).await;
         }
-        let mut draw = audit::PoolDraw::new(request_hash, txid, seed_bytes, deadline_daa, accepted_daa, pieces, path);
-        if let Some((attempts, retry_at)) = backoff {
-            draw.attempts = attempts;
-            draw.retry_at = retry_at;
-        }
-        queue.push(draw);
     }
 
-    /// Starts the replay of the earliest-deadline draw; false when none could start.
+    /// Answers `opening` with the reason it is not served.
+    async fn send_opening_error(&self, opening: &AiOpening, error: &str) {
+        let line_id = self.last_stratum_id.fetch_add(1, Ordering::SeqCst);
+        note_pending(&mut *self.openings_pending.lock().await, line_id);
+        let _ = self.send_channel.send(opening.result(line_id, &self.miner_address, &[], error)).await;
+    }
+
+    /// Starts the replay of the first ready draw in `replay_order`; false when none could start.
     async fn start_replay(&mut self, miner: &mut MinerManager) -> bool {
         loop {
             let draw = {
@@ -965,8 +1151,7 @@ impl StratumHandler {
                 if queue.is_empty() {
                     return false;
                 }
-                let now = audit::current_daa();
-                queue.sort_by_key(|d| (d.deadline_daa <= now, d.deadline_daa));
+                queue.sort_by_key(replay_order);
                 let Some(i) = queue.iter().position(|d| d.ready()) else { return false };
                 queue.remove(i)
             };
@@ -984,7 +1169,10 @@ impl StratumHandler {
                     )
                 })
             };
-            let Some((model_id, tier, request_hash, trace, built, phases, bundle)) = job else { continue };
+            let Some((model_id, tier, request_hash, trace, built, phases, bundle)) = job else {
+                self.send_opening_error(&opening_of(&draw), "no kept trace for this request").await;
+                continue;
+            };
             let worker = self.miner_address.clone();
             if let Some(bodies) = built {
                 let owed = audit::owed(&bodies, draw.pieces);
@@ -1011,15 +1199,31 @@ impl StratumHandler {
             tokio::task::spawn_blocking(move || {
                 let built = audit::build(&model_id, tier, &request_hash, &trace, &phases, bundle, &draw);
                 let Some(built) = built else {
-                    let mut queue = queue.blocking_lock();
-                    let replaced = queue.iter().any(|d| d.request_hash == draw.request_hash || d.response_txid == draw.response_txid);
-                    if draw.deadline_daa > audit::current_daa() && !replaced {
-                        warn!("Trace: no opening built for request {} — retrying later", &draw.request_hash[..16]);
-                        queue.push(draw.retry());
-                    } else {
-                        warn!("Trace: no opening built for request {}", &draw.request_hash[..16]);
-                    }
+                    let error = {
+                        let mut queue = queue.blocking_lock();
+                        let failures = traces.blocking_lock().get_mut(&draw.request_hash).map(|t| t.note_failure(&draw.key()));
+                        let queued = queue
+                            .iter()
+                            .any(|d| audit::same_or_superseded(d, &draw.request_hash, &draw.response_txid, &draw.seed, &draw.path));
+                        match failures {
+                            None => Some("no kept trace for this request"),
+                            Some(n) if n < audit::MAX_REPLAY_ATTEMPTS => {
+                                warn!("Trace: no opening built for request {} — retrying later", &draw.request_hash[..16]);
+                                if !queued {
+                                    queue.push(draw.clone().retry());
+                                }
+                                None
+                            }
+                            Some(_) => {
+                                warn!("Trace: no opening built for request {} — given up for now", &draw.request_hash[..16]);
+                                Some("replay failed")
+                            }
+                        }
+                    };
                     drop(guard);
+                    if let Some(e) = error {
+                        send_opening_result(&worker, &draw, &[], e);
+                    }
                     return;
                 };
                 let bodies = built.bodies.clone();
@@ -1041,15 +1245,16 @@ impl StratumHandler {
                 };
                 let Some(written) = stored else {
                     drop(guard);
+                    send_opening_result(&worker, &draw, &[], "no kept trace for this request");
                     return;
                 };
                 if let Some(written) = written {
                     let _ = written.recv();
                 }
+                drop(guard);
                 if !send_openings(&worker, &draw, &audit::owed(&bodies, draw.pieces)) {
                     audit::requeue(draw);
                 }
-                drop(guard);
             });
             return true;
         }
@@ -1257,29 +1462,88 @@ fn do_inference_and_upload(
     }
 }
 
-/// Sends one `mining.ai_opening` per body answering `draw` on the live pool connection; blocking.
-/// False when the connection is gone.
+/// Replay order: attention phases first (their window is short), then by arrival (the
+/// deadline of a pool opening is its arrival plus the audit span).
+fn replay_order(d: &audit::PoolDraw) -> (bool, u64) {
+    (d.path.is_empty(), d.deadline_daa)
+}
+
+/// A loaded model that is ready and has a tier, which this worker can trace.
+fn traceable_model() -> Option<[u8; 32]> {
+    keryx_miner::llm::loaded_model_ids()
+        .into_iter()
+        .find(|id| keryx_miner::llm::is_model_ready(id) && keryx_miner::models::pom_tier_index(id, u64::MAX).is_some())
+}
+
+/// The opening request `draw` answers.
+fn opening_of(draw: &audit::PoolDraw) -> AiOpening {
+    AiOpening { request_hash: draw.request_hash.clone(), response_txid: draw.response_txid, seed: draw.seed, path: draw.path.clone() }
+}
+
+/// Records a reply id awaited from the pool, forgetting all of them past `MAX_PENDING_IDS`.
+fn note_pending(pending: &mut HashSet<u32>, id: u32) {
+    if pending.len() >= MAX_PENDING_IDS {
+        pending.clear();
+    }
+    pending.insert(id);
+}
+
+/// Sends the `mining.ai_opening_result` answering `draw` on the live pool connection, its bodies
+/// bundled; blocking. False when the connection is gone.
 fn send_openings(worker: &str, draw: &audit::PoolDraw, bodies: &[Vec<u8>]) -> bool {
+    if bodies.is_empty() {
+        return true;
+    }
+    send_opening_result(worker, draw, &keryx_miner::trace_seq::bundle(bodies), "")
+}
+
+/// Sends one `mining.ai_opening_result` for `draw`: `body`, or `error` when it is empty; blocking.
+fn send_opening_result(worker: &str, draw: &audit::PoolDraw, body: &[u8], error: &str) -> bool {
     let Some(link) = audit::shared().link.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
-    for body in bodies {
-        let id = link.last_id.fetch_add(1, Ordering::SeqCst);
-        link.openings_pending.blocking_lock().insert(id);
-        let line = StratumLine {
-            id: Some(id),
-            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningAiOpening((
-                worker.to_string(),
-                draw.request_hash.clone(),
-                hex::encode(draw.response_txid),
-                hex::encode(draw.seed),
-                BASE64.encode(body),
-            ))),
-            jsonrpc: Some("2.0".into()),
-            error: None,
-        };
-        if link.sender.blocking_send(line).is_err() {
-            warn!("Trace: connection closed before the opening was sent");
-            return false;
-        }
+    let opening = opening_of(draw);
+    let id = link.last_id.fetch_add(1, Ordering::SeqCst);
+    note_pending(&mut link.openings_pending.blocking_lock(), id);
+    if link.sender.blocking_send(opening.result(id, worker, body, error)).is_err() {
+        warn!("Trace: connection closed before the opening was sent");
+        return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draw(rh: &str, txid: u8, seed: u8, path: Vec<u64>, deadline: u64) -> audit::PoolDraw {
+        audit::PoolDraw::new(rh.into(), [txid; 32], [seed; 32], deadline, 0, audit::PIECES_ALL, path)
+    }
+
+    #[test]
+    fn phases_replay_before_first_openings() {
+        let mut q = vec![draw("a", 1, 1, vec![], 100), draw("b", 2, 2, vec![], 200), draw("c", 3, 3, vec![1], 300)];
+        q.sort_by_key(replay_order);
+        assert_eq!(q.iter().map(|d| d.request_hash.as_str()).collect::<Vec<_>>(), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn a_resend_keeps_other_phases_and_a_new_seed_supersedes() {
+        let queued = draw("r", 1, 1, vec![2], 0);
+        assert!(!audit::same_or_superseded(&queued, "r", &[1; 32], &[1; 32], &[]));
+        assert!(audit::same_or_superseded(&queued, "r", &[1; 32], &[1; 32], &[2]));
+        assert!(audit::same_or_superseded(&queued, "r", &[1; 32], &[9; 32], &[]));
+        assert!(audit::same_or_superseded(&queued, "r", &[9; 32], &[1; 32], &[]));
+        assert!(!audit::same_or_superseded(&queued, "other", &[7; 32], &[7; 32], &[2]));
+    }
+
+    #[test]
+    fn pending_ids_are_capped() {
+        let mut p = HashSet::new();
+        for id in 0..MAX_PENDING_IDS as u32 {
+            note_pending(&mut p, id);
+        }
+        assert_eq!(p.len(), MAX_PENDING_IDS);
+        note_pending(&mut p, 999);
+        assert_eq!(p.len(), 1);
+        assert!(p.contains(&999));
+    }
 }

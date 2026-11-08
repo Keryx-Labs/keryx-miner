@@ -17,7 +17,7 @@ const UNDRAWN_KEEP_DAA: u64 = LEDGER_HORIZON_DAA + keryx_miner::trace::OPENING_B
 /// DAA a drawn trace is kept past its last deadline, for later attention phases and redraws.
 const DRAWN_KEEP_DAA: u64 = 6_000;
 /// Latest deadline an audit can reach after its acceptance, and the delay of a phase draw.
-const AUDIT_SPAN_DAA: u64 = 270_000;
+pub(super) const AUDIT_SPAN_DAA: u64 = 270_000;
 const PHASE_DRAW_DELAY_DAA: u64 = keryx_miner::trace::TRACE_SEED_DELAY_DAA;
 /// First delay before a failed replay is retried, doubled at each failure up to the max.
 const REPLAY_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -32,10 +32,10 @@ const DAA_SLACK: u64 = 6_000;
 /// Bodies kept per trace before those of other seeds are dropped.
 const MAX_BUILT: usize = 16;
 const MAX_PHASES: usize = 64;
-const PIECES_ALL: u32 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID;
+pub(super) const PIECES_ALL: u32 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID;
 
 const PIECE_TRACE: u32 = 1;
-const PIECE_ATTN: u32 = 2;
+pub(super) const PIECE_ATTN: u32 = 2;
 const PIECE_RECUR: u32 = 4;
 const PIECE_RESID: u32 = 8;
 
@@ -66,6 +66,10 @@ pub(super) struct PoolTrace {
     pub phases: HashMap<String, Vec<u8>>,
     /// Seed of the latest phase built; only its phases are persisted.
     phase_seed: Option<[u8; 32]>,
+    /// Failed replays by draw key, so a draw given up is not replayed on every resend.
+    failures: HashMap<String, Failures>,
+    /// The answer sent for this trace, resent unchanged when the pool asks again.
+    pub response: Option<SentAnswer>,
 }
 
 impl PoolTrace {
@@ -87,7 +91,39 @@ impl PoolTrace {
             built: HashMap::new(),
             phases: HashMap::new(),
             phase_seed: None,
+            failures: HashMap::new(),
+            response: None,
         }
+    }
+
+    /// DAA the answer was generated at, close to its acceptance.
+    pub fn created_daa(&self) -> u64 {
+        self.created_daa
+    }
+
+    /// What to do with an opening of the draw `key` that is not cached.
+    pub fn opening_action(&mut self, key: &str) -> OpeningAction {
+        let now = std::time::Instant::now();
+        let action = opening_action(self.failures.get(key), now);
+        match action {
+            OpeningAction::Replay => {
+                if self.failures.get(key).is_some_and(|f| f.count >= MAX_REPLAY_ATTEMPTS) {
+                    self.failures.remove(key);
+                }
+            }
+            OpeningAction::Reply => {
+                if let Some(f) = self.failures.get_mut(key) {
+                    f.last_reply = Some(now);
+                }
+            }
+            OpeningAction::Ignore => {}
+        }
+        action
+    }
+
+    /// Counts one more failed replay of the draw `key`; returns the new count.
+    pub fn note_failure(&mut self, key: &str) -> u8 {
+        bump_failure(&mut self.failures, key, std::time::Instant::now())
     }
 
     fn expired(&self, daa: u64) -> bool {
@@ -133,6 +169,7 @@ impl PoolTrace {
     /// Keeps what was built for `draw`; true when phases were added and the record must be
     /// rewritten.
     pub fn store_built(&mut self, draw: &PoolDraw, built: Built) -> bool {
+        self.failures.remove(&draw.key());
         let prefix = format!("{}:", hex::encode(draw.seed));
         if self.built.len() >= MAX_BUILT {
             self.built.retain(|k, _| k.starts_with(&prefix));
@@ -192,6 +229,65 @@ impl PoolTrace {
             gen_secs: None,
         }
     }
+}
+
+/// Replays tried for one draw before it is given up for a while.
+pub(super) const MAX_REPLAY_ATTEMPTS: u8 = 5;
+/// Time after the last failure at which a given-up draw is tried again.
+const GIVE_UP_RESET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Least time between two answers to resends of a given-up draw.
+const GIVE_UP_REPLY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Failed replays of one draw.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Failures {
+    count: u8,
+    last_failure: std::time::Instant,
+    last_reply: Option<std::time::Instant>,
+}
+
+/// What an opening that is not cached gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OpeningAction {
+    /// Queue it for a replay.
+    Replay,
+    /// Answer "replay failed" now.
+    Reply,
+    /// Drop it: the last answer is recent.
+    Ignore,
+}
+
+/// The answer an opening gets after the failures `f` of its draw, at `now`.
+fn opening_action(f: Option<&Failures>, now: std::time::Instant) -> OpeningAction {
+    match f {
+        Some(f) if f.count >= MAX_REPLAY_ATTEMPTS && now.duration_since(f.last_failure) < GIVE_UP_RESET => {
+            match f.last_reply {
+                Some(at) if now.duration_since(at) < GIVE_UP_REPLY_EVERY => OpeningAction::Ignore,
+                _ => OpeningAction::Reply,
+            }
+        }
+        _ => OpeningAction::Replay,
+    }
+}
+
+/// Counts one more failure of `key` in `failures`, bounded to `MAX_BUILT` keys; the new count.
+fn bump_failure(failures: &mut HashMap<String, Failures>, key: &str, now: std::time::Instant) -> u8 {
+    if failures.len() >= MAX_BUILT && !failures.contains_key(key) {
+        if let Some(oldest) = failures.iter().min_by_key(|(_, f)| f.last_failure).map(|(k, _)| k.clone()) {
+            failures.remove(&oldest);
+        }
+    }
+    let f = failures.entry(key.to_string()).or_insert(Failures { count: 0, last_failure: now, last_reply: None });
+    f.count = f.count.saturating_add(1);
+    f.last_failure = now;
+    f.count
+}
+
+/// An answer sent to the pool: its text and, when traced, the commitment and the sealed body.
+#[derive(Clone, Debug)]
+pub(super) struct SentAnswer {
+    pub text: String,
+    pub traced: Option<(String, Vec<u8>)>,
 }
 
 /// A trace is past its keep window at `daa`.
@@ -308,6 +404,10 @@ fn plausible_daa(anchor: u64, elapsed_ms: u64, daa: u64) -> u64 {
 }
 
 /// Key of the draw of `path` under `seed`.
+pub(super) fn draw_key(seed: &[u8; 32], path: &[u64]) -> String {
+    key(seed, path)
+}
+
 fn key(seed: &[u8; 32], path: &[u64]) -> String {
     format!("{}:{:?}", hex::encode(seed), path)
 }
@@ -409,10 +509,12 @@ pub(super) async fn init_store(escrow_state_file: &str) {
                 trace: Arc::new(t.trace),
                 created_daa: t.submitted_daa,
                 deadline_daa,
-                accepted_daa: None,
+                accepted_daa: deadline_daa.map(|d| d.saturating_sub(AUDIT_SPAN_DAA)),
                 built: HashMap::new(),
                 phases,
                 phase_seed,
+                failures: HashMap::new(),
+                response: None,
             },
         );
     }
@@ -454,10 +556,17 @@ pub(super) fn remove(traces: &mut HashMap<String, PoolTrace>, key: &str) {
     }
 }
 
-/// Queues `draw` again, ready in a second, unless a draw for its request is queued; blocking.
+/// Whether queued `d` is the opening (`txid`, `seed`, `path`) again, or an opening of the same
+/// request under another response or seed, which this one supersedes.
+pub(super) fn same_or_superseded(d: &PoolDraw, request_hash: &str, txid: &[u8; 32], seed: &[u8; 32], path: &[u64]) -> bool {
+    (d.response_txid == *txid && d.seed == *seed && d.path == path)
+        || (d.request_hash == request_hash && (d.response_txid != *txid || d.seed != *seed))
+}
+
+/// Queues `draw` again, ready in a second, unless it is queued already or superseded; blocking.
 pub(super) fn requeue(draw: PoolDraw) {
     let mut queue = shared().queue.blocking_lock();
-    if !queue.iter().any(|d| d.request_hash == draw.request_hash) {
+    if !queue.iter().any(|d| same_or_superseded(d, &draw.request_hash, &draw.response_txid, &draw.seed, &draw.path)) {
         let retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
         queue.push(PoolDraw { retry_at, ..draw });
     }
@@ -601,6 +710,44 @@ mod tests {
         let bodies = vec![vec![1u8], vec![VERSION_ATTN], vec![VERSION_RESID]];
         assert_eq!(owed(&bodies, PIECE_RESID | PIECE_TRACE).len(), 2);
         assert!(owed(&bodies, 0).is_empty());
+    }
+
+    #[test]
+    fn replay_failures_count_per_draw_and_stay_bounded() {
+        let now = std::time::Instant::now();
+        let mut f = HashMap::new();
+        let (k1, k2) = (draw_key(&[1; 32], &[]), draw_key(&[1; 32], &[2]));
+        assert_eq!(bump_failure(&mut f, &k1, now), 1);
+        assert_eq!(bump_failure(&mut f, &k1, now), 2);
+        assert_eq!(bump_failure(&mut f, &k2, now), 1);
+        let later = now + std::time::Duration::from_secs(1);
+        for i in 0..MAX_BUILT as u64 {
+            bump_failure(&mut f, &draw_key(&[3; 32], &[i]), later);
+        }
+        assert_eq!(f.len(), MAX_BUILT);
+        assert!(!f.contains_key(&k1) && !f.contains_key(&k2));
+        assert_eq!(bump_failure(&mut f, &draw_key(&[3; 32], &[0]), later), 2);
+    }
+
+    #[test]
+    fn a_given_up_draw_answers_rarely_then_retries() {
+        let t0 = std::time::Instant::now();
+        assert_eq!(opening_action(None, t0), OpeningAction::Replay);
+        let few = Failures { count: MAX_REPLAY_ATTEMPTS - 1, last_failure: t0, last_reply: None };
+        assert_eq!(opening_action(Some(&few), t0), OpeningAction::Replay);
+        let out = Failures { count: MAX_REPLAY_ATTEMPTS, last_failure: t0, last_reply: None };
+        assert_eq!(opening_action(Some(&out), t0), OpeningAction::Reply);
+        let replied = Failures { last_reply: Some(t0), ..out };
+        assert_eq!(opening_action(Some(&replied), t0 + GIVE_UP_REPLY_EVERY / 2), OpeningAction::Ignore);
+        assert_eq!(opening_action(Some(&replied), t0 + GIVE_UP_REPLY_EVERY), OpeningAction::Reply);
+        assert_eq!(opening_action(Some(&replied), t0 + GIVE_UP_RESET), OpeningAction::Replay);
+    }
+
+    #[test]
+    fn requeue_dedup_keeps_other_paths() {
+        let queued = PoolDraw::new("r".into(), [1; 32], [1; 32], 10, 5, PIECES_ALL, vec![2]);
+        assert!(!same_or_superseded(&queued, "r", &[1; 32], &[1; 32], &[]));
+        assert!(same_or_superseded(&queued, "r", &[1; 32], &[1; 32], &[2]));
     }
 
     #[test]

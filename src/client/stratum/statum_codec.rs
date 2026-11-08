@@ -16,7 +16,6 @@ pub enum ErrorCode {
     LowDifficultyShare = 23,
     Unauthorized = 24,
     NotSubscribed = 25,
-    UnknownResponse = 41,
     Busy = 46,
 }
 
@@ -29,7 +28,6 @@ impl Display for ErrorCode {
             ErrorCode::LowDifficultyShare => write!(f, "LowDifficultyShare"),
             ErrorCode::Unauthorized => write!(f, "Unauthorized"),
             ErrorCode::NotSubscribed => write!(f, "NotSubscribed"),
-            ErrorCode::UnknownResponse => write!(f, "UnknownResponse"),
             ErrorCode::Busy => write!(f, "Busy"),
         }
     }
@@ -109,6 +107,15 @@ pub enum SetExtranonce {
     SetExtranoncePlainEth((String,)),
 }
 
+/// `mining.ai_request` params: task_id, txid, request_hash, model, prompt b64, max_tokens, reward,
+/// and an optional extension object carrying the trace parameters.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub(crate) enum AiRequestParams {
+    WithExt((String, String, String, String, String, u32, String, Value)),
+    Plain((String, String, String, String, String, u32, String)),
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "method", content = "params")]
 pub(crate) enum StratumCommand {
@@ -130,19 +137,31 @@ pub(crate) enum StratumCommand {
     #[serde(rename = "mining.declare_capabilities")]
     MiningDeclareCapabilities(Vec<String>),
     #[serde(rename = "mining.ai_request")]
-    MiningAiRequest((String, String, String, String, String, u32, String)),
-    // worker, task_id, request_hash, model, result b64, trace commitment hex ("" if untraced)
+    MiningAiRequest(AiRequestParams),
+    // worker, task_id, request_hash, model, answer text b64, optional {"trace": hex, "body": hex}
     #[serde(rename = "mining.ai_response")]
-    MiningAiResponse((String, String, String, String, String, String)),
+    MiningAiResponse(Vec<Value>),
     /// An inference command whose params did not parse; answered with an error.
     #[serde(skip)]
     MalformedAi,
-    // request_hash, response_txid, seed, deadline_daa, accepted_daa, pieces owed, attention path
-    #[serde(rename = "mining.ai_draw")]
-    MiningAiDraw((String, String, String, u64, u64, u32, Vec<u64>)),
-    // worker, request_hash, response_txid, seed, unsigned opening body b64
+    // request_hash, response_txid, draw seed, attention path, previous partials hex, record url
     #[serde(rename = "mining.ai_opening")]
-    MiningAiOpening((String, String, String, String, String)),
+    MiningAiOpening(Vec<Value>),
+    // worker, request_hash, response_txid, path, unsigned body hex, error ("" on success)
+    #[serde(rename = "mining.ai_opening_result")]
+    MiningAiOpeningResult(Vec<Value>),
+    // Worker description sent once after authorize: [{"v":1,"miner":{..},"trace":1,"model":{..}}]
+    #[serde(rename = "mining.hello")]
+    MiningHello(Vec<Value>),
+    // Periodic worker state: [{"v":1,"trace":0|1,"models":[hex]}]
+    #[serde(rename = "mining.telemetry")]
+    MiningTelemetry(Vec<Value>),
+    // Off-chain chat request from the pool: {"reqId", "model_id", "prompt", "max_tokens", ...}
+    #[serde(rename = "mining.inference_request")]
+    MiningInferenceRequest(Value),
+    // Answer to an off-chain chat request: {"reqId", "ok", "error" | "text", ...}
+    #[serde(rename = "mining.inference_result")]
+    MiningInferenceResult(Value),
     // Phase 2 Inference: bridge → miner — "model_id_hex:nonce_hex" capability challenge
     #[serde(rename = "mining.challenge")]
     MiningChallenge((String, String)),
@@ -183,16 +202,6 @@ pub(crate) struct StratumLine {
 }
 
 impl StratumLine {
-    /// Success reply to the pool's command `id`.
-    pub(crate) fn ok_reply(id: u32) -> Self {
-        Self {
-            id: Some(id),
-            payload: StratumLinePayload::StratumResult { result: StratumResult::Plain(Some(true)) },
-            jsonrpc: Some("2.0".into()),
-            error: None,
-        }
-    }
-
     /// Error reply to the pool's command `id`.
     pub(crate) fn error_reply(id: u32, code: ErrorCode, message: &str) -> Self {
         Self {
@@ -274,14 +283,34 @@ impl Decoder for NewLineJsonCodec {
     }
 }
 
+/// Methods this worker parses; any other method is skipped.
+const KNOWN_METHODS: &[&str] = &[
+    "mining.set_extranonce",
+    "set_extranonce",
+    "mining.set_difficulty",
+    "mining.notify",
+    "mining.subscribe",
+    "mining.authorize",
+    "mining.keepalive",
+    "mining.submit",
+    "mining.declare_capabilities",
+    "mining.challenge",
+    "mining.challenge_response",
+    "mining.inference_request",
+];
+
 /// Parses one line; a malformed `mining.ai_*` command becomes `MalformedAi`, or is skipped when it
-/// has no id.
+/// has no id; a line with an unknown method is skipped.
 fn parse_line(s: String) -> Result<Option<StratumLine>, NewLineJsonCodecError> {
     match serde_json::from_str::<StratumLine>(&s) {
         Ok(line) => Ok(Some(line)),
         Err(e) => {
             let value = serde_json::from_str::<Value>(&s).ok();
             let method = value.as_ref().and_then(|v| v.get("method")).and_then(Value::as_str);
+            if let Some(m) = method.filter(|m| !m.starts_with("mining.ai_") && !KNOWN_METHODS.contains(m)) {
+                log::warn!("Stratum: unknown method {} ignored", m);
+                return Ok(None);
+            }
             match method.filter(|m| m.starts_with("mining.ai_")) {
                 Some(m) => {
                     log::warn!("Stratum: malformed {} ignored: {}", m, e);
@@ -336,6 +365,56 @@ mod tests {
         assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MalformedAi)));
         let mut buf = BytesMut::from(&b"{\"id\":9,\"method\":\"mining.notify\",\"params\":[1]}\n"[..]);
         assert!(codec.decode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn unknown_methods_are_skipped() {
+        let mut codec = NewLineJsonCodec::new();
+        let mut buf = BytesMut::from(
+            &b"{\"id\":null,\"method\":\"mining.unheard_of\",\"params\":{\"reqId\":\"a\"}}\n{\"id\":3,\"result\":true,\"error\":null}\n"[..],
+        );
+        assert_eq!(codec.decode(&mut buf).unwrap().unwrap().id, Some(3));
+    }
+
+    #[test]
+    fn ai_request_takes_seven_or_eight_params() {
+        let h = "ab".repeat(32);
+        let plain = format!("{{\"id\":1,\"method\":\"mining.ai_request\",\"params\":[\"{h}\",\"{h}\",\"{h}\",\"{h}\",\"aGk=\",8,\"5\"]}}");
+        let ext = format!(
+            "{{\"id\":2,\"method\":\"mining.ai_request\",\"params\":[\"{h}\",\"{h}\",\"{h}\",\"{h}\",\"aGk=\",8,\"5\",{{\"trace\":{{\"tier\":2,\"prompt_len\":17}}}}]}}"
+        );
+        for (s, with_ext) in [(plain, false), (ext, true)] {
+            let line = parse_line(s).unwrap().unwrap();
+            match line.payload {
+                StratumLinePayload::StratumCommand(StratumCommand::MiningAiRequest(p)) => {
+                    assert_eq!(matches!(p, AiRequestParams::WithExt(_)), with_ext)
+                }
+                other => panic!("{:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn ai_opening_parses_any_param_list() {
+        let s = "{\"id\":null,\"method\":\"mining.ai_opening\",\"params\":[\"a\",\"b\",\"c\",[1,2],\"00\"]}".to_string();
+        let line = parse_line(s).unwrap().unwrap();
+        assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MiningAiOpening(p)) if p.len() == 5));
+    }
+
+    #[test]
+    fn chat_requests_parse_and_hello_serializes() {
+        let s = "{\"id\":null,\"method\":\"mining.inference_request\",\"params\":{\"reqId\":\"r1\",\"prompt\":\"hi\"}}".to_string();
+        let line = parse_line(s).unwrap().unwrap();
+        assert!(matches!(line.payload, StratumLinePayload::StratumCommand(StratumCommand::MiningInferenceRequest(v)) if v["reqId"] == "r1"));
+        let hello = StratumLine {
+            id: Some(2),
+            payload: StratumLinePayload::StratumCommand(StratumCommand::MiningHello(vec![serde_json::json!({"v": 1, "trace": 1})])),
+            jsonrpc: None,
+            error: None,
+        };
+        let v = serde_json::to_value(&hello).unwrap();
+        assert_eq!(v["method"], "mining.hello");
+        assert_eq!(v["params"][0]["trace"], 1);
     }
 
     #[test]
