@@ -426,7 +426,7 @@ impl MinerManager {
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::pom_activation_daa()) {
                         // The inference gate is raised before inference is spawned. A worker that has
                         // not consumed the watch::None pause yet must not start another PoM op.
-                        if keryx_miner::pom_gpu::inference_paused() {
+                        if keryx_miner::pom_gpu::inference_paused_for(worker_device_id) {
                             if let Some(cmd) = block_channel.get_changed()? {
                                 state = match cmd {
                                     Some(WorkerCommand::Job(ns)) => Some(ns),

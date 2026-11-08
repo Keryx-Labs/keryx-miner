@@ -168,19 +168,36 @@ impl AiOpening {
 pub(super) struct InferenceGuard {
     miner: Arc<AtomicBool>,
     busy: Arc<AtomicBool>,
+    /// The one device paused with the model it serves, or `None` for the whole rig.
+    device: Option<(u32, [u8; 32])>,
 }
 
 impl InferenceGuard {
-    pub fn new(miner: Arc<AtomicBool>, busy: Arc<AtomicBool>) -> Self {
-        keryx_miner::pom_gpu::set_inference_paused(true);
-        miner.store(true, Ordering::SeqCst);
-        Self { miner, busy }
+    /// Pauses `device` alone for `model_id` when given, else the whole rig.
+    pub fn new(miner: Arc<AtomicBool>, busy: Arc<AtomicBool>, device: Option<u32>, model_id: [u8; 32]) -> Self {
+        let device = device.map(|d| (d, model_id));
+        match device {
+            Some((dev, model)) => keryx_miner::pom_gpu::set_inference_paused_on(dev, &model, true),
+            None => {
+                keryx_miner::pom_gpu::set_inference_paused(true);
+                miner.store(true, Ordering::SeqCst);
+            }
+        }
+        Self { miner, busy, device }
+    }
+
+    /// Whether the whole rig is paused, so templates must be held.
+    pub fn whole_rig(&self) -> bool {
+        self.device.is_none()
     }
 }
 
 impl Drop for InferenceGuard {
     fn drop(&mut self) {
-        keryx_miner::pom_gpu::set_inference_paused(false);
+        match self.device {
+            Some((dev, model)) => keryx_miner::pom_gpu::set_inference_paused_on(dev, &model, false),
+            None => keryx_miner::pom_gpu::set_inference_paused(false),
+        }
         self.miner.store(false, Ordering::SeqCst);
         self.busy.store(false, Ordering::SeqCst);
         super::audit::shared().wake.notify_one();

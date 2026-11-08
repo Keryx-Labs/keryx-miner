@@ -1375,14 +1375,77 @@ pub fn is_installed(device_id: u32) -> bool {
 /// Raised before an inference is spawned, lowered once no inference is in flight. While
 /// raised, no PoM operation may start or reload a model — including a worker that acquired the
 /// lifecycle lock before the pause.
-static INFERENCE_PAUSED: AtomicBool = AtomicBool::new(false);
+/// One bit per device, plus `PAUSE_ALL` for the whole rig.
+static INFERENCE_PAUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const PAUSE_ALL: u64 = 1 << 63;
 
-pub fn set_inference_paused(paused: bool) {
-    INFERENCE_PAUSED.store(paused, Ordering::Release);
+fn pause_bit(device_id: u32) -> u64 {
+    if device_id < 63 { 1 << device_id } else { PAUSE_ALL }
 }
 
+/// The device an inference was routed to while it alone is paused, with its model.
+static SERVING: std::sync::Mutex<Option<([u8; 32], u32)>> = std::sync::Mutex::new(None);
+
+/// Pauses (or resumes) every device.
+pub fn set_inference_paused(paused: bool) {
+    INFERENCE_PAUSED.store(if paused { PAUSE_ALL } else { 0 }, Ordering::Release);
+    if !paused {
+        *SERVING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// Pauses (or resumes) the one device serving an inference of `model_id`; the others keep
+/// mining. While paused, the inference of `model_id` is pinned to that device.
+pub fn set_inference_paused_on(device_id: u32, model_id: &[u8; 32], paused: bool) {
+    let bit = pause_bit(device_id);
+    let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+    if paused {
+        INFERENCE_PAUSED.fetch_or(bit, Ordering::AcqRel);
+        *serving = Some((*model_id, device_id));
+    } else {
+        INFERENCE_PAUSED.fetch_and(!bit, Ordering::AcqRel);
+        if serving.is_some_and(|(_, d)| d == device_id) {
+            *serving = None;
+        }
+    }
+}
+
+/// Pauses `device_id` alone, clearing any other pause: for a client running one job at a time.
+pub fn set_inference_paused_only(device_id: u32, model_id: &[u8; 32]) {
+    let mut serving = SERVING.lock().unwrap_or_else(|e| e.into_inner());
+    INFERENCE_PAUSED.store(pause_bit(device_id), Ordering::Release);
+    *serving = Some((*model_id, device_id));
+}
+
+/// The device the inference of `model_id` is pinned to while that device alone is paused.
+pub fn pinned_device(model_id: &[u8; 32]) -> Option<u32> {
+    SERVING.lock().unwrap_or_else(|e| e.into_inner()).filter(|(m, _)| m == model_id).map(|(_, d)| d)
+}
+
+/// Whether any device is paused for an inference.
 pub fn inference_paused() -> bool {
-    INFERENCE_PAUSED.load(Ordering::Acquire)
+    INFERENCE_PAUSED.load(Ordering::Acquire) != 0
+}
+
+/// Whether the whole rig is paused for an inference.
+pub fn inference_paused_all() -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire) & PAUSE_ALL != 0
+}
+
+/// Whether `device_id` is paused for an inference.
+pub fn inference_paused_for(device_id: u32) -> bool {
+    INFERENCE_PAUSED.load(Ordering::Acquire) & (PAUSE_ALL | pause_bit(device_id)) != 0
+}
+
+/// The device to pause alone for inference on `model_id`: its mining device on a rig of several,
+/// `None` when the whole rig must pause (one device, or the model is mined on none).
+pub fn serving_device(model_id: &[u8; 32]) -> Option<u32> {
+    (mining_device_count() > 1).then(|| device_for_model(model_id)).flatten()
+}
+
+/// Devices with a mining tier assigned.
+pub fn mining_device_count() -> usize {
+    mining_tiers().lock().map(|g| g.len()).unwrap_or(0)
 }
 
 /// Set once a CUDA fault that outlives the context is seen; the process must restart to recover.
@@ -1438,7 +1501,7 @@ pub fn release_pad(device_id: u32) {
 /// Convenience: search a nonce batch via the installed miner for a specific device.
 #[allow(clippy::too_many_arguments)]
 pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: &[u8; 32], start: u64, batch: u64, h3: bool, walk_v2: bool, h5_1: bool, h5_2: bool, v3: bool, v4: bool, seed_h10: bool, seed_h14: bool, pad: Option<([u8; 32], u64)>) -> Option<u64> {
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         log_throttled(device_id, "paused", || info!("PoM[gpu{}]: mining paused while an inference runs", device_id));
         return None;
     }
@@ -1469,7 +1532,7 @@ pub fn mine(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, target_le: 
 
 /// Convenience: v3 dump for the winning nonce via the installed miner for a specific device.
 pub fn dump_v3(device_id: u32, pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, h3: bool, h5_1: bool, h5_2: bool) -> Option<(Vec<u8>, Vec<u8>, u64)> {
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return None;
     }
     let miner = {
@@ -1701,7 +1764,7 @@ pub fn load_llama_for_inference(gguf: &str, target_dev: u32) -> Result<u64, crat
 /// inference has priority, so mining reloads its model when it next gets the GPU. Returns true if
 /// the miner is ready to mine.
 pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return false;
     }
     if mining_model_id(device_id).is_some_and(|m| crate::llm::model_is_unavailable(&m)) {
@@ -1872,7 +1935,7 @@ fn is_sticky_gpu_runtime_fault(err: &str) -> bool {
 fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // Re-check under the per-device lifecycle lock: a worker that queued on the lock before the
     // pause was raised must not reload the mining model while inference is still generating.
-    if inference_paused() {
+    if inference_paused_for(device_id) {
         return false;
     }
     let (model_id, gguf) = match mining_tiers().lock().ok().and_then(|g| g.get(&device_id).cloned()) {
@@ -2049,6 +2112,26 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inference_pause_is_per_device_or_whole_rig() {
+        let m = [7u8; 32];
+        super::set_inference_paused(false);
+        super::set_inference_paused_on(2, &m, true);
+        assert!(super::inference_paused() && !super::inference_paused_all());
+        assert!(super::inference_paused_for(2) && !super::inference_paused_for(0));
+        assert_eq!((super::pinned_device(&m), super::pinned_device(&[8; 32])), (Some(2), None));
+        super::set_inference_paused_on(2, &m, false);
+        assert!(!super::inference_paused() && super::pinned_device(&m).is_none());
+        super::set_inference_paused_on(1, &m, true);
+        super::set_inference_paused_only(3, &m);
+        assert!(super::inference_paused_for(3) && !super::inference_paused_for(1));
+        assert_eq!(super::pinned_device(&m), Some(3));
+        super::set_inference_paused(true);
+        assert!(super::inference_paused_all() && super::inference_paused_for(0) && super::inference_paused_for(7));
+        super::set_inference_paused(false);
+        assert!(!super::inference_paused_for(7));
+    }
+
     use super::*;
 
     fn t(name: &str, ptr: u64, nbytes: usize, dev: bool) -> (String, u64, usize, bool) {

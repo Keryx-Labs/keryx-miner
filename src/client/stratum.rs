@@ -569,7 +569,8 @@ impl StratumHandler {
                                 return miner.process_block(None).await;
                             }
                             let target = effective_target(self.target_pool, job.block_bits)?;
-                            if self.challenge_in_flight.load(Ordering::SeqCst) {
+                            // A whole-rig pause holds the job; a one-device pause lets the others mine.
+                            if self.challenge_in_flight.load(Ordering::SeqCst) && keryx_miner::pom_gpu::inference_paused_all() {
                                 return miner.process_block(None).await;
                             }
                             if let Some(task_json) = job.task_json {
@@ -963,11 +964,18 @@ impl StratumHandler {
             self.request_queue.push_front((request, queued_at));
             return;
         }
-        let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
-        if let Err(error) = miner.process_block(None).await {
-            warn!("Could not pause mining for AI request: {}", error);
-            self.refuse(&request, "mining could not pause");
-            return;
+        let guard = InferenceGuard::new(
+            miner.opoi_challenge_flag(),
+            self.challenge_in_flight.clone(),
+            keryx_miner::pom_gpu::serving_device(&request.model_id),
+            request.model_id,
+        );
+        if guard.whole_rig() {
+            if let Err(error) = miner.process_block(None).await {
+                warn!("Could not pause mining for AI request: {}", error);
+                self.refuse(&request, "mining could not pause");
+                return;
+            }
         }
         let sender = self.send_channel.clone();
         let worker = self.miner_address.clone();
@@ -1201,11 +1209,18 @@ impl StratumHandler {
                 self.replay_queue.lock().await.push(draw);
                 return true;
             }
-            let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
-            if let Err(error) = miner.process_block(None).await {
-                warn!("Could not pause mining for an audit replay: {}", error);
-                self.replay_queue.lock().await.push(draw.retry());
-                return true;
+            let guard = InferenceGuard::new(
+                miner.opoi_challenge_flag(),
+                self.challenge_in_flight.clone(),
+                keryx_miner::pom_gpu::serving_device(&model_id),
+                model_id,
+            );
+            if guard.whole_rig() {
+                if let Err(error) = miner.process_block(None).await {
+                    warn!("Could not pause mining for an audit replay: {}", error);
+                    self.replay_queue.lock().await.push(draw.retry());
+                    return true;
+                }
             }
             info!("Trace: replaying the audit of request {} (path {:?})", &draw.request_hash[..16], draw.path);
             let traces = self.pool_traces.clone();
@@ -1290,7 +1305,7 @@ impl StratumHandler {
             self.pending_challenge = Some((model_id_hex, nonce_hex));
             return;
         }
-        let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone());
+        let guard = InferenceGuard::new(miner.opoi_challenge_flag(), self.challenge_in_flight.clone(), None, model_id);
         miner.process_block(None).await.ok();
         info!("Inference challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
 
@@ -1371,6 +1386,7 @@ impl StratumHandler {
         // Pause PoW — running kHeavyHash and LLM inference simultaneously crashes the GPU.
         let miner_flag = miner.opoi_challenge_flag();
         miner_flag.store(true, Ordering::SeqCst);
+        keryx_miner::pom_gpu::set_inference_paused(true);
         miner.process_block(None).await.ok();
         info!("Inference task [{}]: PoW suspended for GPU inference", task.stable_id);
 
@@ -1389,6 +1405,7 @@ impl StratumHandler {
         tokio::task::spawn_blocking(move || {
             run_inference_and_upload(model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref);
             // Clear both flags — PoW resumes on the next mining.notify from the bridge.
+            keryx_miner::pom_gpu::set_inference_paused(false);
             miner_flag.store(false, Ordering::SeqCst);
             challenge_flag.store(false, Ordering::SeqCst);
         });

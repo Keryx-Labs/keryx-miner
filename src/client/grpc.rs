@@ -476,6 +476,8 @@ struct ReplayJob {
     seed_hash: String,
     /// Path of the attention phase it builds; `None` for the first opening.
     path: Option<Vec<u64>>,
+    /// Model the replay runs, which tells the device it occupies.
+    model_id: [u8; 32],
     started: std::time::Instant,
     rx: oneshot::Receiver<Option<Vec<u8>>>,
 }
@@ -1404,6 +1406,34 @@ impl KeryxdHandler {
         }
     }
 
+    /// Pauses mining before work on `model_id`: only its device on a multi-GPU rig (the work is
+    /// pinned to it), else the rig. One job runs at a time, so any other pause is cleared.
+    async fn pause_for(&self, model_id: &[u8; 32], miner: &mut MinerManager) -> Result<(), Error> {
+        match keryx_miner::pom_gpu::serving_device(model_id) {
+            Some(dev) => {
+                keryx_miner::pom_gpu::set_inference_paused_only(dev, model_id);
+                if let Some(flag) = &self.opoi_challenge_active {
+                    flag.store(false, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            None => {
+                self.set_opoi_pause(true);
+                miner.process_block(None).await
+            }
+        }
+    }
+
+    /// The device the running inference work occupies alone, with its model, when the rest of the
+    /// rig mines on.
+    fn busy_device(&self) -> Option<(u32, [u8; 32])> {
+        if self.challenge_inference_rx.is_some() {
+            return None;
+        }
+        let model = self.inference_rx.as_ref().map(|j| j.model_id).or(self.replay_rx.as_ref().map(|j| j.model_id))?;
+        keryx_miner::pom_gpu::pinned_device(&model).or_else(|| keryx_miner::pom_gpu::serving_device(&model)).map(|d| (d, model))
+    }
+
     /// Whether the GPU is taken by inference work: a request, a challenge or a replay.
     fn inference_busy(&self) -> bool {
         self.inference_rx.is_some() || self.challenge_inference_rx.is_some() || self.replay_rx.is_some()
@@ -1636,13 +1666,13 @@ impl KeryxdHandler {
         self.ai_request_queue.push_back(entry);
     }
 
-    fn try_start_inference(&mut self) {
+    async fn try_start_inference(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
         // Retry state lives only as long as its request is queued or running.
         let running = self.inference_rx.as_ref().and_then(|j| j.retry.as_ref()).map(|(sid, ..)| sid.clone());
         let queue = &self.ai_request_queue;
         self.request_retries.retain(|sid, _| running.as_ref() == Some(sid) || queue.iter().any(|(q, ..)| q == sid));
         if self.inference_busy() || keryx_miner::llm::probe_in_flight() || self.urgent_replay(self.next_request_work()) {
-            return;
+            return Ok(());
         }
         while self.ai_request_queue.front().is_some_and(|(sid, ..)| self.ai_answered_by_me.contains(sid)) {
             if let Some((sid, ..)) = self.ai_request_queue.pop_front() {
@@ -1650,7 +1680,7 @@ impl KeryxdHandler {
             }
         }
         self.drop_unawaited_requests();
-        let Some(index) = self.startable_request() else { return };
+        let Some(index) = self.startable_request() else { return Ok(()) };
         if let Some(entry) = self.ai_request_queue.remove(index) {
             let retry = Some(entry.clone());
             let (stable_id, request_hash, model_id, prompt, prompt_len, max_tokens, private) = entry;
@@ -1676,7 +1706,7 @@ impl KeryxdHandler {
                 // No inference to run: the answer is the fixed error text.
                 let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None }), 0.0, false));
                 self.inference_rx = Some(job);
-                return;
+                return Ok(());
             }
             // Second guard: re-check readiness at execution time (files could have been deleted).
             if !keryx_miner::llm::is_model_ready(&model_id) {
@@ -1684,8 +1714,10 @@ impl KeryxdHandler {
                 if let Some(entry) = job.retry {
                     self.retry_request(entry);
                 }
-                return;
+                return Ok(());
             }
+            // Mining pauses on the device this very request runs on (or the whole rig) first.
+            self.pause_for(&model_id, miner).await?;
             info!("Inference: spawning LLM inference (max_tokens={}{})", max_tokens, if tier.is_some() { ", traced" } else { "" });
             tokio::task::spawn_blocking(move || {
                 let started = std::time::Instant::now();
@@ -1702,6 +1734,7 @@ impl KeryxdHandler {
             });
             self.inference_rx = Some(job);
         }
+        Ok(())
     }
 
     /// Records the seed block of the block task window of a template, once per window and parent set.
@@ -1794,14 +1827,13 @@ impl KeryxdHandler {
         let (seed, seed_hash, accepted_daa) = (d.seed, d.seed_hash.clone(), d.accepted_daa);
         let (model_id, tier, trace, request_hash) = (p.model_id, p.tier, Arc::clone(&p.trace), p.request_hash);
         info!("Trace: response {} audited at chain block {} — replaying {} points", txid, seed_hash, keryx_miner::trace::POINTS);
-        self.set_opoi_pause(true);
-        miner.process_block(None).await?;
+        self.pause_for(&model_id, miner).await?;
         let (tx_done, rx_done) = oneshot::channel::<Option<Vec<u8>>>();
         tokio::task::spawn_blocking(move || {
             let body = keryx_miner::llm::open_trace(&model_id, tier, &trace, &seed, txid_bytes, &request_hash, accepted_daa);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, started: std::time::Instant::now(), rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: None, model_id, started: std::time::Instant::now(), rx: rx_done });
         Ok(())
     }
 
@@ -1814,15 +1846,14 @@ impl KeryxdHandler {
         let (seed, seed_hash, prev) = (d.seed, d.seed_hash.clone(), a.last_partials());
         let (model_id, tier, trace) = (p.model_id, p.tier, Arc::clone(&p.trace));
         info!("Trace: response {} — replaying attention phase {}", txid, path.len());
-        self.set_opoi_pause(true);
-        miner.process_block(None).await?;
+        self.pause_for(&model_id, miner).await?;
         let (tx_done, rx_done) = oneshot::channel::<Option<Vec<u8>>>();
         let job_path = path.clone();
         tokio::task::spawn_blocking(move || {
             let body = keryx_miner::llm::open_attention_phase(&model_id, tier, &trace, &seed, txid_bytes, &job_path, &prev);
             let _ = tx_done.send(body);
         });
-        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), started: std::time::Instant::now(), rx: rx_done });
+        self.replay_rx = Some(ReplayJob { response_txid: txid, seed_hash, path: Some(path), model_id, started: std::time::Instant::now(), rx: rx_done });
         Ok(())
     }
 
@@ -3187,12 +3218,8 @@ impl KeryxdHandler {
                         self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         // Pause and drain mining BEFORE spawning inference, so no PoM op can
                         // race the model swap: PAUSE -> DRAIN -> SWAP -> GENERATE -> RESUME.
-                        if !self.inference_busy() && self.startable_request().is_some()
-                        {
-                            self.set_opoi_pause(true);
-                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-queue-a", || info!("Template held: request queue of {} waiting to start", self.ai_request_queue.len()));
-                            miner.process_block(None).await?;
-                            self.try_start_inference();
+                        if !self.inference_busy() && self.startable_request().is_some() {
+                            self.try_start_inference(miner).await?;
                         }
                         // Escrow: check for new escrow UTXOs and mature claims.
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
@@ -3311,26 +3338,33 @@ impl KeryxdHandler {
                 if let Some(ref block) = template.block {
                     self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                 }
-                if !self.inference_busy() && self.startable_request().is_some()
-                {
-                    self.set_opoi_pause(true);
-                    keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-queue-b", || info!("Template held: request queue of {} waiting to start", self.ai_request_queue.len()));
-                    miner.process_block(None).await?;
-                    self.try_start_inference();
+                if !self.inference_busy() && self.startable_request().is_some() {
+                    self.try_start_inference(miner).await?;
                 }
-                // Pause GPU mining while any inference is in flight (GPU is occupied by the model).
-                // This covers both regular AiRequest inference and node-issued challenge inference.
+                // Pause GPU mining while any inference is in flight. On a multi-GPU rig only the
+                // device serving it pauses and the template still goes to the others.
                 if self.inference_busy() {
-                    let (inf, chal, rep) = (self.inference_rx.is_some(), self.challenge_inference_rx.is_some(), self.replay_rx.is_some());
-                    keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-busy", || {
-                        info!("Template held: inference {} challenge {} replay {}", inf, chal, rep)
-                    });
-                    self.set_opoi_pause(true);
-                    miner.process_block(None).await?;
-                    return Ok(());
+                    match self.busy_device() {
+                        Some((dev, model)) => {
+                            keryx_miner::pom_gpu::set_inference_paused_only(dev, &model);
+                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-busy-dev", || {
+                                info!("Inference on GPU {} — the other GPUs keep mining", dev)
+                            });
+                        }
+                        None => {
+                            let (inf, chal, rep) = (self.inference_rx.is_some(), self.challenge_inference_rx.is_some(), self.replay_rx.is_some());
+                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-busy", || {
+                                info!("Template held: inference {} challenge {} replay {}", inf, chal, rep)
+                            });
+                            self.set_opoi_pause(true);
+                            miner.process_block(None).await?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    // Past this point any pause comes from the node, not from us.
+                    self.set_opoi_pause(false);
                 }
-                // Past this point any pause comes from the node, not from us.
-                self.set_opoi_pause(false);
                 if let Some(header) = template.block.as_ref().and_then(|b| b.header.as_ref()) {
                     self.resolve_task_seed(header).await;
                 }
@@ -3408,12 +3442,8 @@ impl KeryxdHandler {
                         self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                         self.backfill_note_block(&hash, block.header.as_ref());
                         self.backfill_pump().await?;
-                        if !self.inference_busy() && self.startable_request().is_some()
-                        {
-                            self.set_opoi_pause(true);
-                            keryx_miner::pom_gpu::log_throttled(u32::MAX, "tpl-queue-a", || info!("Template held: request queue of {} waiting to start", self.ai_request_queue.len()));
-                            miner.process_block(None).await?;
-                            self.try_start_inference();
+                        if !self.inference_busy() && self.startable_request().is_some() {
+                            self.try_start_inference(miner).await?;
                         }
                         let claim_tx = self.escrow_watcher.as_mut().and_then(|w| w.handle_block(&block));
                         if let Some(w) = self.escrow_watcher.as_ref() {
