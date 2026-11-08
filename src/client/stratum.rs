@@ -1064,6 +1064,7 @@ impl StratumHandler {
             let guard = guard;
             let mut request_hash = [0u8; 32];
             let mut traced_key = None;
+            let mut record = None;
             let (text, traced) = match tier
                 .filter(|_| hex::decode_to_slice(&request.request_hash, &mut request_hash).is_ok())
             {
@@ -1085,7 +1086,7 @@ impl StratumHandler {
                         }
                         return;
                     };
-                    let text = generated.text;
+                    let (text, device) = (generated.text, generated.device);
                     match generated.trace {
                         Some(trace) => {
                             let answer = if trace.record.stage == keryx_miner::trace::STAGE_CHAIN {
@@ -1111,6 +1112,9 @@ impl StratumHandler {
                                     let _ = sender.try_send(line);
                                 }
                                 return;
+                            }
+                            if let Some(url) = request.upload.clone() {
+                                record = Some((url, device, t.trace.clone()));
                             }
                             let mut t = t;
                             t.response = Some(audit::SentAnswer { text: text.clone(), traced: Some((commitment.clone(), answer.clone())) });
@@ -1144,6 +1148,21 @@ impl StratumHandler {
             let id = ids.fetch_add(1, Ordering::SeqCst);
             match request.response(id, worker, &text, traced) {
                 Ok(line) => {
+                    if let Some((url, device, trace)) = record.take() {
+                        let (task_id, model_id, max_tokens) = (request.task_id.clone(), request.model_id, request.max_tokens as u32);
+                        let tier = tier.unwrap_or_default();
+                        let spawned = std::thread::Builder::new().name("trace-upload".into()).spawn(move || {
+                            let header = keryx_miner::trace_record::header(model_id, tier, request_hash, max_tokens, device);
+                            let blob = keryx_miner::trace_record::encode_record(&header, &trace);
+                            match ai::upload_record(&url, &task_id, &blob) {
+                                Ok(status) => info!("AI request {}: trace record sent ({} B, HTTP {})", task_id, blob.len(), status),
+                                Err(e) => warn!("AI request {}: trace record not sent ({})", task_id, e),
+                            }
+                        });
+                        if let Err(e) = spawned {
+                            warn!("AI request {}: trace record not sent ({})", request.task_id, e);
+                        }
+                    }
                     {
                         let mut pending = pending.blocking_lock();
                         if pending.len() >= MAX_PENDING_IDS {

@@ -99,7 +99,7 @@ type SeqReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-const ABI: c_int = 9;
+pub(crate) const ABI: c_int = 9;
 /// Context kept for the block task while the context pad is resident.
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.

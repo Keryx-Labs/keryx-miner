@@ -8,6 +8,8 @@ use std::sync::{
 };
 
 const MAX_PAYLOAD_BYTES: usize = 1_048_576;
+const MAX_UPLOAD_URL: usize = 2048;
+const UPLOAD_ATTEMPTS: u32 = 4;
 
 /// Trace parameters the pool sets for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,12 +30,14 @@ pub(super) struct AiRequest {
     pub max_tokens: usize,
     /// Trace parameters set by the pool, when it sent them.
     pub trace: Option<TraceSpec>,
+    /// Where the pool wants the trace record posted.
+    pub upload: Option<String>,
     /// Id of the pool's `mining.ai_request`, for an error reply.
     pub reply_id: Option<u32>,
 }
 
 /// The `trace` object of a request extension; `None` when the extension carries none.
-fn parse_trace(ext: &Value) -> Result<Option<(TraceSpec, Option<u32>)>, Error> {
+fn parse_trace(ext: &Value) -> Result<Option<(TraceSpec, Option<u32>, Option<String>)>, Error> {
     let Some(t) = ext.get("trace").filter(|t| !t.is_null()) else { return Ok(None) };
     let tier = t.get("tier").and_then(Value::as_u64).filter(|v| *v < 16).ok_or("Invalid AI trace tier")? as u8;
     let flag = |k: &str| t.get(k).and_then(Value::as_bool).unwrap_or(true);
@@ -42,7 +46,12 @@ fn parse_trace(ext: &Value) -> Result<Option<(TraceSpec, Option<u32>)>, Error> {
         None => None,
         Some(v) => Some(v.as_u64().and_then(|v| u32::try_from(v).ok()).ok_or("Invalid AI trace prompt length")?),
     };
-    Ok(Some((TraceSpec { tier, chain, attention: chain && attention }, prompt_len)))
+    let upload = match t.get("upload").and_then(Value::as_str) {
+        None => None,
+        Some(u) if u.len() <= MAX_UPLOAD_URL && (u.starts_with("http://") || u.starts_with("https://")) => Some(u.to_string()),
+        Some(_) => return Err("Invalid AI trace upload URL".into()),
+    };
+    Ok(Some((TraceSpec { tier, chain, attention: chain && attention }, prompt_len, upload)))
 }
 
 impl AiRequest {
@@ -70,7 +79,7 @@ impl AiRequest {
         }
         let prompt = crate::client::grpc::decode_private_prompt(&raw);
         let sent_len = raw.len().min(keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN) as u32;
-        let prompt_len = trace.and_then(|(_, l)| l).map_or(sent_len, |l| l.min(keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u32));
+        let prompt_len = trace.as_ref().and_then(|(_, l, _)| *l).map_or(sent_len, |l| l.min(keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u32));
         let mut model_id = [0; 32];
         hex::decode_to_slice(&model_hex, &mut model_id)?;
         Ok(Self {
@@ -81,7 +90,8 @@ impl AiRequest {
             prompt,
             prompt_len,
             max_tokens: max_tokens as usize,
-            trace: trace.map(|(t, _)| t),
+            upload: trace.as_ref().and_then(|(_, _, u)| u.clone()),
+            trace: trace.map(|(t, _, _)| t),
             reply_id: None,
         })
     }
@@ -275,6 +285,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_takes_the_upload_url() {
+        let t = |u: Value| AiRequest::parse(with_ext(b"hi", json!({"trace": {"tier": 1, "upload": u}})));
+        assert_eq!(t(json!("https://pool.example/traces/")).unwrap().upload.as_deref(), Some("https://pool.example/traces/"));
+        assert_eq!(t(json!("http://10.0.0.1:8080/r")).unwrap().upload.as_deref(), Some("http://10.0.0.1:8080/r"));
+        assert_eq!(t(json!(7)).unwrap().upload, None);
+        assert_eq!(t(Value::Null).unwrap().upload, None);
+        assert_eq!(AiRequest::parse(fields(b"hi")).unwrap().upload, None);
+        assert!(t(json!("ftp://pool.example/")).is_err());
+        assert!(t(json!("file:///etc/passwd")).is_err());
+        assert!(t(json!(format!("https://{}", "a".repeat(MAX_UPLOAD_URL)))).is_err());
+    }
+
+    #[test]
+    fn upload_retries_server_errors_and_stops_on_a_refusal() {
+        use std::io::{Read, Write};
+        let serve = |codes: Vec<u16>| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = l.local_addr().unwrap().port();
+            let h = std::thread::spawn(move || {
+                let mut paths = Vec::new();
+                for code in codes {
+                    let (mut s, _) = l.accept().unwrap();
+                    let mut buf = vec![0; 65536];
+                    let n = s.read(&mut buf).unwrap();
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    paths.push(head.lines().next().unwrap_or_default().to_string());
+                    write!(s, "HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                paths
+            });
+            (format!("http://127.0.0.1:{port}/rec/"), h)
+        };
+        let (url, h) = serve(vec![201]);
+        assert_eq!(upload_record(&url, "ABCD", b"x"), Ok(201));
+        assert_eq!(h.join().unwrap(), vec!["POST /rec/abcd HTTP/1.1".to_string()]);
+        let (url, h) = serve(vec![403]);
+        assert_eq!(upload_record(&url, "ab", b"x"), Err("HTTP 403".into()));
+        assert_eq!(h.join().unwrap().len(), 1);
+        let (url, h) = serve(vec![503, 200]);
+        assert_eq!(upload_record(&url, "ab", b"x"), Ok(200));
+        assert_eq!(h.join().unwrap().len(), 2);
+    }
+
+    #[test]
     fn response_carries_the_text_and_the_trace_object() {
         let r = AiRequest::parse(fields(b"hi")).unwrap();
         let line = r.response(9, "w".into(), "Paris", Some(("aa".into(), vec![1, 2]))).unwrap();
@@ -304,4 +358,28 @@ mod tests {
         assert_eq!(v["method"], "mining.ai_opening_result");
         assert_eq!(v["params"], json!(["w", "ab".repeat(32), tx, [2, 0], "b001", ""]));
     }
+}
+
+/// POSTs a trace record to `{url}/{request_hash}`. Blocking.
+pub(super) fn upload_record(url: &str, request_hash_hex: &str, blob: &[u8]) -> Result<u16, String> {
+    let target = format!("{}/{}", url.trim_end_matches('/'), request_hash_hex.to_ascii_lowercase());
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(300))
+        .build();
+    let mut last = String::new();
+    for attempt in 1..=UPLOAD_ATTEMPTS {
+        match agent.post(&target).set("Content-Type", "application/octet-stream").send_bytes(blob) {
+            Ok(r) => return Ok(r.status()),
+            Err(ureq::Error::Status(code, _)) if code < 500 && code != 408 && code != 429 => {
+                return Err(format!("HTTP {code}"));
+            }
+            Err(ureq::Error::Status(code, _)) => last = format!("HTTP {code}"),
+            Err(e) => last = e.to_string(),
+        }
+        if attempt < UPLOAD_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_secs(5 * attempt as u64));
+        }
+    }
+    Err(last)
 }

@@ -893,6 +893,8 @@ struct Traced {
 pub struct Generated {
     pub text: String,
     pub trace: Option<crate::trace::ResponseTrace>,
+    /// CUDA device the answer was generated on.
+    pub device: u32,
 }
 
 /// `load_and_run_inference` with the canonical trace of `tier` captured.
@@ -1390,7 +1392,7 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
     match outcome {
         Ok((text, trace)) if trace.is_some() || !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
-            Some(Generated { text: truncate_answer(text, max_tokens), trace })
+            Some(Generated { text: truncate_answer(text, max_tokens), trace, device: dev_id })
         }
         Ok(_) => {
             log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);

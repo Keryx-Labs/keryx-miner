@@ -17,6 +17,7 @@ pub mod pom_v5;
 pub mod block_task;
 pub mod trace;
 pub mod trace_seq;
+pub mod trace_record;
 pub mod trace_store;
 pub mod llm;
 pub mod xoshiro256starstar;

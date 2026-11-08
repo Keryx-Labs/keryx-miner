@@ -1704,7 +1704,7 @@ impl KeryxdHandler {
             };
             if unreadable {
                 // No inference to run: the answer is the fixed error text.
-                let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None }), 0.0, false));
+                let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None, device: 0 }), 0.0, false));
                 self.inference_rx = Some(job);
                 return Ok(());
             }
@@ -1724,7 +1724,7 @@ impl KeryxdHandler {
                 let result = match tier {
                     Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, chain, attention),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
-                        .map(|text| keryx_miner::llm::Generated { text, trace: None }),
+                        .map(|text| keryx_miner::llm::Generated { text, trace: None, device: 0 }),
                 };
                 let transient = result.is_none() && keryx_miner::llm::last_failure_transient();
                 if result.is_none() {
