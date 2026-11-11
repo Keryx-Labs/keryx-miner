@@ -507,7 +507,7 @@ const AWAITED_POLL_SECS: u64 = 10;
 const AWAITED_POLL_MAX: usize = 1_024;
 /// Seconds between two `GetServiceProviders` polls.
 const PROVIDERS_POLL_SECS: u64 = 60;
-/// Seconds added to the estimated generation time per sibling rank.
+/// Seconds added to the estimated prompt and generation time per sibling rank.
 const SIBLING_MARGIN_SECS: u64 = 15;
 /// Seconds between polls while a queued request has no node check yet.
 const UNCHECKED_POLL_SECS: u64 = 2;
@@ -1622,11 +1622,12 @@ impl KeryxdHandler {
         if !self.node_checks_requests {
             return true;
         }
-        let Some((sid, _, model_id, _, _, max_tokens, _)) = self.ai_request_queue.get(index) else { return false };
+        let Some(q) = self.ai_request_queue.get(index) else { return false };
+        let sid = &q.0;
         let queued = self.request_queued_at.get(sid).copied().unwrap_or(now);
-        let gen_daa = speeds::generation_daa(model_id, *max_tokens as u32);
+        let work = self.request_work_daa(q);
         let rank = self.request_rank(index);
-        let delay = std::time::Duration::from_secs(rank as u64 * (gen_daa.map_or(60, |d| d / 10) + SIBLING_MARGIN_SECS));
+        let delay = std::time::Duration::from_secs(rank as u64 * (work / 10 + SIBLING_MARGIN_SECS));
         if self.request_closed(sid) {
             return false;
         }
@@ -1635,7 +1636,6 @@ impl KeryxdHandler {
         }
         let check = self.request_checks.get(sid);
         let window_end = check.map_or(0, |c| c.1);
-        let work = self.ai_request_queue.get(index).map_or(0, |q| self.request_work_daa(q));
         let deadline_near = window_end > 0 && self.last_known_daa + SIBLING_SLACK_WORKS * work + WINDOW_SAFETY_DAA >= window_end;
         let waited = now.saturating_duration_since(queued);
         if waited < delay && !deadline_near {
