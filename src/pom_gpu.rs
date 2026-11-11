@@ -1962,25 +1962,32 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         Err(_) => return,
     };
     let mut swapped = false;
-    for &(dev, tier) in &devices {
+    for &(dev, _) in &devices {
         if device_dead(dev) {
             continue;
         }
-        // No model for this tier in the era being entered: nothing to swap to, the device simply
-        // has nothing valid to mine until its own gate.
-        let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
-        let current = mining_tiers().lock().ok().and_then(|g| g.get(&dev).map(|(id, _)| *id));
-        if current == Some(spec.model_id) {
-            continue;
-        }
+        let (current, spec, gguf) = {
+            let Ok(mut mt) = mining_tiers().lock() else { continue };
+            let Some(tier) = device_tiers().lock().ok().and_then(|g| g.get(&dev).copied()) else { continue };
+            // No model for this tier in the era being entered: nothing to swap to, the device simply
+            // has nothing valid to mine until its own gate.
+            let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
+            let current = mt.get(&dev).map(|(id, _)| *id);
+            if current == Some(spec.model_id) {
+                continue;
+            }
+            let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
+            mt.insert(dev, (spec.model_id, gguf.clone()));
+            (current, spec, gguf)
+        };
         swapped = true;
-        let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
         info!("PoM[gpu{}]: era crossing at DAA {} — mining model → {}.", dev, daa, spec.name);
-        set_mining_tier(dev, spec.model_id, gguf.clone());
         // Free the retired model's possession index (indices are keyed by MODEL, so the new
         // model's index simply builds under its own key at the next ensure_installed).
         if let Some(old_id) = current {
-            crate::pom::clear_index(&old_id);
+            if !mining_tiers().lock().is_ok_and(|g| g.values().any(|(id, _)| *id == old_id)) {
+                crate::pom::clear_index(&old_id);
+            }
         }
         // Same staleness for the in-process llama engine: `ensure_loaded` is load-once, so after the
         // crossing it would keep hosting the previous era's model. Unload it when it lives on this
@@ -1995,8 +2002,10 @@ pub fn advance_mining_tier_if_due(daa: u64) {
     // routing — refresh it as the union of era-correct models so the miner stops announcing the
     // previous era's model_ids after the crossing.
     if swapped {
+        let Ok(_served) = mining_tiers().lock() else { return };
+        let tiers: Vec<crate::models::Tier> = device_tiers().lock().map(|g| g.values().copied().collect()).unwrap_or_default();
         let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
-        for &(_, tier) in &devices {
+        for tier in tiers {
             let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
             if !union.iter().any(|s| s.model_id == spec.model_id) {
                 union.push(spec);
@@ -2260,11 +2269,38 @@ fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
     }
 }
 
+/// Sets the served models (`ai:cap`) to the distinct models the GPUs mine.
+fn refresh_served_models() {
+    let Ok(g) = mining_tiers().lock() else { return };
+    let mut union: Vec<&'static crate::models::ModelSpec> = Vec::new();
+    for (id, _) in g.values() {
+        if let Some(spec) = crate::models::REGISTRY.iter().copied().find(|s| s.model_id == *id) {
+            if !union.iter().any(|s| s.model_id == spec.model_id) {
+                union.push(spec);
+            }
+        }
+    }
+    crate::llm::init_supported(Box::leak(union.into_boxed_slice()));
+}
+
+/// Frees what `failed_model` held on `device_id` after the GPU left it: the engine unless it
+/// already hosts `keep_gguf`, and the host index when no GPU mines that model any more.
+fn release_failed_model(device_id: u32, failed_model: &[u8; 32], keep_gguf: Option<&str>) {
+    uninstall(device_id);
+    if keep_gguf.is_none_or(|g| !crate::llama_engine::active_for(g, device_id as usize)) {
+        crate::llama_engine::unload(device_id as usize);
+    }
+    let mined = mining_tiers().lock().is_ok_and(|g| g.values().any(|(id, _)| id == failed_model));
+    if !mined {
+        crate::pom::clear_index(failed_model);
+    }
+}
+
 /// After a GPU fails to load its assigned tier (OOM), reassign it to the largest **already-downloaded**
 /// PoM model strictly smaller than the failed one that hasn't itself been banlisted on this GPU — so a
 /// card whose VRAM estimate was optimistic (driver overhead + KV cache + fragmentation) mines a
-/// smaller tier instead of idling. The picked model joins the served models. Returns true if a
-/// downgrade was applied.
+/// smaller tier instead of idling. The GPU keeps that tier for later eras, and the served models
+/// follow what the GPUs mine. Returns true if a downgrade was applied.
 fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> bool {
     let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
         return false;
@@ -2277,13 +2313,28 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
     match pick {
         Some((tier, spec)) => {
             let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
+            let Some(hw_tier) = crate::models::tier_from_index(tier) else { return false };
             info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
-            crate::llm::add_supported(spec);
-            set_mining_tier(device_id, spec.model_id, gguf);
+            if let Ok(mut mt) = mining_tiers().lock() {
+                if let Ok(mut dt) = device_tiers().lock() {
+                    dt.insert(device_id, hw_tier);
+                }
+                mt.insert(device_id, (spec.model_id, gguf.clone()));
+            }
+            release_failed_model(device_id, failed_model, Some(&gguf));
+            refresh_served_models();
             true
         }
         None => {
             log::warn!("PoM[gpu{}]: OOM and no smaller downloaded tier available — this GPU will not mine PoM (lower the tier flag or add VRAM).", device_id);
+            if let Ok(mut mt) = mining_tiers().lock() {
+                if let Ok(mut dt) = device_tiers().lock() {
+                    dt.remove(&device_id);
+                }
+                mt.remove(&device_id);
+            }
+            release_failed_model(device_id, failed_model, None);
+            refresh_served_models();
             false
         }
     }

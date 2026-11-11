@@ -239,6 +239,18 @@ pub fn staging_daa() -> u64 {
     }
 }
 
+/// The tier of a `pom_tier_index` value.
+pub fn tier_from_index(index: u8) -> Option<Tier> {
+    Some(match index {
+        0 => Tier::VeryLight,
+        1 => Tier::Light,
+        2 => Tier::Default,
+        3 => Tier::High,
+        4 => Tier::VeryHigh,
+        _ => return None,
+    })
+}
+
 /// The single model a hardware `tier` mines AND serves at `daa` — matching the node's per-block
 /// tier table (`pom_tiers`). The hardware tier is fixed; the model it must mine flips at a gate,
 /// which is what arms `advance_mining_tier_if_due`.

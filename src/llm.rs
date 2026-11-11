@@ -855,17 +855,6 @@ pub fn downloaded_pom_specs() -> Vec<&'static ModelSpec> {
         .collect()
 }
 
-/// Adds `spec` to the served models (`ai:cap`) when it is not one of them yet.
-pub fn add_supported(spec: &'static ModelSpec) {
-    let mut specs = SUPPORTED_SPECS.write().unwrap();
-    if specs.iter().any(|s| s.model_id == spec.model_id) {
-        return;
-    }
-    let mut union = specs.to_vec();
-    union.push(spec);
-    *specs = Box::leak(union.into_boxed_slice());
-}
-
 /// True only when the model is supported, its files are completely downloaded, and it is not
 /// currently withdrawn from `ai:cap`.
 pub fn is_model_ready(model_id: &[u8; 32]) -> bool {
