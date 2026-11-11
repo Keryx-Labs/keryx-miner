@@ -650,11 +650,14 @@ async fn get_client(
     keepalive_seconds: u64,
     keepalive_timeout_seconds: u64,
     pool_password: String,
+    pool_ca_file: Option<String>,
 ) -> Result<Box<dyn Client + 'static>, Error> {
-    if keryxd_address.starts_with("stratum+tcp://") {
-        let (_schema, address) = keryxd_address.split_once("://").unwrap();
+    if client::stratum::is_stratum_url(&keryxd_address) {
+        let (schema, address) = keryxd_address.split_once("://").unwrap();
+        let tls = (schema != "stratum+tcp").then_some(client::stratum::TlsSettings { ca_file: pool_ca_file });
         Ok(StratumHandler::connect(
             address.to_string().clone(),
+            tls,
             mining_address.clone(),
             mine_when_not_synced,
             ipfs_url.clone(),
@@ -801,6 +804,7 @@ async fn client_main(
         opt.stratum_keepalive_seconds,
         opt.stratum_keepalive_timeout_seconds,
         opt.pool_password.clone(),
+        opt.pool_ca_file.clone(),
     )
     .await?;
 
@@ -1127,7 +1131,7 @@ async fn run() -> Result<(), Error> {
                 None
             }
         }
-    } else if opt.keryxd_address.starts_with("stratum+tcp://") && !keryx_miner::pom::is_testnet() {
+    } else if client::stratum::is_stratum_url(&opt.keryxd_address) && !keryx_miner::pom::is_testnet() {
         match tokio::time::timeout(
             std::time::Duration::from_secs(15),
             tokio::task::spawn_blocking(public_api_daa),
@@ -1148,7 +1152,10 @@ async fn run() -> Result<(), Error> {
     };
 
     // Resolve escrow private key (once, before the reconnect loop).
-    let pool_mode = opt.keryxd_address.starts_with("stratum+tcp://");
+    let pool_mode = client::stratum::is_stratum_url(&opt.keryxd_address);
+    if opt.keryxd_address.starts_with("stratum+tcp://") {
+        warn!("Pool connection is not encrypted; use stratum+ssl:// if the pool offers it.");
+    }
     let escrow_privkey: Option<String> = if pool_mode {
         None
     } else {

@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -322,9 +323,49 @@ impl Client for StratumHandler {
     }
 }
 
+/// Whether `url` names a stratum pool (`stratum+tcp://`, `stratum+ssl://` or `stratum+tls://`).
+pub fn is_stratum_url(url: &str) -> bool {
+    ["stratum+tcp://", "stratum+ssl://", "stratum+tls://"].iter().any(|p| url.starts_with(p))
+}
+
+/// TLS options of a stratum connection.
+pub struct TlsSettings {
+    /// Extra PEM certificate authority trusted besides the public roots.
+    pub ca_file: Option<String>,
+}
+
+trait PoolIo: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> PoolIo for T {}
+
+async fn tls_wrap(socket: TcpStream, address: &str, settings: &TlsSettings) -> Result<Box<dyn PoolIo>, Error> {
+    use tokio_rustls::rustls::{self, pki_types::pem::PemObject, pki_types::CertificateDer, pki_types::ServerName, RootCertStore};
+
+    let mut roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    if let Some(path) = &settings.ca_file {
+        let mut added = 0;
+        for cert in CertificateDer::pem_file_iter(path).map_err(|e| format!("pool CA file {}: {}", path, e))? {
+            roots.add(cert.map_err(|e| format!("pool CA file {}: {}", path, e))?)?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!("pool CA file {}: no certificate", path).into());
+        }
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let host = address.rsplit_once(':').map_or(address, |(h, _)| h).trim_start_matches('[').trim_end_matches(']');
+    let name = ServerName::try_from(host.to_string()).map_err(|e| format!("pool host {}: {}", host, e))?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, socket)).await??;
+    Ok(Box::new(stream))
+}
+
 impl StratumHandler {
     pub async fn connect(
         address: String,
+        tls: Option<TlsSettings>,
         miner_address: String,
         mine_when_not_synced: bool,
         ipfs_url: String,
@@ -337,8 +378,16 @@ impl StratumHandler {
         info!("Connecting to {}", address);
         let pool_address = address.clone();
         let proof_encoding = Arc::new(ProofEncoding::default());
-        let socket = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(address)).await??;
-        socket.set_nodelay(true)?;
+        let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&address)).await??;
+        tcp.set_nodelay(true)?;
+        let socket: Box<dyn PoolIo> = match &tls {
+            Some(settings) => {
+                let stream = tls_wrap(tcp, &address, settings).await?;
+                info!("TLS session established with {}", address);
+                stream
+            }
+            None => Box::new(tcp),
+        };
 
         let client = Framed::new(socket, NewLineJsonCodec::new());
         let (send_channel, recv) = mpsc::channel::<StratumLine>(3);

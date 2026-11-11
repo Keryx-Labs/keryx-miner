@@ -158,6 +158,9 @@ pub struct Opt {
     #[clap(long = "pool-password", default_value = "x", help = "Password sent with mining.authorize (e.g. d=4 for a fixed difficulty)")]
     pub pool_password: String,
 
+    #[clap(long = "pool-ca-file", help = "Extra PEM certificate authority trusted for stratum+ssl:// pools")]
+    pub pool_ca_file: Option<String>,
+
     #[clap(short, long, help = "Keryxd port [default: Mainnet = 22110, Testnet = 22210]")]
     port: Option<u16>,
 
