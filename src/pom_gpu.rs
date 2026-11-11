@@ -2263,13 +2263,13 @@ fn oom_banlist_add(device_id: u32, model_id: [u8; 32]) {
 /// After a GPU fails to load its assigned tier (OOM), reassign it to the largest **already-downloaded**
 /// PoM model strictly smaller than the failed one that hasn't itself been banlisted on this GPU — so a
 /// card whose VRAM estimate was optimistic (driver overhead + KV cache + fragmentation) mines a
-/// smaller tier instead of idling. Returns true if a downgrade was applied. No extra prefetch is
-/// needed: the candidate set is the served union (a mixed rig already downloaded the smaller tiers).
+/// smaller tier instead of idling. The picked model joins the served models. Returns true if a
+/// downgrade was applied.
 fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> bool {
     let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
         return false;
     };
-    let pick = crate::llm::served_pom_specs()
+    let pick = crate::llm::downloaded_pom_specs()
         .into_iter()
         .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
         .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(device_id, &s.model_id))
@@ -2278,6 +2278,7 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
         Some((tier, spec)) => {
             let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
             info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
+            crate::llm::add_supported(spec);
             set_mining_tier(device_id, spec.model_id, gguf);
             true
         }

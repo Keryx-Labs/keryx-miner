@@ -845,16 +845,25 @@ pub fn loaded_model_ids() -> Vec<[u8; 32]> {
         .collect()
 }
 
-/// Downloaded (`.ok`) PoM model specs — the OOM-downgrade candidate set when a GPU can't hold its
-/// assigned tier. Restricting to already-downloaded models means a downgrade needs no extra prefetch
-/// (a mixed rig already pulled the smaller tiers for its smaller cards).
-pub fn served_pom_specs() -> Vec<&'static ModelSpec> {
-    let specs = *SUPPORTED_SPECS.read().unwrap();
-    specs
+/// Downloaded (`.ok`) PoM model specs, served or not — the OOM-downgrade candidate set when a GPU
+/// can't hold its assigned tier. A downgrade needs no extra prefetch.
+pub fn downloaded_pom_specs() -> Vec<&'static ModelSpec> {
+    crate::models::REGISTRY
         .iter()
         .copied()
         .filter(|s| crate::models::is_pom_model(&s.model_id) && model_dir(s).join(".ok").exists())
         .collect()
+}
+
+/// Adds `spec` to the served models (`ai:cap`) when it is not one of them yet.
+pub fn add_supported(spec: &'static ModelSpec) {
+    let mut specs = SUPPORTED_SPECS.write().unwrap();
+    if specs.iter().any(|s| s.model_id == spec.model_id) {
+        return;
+    }
+    let mut union = specs.to_vec();
+    union.push(spec);
+    *specs = Box::leak(union.into_boxed_slice());
 }
 
 /// True only when the model is supported, its files are completely downloaded, and it is not
