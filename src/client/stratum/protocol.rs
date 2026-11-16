@@ -9,12 +9,39 @@ pub(super) struct MiningJob {
     pub daa_score: u64,
     pub block_bits: Option<u32>,
     pub task_json: Option<String>,
+    /// Full template header (v4); the worker hashes it itself.
+    pub header: Option<crate::proto::RpcBlockHeader>,
+    /// Block task window seed of the template (v4); `None` when the pool sent none.
+    pub window_seed: Option<[u8; 32]>,
 }
 
 impl TryFrom<MiningNotify> for MiningJob {
     type Error = Error;
 
     fn try_from(notify: MiningNotify) -> Result<Self, Error> {
+        if let MiningNotify::MiningNotifyV4((id, header_hex, timestamp, daa_score, bits, seed_hex)) = notify {
+            let bytes = hex::decode(&header_hex).map_err(|e| format!("mining.notify header is not hex: {e}"))?;
+            let header = <crate::proto::RpcBlockHeader as prost::Message>::decode(bytes.as_slice())
+                .map_err(|e| format!("mining.notify header does not decode: {e}"))?;
+            let window_seed = match seed_hex.as_str() {
+                "" => None,
+                s => {
+                    let mut seed = [0u8; 32];
+                    hex::decode_to_slice(s, &mut seed).map_err(|e| format!("mining.notify window seed is not 32-byte hex: {e}"))?;
+                    Some(seed)
+                }
+            };
+            return Ok(Self {
+                id,
+                header_hash: [0; 4],
+                timestamp,
+                daa_score,
+                block_bits: Some(bits),
+                task_json: None,
+                header: Some(header),
+                window_seed,
+            });
+        }
         let (id, header_hash, timestamp, daa_score, block_bits, task_json) = match notify {
             MiningNotify::MiningNotifyWithTaskV3((id, hash, time, daa, bits, task)) => {
                 (id, hash, time, daa, Some(bits), Some(task))
@@ -24,7 +51,7 @@ impl TryFrom<MiningNotify> for MiningJob {
             MiningNotify::MiningNotifyShortV2((id, hash, time, daa)) => (id, hash, time, daa, None, None),
             _ => return Err("Keryx mining.notify must include the actual DAA score".into()),
         };
-        Ok(Self { id, header_hash, timestamp, daa_score, block_bits, task_json })
+        Ok(Self { id, header_hash, timestamp, daa_score, block_bits, task_json, header: None, window_seed: None })
     }
 }
 

@@ -1,22 +1,23 @@
-/// OPoI Fraud Proof — Phase 3 C: deterministic re-execution.
-///
-/// The verifiable component of an AiResponse is a 32-byte commitment:
-///   `commitment = model_fixed::forward(request_hash)`
-/// where `request_hash = blake2b(raw_AiRequest_payload)[0..32]`.
-///
-/// This commitment is deterministic (bit-exact on all hardware) and fast
-/// to re-execute (~microseconds), so there is no need for a ZK circuit.
-/// The miner MUST prepend the commitment to AiResponse.result; fraud is
-/// detected when the on-chain commitment differs from the re-computed one.
-///
-/// Wire format of `proof_data` inside `AiChallengePayload` (Phase 3 C):
-///   `[request_hash: 32 bytes]`
-///
-/// The verifier uses `request_hash` to:
-///   1. Confirm it matches the `request_hash` stored in the AiResponseRecord.
-///   2. Re-compute `model_fixed::forward(request_hash)`.
-///   3. Compare with `claimed_commitment` from the AiResponseRecord.
-///   If they differ, the miner published a fraudulent commitment → slash.
+//! OPoI Fraud Proof — Phase 3 C: deterministic re-execution.
+//!
+//! The verifiable component of an AiResponse is a 32-byte commitment:
+//!   `commitment = model_fixed::forward(request_hash)`
+//! where `request_hash = blake2b(raw_AiRequest_payload)[0..32]`.
+//!
+//! This commitment is deterministic (bit-exact on all hardware) and fast
+//! to re-execute (~microseconds), so there is no need for a ZK circuit.
+//! The miner MUST prepend the commitment to AiResponse.result; fraud is
+//! detected when the on-chain commitment differs from the re-computed one.
+//!
+//! Wire format of `proof_data` inside `AiChallengePayload` (Phase 3 C):
+//!   `[request_hash: 32 bytes]`
+//!
+//! The verifier uses `request_hash` to:
+//!   1. Confirm it matches the `request_hash` stored in the AiResponseRecord.
+//!   2. Re-compute `model_fixed::forward(request_hash)`.
+//!   3. Compare with `claimed_commitment` from the AiResponseRecord.
+//!
+//! If they differ, the miner published a fraudulent commitment → slash.
 
 use crate::model_fixed;
 

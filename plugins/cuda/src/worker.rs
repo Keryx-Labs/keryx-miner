@@ -37,9 +37,8 @@ pub struct Kernel<'kernel> {
 impl<'kernel> Kernel<'kernel> {
     pub fn new(module: Weak<Module>, name: &'kernel str) -> Result<Kernel<'kernel>, Error> {
         let func = Arc::new(unsafe {
-            module.as_ptr().as_ref().unwrap().get_function(name).map_err(|e| {
+            module.as_ptr().as_ref().unwrap().get_function(name).inspect_err(|&e| {
                 error!("Error loading function: {}", e);
-                e
             })?
         });
         let (_, block_size) = func.suggested_launch_configuration(0, 0.into())?;
@@ -56,7 +55,7 @@ impl<'kernel> Kernel<'kernel> {
     }
 
     pub fn set_workload(&mut self, workload: u32) {
-        self.grid_size = (workload + self.block_size - 1) / self.block_size
+        self.grid_size = workload.div_ceil(self.block_size)
     }
 }
 
@@ -187,16 +186,14 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         let mut selection_path = String::new();
 
         let load_ptx = |ptx, label: &str| {
-            Module::from_ptx(ptx, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+            Module::from_ptx(ptx, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|&e| {
                 error!("Failed to load {} PTX: {}", label, e);
-                e
             })
         };
 
         let load_fatbin = |fatbin: &[u8], label: &str| {
-            Module::from_fatbin(fatbin, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+            Module::from_fatbin(fatbin, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|&e| {
                 error!("Failed to load {} fatbin: {}", label, e);
-                e
             })
         };
 
@@ -355,9 +352,8 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         } else if major > 7 || (major == 7 && minor >= 5) {
             // sm_75 (RTX 20 / Turing)
             selected_module = "ptx:sm_75".to_string();
-            _module = Some(Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+            _module = Some(Arc::new(Module::from_ptx(PTX_75, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|_e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                e
             })?));
         } else if major == 7 {
             // sm_70/sm_72 (Volta)
@@ -377,9 +373,8 @@ impl<'gpu> CudaGPUWorker<'gpu> {
         } else if major > 6 || (major == 6 && minor >= 1) {
             // sm_61 (GTX 10 / Pascal)
             selected_module = "ptx:sm_61".to_string();
-            _module = Some(Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).map_err(|e| {
+            _module = Some(Arc::new(Module::from_ptx(PTX_61, &[ModuleJitOption::OptLevel(OptLevel::O4)]).inspect_err(|_e| {
                 error!("Error loading PTX. Make sure you have the updated driver for you devices");
-                e
             })?));
         } else {
             return Err(format!(

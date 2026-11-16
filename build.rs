@@ -97,9 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // In-process llama.cpp engine: build `libkeryx-llama.so` next to the miner binary.
-    // llama.cpp is PINNED to b10032 — the SAME pin as hiveos/build-keryx-llama.sh and the
+    // llama.cpp is PINNED to b10015 — the SAME pin as hiveos/build-keryx-llama.sh and the
     // byte-identity proof in tools/llama_zerodup_spike. Bump all together, then re-verify.
     println!("cargo:rerun-if-changed=tools/keryx-llama/keryx_llama.cpp");
+    println!("cargo:rerun-if-changed=tools/keryx-llama/patches");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SKIP");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SRC");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_ARCHS");
@@ -112,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const LLAMA_TAG: &str = "b10032";
+const LLAMA_TAG: &str = "b10015";
 const LLAMA_ESCAPE_HINT: &str = "set KERYX_LLAMA_SKIP=1 to build the miner without it (a prebuilt libkeryx-llama.so must then be placed next to the binary)";
 
 /// Builds `libkeryx-llama.so` into the cargo profile dir (next to the miner binary):
@@ -143,6 +144,22 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     apply_llama_patches(&src)?;
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
+    // Reconfigure from scratch when the cache was written at another path (raw or canonical).
+    let cache = build_dir.join("CMakeCache.txt");
+    if let Ok(content) = fs::read_to_string(&cache) {
+        let canon = |p: &std::path::Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mismatch = |cached: &str, dir: &std::path::Path| {
+            cached != dir.to_string_lossy() && cached != canon(dir).to_string_lossy()
+        };
+        let entry = |key: &str| content.lines().find_map(|l| l.strip_prefix(key));
+        let stale = entry("CMAKE_HOME_DIRECTORY:INTERNAL=").is_some_and(|p| mismatch(p, &src))
+            || entry("CMAKE_CACHEFILE_DIR:INTERNAL=").is_some_and(|p| mismatch(p, &build_dir));
+        if stale {
+            eprintln!("llama build cache was created at another path — wiping {} to reconfigure", build_dir.display());
+            fs::remove_dir_all(&build_dir)
+                .map_err(|e| format!("cannot wipe the stale llama build dir {}: {e} — remove it manually", build_dir.display()))?;
+        }
+    }
     // Native kernels for every supported GPU generation (Volta to Blackwell); needs nvcc >= 12.8.
     // Override with a shorter list for a faster development build.
     let archs = env::var("KERYX_LLAMA_ARCHS")
@@ -167,6 +184,8 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
             "-DGGML_F16C=OFF",
             "-DGGML_BMI2=OFF",
             "-DGGML_CUDA_NCCL=OFF",
+            // Traces are captured in the quantized kernels: no cuBLAS fallback on any architecture.
+            "-DGGML_CUDA_FORCE_MMQ=ON",
             "-DCMAKE_BUILD_TYPE=Release",
             &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
         ]);
@@ -282,9 +301,8 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
     Err(format!("cannot locate the CUDA toolkit root (needed to link libkeryx-llama.so); set CUDA_HOME, or {LLAMA_ESCAPE_HINT}").into())
 }
 
-/// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order.
-/// The applied set is stamped in `.keryx-patches`; when it differs from the current set the
-/// checkout is reset to the tag first (patches overlap, so they cannot be undone one by one).
+/// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order, from a
+/// pristine tree whenever the patch set changes.
 fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // Absolute without canonicalize: the `\\?\` form it yields on Windows is not a path git can open.
     let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("tools/keryx-llama/patches");
@@ -305,6 +323,10 @@ fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::
     run(
         "git checkout of the pristine llama.cpp tree",
         std::process::Command::new("git").current_dir(src).args(["checkout", "--", "."]),
+    )?;
+    run(
+        "git clean of the llama.cpp tree",
+        std::process::Command::new("git").current_dir(src).args(["clean", "-fdq", "--", "ggml/src/ggml-cuda"]),
     )?;
     for patch in &patches {
         run(

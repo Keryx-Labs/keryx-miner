@@ -1,0 +1,949 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a7..3823fbc 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,4 +1,5 @@
+ #include "gated_delta_net.cuh"
++#include "q8seq.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
+ template <int S_v, bool KDA, bool keep_rs_t>
+@@ -27,7 +28,8 @@ gated_delta_net_cuda(const float * q,
+                                      const uint3   rq3_magic,
+                                      float         scale,
+                                      int64_t       state_slot_stride,
+-                                     int           K) {
++                                     int           K,
++                                     const ggml_cuda_gdn_ckpt ck) {
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     // each warp owns one column, using warp-level primitives to reduce across rows
+@@ -142,6 +144,17 @@ gated_delta_net_cuda(const float * q,
+ 
+         attn_data += S_v * H;
+ 
++        if (ck.data != nullptr) {
++            const uint32_t p1 = ck.pos0 + (uint32_t) t + 1;
++            if (p1 % ck.interval == 0) {
++                float * dc = ck.data + ((uint64_t) (p1 / ck.interval - ck.first) * H + h_idx) * S_v * S_v;
++#pragma unroll
++                for (int r = 0; r < rows_per_lane; r++) {
++                    dc[col * S_v + r * warp_size + lane] = s_shard[r];
++                }
++            }
++        }
++
+         if constexpr (keep_rs_t) {
+             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+@@ -176,7 +189,7 @@ static void launch_gated_delta_net(
+         int64_t sv1,   int64_t sv2, int64_t sv3,
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
++        float scale, int64_t state_slot_stride, int K, const ggml_cuda_gdn_ckpt ck, cudaStream_t stream) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     const int num_warps = 4;
+@@ -192,26 +205,26 @@ static void launch_gated_delta_net(
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ck);
+             break;
+         case 32:
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ck);
+             break;
+         case 64: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ck);
+             break;
+         }
+         case 128: {
+             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
++                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ck);
+             break;
+         }
+         default:
+@@ -293,26 +306,27 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         state_d           = cache->data;
+         state_slot_stride = cache->slot_stride;
+     }
++    const ggml_cuda_gdn_ckpt ck = ggml_cuda_q8s_gdn_ckpt(dst, S_v, H, n_tokens, n_seqs);
+ 
+     if (kda) {
+         if (keep_rs) {
+             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, ck, stream);
+         } else {
+             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, ck, stream);
+         }
+     } else {
+         if (keep_rs) {
+             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, ck, stream);
+         } else {
+             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, ck, stream);
+         }
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf437..72d4ef8 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -1,3 +1,5 @@
++#pragma once
++
+ #include "common.cuh"
+ #include "ggml.h"
+ 
+@@ -7,6 +9,15 @@ struct ggml_cuda_gated_delta_net_fused_cache {
+     int64_t slot_stride; // between rollback slots (0 when K==1)
+ };
+ 
++// state checkpoints: after each position p with (p + 1) % interval == 0, the state of every head
++// at data[((p + 1) / interval - first) * H + head] (null data: none)
++struct ggml_cuda_gdn_ckpt {
++    float *  data;
++    uint32_t pos0;
++    uint32_t interval;
++    uint32_t first;
++};
++
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 462d88e..a5bf7f7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -33,6 +33,7 @@
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/q8canon.cuh"
++#include "ggml-cuda/q8seq.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+ #include "ggml-cuda/opt-step-sgd.cuh"
+@@ -3915,6 +3916,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
++                    for (int j = i; j <= i + nodes_to_skip; ++j) {
++                        ggml_cuda_q8s_node(cgraph->nodes[j], cuda_ctx->stream());
++                    }
+                     i += nodes_to_skip;
+                     ggml_cuda_q8c_resid(cgraph->nodes[i], cuda_ctx->stream());
+                     continue;
+@@ -3934,6 +3938,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 ggml_cuda_q8c_node(node, cuda_ctx->stream());
++                ggml_cuda_q8s_node(node, cuda_ctx->stream());
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
+index 923ecca..883f0dd 100644
+--- a/ggml/src/ggml-cuda/q8canon.cu
++++ b/ggml/src/ggml-cuda/q8canon.cu
+@@ -480,7 +480,8 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+                 return false;
+             }
+             const uint8_t tag = b[o];
+-            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : 0;
++            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : tag == 4 ? 25 + 84 :
++                               tag == 5 ? 49 + 84 : tag == 6 ? 25 + 76 : tag == 7 ? 49 + 76 : 0;
+             if (ext == 0 || o + ext > len) {
+                 return false;
+             }
+@@ -491,7 +492,7 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+                     return false;
+                 }
+                 n_layers++;
+-                moe = moe || tag == 3;
++                moe = moe || tag == 3 || tag == 5 || tag == 7;
+             }
+             o += ext;
+         }
+diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
+new file mode 100644
+index 0000000..8f90ac3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/q8seq.cu
+@@ -0,0 +1,706 @@
++#include "q8seq.cuh"
++
++#include "ggml.h"
++
++#include <cuda_fp16.h>
++
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <unordered_set>
++#include <vector>
++
++#define QS_CHUNK       1024
++#define QS_STACK       54
++#define QS_BATCH       64
++#define QS_MAX_DEVICES 16
++#define QS_MAX_CAPS    16
++
++#define QS_CHUNK_START 1u
++#define QS_CHUNK_END   2u
++#define QS_PARENT      4u
++#define QS_ROOT        8u
++
++__constant__ uint32_t qs_iv[8] = { 0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
++                                   0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u };
++
++// Incremental BLAKE3 of one stream: merged subtree CVs, finalized chunk count, and the last
++// (possibly full) chunk, kept until more input or the end shows whether it is the final one.
++struct qs_stream {
++    uint32_t stack[QS_STACK][8];
++    uint32_t partial[QS_CHUNK / 4];
++    uint64_t chunks;
++    uint32_t stack_len;
++    uint32_t partial_len;
++};
++
++struct qs_cap {
++    uint32_t  stream;
++    uint64_t  lo;
++    uint64_t  hi;
++    uint8_t * bytes;
++    uint32_t (*cvs)[8];
++    uint32_t  max_chunks;
++    uint32_t  n_cvs;
++};
++
++static __device__ __forceinline__ uint32_t qs_rotr(uint32_t x, int n) {
++    return __funnelshift_r(x, x, n);
++}
++
++static __device__ __forceinline__ void qs_g(uint32_t * v, int a, int b, int c, int d, uint32_t x, uint32_t y) {
++    v[a] = v[a] + v[b] + x; v[d] = qs_rotr(v[d] ^ v[a], 16);
++    v[c] = v[c] + v[d];     v[b] = qs_rotr(v[b] ^ v[c], 12);
++    v[a] = v[a] + v[b] + y; v[d] = qs_rotr(v[d] ^ v[a], 8);
++    v[c] = v[c] + v[d];     v[b] = qs_rotr(v[b] ^ v[c], 7);
++}
++
++static __device__ void qs_compress(const uint32_t cv[8], const uint32_t m_in[16], uint64_t counter, uint32_t len,
++                                   uint32_t flags, uint32_t out[8]) {
++    constexpr int perm[16] = { 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8 };
++    uint32_t v[16];
++    uint32_t m[16];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        v[i] = cv[i];
++    }
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        v[8 + i] = qs_iv[i];
++    }
++    v[12] = (uint32_t) counter;
++    v[13] = (uint32_t) (counter >> 32);
++    v[14] = len;
++    v[15] = flags;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) {
++        m[i] = m_in[i];
++    }
++#pragma unroll
++    for (int r = 0; r < 7; ++r) {
++        qs_g(v, 0, 4,  8, 12, m[ 0], m[ 1]);
++        qs_g(v, 1, 5,  9, 13, m[ 2], m[ 3]);
++        qs_g(v, 2, 6, 10, 14, m[ 4], m[ 5]);
++        qs_g(v, 3, 7, 11, 15, m[ 6], m[ 7]);
++        qs_g(v, 0, 5, 10, 15, m[ 8], m[ 9]);
++        qs_g(v, 1, 6, 11, 12, m[10], m[11]);
++        qs_g(v, 2, 7,  8, 13, m[12], m[13]);
++        qs_g(v, 3, 4,  9, 14, m[14], m[15]);
++        if (r < 6) {
++            uint32_t t[16];
++#pragma unroll
++            for (int i = 0; i < 16; ++i) {
++                t[i] = m[perm[i]];
++            }
++#pragma unroll
++            for (int i = 0; i < 16; ++i) {
++                m[i] = t[i];
++            }
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        out[i] = v[i] ^ v[i + 8];
++    }
++}
++
++static __device__ void qs_parent(const uint32_t l[8], const uint32_t r[8], bool root, uint32_t out[8]) {
++    uint32_t m[16];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        m[i]     = l[i];
++        m[8 + i] = r[i];
++    }
++    qs_compress(qs_iv, m, 0, 64, QS_PARENT | (root ? QS_ROOT : 0u), out);
++}
++
++// Chaining value (or, with `root`, the hash) of chunk `counter` holding the `len` bytes of `w`.
++static __device__ void qs_chunk(const uint32_t * w, uint32_t len, uint64_t counter, bool root, uint32_t out[8]) {
++    const uint32_t nblk = len == 0 ? 1 : (len + 63) / 64;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        out[i] = qs_iv[i];
++    }
++    for (uint32_t b = 0; b < nblk; ++b) {
++        const uint32_t blen = len == 0 ? 0 : min(64u, len - b*64);
++        uint32_t m[16];
++#pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            m[i] = 4*i < blen ? w[b*16 + i] : 0u;
++        }
++        const bool last = b == nblk - 1;
++        const uint32_t flags = (b == 0 ? QS_CHUNK_START : 0u) | (last ? QS_CHUNK_END : 0u) | (last && root ? QS_ROOT : 0u);
++        qs_compress(out, m, counter, blen, flags, out);
++    }
++}
++
++static __device__ void qs_record_cv(qs_cap * caps, uint32_t n_caps, uint32_t sid, uint64_t idx, const uint32_t cv[8]) {
++    for (uint32_t k = 0; k < n_caps; ++k) {
++        if (caps[k].stream == sid && idx < caps[k].max_chunks) {
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                caps[k].cvs[idx][j] = cv[j];
++            }
++            caps[k].n_cvs = max(caps[k].n_cvs, (uint32_t) idx + 1);
++        }
++    }
++}
++
++static __device__ void qs_push(qs_stream & st, uint32_t cv[8], qs_cap * caps, uint32_t n_caps, uint32_t sid) {
++    qs_record_cv(caps, n_caps, sid, st.chunks, cv);
++    uint64_t total = st.chunks + 1;
++    while ((total & 1) == 0) {
++        qs_parent(st.stack[--st.stack_len], cv, false, cv);
++        total >>= 1;
++    }
++#pragma unroll
++    for (int j = 0; j < 8; ++j) {
++        st.stack[st.stack_len][j] = cv[j];
++    }
++    st.stack_len++;
++    st.chunks++;
++}
++
++// One block per stream `stream0 + blockIdx.x*step`: appends `len` bytes at `src + blockIdx.x*pitch`.
++static __global__ void qs_append(qs_stream * streams, uint32_t stream0, uint32_t step, const uint8_t * src, uint64_t pitch,
++                                 uint32_t len, qs_cap * caps, uint32_t n_caps) {
++    __shared__ uint32_t cvs[QS_BATCH][8];
++    const uint32_t sid = stream0 + blockIdx.x*step;
++    qs_stream & st = streams[sid];
++    const uint32_t * p = (const uint32_t *) (src + blockIdx.x*pitch);
++    uint32_t pl = st.partial_len;
++    uint64_t ch = st.chunks;
++    __syncthreads();
++    const uint64_t base = ch*QS_CHUNK + pl;
++    for (uint32_t k = 0; k < n_caps; ++k) {
++        if (caps[k].stream != sid || caps[k].hi <= base || caps[k].lo >= base + len) {
++            continue;
++        }
++        const uint64_t a = max(caps[k].lo, base), b = min(caps[k].hi, base + len);
++        for (uint64_t i = a + threadIdx.x; i < b; i += blockDim.x) {
++            caps[k].bytes[i - caps[k].lo] = ((const uint8_t *) p)[i - base];
++        }
++    }
++    uint32_t off = 0;
++    if (len > 0 && pl == QS_CHUNK) {
++        if (threadIdx.x == 0) {
++            uint32_t cv[8];
++            qs_chunk(st.partial, QS_CHUNK, ch, false, cv);
++            qs_push(st, cv, caps, n_caps, sid);
++        }
++        pl = 0;
++        ch++;
++        __syncthreads();
++    }
++    if (len > 0 && pl > 0) {
++        const uint32_t take = min(QS_CHUNK - pl, len);
++        for (uint32_t i = threadIdx.x; i < take / 4; i += blockDim.x) {
++            st.partial[pl / 4 + i] = p[i];
++        }
++        __syncthreads();
++        pl += take;
++        off = take;
++        if (off < len) {
++            if (threadIdx.x == 0) {
++                uint32_t cv[8];
++                qs_chunk(st.partial, QS_CHUNK, ch, false, cv);
++                qs_push(st, cv, caps, n_caps, sid);
++            }
++            pl = 0;
++            ch++;
++            __syncthreads();
++        }
++    }
++    if (off < len) {
++        const uint32_t rest   = len - off;
++        const uint32_t n_full = (rest - 1) / QS_CHUNK;
++        for (uint32_t b0 = 0; b0 < n_full; b0 += QS_BATCH) {
++            const uint32_t nb = min((uint32_t) QS_BATCH, n_full - b0);
++            if (threadIdx.x < nb) {
++                qs_chunk(p + (off + (b0 + threadIdx.x)*QS_CHUNK) / 4, QS_CHUNK, ch + threadIdx.x, false, cvs[threadIdx.x]);
++            }
++            __syncthreads();
++            if (threadIdx.x == 0) {
++                for (uint32_t j = 0; j < nb; ++j) {
++                    qs_push(st, cvs[j], caps, n_caps, sid);
++                }
++            }
++            ch += nb;
++            __syncthreads();
++        }
++        const uint32_t tail = rest - n_full*QS_CHUNK;
++        for (uint32_t i = threadIdx.x; i < tail / 4; i += blockDim.x) {
++            st.partial[i] = p[(off + n_full*QS_CHUNK) / 4 + i];
++        }
++        pl = tail;
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        st.partial_len = pl;
++    }
++}
++
++// One thread per stream: the BLAKE3 hash of everything appended.
++static __global__ void qs_finalize(qs_stream * streams, uint32_t n, uint32_t (*roots)[8], qs_cap * caps, uint32_t n_caps) {
++    const uint32_t sid = blockIdx.x*blockDim.x + threadIdx.x;
++    if (sid >= n) {
++        return;
++    }
++    const qs_stream & st = streams[sid];
++    uint32_t cv[8];
++    if (st.chunks == 0) {
++        qs_chunk(st.partial, st.partial_len, 0, true, cv);
++    } else {
++        qs_chunk(st.partial, st.partial_len, st.chunks, false, cv);
++        qs_record_cv(caps, n_caps, sid, st.chunks, cv);
++        for (int i = (int) st.stack_len - 1; i >= 0; --i) {
++            qs_parent(st.stack[i], cv, i == 0, cv);
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < 8; ++j) {
++        roots[sid][j] = cv[j];
++    }
++}
++
++// Cache rows written at `idx` (one per token), split per head: out[h][t] = row[idx[t]][h].
++static __global__ void qs_gather_rows(const uint8_t * cache, uint64_t row_bytes, const int64_t * idx, uint32_t n_tokens,
++                                      uint32_t head_bytes, uint8_t * out) {
++    const uint32_t h = blockIdx.x;
++    for (uint32_t t = blockIdx.y; t < n_tokens; t += gridDim.y) {
++        const uint8_t * row = cache + (uint64_t) idx[t]*row_bytes + (uint64_t) h*head_bytes;
++        uint8_t * dst = out + ((uint64_t) h*n_tokens + t)*head_bytes;
++        for (uint32_t i = threadIdx.x; i < head_bytes; i += blockDim.x) {
++            dst[i] = row[i];
++        }
++    }
++}
++
++// Records of head `blockIdx.x` at every token: q, k, v, o as f16, beta as f32, then g as f32 (one
++// value) or f16 (one per key dimension).
++static __global__ void qs_records(const float * q, const float * k, const float * v, const float * g, const float * beta,
++                                  const float * o, int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1,
++                                  int64_t sb2, uint32_t H, uint32_t H_k, uint32_t S, uint32_t n_tokens, bool kda,
++                                  uint32_t rec_bytes, uint8_t * out) {
++    const uint32_t h = blockIdx.x, hk = h % H_k;
++    for (uint32_t t = 0; t < n_tokens; ++t) {
++        uint8_t * r = out + ((uint64_t) h*n_tokens + t)*rec_bytes;
++        __half * hv = (__half *) r;
++        const float * qt = q + t*sq2 + hk*sq1;
++        const float * kt = k + t*sq2 + hk*sq1;
++        const float * vt = v + t*sv2 + h*sv1;
++        const float * ot = o + ((uint64_t) t*H + h)*S;
++        const int64_t gb = t*sb2 + h*sb1;
++        for (uint32_t i = threadIdx.x; i < S; i += blockDim.x) {
++            hv[i]       = __float2half_rn(qt[i]);
++            hv[S + i]   = __float2half_rn(kt[i]);
++            hv[2*S + i] = __float2half_rn(vt[i]);
++            hv[3*S + i] = __float2half_rn(ot[i]);
++            if (kda) {
++                ((__half *) (r + 8*S + 4))[i] = __float2half_rn(g[gb*S + i]);
++            }
++        }
++        if (threadIdx.x == 0) {
++            memcpy(r + 8*S, &beta[gb], 4);
++            if (!kda) {
++                memcpy(r + 8*S + 4, &g[gb], 4);
++            }
++        }
++    }
++}
++
++// --- host side ---
++
++struct qs_layer {
++    uint32_t kind  = 0;
++    uint32_t slot  = 0;
++    uint32_t heads = 0;
++    uint32_t hd    = 0;
++};
++
++struct qs_dev {
++    bool on = false;
++    std::vector<qs_layer> layer;  // by layer index
++    uint32_t n_attn = 0, n_recur = 0, seq_heads = 0, interval = 0, max_tokens = 0, n_leaves = 0;
++    qs_stream * streams = nullptr;
++    uint8_t *   scratch = nullptr;
++    size_t      scratch_bytes = 0;
++    float *     ckpt = nullptr;
++    size_t      ckpt_bytes = 0;
++    uint32_t (*roots)[8] = nullptr;
++    qs_cap *    d_caps = nullptr;
++    std::vector<qs_cap> caps;
++    uint32_t    n_caps = 0;
++    uint64_t    pos = 0;
++    uint32_t    ub_tokens = 0;
++    std::unordered_set<uint32_t> seen;
++    bool        overflow = false;
++};
++
++static qs_dev     qs_devs[QS_MAX_DEVICES];
++static std::mutex qs_mtx;
++
++static qs_dev * qs_current() {
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= QS_MAX_DEVICES) {
++        return nullptr;
++    }
++    qs_dev * s = &qs_devs[dev];
++    return s->on ? s : nullptr;
++}
++
++struct qs_scoped_device {
++    int  prev = -1;
++    bool ok   = false;
++    explicit qs_scoped_device(int dev) {
++        if (dev >= 0 && dev < QS_MAX_DEVICES && cudaGetDevice(&prev) == cudaSuccess && cudaSetDevice(dev) == cudaSuccess) {
++            ok = true;
++        }
++    }
++    ~qs_scoped_device() {
++        if (ok && prev >= 0) {
++            cudaSetDevice(prev);
++        }
++    }
++};
++
++// Layer of a tensor named `<prefix><layer>`, followed through views and row gathers.
++static int qs_layer_of(const ggml_tensor * t, const char * prefix) {
++    const size_t n = strlen(prefix);
++    for (int depth = 0; t && depth < 8; ++depth) {
++        if (strncmp(t->name, prefix, n) == 0) {
++            char * end = nullptr;
++            const long il = strtol(t->name + n, &end, 10);
++            return end != t->name + n && il >= 0 ? (int) il : -1;
++        }
++        t = t->view_src ? t->view_src : (t->op == GGML_OP_GET_ROWS || t->op == GGML_OP_RESHAPE) ? t->src[0] : nullptr;
++    }
++    return -1;
++}
++
++static void qs_append_heads(qs_dev & s, uint32_t stream0, uint32_t heads, const uint8_t * src, uint64_t pitch, uint32_t len,
++                            cudaStream_t stream) {
++    if (len == 0 || heads == 0) {
++        return;
++    }
++    qs_append<<<heads, 128, 0, stream>>>(s.streams, stream0, 2, src, pitch, len, s.d_caps, s.n_caps);
++}
++
++static uint32_t qs_record_bytes(uint32_t kind, uint32_t hd) {
++    return 8*hd + 4 + (kind == Q8S_KDA ? 2*hd : 4);
++}
++
++// A source seen twice starts the next ubatch: the position moves past the previous one.
++static void qs_mark(qs_dev & s, uint32_t key, uint32_t n_tokens) {
++    if (s.seen.count(key)) {
++        s.pos += s.ub_tokens;
++        s.seen.clear();
++    }
++    s.seen.insert(key);
++    s.ub_tokens = n_tokens;
++}
++
++ggml_cuda_gdn_ckpt ggml_cuda_q8s_gdn_ckpt(const ggml_tensor * dst, int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs) {
++    ggml_cuda_gdn_ckpt ck = { nullptr, 0, 1, 0 };
++    qs_dev * s = qs_current();
++    if (!s || n_seqs != 1) {
++        return ck;
++    }
++    const int il = qs_layer_of(dst->src[5], "cache_s_l");
++    if (il < 0 || il >= (int) s->layer.size() || (s->layer[il].kind != Q8S_GDA && s->layer[il].kind != Q8S_KDA)) {
++        return ck;
++    }
++    qs_mark(*s, 3*(uint32_t) il + 2, (uint32_t) n_tokens);
++    const uint64_t first = s->pos / s->interval + 1, last = (s->pos + n_tokens) / s->interval;
++    if (last < first) {
++        return ck;
++    }
++    if ((last - first + 1)*H*S_v*S_v*sizeof(float) > s->ckpt_bytes) {
++        s->overflow = true;
++        return ck;
++    }
++    ck.data     = s->ckpt;
++    ck.pos0     = (uint32_t) s->pos;
++    ck.interval = s->interval;
++    ck.first    = (uint32_t) first;
++    return ck;
++}
++
++static void qs_kv_rows(qs_dev & s, const ggml_tensor * node, bool value, cudaStream_t stream) {
++    const int il = qs_layer_of(node, value ? "cache_v_l" : "cache_k_l");
++    if (il < 0 || il >= (int) s.layer.size()) {
++        return;
++    }
++    const qs_layer & L = s.layer[il];
++    if (L.kind != Q8S_ATTN && !(L.kind == Q8S_MLA && !value)) {
++        return;
++    }
++    const ggml_tensor * cur = node->src[0];
++    const ggml_tensor * idx = node->src[1];
++    if (node->type != GGML_TYPE_Q8_0 || !idx || idx->type != GGML_TYPE_I64 || L.hd % 32 != 0) {
++        s.overflow = true;
++        return;
++    }
++    const uint32_t n_tokens   = (uint32_t) cur->ne[1];
++    const uint32_t head_bytes = L.hd / 32 * 34;
++    const uint64_t row_bytes  = node->nb[1];
++    if (row_bytes < (uint64_t) L.heads*head_bytes || (uint64_t) L.heads*n_tokens*head_bytes > s.scratch_bytes || n_tokens > s.max_tokens) {
++        s.overflow = true;
++        return;
++    }
++    qs_mark(s, 3*(uint32_t) il + (value ? 1 : 0), n_tokens);
++    const uint8_t * base = (const uint8_t *) node->data;
++    dim3 grid(L.heads, std::min<uint32_t>(n_tokens, 64));
++    qs_gather_rows<<<grid, 128, 0, stream>>>(base, row_bytes, (const int64_t *) idx->data, n_tokens, head_bytes, s.scratch);
++    const uint32_t stream0 = 2*(L.slot*s.seq_heads) + (value ? 1 : 0);
++    qs_append_heads(s, stream0, L.heads, s.scratch, (uint64_t) n_tokens*head_bytes, n_tokens*head_bytes, stream);
++}
++
++static void qs_recurrent(qs_dev & s, const ggml_tensor * dst, cudaStream_t stream) {
++    const int il = qs_layer_of(dst->src[5], "cache_s_l");
++    if (il < 0 || il >= (int) s.layer.size()) {
++        return;
++    }
++    const qs_layer & L = s.layer[il];
++    if (L.kind != Q8S_GDA && L.kind != Q8S_KDA) {
++        return;
++    }
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * g = dst->src[3], * b = dst->src[4];
++    const uint32_t S = (uint32_t) v->ne[0], H = (uint32_t) v->ne[1], n_tokens = (uint32_t) v->ne[2], H_k = (uint32_t) q->ne[1];
++    const bool kda = L.kind == Q8S_KDA;
++    const uint32_t rb = qs_record_bytes(L.kind, L.hd);
++    if (S != L.hd || H != L.heads || v->ne[3] != 1 || (uint64_t) H*n_tokens*rb > s.scratch_bytes || n_tokens > s.max_tokens
++        || (g->ne[0] == (int64_t) S) != kda) {
++        s.overflow = true;
++        return;
++    }
++    const int64_t sq1 = q->nb[1] / 4, sq2 = q->nb[2] / 4, sv1 = v->nb[1] / 4, sv2 = v->nb[2] / 4, sb1 = b->nb[1] / 4, sb2 = b->nb[2] / 4;
++    qs_records<<<H, 128, 0, stream>>>((const float *) q->data, (const float *) k->data, (const float *) v->data,
++                                      (const float *) g->data, (const float *) b->data, (const float *) dst->data,
++                                      sq1, sq2, sv1, sv2, sb1, sb2, H, H_k, S, n_tokens, kda, rb, s.scratch);
++    const uint32_t rec0 = 2*s.seq_heads*s.n_attn + 2*(L.slot*s.seq_heads);
++    qs_append_heads(s, rec0, H, s.scratch, (uint64_t) n_tokens*rb, n_tokens*rb, stream);
++    const uint64_t first = s.pos / s.interval + 1, last = (s.pos + n_tokens) / s.interval;
++    const uint64_t state_bytes = (uint64_t) S*S*sizeof(float);
++    for (uint64_t c = first; c <= last; ++c) {
++        const uint8_t * src = (const uint8_t *) s.ckpt + (c - first)*H*state_bytes;
++        qs_append_heads(s, rec0 + 1, H, src, state_bytes, (uint32_t) state_bytes, stream);
++    }
++}
++
++// A captured graph replays its launches without these hooks: refuse rather than commit stale leaves.
++static bool qs_capturing(qs_dev & s, cudaStream_t stream) {
++    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
++    if (cudaStreamIsCapturing(stream, &st) != cudaSuccess || st != cudaStreamCaptureStatusNone) {
++        s.overflow = true;
++        return true;
++    }
++    return false;
++}
++
++void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
++    qs_dev * s = qs_current();
++    if (!s || ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_GATED_DELTA_NET) && qs_capturing(*s, stream))) {
++        return;
++    }
++    if (node->op == GGML_OP_SET_ROWS) {
++        if (qs_layer_of(node, "cache_k_l") >= 0) {
++            qs_kv_rows(*s, node, false, stream);
++        } else if (qs_layer_of(node, "cache_v_l") >= 0) {
++            qs_kv_rows(*s, node, true, stream);
++        }
++    } else if (node->op == GGML_OP_GATED_DELTA_NET) {
++        qs_recurrent(*s, node, stream);
++    }
++}
++
++static void qs_free(qs_dev & s) {
++    cudaFree(s.streams);
++    cudaFree(s.scratch);
++    cudaFree(s.ckpt);
++    cudaFree(s.roots);
++    cudaFree(s.d_caps);
++    for (auto & c : s.caps) {
++        cudaFree(c.bytes);
++        cudaFree(c.cvs);
++    }
++    s = qs_dev();
++}
++
++extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint32_t n, uint32_t n_attn, uint32_t n_recur,
++                                       uint32_t seq_heads, uint32_t interval, uint32_t max_tokens) {
++    std::lock_guard<std::mutex> lock(qs_mtx);
++    qs_scoped_device sd(device);
++    if (!sd.ok || interval == 0 || seq_heads == 0 || max_tokens == 0) {
++        return -1;
++    }
++    qs_dev & s = qs_devs[device];
++    qs_free(s);
++    size_t scratch = 0, ckpt = 0;
++    for (uint32_t i = 0; i < n; ++i) {
++        const uint32_t * r = layers + 5*i;
++        const uint32_t il = r[0], kind = r[1], slot = r[2], heads = r[3], hd = r[4];
++        const bool recur = kind == Q8S_GDA || kind == Q8S_KDA;
++        if (kind < Q8S_ATTN || kind > Q8S_KDA || heads == 0 || heads > seq_heads || slot >= (recur ? n_recur : n_attn)) {
++            return -2;
++        }
++        if (il >= s.layer.size()) {
++            s.layer.resize(il + 1);
++        }
++        s.layer[il] = { kind, slot, heads, hd };
++        const size_t per_tok = recur ? qs_record_bytes(kind, hd) : hd / 32 * 34;
++        scratch = std::max(scratch, (size_t) heads*max_tokens*per_tok);
++        if (recur) {
++            ckpt = std::max(ckpt, (size_t) (max_tokens / interval + 1)*heads*hd*hd*sizeof(float));
++        }
++    }
++    s.n_attn = n_attn;
++    s.n_recur = n_recur;
++    s.seq_heads = seq_heads;
++    s.interval = interval;
++    s.max_tokens = max_tokens;
++    s.n_leaves = 2*seq_heads*(n_attn + n_recur);
++    if (cudaMalloc(&s.streams, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess
++        || cudaMalloc(&s.scratch, std::max<size_t>(scratch, 4)) != cudaSuccess
++        || cudaMalloc(&s.ckpt, std::max<size_t>(ckpt, 4)) != cudaSuccess
++        || cudaMalloc(&s.roots, (size_t) s.n_leaves*32) != cudaSuccess
++        || cudaMalloc(&s.d_caps, QS_MAX_CAPS*sizeof(qs_cap)) != cudaSuccess) {
++        qs_free(s);
++        return -3;
++    }
++    s.scratch_bytes = scratch;
++    s.ckpt_bytes = ckpt;
++    s.on = true;
++    return 0;
++}
++
++extern "C" void ggml_cuda_q8s_release(int device) {
++    std::lock_guard<std::mutex> lock(qs_mtx);
++    qs_scoped_device sd(device);
++    if (sd.ok) {
++        qs_free(qs_devs[device]);
++    }
++}
++
++extern "C" int ggml_cuda_q8s_begin_response(int device) {
++    std::lock_guard<std::mutex> lock(qs_mtx);
++    qs_scoped_device sd(device);
++    if (!sd.ok || !qs_devs[device].on) {
++        return -1;
++    }
++    qs_dev & s = qs_devs[device];
++    if (cudaDeviceSynchronize() != cudaSuccess) {
++        return -2;
++    }
++    s.pos = 0;
++    s.ub_tokens = 0;
++    s.seen.clear();
++    s.overflow = false;
++    if (cudaMemset(s.streams, 0, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess) {
++        return -2;
++    }
++    for (auto & c : s.caps) {
++        if (cudaMemset(c.bytes, 0, c.hi - c.lo) != cudaSuccess || cudaMemset(c.cvs, 0, (size_t) c.max_chunks*32) != cudaSuccess) {
++            return -2;
++        }
++    }
++    std::vector<qs_cap> caps = s.caps;
++    for (auto & c : caps) {
++        c.n_cvs = 0;
++    }
++    if (!caps.empty() && cudaMemcpy(s.d_caps, caps.data(), caps.size()*sizeof(qs_cap), cudaMemcpyHostToDevice) != cudaSuccess) {
++        return -2;
++    }
++    return cudaDeviceSynchronize() == cudaSuccess ? 0 : -2;
++}
++
++extern "C" int ggml_cuda_q8s_roots(int device, uint8_t * out, size_t out_cap, uint32_t * n_leaves) {
++    std::lock_guard<std::mutex> lock(qs_mtx);
++    qs_scoped_device sd(device);
++    if (!sd.ok || !qs_devs[device].on) {
++        return -1;
++    }
++    qs_dev & s = qs_devs[device];
++    if (s.overflow) {
++        return -4;
++    }
++    if (out_cap < (size_t) s.n_leaves*32) {
++        return -2;
++    }
++    if (cudaDeviceSynchronize() != cudaSuccess) {
++        return -3;
++    }
++    qs_finalize<<<(s.n_leaves + 127) / 128, 128>>>(s.streams, s.n_leaves, s.roots, s.d_caps, s.n_caps);
++    if (cudaMemcpy(out, s.roots, (size_t) s.n_leaves*32, cudaMemcpyDeviceToHost) != cudaSuccess) {
++        return -3;
++    }
++    *n_leaves = s.n_leaves;
++    return 0;
++}
++
++extern "C" int ggml_cuda_q8s_arm(int device, const uint32_t * stream, const uint64_t * lo, const uint64_t * hi, uint32_t n,
++                                 uint32_t max_chunks) {
++    std::lock_guard<std::mutex> lock(qs_mtx);
++    qs_scoped_device sd(device);
++    if (!sd.ok || !qs_devs[device].on || n > QS_MAX_CAPS) {
++        return -1;
++    }
++    qs_dev & s = qs_devs[device];
++    if (cudaDeviceSynchronize() != cudaSuccess) {
++        return -3;
++    }
++    for (auto & c : s.caps) {
++        cudaFree(c.bytes);
++        cudaFree(c.cvs);
++    }
++    s.caps.clear();
++    for (uint32_t k = 0; k < n; ++k) {
++        if (stream[k] >= s.n_leaves || hi[k] <= lo[k] || hi[k] - lo[k] > (1u << 27)) {
++            s.caps.clear();
++            return -2;
++        }
++        qs_cap c = { stream[k], lo[k], hi[k], nullptr, nullptr, max_chunks, 0 };
++        if (cudaMalloc(&c.bytes, hi[k] - lo[k]) != cudaSuccess || cudaMalloc(&c.cvs, (size_t) max_chunks*32) != cudaSuccess) {
++            return -3;
++        }
++        s.caps.push_back(c);
++    }
++    s.n_caps = n;
++    return 0;
++}
++
++extern "C" int ggml_cuda_q8s_read_captures(int device, uint8_t * bytes, size_t bytes_cap, uint64_t * lens, uint8_t * cvs,
++                                           size_t cvs_cap, uint32_t * n_cvs, uint32_t n) {
++    std::lock_guard<std::mutex> lock(qs_mtx);
++    qs_scoped_device sd(device);
++    if (!sd.ok || !qs_devs[device].on || n != qs_devs[device].n_caps) {
++        return -1;
++    }
++    qs_dev & s = qs_devs[device];
++    std::vector<qs_cap> caps(n);
++    if (n > 0 && cudaMemcpy(caps.data(), s.d_caps, n*sizeof(qs_cap), cudaMemcpyDeviceToHost) != cudaSuccess) {
++        return -3;
++    }
++    size_t bo = 0, co = 0;
++    for (uint32_t k = 0; k < n; ++k) {
++        const size_t len = caps[k].hi - caps[k].lo, cl = (size_t) caps[k].n_cvs*32;
++        if (bo + len > bytes_cap || co + cl > cvs_cap) {
++            return -2;
++        }
++        if (cudaMemcpy(bytes + bo, caps[k].bytes, len, cudaMemcpyDeviceToHost) != cudaSuccess
++            || cudaMemcpy(cvs + co, caps[k].cvs, cl, cudaMemcpyDeviceToHost) != cudaSuccess) {
++            return -3;
++        }
++        lens[k] = len;
++        n_cvs[k] = caps[k].n_cvs;
++        bo += len;
++        co += cl;
++    }
++    for (auto & c : s.caps) {
++        cudaFree(c.bytes);
++        cudaFree(c.cvs);
++    }
++    s.caps.clear();
++    s.n_caps = 0;
++    return 0;
++}
+diff --git a/ggml/src/ggml-cuda/q8seq.cuh b/ggml/src/ggml-cuda/q8seq.cuh
+new file mode 100644
+index 0000000..1154a5e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/q8seq.cuh
+@@ -0,0 +1,42 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cuda_runtime.h>
++
++#include "gated_delta_net.cuh"
++
++struct ggml_tensor;
++
++// Sequence leaves of verifiable inference: per layer and head, every position end to end, hashed
++// on the device as the positions are evaluated. Stream `i` is sequence leaf `i`.
++
++enum q8s_kind {
++    Q8S_ATTN = 1, // key and value cache rows
++    Q8S_MLA  = 2, // latent key cache rows only
++    Q8S_GDA  = 3, // records and state checkpoints, one decay per head
++    Q8S_KDA  = 4, // records and state checkpoints, one decay per key dimension
++};
++
++// Hooks (current device).
++void               ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream);
++ggml_cuda_gdn_ckpt ggml_cuda_q8s_gdn_ckpt(const ggml_tensor * dst, int64_t S_v, int64_t H, int64_t n_tokens, int64_t n_seqs);
++
++// Control (any device). Every call returns 0 on success and a negative value otherwise.
++extern "C" {
++    // `layers`: `n` rows of (layer, kind, slot, heads, head_dim).
++    int  ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint32_t n, uint32_t n_attn, uint32_t n_recur,
++                                 uint32_t seq_heads, uint32_t interval, uint32_t max_tokens);
++    void ggml_cuda_q8s_release(int device);
++    int  ggml_cuda_q8s_begin_response(int device);
++    // Sequence roots of the response: `n_leaves` BLAKE3 hashes into `out`.
++    int  ggml_cuda_q8s_roots(int device, uint8_t * out, size_t out_cap, uint32_t * n_leaves);
++    // Up to 16 captures of byte spans `[lo, hi)` of streams, recorded with the chunk chaining
++    // values of each stream (up to `max_chunks`), for the next response.
++    int  ggml_cuda_q8s_arm(int device, const uint32_t * stream, const uint64_t * lo, const uint64_t * hi, uint32_t n,
++                           uint32_t max_chunks);
++    // Captured bytes end to end (`lens[k]` each), then the chunk chaining values of each capture
++    // (`n_cvs[k]` each, 32 bytes), after `ggml_cuda_q8s_roots`.
++    int  ggml_cuda_q8s_read_captures(int device, uint8_t * bytes, size_t bytes_cap, uint64_t * lens, uint8_t * cvs,
++                                     size_t cvs_cap, uint32_t * n_cvs, uint32_t n);
++}

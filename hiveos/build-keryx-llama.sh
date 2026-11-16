@@ -10,12 +10,12 @@
 #   pascal: /tmp/cuda124 (12.4), archs 60;61
 # Output: hiveos/dist-<line>/libkeryx-llama.so  (package-line.sh bundles it when present)
 #
-# llama.cpp PINNED to b10032 — the SAME pin as build-llama-server.sh and the byte-identity
+# llama.cpp PINNED to b10015 — the SAME pin as build-llama-server.sh and the byte-identity
 # proof in tools/llama_zerodup_spike. Bump all together, then re-verify the spike.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINE="$1"; JOBS="${2:-16}"
-TAG=b10032
+TAG=b10015
 case "$LINE" in
   modern) ARCHS="75;80;86;89;90;120"; CUDAMOUNT=(); KCUDA=/usr/local/cuda ;;
   legacy) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
@@ -36,9 +36,10 @@ SRC=/tmp/llama-src-$TAG
 if [ ! -d "$SRC" ]; then
   git clone --quiet --depth 1 --branch "$TAG" https://github.com/ggml-org/llama.cpp "$SRC"
 fi
-git -C "$SRC" checkout -- .
-for P in "$REPO"/tools/keryx-llama/patches/*.patch; do
-  git -C "$SRC" apply "$P"
+git -C "$SRC" checkout --quiet -- .
+git -C "$SRC" clean -fdq
+for p in "$REPO"/tools/keryx-llama/patches/*.patch; do
+  git -C "$SRC" apply "$p"
 done
 
 docker run --rm --network host \
@@ -54,7 +55,7 @@ docker run --rm --network host \
     /tmp/cmk/bin/cmake -S /llama -B $B -DGGML_CUDA=ON -DGGML_RPC=ON \
       -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DBUILD_SHARED_LIBS=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FORCE_MMQ=ON -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc
     /tmp/cmk/bin/cmake --build $B --target llama -j "$JOBS"
     g++ -O2 -std=c++17 $WRAPFLAGS -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama.cpp \

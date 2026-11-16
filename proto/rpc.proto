@@ -55,6 +55,9 @@ message RpcBlockHeader {
   // H6: the winning walk's proven PoM tier, committed into the block hash. Filled on
   // submit_block from the GPU that solved the block, exactly like pomFinalState.
   uint32 pomTier = 18;
+  // Block task root of the block's window, committed into both the block hash and the pre-PoW
+  // hash at/after the block task gate. Field number mirrors the node's rpc.proto. Hex string.
+  string taskRoot = 19;
 }
 
 message RpcBlockLevelParents {
@@ -329,10 +332,16 @@ message SubmitTransactionResponseMessage{
 //
 // See: VirtualSelectedParentChainChangedNotificationMessage
 message NotifyVirtualSelectedParentChainChangedRequestMessage{
+  bool includeAcceptedTransactionIds = 1;
 }
 
 message NotifyVirtualSelectedParentChainChangedResponseMessage{
   RPCError error = 1000;
+}
+
+message RpcAcceptedTransactionIds{
+  string acceptingBlockHash = 1;
+  repeated string acceptedTransactionIds = 2;
 }
 
 // VirtualSelectedParentChainChangedNotificationMessage is sent whenever the DAG's selected parent
@@ -342,6 +351,10 @@ message NotifyVirtualSelectedParentChainChangedResponseMessage{
 message VirtualSelectedParentChainChangedNotificationMessage{
   // The chain blocks that were removed, in high-to-low order
   repeated string removedChainBlockHashes = 1;
+
+  // The transactions accepted by each block in addedChainBlockHashes.
+  // Will be filled only if `includeAcceptedTransactionIds = true` in the notify request.
+  repeated RpcAcceptedTransactionIds acceptedTransactionIds = 2;
 
   // The chain blocks that were added, in low-to-high order
   repeated string addedChainBlockHashes = 3;
@@ -377,6 +390,7 @@ message GetSubnetworkResponseMessage{
 // parent chain from some startHash to this kaspad's current virtual
 message GetVirtualSelectedParentChainFromBlockRequestMessage{
   string startHash = 1;
+  bool includeAcceptedTransactionIds = 2;
 }
 
 message GetVirtualSelectedParentChainFromBlockResponseMessage{
@@ -385,6 +399,9 @@ message GetVirtualSelectedParentChainFromBlockResponseMessage{
 
   // The chain blocks that were added, in low-to-high order
   repeated string addedChainBlockHashes = 3;
+
+  // The transactions accepted by each added block, when asked for.
+  repeated RpcAcceptedTransactionIds acceptedTransactionIds = 2;
 
   RPCError error = 1000;
 }
@@ -720,6 +737,8 @@ message ServicePendingBurnMessage {
   uint32 consecutiveMisses = 3;
   uint32 burnedClaims = 4;
   uint64 burnedSompi = 5;
+  // Missed request; empty from older nodes. Field numbers mirror the node's rpc.proto.
+  string requestHash = 6;
 }
 
 // Lifetime strike tally per miner — never reset, unlike consecutiveMisses. Field numbers mirror
@@ -730,6 +749,55 @@ message ServiceStrikeTotalMessage {
 }
 
 message GetServiceStrikesRequestMessage {
+}
+
+message AwaitedOpeningMessage {
+  string responseTxid = 1;
+  string escrowPubkey = 2;
+  string seed = 3;
+  uint64 deadlineDaa = 4;
+  uint32 pieces = 5;
+  repeated uint64 attentionPath = 6;
+  uint64 acceptedDaa = 7;
+}
+
+message GetAwaitedOpeningsRequestMessage {
+  repeated string responseTxids = 1;
+  string escrowPubkey = 2;
+  repeated string requestHashes = 3;
+}
+
+message AwaitedRequestMessage {
+  string requestHash = 1;
+  uint64 windowEndDaa = 2;
+}
+
+message GetAwaitedOpeningsResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated AwaitedOpeningMessage openings = 2;
+  repeated AwaitedRequestMessage awaitedRequests = 3;
+  bool requestsChecked = 4;
+  repeated string closedRequests = 5;
+
+  RPCError error = 1000;
+}
+
+message ServiceProviderMessage {
+  uint32 tier = 1;
+  string modelId = 2;
+  string identity = 3;
+  string escrowPubkey = 4;
+}
+
+message GetServiceProvidersRequestMessage {
+  uint64 windowDaa = 1;
+}
+
+message GetServiceProvidersResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated ServiceProviderMessage providers = 2;
+
+  RPCError error = 1000;
 }
 
 message GetServiceStrikesResponseMessage {

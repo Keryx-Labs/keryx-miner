@@ -1,0 +1,14 @@
+[package]
+name = "keryx-verifiable-inference"
+version = "0.5.7"
+edition = "2024"
+rust-version = "1.88.0"
+license = "ISC"
+description = "Verification of inference trace openings (byte-exact mirror of the node crate)"
+
+[dependencies]
+blake3 = "1"
+libm = "0.2"
+
+[features]
+testkit = []

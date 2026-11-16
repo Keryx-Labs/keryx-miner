@@ -1,0 +1,206 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -6,6 +6,28 @@
+ 
+ #include <cstdint>
+ 
++// Device buffer for the log softmax mass of every row of `kqv` when its sequence leaves are
++// traced, else null.
++float * ggml_cuda_q8s_lse_target(const ggml_tensor * kqv, bool stream_k);
++
++// Log softmax mass of each row from the (max, sum) of its `parallel_blocks` parts.
++static __global__ void flash_attn_lse_from_meta(const float2 * meta, const int parallel_blocks, const int64_t nrows, float * lse) {
++    const int64_t r = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (r >= nrows) {
++        return;
++    }
++    const float2 * m = meta + r*parallel_blocks;
++    double kqmax = m[0].x;
++    for (int l = 1; l < parallel_blocks; ++l) {
++        kqmax = fmax(kqmax, (double) m[l].x);
++    }
++    double sum = 0.0;
++    for (int l = 0; l < parallel_blocks; ++l) {
++        sum += (double) m[l].y*exp((double) m[l].x - kqmax);
++    }
++    lse[r] = (float) (kqmax + log(sum));
++}
++
+ #define FATTN_KQ_STRIDE       256
+ #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
+ #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
+@@ -1184,6 +1206,11 @@
+         }
+     }
+ 
++    float * lse_out = ggml_cuda_q8s_lse_target(KQV, stream_k);
++    if (lse_out && parallel_blocks == 1) {
++        dst_tmp_meta.alloc(ggml_nrows(KQV));
++    }
++
+     float scale         = 1.0f;
+     float max_bias      = 0.0f;
+     float logit_softcap = 0.0f;
+@@ -1270,5 +1297,9 @@
+         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+     }
++    if (lse_out) {
++        const int64_t nrows = ggml_nrows(KQV);
++        flash_attn_lse_from_meta<<<(nrows + 255)/256, 256, 0, main_stream>>>(dst_tmp_meta.ptr, parallel_blocks, nrows, lse_out);
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1134,7 +1134,7 @@
+         }
+ #endif // FAST_FP16_AVAILABLE
+ 
+-        if (gridDim.y != 1 && threadIdx.x == 0) {
++        if (dst_meta && threadIdx.x == 0) {
+             dst_meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
+--- a/ggml/src/ggml-cuda/q8seq.cu
++++ b/ggml/src/ggml-cuda/q8seq.cu
+@@ -15,6 +15,7 @@
+ #define QS_BATCH       64
+ #define QS_MAX_DEVICES 16
+ #define QS_MAX_CAPS    16
++#define QS_LSE_HEADS   256
+ 
+ #define QS_CHUNK_START 1u
+ #define QS_CHUNK_END   2u
+@@ -335,6 +336,11 @@
+     uint32_t    ub_tokens = 0;
+     std::unordered_set<uint32_t> seen;
+     bool        overflow = false;
++    float *     lse = nullptr;
++    size_t      lse_cap = 0;
++    int         lse_layer = -1;
++    uint32_t    lse_heads = 0, lse_tokens = 0;
++    std::vector<uint64_t> lse_pos;  // by layer index
+ };
+ 
+ static qs_dev     qs_devs[QS_MAX_DEVICES];
+@@ -498,9 +504,63 @@
+     return false;
+ }
+ 
++float * ggml_cuda_q8s_lse_target(const ggml_tensor * kqv, bool stream_k) {
++    qs_dev * s = qs_current();
++    if (!s) {
++        return nullptr;
++    }
++    const int il = qs_layer_of(kqv->src[1], "cache_k_l");
++    if (il < 0 || il >= (int) s->layer.size() || (s->layer[il].kind != Q8S_ATTN && s->layer[il].kind != Q8S_MLA)) {
++        return nullptr;
++    }
++    const uint32_t n_head = (uint32_t) kqv->ne[1], n_tokens = (uint32_t) (kqv->ne[2]*kqv->ne[3]);
++    if (stream_k || s->lse_layer >= 0 || n_head % s->layer[il].heads != 0 || (size_t) n_head*n_tokens > s->lse_cap) {
++        s->overflow = true;
++        return nullptr;
++    }
++    s->lse_layer = il;
++    s->lse_heads = n_head;
++    s->lse_tokens = n_tokens;
++    return s->lse;
++}
++
++// Log masses of `n_head` query heads at every token, grouped per key/value head:
++// out[kv][t][qi] = lse[t][kv*g + qi].
++static __global__ void qs_lse_gather(const float * lse, uint32_t n_head, uint32_t n_tokens, uint32_t g, float * out) {
++    const uint64_t i = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= (uint64_t) n_head*n_tokens) {
++        return;
++    }
++    const uint32_t t = i / n_head, h = i % n_head, kv = h / g, qi = h % g;
++    out[((uint64_t) kv*n_tokens + t)*g + qi] = lse[i];
++}
++
++static void qs_lse(qs_dev & s, const ggml_tensor * node, cudaStream_t stream) {
++    const int il = qs_layer_of(node->src[1], "cache_k_l");
++    if (s.lse_layer < 0 && (il < 0 || il >= (int) s.layer.size() || (s.layer[il].kind != Q8S_ATTN && s.layer[il].kind != Q8S_MLA))) {
++        return;
++    }
++    if (il != s.lse_layer) {
++        s.overflow = true;
++        s.lse_layer = -1;
++        return;
++    }
++    const qs_layer & L = s.layer[il];
++    const uint32_t g = s.lse_heads / L.heads, n = s.lse_heads*s.lse_tokens;
++    qs_lse_gather<<<(n + 255)/256, 256, 0, stream>>>(s.lse, s.lse_heads, s.lse_tokens, g, (float *) s.scratch);
++    const uint32_t len = s.lse_tokens*g*sizeof(float);
++    qs_append<<<L.heads, 128, 0, stream>>>(s.streams, 2*s.seq_heads*(s.n_attn + s.n_recur) + L.slot*s.seq_heads, 1, s.scratch, len, len, s.d_caps, s.n_caps);
++    s.lse_pos[il] += s.lse_tokens;
++    s.lse_layer = -1;
++}
++
+ void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
+     qs_dev * s = qs_current();
+-    if (!s || ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_GATED_DELTA_NET) && qs_capturing(*s, stream))) {
++    if (!s || ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_GATED_DELTA_NET || node->op == GGML_OP_FLASH_ATTN_EXT) && qs_capturing(*s, stream))) {
++        return;
++    }
++    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
++        qs_lse(*s, node, stream);
+         return;
+     }
+     if (node->op == GGML_OP_SET_ROWS) {
+@@ -515,6 +575,7 @@
+ }
+ 
+ static void qs_free(qs_dev & s) {
++    cudaFree(s.lse);
+     cudaFree(s.streams);
+     cudaFree(s.scratch);
+     cudaFree(s.ckpt);
+@@ -559,8 +620,11 @@
+     s.seq_heads = seq_heads;
+     s.interval = interval;
+     s.max_tokens = max_tokens;
+-    s.n_leaves = 2*seq_heads*(n_attn + n_recur);
+-    if (cudaMalloc(&s.streams, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess
++    s.n_leaves = 2*seq_heads*(n_attn + n_recur) + seq_heads*n_attn;
++    const size_t lse_cap = (size_t) QS_LSE_HEADS*max_tokens;
++    scratch = std::max(scratch, lse_cap*sizeof(float));
++    if (cudaMalloc(&s.lse, lse_cap*sizeof(float)) != cudaSuccess
++        || cudaMalloc(&s.streams, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess
+         || cudaMalloc(&s.scratch, std::max<size_t>(scratch, 4)) != cudaSuccess
+         || cudaMalloc(&s.ckpt, std::max<size_t>(ckpt, 4)) != cudaSuccess
+         || cudaMalloc(&s.roots, (size_t) s.n_leaves*32) != cudaSuccess
+@@ -570,6 +634,7 @@
+     }
+     s.scratch_bytes = scratch;
+     s.ckpt_bytes = ckpt;
++    s.lse_cap = lse_cap;
+     s.on = true;
+     return 0;
+ }
+@@ -596,6 +661,8 @@
+     s.ub_tokens = 0;
+     s.seen.clear();
+     s.overflow = false;
++    s.lse_layer = -1;
++    s.lse_pos.assign(s.layer.size(), 0);
+     if (cudaMemset(s.streams, 0, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess) {
+         return -2;
+     }
+@@ -624,6 +691,12 @@
+     if (s.overflow) {
+         return -4;
+     }
++    for (size_t il = 0; il < s.layer.size(); ++il) {
++        const uint32_t kind = s.layer[il].kind;
++        if ((kind == Q8S_ATTN || kind == Q8S_MLA) && (il >= s.lse_pos.size() || s.lse_pos[il] != s.pos + s.ub_tokens)) {
++            return -4;
++        }
++    }
+     if (out_cap < (size_t) s.n_leaves*32) {
+         return -2;
+     }

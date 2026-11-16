@@ -1,10 +1,10 @@
-/// Keryx OPoI (Optimistic Proof of Inference) — Phase 2 + Phase 3
-///
-/// Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
-///   Tags are verified on-chain; collateral is slashed for fraud.
-///   (The Phase-1 f32 MLP was reference-only, never consensus post-Phase 2 — removed.)
-/// Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
-/// Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
+//! Keryx OPoI (Optimistic Proof of Inference) — Phase 2 + Phase 3
+//!
+//! Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
+//!   Tags are verified on-chain; collateral is slashed for fraud.
+//!   (The Phase-1 f32 MLP was reference-only, never consensus post-Phase 2 — removed.)
+//! Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
+//! Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
 
 pub mod ai_payload;
 pub mod fraud_proof;
@@ -14,18 +14,19 @@ pub mod task;
 
 pub use ai_payload::{
     avail_signed_bytes, AiAvailPayload, AI_AVAIL_PAYLOAD_LEN, AI_AVAIL_SIGNED_LEN, SUBNETWORK_ID_AI_AVAIL_HEX,
-    AiRequestPayload, AiResponder, AiResponseLink, AiResponsePayload, AiChallengePayload,
+    AiRequestPayload, AiResponder, AiResponseLink, AiResponsePayload, AiChallengePayload, TraceCommitment,
     AI_REQUEST_HEADER_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN,
-    MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_V2_LEN,
+    AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_V2_LEN,
+    AI_RESPONSE_EXT_PRIVATE_BODY, AI_RESPONSE_EXT_TRACE, AI_RESPONSE_TRACE_LEN, AI_RESPONSE_TRACE_TOKENS_LEN, AI_RESPONSE_EXT_HEADER_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14,
+    MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
     AI_RESPONSE_LINK_LEN, MAX_AI_RESPONSE_LINKS,
-    AI_RESPONSE_EXT_PRIVATE_BODY, AI_RESPONSE_EXT_HEADER_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
-    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
+    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX, SUBNETWORK_ID_AI_OPENING_HEX,
 };
 pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
 pub use private::{
     escrow_pubkey_of, max_private_prompt_len, open_request, open_response, seal_request, seal_request_with_rng, seal_response,
-    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret,
+    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret, ResponseKey,
     PrivateResponseEnvelope, MAX_PRIVATE_RECIPIENTS, PRIVATE_MAGIC, PRIVATE_VERSION,
 };
 

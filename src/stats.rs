@@ -96,6 +96,8 @@ pub struct MinerStatsSnapshot {
     pub service_status: Option<String>,
     pub api_port: Option<u16>,
     pub total_hashrate_hs: u64,
+    /// Rig-wide power draw: sum of the per-GPU readings, `None` when no GPU reports one.
+    pub total_power_draw_w: Option<f32>,
     pub accepted_blocks: u64,
     pub rejected_blocks: u64,
     pub claimed_outputs: u64,
@@ -226,14 +228,13 @@ impl MinerStats {
                     let power_draw_w = device
                         .power_usage()
                         .ok()
-                        .map(|milliwatts| normalize_power_draw_w(Some(milliwatts as f32), None))
-                        .flatten();
+                        .and_then(|milliwatts| normalize_power_draw_w(Some(milliwatts as f32), None));
 
                     if let Ok(field_values) = device.field_values_for(&[FieldId(82)]) {
                         if let Some(Ok(field_sample)) = field_values.first() {
                             if let Ok(value) = &field_sample.value {
                                 let temp = match value {
-                                    nvml_wrapper::enums::device::SampleValue::I64(temp) => Some(*temp as i64),
+                                    nvml_wrapper::enums::device::SampleValue::I64(temp) => Some(*temp),
                                     nvml_wrapper::enums::device::SampleValue::U32(temp) => Some(*temp as i64),
                                     nvml_wrapper::enums::device::SampleValue::U64(temp) => Some(*temp as i64),
                                     nvml_wrapper::enums::device::SampleValue::F64(_) => None,
@@ -248,9 +249,9 @@ impl MinerStats {
                     nvml_fallbacks.insert(
                         logical_idx,
                         GpuTelemetry {
-                            temp_c: temp_c.map(|temp| temp as u32),
+                            temp_c,
                             memory_temp_c: nvml_memory_temps.get(&logical_idx).copied(),
-                            fan_percent: fan_percent.map(|fan| fan as u32),
+                            fan_percent,
                             power_draw_w,
                         },
                     );
@@ -308,7 +309,7 @@ impl MinerStats {
                         fresh.insert(
                             gpu_idx,
                             GpuTelemetry {
-                                temp_c: temp_c,
+                                temp_c,
                                 memory_temp_c: normalize_memory_temp_c(nvidia_smi_memory_temp_c, None),
                                 fan_percent,
                                 power_draw_w,
@@ -402,6 +403,8 @@ impl MinerStats {
             }
         });
 
+        let total_power_draw_w = devices.iter().filter_map(|d| d.power_draw_w).reduce(|a, b| a + b);
+
         MinerStatsSnapshot {
             started_epoch_s,
             uptime_s,
@@ -414,6 +417,7 @@ impl MinerStats {
                 p => Some(p as u16),
             },
             total_hashrate_hs: self.total_hashrate_hs.load(Ordering::Acquire),
+            total_power_draw_w,
             accepted_blocks: self.accepted_blocks.load(Ordering::Acquire),
             rejected_blocks: self.rejected_blocks.load(Ordering::Acquire),
             claimed_outputs: self.claimed_outputs.load(Ordering::Acquire),
@@ -626,7 +630,7 @@ DEVICE #1:
 
         let memtemps = parse_nvtool_memtemp_output(output);
         assert_eq!(memtemps.get(&0), Some(&72));
-        assert!(memtemps.get(&1).is_none());
+        assert!(!memtemps.contains_key(&1));
     }
 
     #[test]

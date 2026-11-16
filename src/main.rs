@@ -232,6 +232,26 @@ fn adjust_console() -> Result<(), Error> {
 }
 
 #[cfg(test)]
+mod cuda_device_tests {
+    use super::cuda_devices_from_args;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cuda_devices_follow_the_command_line() {
+        assert_eq!(cuda_devices_from_args(&args(&["miner", "--testnet"])), None);
+        assert_eq!(cuda_devices_from_args(&args(&["miner", "--cuda-device", "4"])), Some(vec![4]));
+        assert_eq!(cuda_devices_from_args(&args(&["miner", "--cuda-device=0,2"])), Some(vec![0, 2]));
+        assert_eq!(
+            cuda_devices_from_args(&args(&["miner", "--cuda-device", "1", "--cuda-device", "3"])),
+            Some(vec![1, 3])
+        );
+    }
+}
+
+#[cfg(test)]
 mod recovery_tests {
     use super::*;
 
@@ -339,6 +359,33 @@ extern "C" fn plugin_log_sink(level: u8, msg_ptr: *const u8, msg_len: usize) {
         _ => log::Level::Info,
     };
     log::log!(lvl, "{}", msg);
+}
+
+/// Minimum NVIDIA driver major version accepted for mining.
+const MIN_NVIDIA_DRIVER_MAJOR: u32 = 595;
+
+/// Installed NVIDIA driver version string (e.g. "595.71.05"), from NVML or the kernel module.
+fn nvidia_driver_version() -> Option<String> {
+    if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+        if let Ok(v) = nvml.sys_driver_version() {
+            return Some(v);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/driver/nvidia/version").ok()?;
+        return text
+            .split_whitespace()
+            .find(|w| w.split('.').count() >= 2 && w.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())))
+            .map(str::to_string);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Major component of an NVIDIA driver version string.
+fn nvidia_driver_major(version: &str) -> Option<u32> {
+    version.split('.').next()?.trim().parse().ok()
 }
 
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
@@ -457,6 +504,23 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
     }
 }
 
+/// CUDA devices named by `--cuda-device` in `args`; `None` when the option is absent.
+fn cuda_devices_from_args(args: &[String]) -> Option<Vec<usize>> {
+    let mut out: Option<Vec<usize>> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let value = if arg == "--cuda-device" {
+            it.next().cloned()
+        } else {
+            arg.strip_prefix("--cuda-device=").map(str::to_string)
+        };
+        if let Some(v) = value {
+            out.get_or_insert_with(Vec::new).extend(v.split(',').filter_map(|d| d.trim().parse::<usize>().ok()));
+        }
+    }
+    out
+}
+
 /// Assign each CUDA device the highest PoM tier that (a) is ≤ the `ceiling` flag and (b) fits its
 /// VRAM — so a heterogeneous rig mines a different tier per GPU instead of the lowest common
 /// denominator, small cards downgrade instead of failing, and big cards are not pushed past the
@@ -487,7 +551,19 @@ fn assign_pom_tiers(
         candidates.iter().copied().find(|(floor, _, _)| *floor <= vram_mb).map(|(_, t, s)| (t, s))
     };
 
-    let devices = keryx_miner::pom_gpu::query_all_gpus_vram();
+    let mut devices = keryx_miner::pom_gpu::query_all_gpus_vram();
+    if let Some(selected) = cuda_devices_from_args(&std::env::args().collect::<Vec<_>>()) {
+        for id in selected.iter().filter(|id| !devices.iter().any(|(d, _)| d == *id)) {
+            log::error!("PoM: --cuda-device {}: no such CUDA device on this machine.", id);
+        }
+        for (id, _) in forced.iter().enumerate().filter(|(id, f)| f.is_some() && !selected.contains(id)) {
+            log::warn!("PoM: --force-model entry for GPU {} ignored — --cuda-device does not select that GPU.", id);
+        }
+        devices.retain(|(id, _)| selected.contains(id));
+        if devices.is_empty() {
+            return Vec::new();
+        }
+    }
     if devices.is_empty() {
         // No enumeration: a forced first entry still wins for the fallback device-0 tier.
         if let Some(t) = forced.first().copied().flatten() {
@@ -503,7 +579,7 @@ fn assign_pom_tiers(
     }
     let mut out = Vec::with_capacity(devices.len());
     for (id, vram_mb) in devices {
-        match forced.get(id as usize).copied() {
+        match forced.get(id).copied() {
             Some(Some(t)) => {
                 let spec = keryx_miner::models::spec_for_tier(t);
                 log::info!(
@@ -586,16 +662,22 @@ async fn get_client(
     ipfs_url: String,
     keepalive_seconds: u64,
     keepalive_timeout_seconds: u64,
+    pool_password: String,
+    pool_ca_file: Option<String>,
 ) -> Result<Box<dyn Client + 'static>, Error> {
-    if keryxd_address.starts_with("stratum+tcp://") {
-        let (_schema, address) = keryxd_address.split_once("://").unwrap();
+    if client::stratum::is_stratum_url(&keryxd_address) {
+        let (schema, address) = keryxd_address.split_once("://").unwrap();
+        let tls = (schema != "stratum+tcp").then_some(client::stratum::TlsSettings { ca_file: pool_ca_file });
         Ok(StratumHandler::connect(
             address.to_string().clone(),
+            tls,
             mining_address.clone(),
             mine_when_not_synced,
             ipfs_url.clone(),
             keepalive_seconds,
             keepalive_timeout_seconds,
+            escrow_state_file,
+            pool_password,
         )
         .await?)
     } else if keryxd_address.starts_with("grpc://") {
@@ -681,6 +763,39 @@ fn recovered_escrow_state(api_entries: Vec<ApiEscrowEntry>) -> Result<(escrow::E
     Ok((escrow::EscrowState { entries, journal_seq: 0 }, total_sompi))
 }
 
+const PUBLIC_API_INFO: &str = "https://keryx-labs.com/api/v1/info";
+const PUBLIC_API_DAA_MARGIN: u64 = 864_000;
+
+/// Mainnet virtual DAA as reported by the public API.
+fn public_api_daa() -> Option<u64> {
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
+    let body = agent.get(PUBLIC_API_INFO).call().ok()?.into_string().ok()?;
+    parse_public_info(&body)
+}
+
+/// Extracts the DAA from a `/api/v1/info` body; `None` unless it describes mainnet.
+fn parse_public_info(body: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("network")?.as_str()? != "keryx-mainnet" {
+        return None;
+    }
+    v.get("last_daa_score")?.as_u64().filter(|daa| *daa > 0)
+}
+
+#[cfg(test)]
+mod public_api_tests {
+    use super::parse_public_info;
+
+    #[test]
+    fn reads_mainnet_daa_only() {
+        assert_eq!(parse_public_info(r#"{"network":"keryx-mainnet","last_daa_score":148034866}"#), Some(148034866));
+        assert_eq!(parse_public_info(r#"{"network":"keryx-testnet","last_daa_score":5}"#), None);
+        assert_eq!(parse_public_info(r#"{"network":"keryx-mainnet","last_daa_score":0}"#), None);
+        assert_eq!(parse_public_info(r#"{"last_daa_score":148034866}"#), None);
+        assert_eq!(parse_public_info("<html>"), None);
+    }
+}
+
 async fn client_main(
     opt: &Opt,
     plugin_manager: &PluginManager,
@@ -701,6 +816,8 @@ async fn client_main(
         opt.ipfs_url.clone(),
         opt.stratum_keepalive_seconds,
         opt.stratum_keepalive_timeout_seconds,
+        opt.pool_password.clone(),
+        opt.pool_ca_file.clone(),
     )
     .await?;
 
@@ -772,7 +889,29 @@ fn tokio_blocking_threads() -> Option<usize> {
     std::env::var("KERYX_BLOCKING_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).map(|n| n.clamp(2, 64))
 }
 
+/// Sets a variable read by llama.cpp through the C runtime's `getenv`.
+fn set_llama_env(name: &str, value: &str) {
+    std::env::set_var(name, value);
+    // On Windows `set_var` only updates the OS block; the C runtime keeps its own copy.
+    #[cfg(windows)]
+    {
+        extern "C" {
+            fn _putenv_s(name: *const std::os::raw::c_char, value: *const std::os::raw::c_char) -> std::os::raw::c_int;
+        }
+        let (Ok(n), Ok(v)) = (std::ffi::CString::new(name), std::ffi::CString::new(value)) else { return };
+        unsafe {
+            _putenv_s(n.as_ptr(), v.as_ptr());
+        }
+    }
+}
+
 fn main() -> Result<(), Error> {
+    // The canonical trace cannot be replayed under CUDA graphs on every model.
+    if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_none() {
+        set_llama_env("GGML_CUDA_DISABLE_GRAPHS", "1");
+    }
+    // Attention openings expect unrotated key and value cache rows.
+    set_llama_env("LLAMA_ATTN_ROT_DISABLE", "1");
     // Hidden child mode of the startup engine check (see llama_engine::probe_device).
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--probe-engine-device") {
@@ -956,15 +1095,21 @@ async fn run() -> Result<(), Error> {
         });
     }
     let ui_state = if is_tty { Some(Arc::new(UiState::new())) } else { None };
-    let plain_log_path = opt.plain_log_file.clone().or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok());
-    let plain_log_file =
-        plain_log_path.and_then(|path| match OpenOptions::new().create(true).append(true).open(&path) {
+    // An empty path turns the plain log file off.
+    let plain_log_path = opt
+        .plain_log_file
+        .clone()
+        .or_else(|| std::env::var("KERYX_PLAIN_LOG_FILE").ok())
+        .unwrap_or_else(|| logging::DEFAULT_PLAIN_LOG_FILE.to_string());
+    let plain_log_file = Some(plain_log_path).filter(|path| !path.is_empty()).and_then(|path| {
+        match logging::PlainLogFile::open(&path) {
             Ok(file) => Some(file),
             Err(e) => {
                 eprintln!("Failed to open plain log file '{}': {}", path, e);
                 None
             }
-        });
+        }
+    });
     init_logging(opt.log_level(), ui_state.clone(), !is_tty, plain_log_file)?;
     plugin_manager.set_log_sink(Some(plugin_log_sink));
     for warning in plugin_manager.drain_startup_warnings() {
@@ -1092,12 +1237,31 @@ async fn run() -> Result<(), Error> {
                 None
             }
         }
+    } else if client::stratum::is_stratum_url(&opt.keryxd_address) && !keryx_miner::pom::is_testnet() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(public_api_daa),
+        )
+        .await
+        {
+            Ok(Ok(Some(daa))) => {
+                info!("Public API at DAA {}.", daa);
+                Some(daa.saturating_sub(PUBLIC_API_DAA_MARGIN))
+            }
+            _ => {
+                warn!("Could not read the chain DAA from the public API — prefetching every scheduled era.");
+                None
+            }
+        }
     } else {
         None
     };
 
     // Resolve escrow private key (once, before the reconnect loop).
-    let pool_mode = opt.keryxd_address.starts_with("stratum+tcp://");
+    let pool_mode = client::stratum::is_stratum_url(&opt.keryxd_address);
+    if opt.keryxd_address.starts_with("stratum+tcp://") {
+        warn!("Pool connection is not encrypted; use stratum+ssl:// if the pool offers it.");
+    }
     let escrow_privkey: Option<String> = if pool_mode {
         None
     } else {
@@ -1170,9 +1334,8 @@ async fn run() -> Result<(), Error> {
                         info!("Payout address is this miner's escrow key — delegation signed locally, nothing to set up.");
                         Ok(cert)
                     }
-                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).map(|cert| {
+                    None => escrow::load_cert(&opt.escrow_cert_file, address, &escrow_pubkey_hex).inspect(|_cert| {
                         info!("Escrow delegation cert loaded from '{}'.", opt.escrow_cert_file);
-                        cert
                     }),
                 },
             };
@@ -1269,13 +1432,20 @@ async fn run() -> Result<(), Error> {
     if let Some(daa) = chain_daa {
         keryx_miner::models::set_current_daa(daa);
     }
+    if let Some(selected) = cuda_devices_from_args(&std::env::args().collect::<Vec<_>>()) {
+        let present = keryx_miner::pom_gpu::query_all_gpus_vram();
+        if let Some(id) = selected.iter().find(|id| !present.iter().any(|(d, _)| d == *id)) {
+            error!("--cuda-device {}: no such CUDA device on this machine.", id);
+            return Err(format!("no CUDA device {}", id).into());
+        }
+    }
     let pom_assignments = assign_pom_tiers(tier, &forced_tiers);
     // The served/announced lineup (ai:cap) = the current-era models across all GPUs.
     let specs = lineup_from_assignments(&pom_assignments, tier);
     keryx_miner::llm::init_supported(specs);
     log::debug!("Inference active — {} model(s) staged.", specs.len());
     // Where the chain actually is, so the eras it has already left are not downloaded. Bounded and
-    // fail-open: an unreachable node (or pool mining) just falls back to prefetching every era.
+    // fail-open: an unknown height just falls back to prefetching every era.
     // Prefetch every era this miner can still reach, so a crossing ahead of us hot-swaps without a
     // mid-run download stall. Block until every such model is downloaded before mining: never start
     // hashing while a model is still downloading.
@@ -1366,6 +1536,22 @@ async fn run() -> Result<(), Error> {
             error!("GPU probe task panicked: {}", e);
             return Err(e.into());
         }
+    }
+    match nvidia_driver_version() {
+        Some(version) => match nvidia_driver_major(&version) {
+            Some(major) if major >= MIN_NVIDIA_DRIVER_MAJOR => info!("NVIDIA driver {}.", version),
+            Some(_) => {
+                error!(
+                    "NVIDIA driver {} is not supported: mining requires driver {} or newer.",
+                    version, MIN_NVIDIA_DRIVER_MAJOR
+                );
+                error!("HiveOS: run `nvidia-driver-update {}` then reboot.", MIN_NVIDIA_DRIVER_MAJOR);
+                error!("Other systems: install NVIDIA driver {} or newer, then restart the miner.", MIN_NVIDIA_DRIVER_MAJOR);
+                return Err("NVIDIA driver too old — cannot start mining".into());
+            }
+            None => warn!("NVIDIA driver version '{}' could not be parsed.", version),
+        },
+        None => warn!("NVIDIA driver version could not be read."),
     }
     // A library without kernels for a mining GPU passes the load probe and aborts the process on
     // the first request; check every mining GPU up front (in a child process) instead.

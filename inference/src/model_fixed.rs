@@ -1,18 +1,18 @@
-/// Fixed-point MLP for OPoI Phase 2 — deterministic on all hardware.
-///
-/// Architecture: 32 → 256 → 128 → 32 (ReLU / ReLU / identity)
-///
-/// All arithmetic is i32/i64 — no floating-point operations anywhere.
-/// This guarantees bit-exact results on every CPU regardless of SIMD,
-/// FMA extensions, or compiler rounding mode.  Used as the canonical
-/// reference model for fraud-proof verification: a challenger computes
-/// the expected tag here and the consensus verifier checks it on-chain.
-///
-/// Weight layout: w[output_neuron * n_inputs + input_neuron]
-///
-/// Scale convention: each hidden-layer accumulator is right-shifted by
-/// NORM_SHIFT (= 10 bits) to keep activations in a bounded integer range
-/// before being fed into the next layer.
+//! Fixed-point MLP for OPoI Phase 2 — deterministic on all hardware.
+//!
+//! Architecture: 32 → 256 → 128 → 32 (ReLU / ReLU / identity)
+//!
+//! All arithmetic is i32/i64 — no floating-point operations anywhere.
+//! This guarantees bit-exact results on every CPU regardless of SIMD,
+//! FMA extensions, or compiler rounding mode.  Used as the canonical
+//! reference model for fraud-proof verification: a challenger computes
+//! the expected tag here and the consensus verifier checks it on-chain.
+//!
+//! Weight layout: w[output_neuron * n_inputs + input_neuron]
+//!
+//! Scale convention: each hidden-layer accumulator is right-shifted by
+//! NORM_SHIFT (= 10 bits) to keep activations in a bounded integer range
+//! before being fed into the next layer.
 
 use crate::task::MODEL_SEED;
 

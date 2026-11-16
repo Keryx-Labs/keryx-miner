@@ -422,6 +422,7 @@ mod tests {
             steps_v2: None,
             v3: Some(v3),
             v4: None,
+            task: None,
         };
         let bytes = with_v3.to_wire_bytes();
         // A v3 proof travels in the pre-v4 layout: the v4-aware and pre-v3 layouts both reject it.

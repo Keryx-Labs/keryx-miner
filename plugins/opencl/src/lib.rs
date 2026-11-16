@@ -68,7 +68,7 @@ impl Plugin for OpenCLPlugin {
             let num_devices = platform.get_devices(CL_DEVICE_TYPE_ALL).unwrap_or_default().len();
             info!("{}: {} ({} devices available)", vendor, name, num_devices);
         }
-        let amd_platforms = (&platforms)
+        let amd_platforms = platforms
             .iter()
             .filter(|p| {
                 p.vendor().unwrap_or_else(|_| "Unk".into()) == "Advanced Micro Devices, Inc."

@@ -1,0 +1,1327 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0878ab9..462d88e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -32,6 +32,7 @@
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/q8canon.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+ #include "ggml-cuda/opt-step-sgd.cuh"
+@@ -3192,6 +3193,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         std::fill(ops, ops + 8, node->op);
+ 
+         for (; n_fuse <= 6; ++n_fuse) {
++            if (ggml_cuda_q8c_is_resid(cgraph->nodes[i + n_fuse])) {
++                break;
++            }
+             if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
+                 break;
+             }
+@@ -3620,6 +3624,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             }
+ 
+             const ggml_tensor * bias = with_bias ? get_bias_tensor(out_node, scale_node, bias_op) : nullptr;
++            if (with_bias && bias && bias->op != GGML_OP_NONE && ggml_cuda_q8c_enabled()) {
++                continue;
++            }
+             if (with_bias && !bias) {
+                 continue;
+             }
+@@ -3689,6 +3696,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             continue;
+         }
+ 
++        if (bias_tensor && bias_tensor->op != GGML_OP_NONE && ggml_cuda_q8c_enabled()) {
++            continue;
++        }
+         if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+             continue;
+         }
+@@ -3790,6 +3800,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         // With the use of CUDA graphs, the execution will be performed by the graph launch.
+         if (!use_cuda_graph || cuda_graph_update_required) {
+             [[maybe_unused]] int prev_i = 0;
++            ggml_cuda_q8c_begin(graph_key);
+ 
+             if (stream_ctx.concurrent_events.size() > 0) {
+                 should_launch_concurrent_events = true;
+@@ -3905,6 +3916,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
+                     i += nodes_to_skip;
++                    ggml_cuda_q8c_resid(cgraph->nodes[i], cuda_ctx->stream());
+                     continue;
+                 }
+ #ifndef NDEBUG
+@@ -3921,6 +3933,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ #endif  // NDEBUG
+ 
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
++                ggml_cuda_q8c_node(node, cuda_ctx->stream());
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+@@ -3967,6 +3980,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         graph_evaluated_or_captured = true;
+ #endif  // USE_CUDA_GRAPH
+     }
++    ggml_cuda_q8c_commit(graph_key, cuda_ctx->stream());
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index bf9f5d5..725c0be 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -1,5 +1,6 @@
+ #include "common.cuh"
+ #include "mmq.cuh"
++#include "q8canon.cuh"
+ #include "quantize.cuh"
+ #include "mmid.cuh"
+ 
+@@ -125,6 +126,16 @@ void ggml_cuda_mul_mat_q(
+     // TODO: tighter pool buffer size vs q8 path
+     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+ 
++    int q8c_r = ggml_cuda_q8c_enabled() && !use_native_fp4 ? ggml_cuda_q8c_rank(src0->name) : -1;
++    const int q8c_lay = ggml_cuda_q8c_layout(q8c_r);
++    if ((ids != nullptr) != (q8c_lay == Q8C_EXPERTS)) {
++        q8c_r = -1;
++    }
++    const bool q8c_tok3 = ne13 > 1;
++    const int64_t q8c_leaves = q8c_lay == Q8C_EXPERTS ? ne12 : q8c_lay == Q8C_HEADS ? (q8c_tok3 ? ne13 : ne11) : ne11*ne12*ne13;
++    const int q8c_shift = q8c_r >= 0 ? ggml_cuda_q8c_row_shift(q8c_r, q8c_leaves) : 0;
++    const int64_t q8c_row_bytes = ne10_padded/(4*QK8_1) * sizeof(block_q8_1_mmq);
++
+     if (!ids) {
+         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+@@ -142,6 +153,12 @@ void ggml_cuda_mul_mat_q(
+             } else {
+                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
++                if (q8c_r >= 0 && q8c_lay == Q8C_HEADS) {
++                    ggml_cuda_q8c_gather_rows(src1_q8_1.get(), Q8C_MMQ, q8c_leaves, q8c_row_bytes, ne11, ne12,
++                                              q8c_tok3 ? ne11*ne12 : 1, ne11, nullptr, 0, 0, 2*q8c_r, -1, q8c_shift, stream);
++                } else if (q8c_r >= 0) {
++                    ggml_cuda_q8c_rows(src1_q8_1.get(), Q8C_MMQ, ne11*ne12*ne13, q8c_row_bytes, ne11, 2*q8c_r, -1, q8c_shift, stream);
++                }
+             }
+             CUDA_CHECK(cudaGetLastError());
+         }
+@@ -159,6 +176,12 @@ void ggml_cuda_mul_mat_q(
+             ne03, ne13, s03, s13, s3,
+             ne1};
+         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
++        if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r) && q8c_lay == Q8C_HEADS) {
++            ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, q8c_leaves, dst->ne[0]*sizeof(float), 0, dst->ne[2],
++                                      q8c_tok3 ? dst->ne[1]*dst->ne[2] : 1, dst->ne[1], nullptr, 0, 0, 2*q8c_r + 1, -1, q8c_shift, stream);
++        } else if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r)) {
++            ggml_cuda_q8c_out(dst_d, ggml_nrows(dst), dst->ne[0]*sizeof(float), 2*q8c_r + 1, q8c_shift, false, stream);
++        }
+         return;
+     }
+ 
+@@ -203,6 +226,14 @@ void ggml_cuda_mul_mat_q(
+         } else {
+             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
++            if (q8c_r >= 0) {
++                ggml_cuda_pool_alloc<char> q8c_canon(ctx.pool(), ne12*ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
++                    ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq));
++                quantize_mmq_q8_1_cuda(src1_d, nullptr, q8c_canon.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
++                                       ne11, ne12, ne13, stream);
++                ggml_cuda_q8c_gather_rows(q8c_canon.get(), Q8C_MMQ, ne12, q8c_row_bytes, ne11, ne11, ne11, 1, nullptr, 0, 0,
++                                          2*q8c_r, -1, q8c_shift, stream);
++            }
+         }
+         CUDA_CHECK(cudaGetLastError());
+     }
+@@ -221,6 +252,10 @@ void ggml_cuda_mul_mat_q(
+         ne12};
+ 
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
++    if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r)) {
++        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, dst->ne[2], dst->ne[0]*sizeof(float), 0, dst->ne[1], dst->ne[1], 1,
++                                  ids->data, dst->ne[1]*sizeof(int32_t), ids->nb[1], 2*q8c_r + 1, -1, q8c_shift, stream);
++    }
+ }
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e18ada5..d136adb 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "q8canon.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -1220,12 +1221,45 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++    int q8c_x = -1, q8c_x2 = -1, q8c_y = -1, q8c_shift = 0, q8c_lay = Q8C_DENSE;
++    if (ggml_cuda_q8c_enabled()) {
++        const int r0 = ggml_cuda_q8c_rank(src0->name);
++        q8c_lay = ggml_cuda_q8c_layout(r0);
++        if (r0 >= 0 && (ids != nullptr) == (q8c_lay == Q8C_EXPERTS) && (!ids || ne13 == 1)) {
++            if (fusion && fusion->gate) {
++                const int g = ggml_cuda_q8c_rank(fusion->gate->name);
++                q8c_x  = 2*g;
++                q8c_x2 = 2*r0;
++                q8c_y  = 2*g + 1;
++            } else {
++                q8c_x = 2*r0;
++                if ((fusion && fusion->x_bias) || ggml_cuda_q8c_plain(r0)) {
++                    q8c_y = 2*r0 + 1;
++                }
++            }
++            const int64_t n_leaves = q8c_lay == Q8C_EXPERTS ? ne12 : q8c_lay == Q8C_HEADS ? (ne13 > 1 ? ne13 : ne11) : ne11*ne12*ne13;
++            q8c_shift = ggml_cuda_q8c_row_shift(r0, n_leaves);
++        }
++    }
++    const int64_t q8c_row_bytes = ne10_padded/QK8_1 * sizeof(block_q8_1);
++    char * src1_q8_1_slot = q8c_x >= 0 && q8c_lay == Q8C_DENSE ? (char *) ggml_cuda_q8c_slot(ne11*ne12*ne13, q8c_row_bytes, q8c_x, q8c_x2, q8c_shift) : nullptr;
++    ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
++    char * src1_q8_1 = src1_q8_1_slot ? src1_q8_1_slot : src1_q8_1_pool.alloc(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+     {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (q8c_x >= 0 && q8c_lay == Q8C_EXPERTS) {
++            ggml_cuda_q8c_gather_rows(src1_q8_1, Q8C_ROWS, ne12, q8c_row_bytes, 0, ne11, ne11, 1, nullptr, 0, 0,
++                                      q8c_x, q8c_x2, q8c_shift, stream);
++        } else if (q8c_x >= 0 && q8c_lay == Q8C_HEADS) {
++            const bool tok3 = ne13 > 1;
++            ggml_cuda_q8c_gather_rows(src1_q8_1, Q8C_ROWS, tok3 ? ne13 : ne11, q8c_row_bytes, 0, ne12, tok3 ? ne11*ne12 : 1, ne11,
++                                      nullptr, 0, 0, q8c_x, q8c_x2, q8c_shift, stream);
++        } else if (q8c_x >= 0 && !src1_q8_1_slot) {
++            ggml_cuda_q8c_rows(src1_q8_1, Q8C_ROWS, ne11*ne12*ne13, q8c_row_bytes, 0, q8c_x, q8c_x2, q8c_shift, stream);
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1251,10 +1285,20 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
++    if (q8c_y >= 0 && q8c_lay == Q8C_EXPERTS) {
++        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, dst->ne[2], dst->ne[0]*sizeof(float), 0, dst->ne[1], dst->ne[1], 1,
++                                  ids->data, dst->ne[1]*sizeof(int32_t), ids->nb[1], q8c_y, -1, q8c_shift, stream);
++    } else if (q8c_y >= 0 && q8c_lay == Q8C_HEADS) {
++        const bool tok3 = dst->ne[3] > 1;
++        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, tok3 ? dst->ne[3] : dst->ne[1], dst->ne[0]*sizeof(float), 0, dst->ne[2],
++                                  tok3 ? dst->ne[1]*dst->ne[2] : 1, dst->ne[1], nullptr, 0, 0, q8c_y, -1, q8c_shift, stream);
++    } else {
++        ggml_cuda_q8c_out(dst_d, ggml_nrows(dst), dst->ne[0]*sizeof(float), q8c_y, q8c_shift, true, stream);
++    }
+ }
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
+new file mode 100644
+index 0000000..923ecca
+--- /dev/null
++++ b/ggml/src/ggml-cuda/q8canon.cu
+@@ -0,0 +1,1021 @@
++#include "q8canon.cuh"
++
++#include "ggml.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#define Q8C_CHUNK        1024
++#define Q8C_MMQ_BLOCK    144
++#define Q8C_MAX_CHUNKS   1024
++#define Q8C_STAGE_BYTES  (64ull << 20)
++#define Q8C_MAX_SCHUNKS  262144
++#define Q8C_CAP_BYTES    (1u << 22)
++#define Q8C_MAX_DEVICES  16
++#define Q8C_MAX_CAPS     32
++#define Q8C_NONE         0xFFFFFFFFu
++
++#define B3_CHUNK_START 1u
++#define B3_CHUNK_END   2u
++#define B3_PARENT      4u
++#define B3_ROOT        8u
++
++__constant__ uint32_t q8c_iv[8] = { 0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
++                                    0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u };
++
++// Device-resident state; one copy per device.
++__device__ uint32_t   q8c_pos_base = 0;
++__device__ uint32_t   q8c_nl       = 0;
++__device__ uint32_t   q8c_max_pos  = 0;
++__device__ uint32_t   q8c_overflow = 0;
++__device__ uint32_t (*q8c_leaves)[8] = nullptr;
++__device__ uint32_t * q8c_ubatch   = nullptr;
++__device__ uint32_t   q8c_cap_n    = 0;
++__device__ uint32_t   q8c_cap_slot = 0;
++__device__ uint32_t   q8c_cap_pos[Q8C_MAX_CAPS];
++__device__ uint32_t   q8c_cap_leaf[Q8C_MAX_CAPS];
++__device__ uint32_t   q8c_cap_len[Q8C_MAX_CAPS];
++__device__ uint8_t *  q8c_cap_buf  = nullptr;
++__device__ uint32_t   q8c_cvs[Q8C_MAX_SCHUNKS][8];
++
++static __device__ __forceinline__ uint32_t q8c_rotr(uint32_t x, int n) {
++    return __funnelshift_r(x, x, n);
++}
++
++static __device__ __forceinline__ void q8c_g(uint32_t * v, int a, int b, int c, int d, uint32_t x, uint32_t y) {
++    v[a] = v[a] + v[b] + x; v[d] = q8c_rotr(v[d] ^ v[a], 16);
++    v[c] = v[c] + v[d];     v[b] = q8c_rotr(v[b] ^ v[c], 12);
++    v[a] = v[a] + v[b] + y; v[d] = q8c_rotr(v[d] ^ v[a], 8);
++    v[c] = v[c] + v[d];     v[b] = q8c_rotr(v[b] ^ v[c], 7);
++}
++
++static __device__ void q8c_compress(const uint32_t cv[8], const uint32_t m_in[16], uint64_t counter, uint32_t len,
++                                    uint32_t flags, uint32_t out[8]) {
++    constexpr int perm[16] = { 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8 };
++    uint32_t v[16];
++    uint32_t m[16];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        v[i] = cv[i];
++    }
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        v[8 + i] = q8c_iv[i];
++    }
++    v[12] = (uint32_t) counter;
++    v[13] = (uint32_t) (counter >> 32);
++    v[14] = len;
++    v[15] = flags;
++#pragma unroll
++    for (int i = 0; i < 16; ++i) {
++        m[i] = m_in[i];
++    }
++#pragma unroll
++    for (int r = 0; r < 7; ++r) {
++        q8c_g(v, 0, 4,  8, 12, m[ 0], m[ 1]);
++        q8c_g(v, 1, 5,  9, 13, m[ 2], m[ 3]);
++        q8c_g(v, 2, 6, 10, 14, m[ 4], m[ 5]);
++        q8c_g(v, 3, 7, 11, 15, m[ 6], m[ 7]);
++        q8c_g(v, 0, 5, 10, 15, m[ 8], m[ 9]);
++        q8c_g(v, 1, 6, 11, 12, m[10], m[11]);
++        q8c_g(v, 2, 7,  8, 13, m[12], m[13]);
++        q8c_g(v, 3, 4,  9, 14, m[14], m[15]);
++        if (r < 6) {
++            uint32_t t[16];
++#pragma unroll
++            for (int i = 0; i < 16; ++i) {
++                t[i] = m[perm[i]];
++            }
++#pragma unroll
++            for (int i = 0; i < 16; ++i) {
++                m[i] = t[i];
++            }
++        }
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        out[i] = v[i] ^ v[i + 8];
++    }
++}
++
++static __device__ void q8c_parent(const uint32_t l[8], const uint32_t r[8], bool root, uint32_t out[8]) {
++    uint32_t m[16];
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        m[i]     = l[i];
++        m[8 + i] = r[i];
++    }
++    q8c_compress(q8c_iv, m, 0, 64, B3_PARENT | (root ? B3_ROOT : 0u), out);
++}
++
++static __device__ void q8c_block_tree(uint32_t (*cv)[8], uint32_t n) {
++    while (n > 1) {
++        const uint32_t half = n / 2;
++        uint32_t outs[8][8];
++        uint32_t cnt = 0;
++        for (uint32_t i = threadIdx.x; i < half; i += blockDim.x) {
++            q8c_parent(cv[2*i], cv[2*i + 1], n == 2, outs[cnt++]);
++        }
++        __syncthreads();
++        cnt = 0;
++        for (uint32_t i = threadIdx.x; i < half; i += blockDim.x) {
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                cv[i][j] = outs[cnt][j];
++            }
++            cnt++;
++        }
++        if (threadIdx.x == 0 && (n & 1)) {
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                cv[half][j] = cv[n - 1][j];
++            }
++        }
++        __syncthreads();
++        n = half + (n & 1);
++    }
++}
++
++// Byte cursor over one row: contiguous, or MMQ k-blocks of 144 bytes strided by rows_per_channel.
++struct q8c_cursor {
++    const uint8_t * row_base;
++    uint64_t        kstride;
++    bool            mmq;
++
++    __device__ uint32_t word(uint32_t off) const {
++        if (!mmq) {
++            return *(const uint32_t *) (row_base + off);
++        }
++        const uint32_t kb = off / Q8C_MMQ_BLOCK;
++        return *(const uint32_t *) (row_base + kb*kstride + (off - kb*Q8C_MMQ_BLOCK));
++    }
++};
++
++static __device__ q8c_cursor q8c_row_cursor(const uint8_t * base, int kind, int64_t row, int64_t row_bytes, int64_t rpc) {
++    if (kind == Q8C_MMQ) {
++        const int64_t nkb = row_bytes / Q8C_MMQ_BLOCK;
++        const int64_t z   = row / rpc;
++        const int64_t r   = row - z*rpc;
++        return { base + (z*nkb*rpc + r)*Q8C_MMQ_BLOCK, (uint64_t) rpc*Q8C_MMQ_BLOCK, true };
++    }
++    return { base + row*row_bytes, 0, false };
++}
++
++// Leaf made of `n_sub` rows, row `leaf*leaf_stride + sub*sub_stride` for sub-row `sub`, then an
++// optional `tail_bytes` tail at `tail + leaf*tail_pitch`.
++struct q8c_gather {
++    const uint8_t * base;
++    int             kind;
++    int64_t         row_bytes;
++    int64_t         rpc;
++    int64_t         n_sub;
++    int64_t         leaf_stride;
++    int64_t         sub_stride;
++    const uint8_t * tail;
++    int64_t         tail_bytes;
++    int64_t         tail_pitch;
++};
++
++struct q8c_gcursor {
++    q8c_gather g;
++    int64_t    leaf;
++
++    __device__ uint32_t word(uint32_t off) const {
++        const int64_t body = g.n_sub*g.row_bytes;
++        if ((int64_t) off >= body) {
++            return *(const uint32_t *) (g.tail + leaf*g.tail_pitch + (off - body));
++        }
++        const int64_t sub = off / g.row_bytes;
++        const q8c_cursor c = q8c_row_cursor(g.base, g.kind, leaf*g.leaf_stride + sub*g.sub_stride, g.row_bytes, g.rpc);
++        return c.word((uint32_t) (off - sub*g.row_bytes));
++    }
++};
++
++template <typename Cursor>
++static __device__ void q8c_chunk_cv(const Cursor & cur, uint32_t row_bytes, uint32_t c, uint32_t nch, uint32_t out[8]) {
++    const uint32_t chunk_off = c*Q8C_CHUNK;
++    const uint32_t len  = min((uint32_t) Q8C_CHUNK, row_bytes - chunk_off);
++    const uint32_t nblk = (len + 63) / 64;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        out[i] = q8c_iv[i];
++    }
++    for (uint32_t b = 0; b < nblk; ++b) {
++        const uint32_t blen = min(64u, len - b*64);
++        uint32_t m[16];
++#pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            m[i] = 4*i < blen ? cur.word(chunk_off + b*64 + 4*i) : 0u;
++        }
++        const bool last = b == nblk - 1;
++        const uint32_t flags = (b == 0 ? B3_CHUNK_START : 0u) | (last ? B3_CHUNK_END : 0u) | (last && nch == 1 ? B3_ROOT : 0u);
++        q8c_compress(out, m, c, blen, flags, out);
++    }
++}
++
++static __device__ void q8c_put_leaf(uint32_t pos, int leaf, const uint32_t d[8]) {
++    if (leaf < 0) {
++        return;
++    }
++    if (pos >= q8c_max_pos) {
++        q8c_overflow = 1;
++        return;
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        q8c_leaves[(uint64_t) pos*q8c_nl + leaf][i] = d[i];
++    }
++}
++
++template <typename Cursor>
++static __device__ void q8c_capture(uint32_t pos, int leaf_a, int leaf_b, const Cursor & cur, uint32_t row_bytes) {
++    for (uint32_t k = 0; k < q8c_cap_n; ++k) {
++        const uint32_t l = q8c_cap_leaf[k];
++        const bool hit = (leaf_a >= 0 && (uint32_t) leaf_a == l) || (leaf_b >= 0 && (uint32_t) leaf_b == l);
++        if (q8c_cap_pos[k] != pos || !hit || row_bytes > q8c_cap_slot) {
++            continue;
++        }
++        uint32_t * dst = (uint32_t *) (q8c_cap_buf + (uint64_t) k*q8c_cap_slot);
++        for (uint32_t i = threadIdx.x; i < row_bytes / 4; i += blockDim.x) {
++            dst[i] = cur.word(4*i);
++        }
++        if (threadIdx.x == 0) {
++            q8c_cap_len[k] = row_bytes;
++        }
++    }
++}
++
++// One block per row: BLAKE3 of the row, written to its canonical leaf (or leaves).
++static __global__ void q8c_rows_kernel(const uint8_t * base, int kind, int64_t row_bytes, int64_t rpc,
++                                       int leaf_a, int leaf_b, int row_shift) {
++    __shared__ uint32_t cvs[Q8C_MAX_CHUNKS][8];
++    const int64_t  row = blockIdx.x;
++    const uint32_t nch = (uint32_t) ((row_bytes + Q8C_CHUNK - 1) / Q8C_CHUNK);
++    const q8c_cursor cur = q8c_row_cursor(base, kind, row, row_bytes, rpc);
++    for (uint32_t c = threadIdx.x; c < nch; c += blockDim.x) {
++        uint32_t cv[8];
++        q8c_chunk_cv(cur, (uint32_t) row_bytes, c, nch, cv);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            cvs[c][i] = cv[i];
++        }
++    }
++    __syncthreads();
++    q8c_block_tree(cvs, nch);
++    const uint32_t pos = q8c_pos_base + row_shift + (uint32_t) row;
++    if (threadIdx.x == 0) {
++        q8c_put_leaf(pos, leaf_a, cvs[0]);
++        q8c_put_leaf(pos, leaf_b, cvs[0]);
++    }
++    q8c_capture(pos, leaf_a, leaf_b, cur, (uint32_t) row_bytes);
++}
++
++// One block per leaf of a gathered layout.
++static __global__ void q8c_gather_kernel(const q8c_gather g, int leaf_a, int leaf_b, int row_shift) {
++    __shared__ uint32_t cvs[Q8C_MAX_CHUNKS][8];
++    const int64_t  leaf  = blockIdx.x;
++    const uint32_t bytes = (uint32_t) (g.n_sub*g.row_bytes + g.tail_bytes);
++    const uint32_t nch   = (bytes + Q8C_CHUNK - 1) / Q8C_CHUNK;
++    const q8c_gcursor cur = { g, leaf };
++    for (uint32_t c = threadIdx.x; c < nch; c += blockDim.x) {
++        uint32_t cv[8];
++        q8c_chunk_cv(cur, bytes, c, nch, cv);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            cvs[c][i] = cv[i];
++        }
++    }
++    __syncthreads();
++    q8c_block_tree(cvs, nch);
++    const uint32_t pos = q8c_pos_base + row_shift + (uint32_t) leaf;
++    if (threadIdx.x == 0) {
++        q8c_put_leaf(pos, leaf_a, cvs[0]);
++        q8c_put_leaf(pos, leaf_b, cvs[0]);
++    }
++    q8c_capture(pos, leaf_a, leaf_b, cur, bytes);
++}
++
++struct q8c_zc {
++    uint64_t off;
++    uint32_t nrows;
++    uint32_t row_bytes;
++    int32_t  leaf_a;
++    int32_t  leaf_b;
++    int32_t  row_shift;
++    uint32_t chunk_base;
++};
++
++static __global__ void q8c_zc_chunks_kernel(const q8c_zc * ents, uint32_t nents, uint32_t total, const uint8_t * stage) {
++    for (uint32_t g = blockIdx.x*blockDim.x + threadIdx.x; g < total; g += gridDim.x*blockDim.x) {
++        uint32_t lo = 0, hi = nents - 1;
++        while (lo < hi) {
++            const uint32_t mid = (lo + hi + 1) / 2;
++            if (ents[mid].chunk_base <= g) {
++                lo = mid;
++            } else {
++                hi = mid - 1;
++            }
++        }
++        const q8c_zc & e = ents[lo];
++        const uint32_t nch   = (e.row_bytes + Q8C_CHUNK - 1) / Q8C_CHUNK;
++        const uint32_t local = g - e.chunk_base;
++        const uint32_t row   = local / nch;
++        const q8c_cursor cur = { stage + e.off + (uint64_t) row*e.row_bytes, 0, false };
++        uint32_t cv[8];
++        q8c_chunk_cv(cur, e.row_bytes, local - row*nch, nch, cv);
++#pragma unroll
++        for (int i = 0; i < 8; ++i) {
++            q8c_cvs[g][i] = cv[i];
++        }
++    }
++}
++
++static __global__ void q8c_zc_rows_kernel(const q8c_zc * ents, const uint8_t * stage) {
++    const q8c_zc & e = ents[blockIdx.x];
++    const uint32_t nch = (e.row_bytes + Q8C_CHUNK - 1) / Q8C_CHUNK;
++    for (uint32_t r = 0; r < e.nrows; ++r) {
++        uint32_t (*cv)[8] = q8c_cvs + e.chunk_base + r*nch;
++        q8c_block_tree(cv, nch);
++        const uint32_t pos = q8c_pos_base + e.row_shift + r;
++        if (threadIdx.x == 0) {
++            q8c_put_leaf(pos, e.leaf_a, cv[0]);
++            q8c_put_leaf(pos, e.leaf_b, cv[0]);
++        }
++        const q8c_cursor cur = { stage + e.off + (uint64_t) r*e.row_bytes, 0, false };
++        q8c_capture(pos, e.leaf_a, e.leaf_b, cur, e.row_bytes);
++        __syncthreads();
++    }
++}
++
++// Meta leaves (position, ubatch size) of the evaluation, then advance the position base.
++static __global__ void q8c_advance_kernel(uint32_t n_tokens) {
++    const uint32_t base = q8c_pos_base;
++    for (uint32_t r = threadIdx.x; r < n_tokens; r += blockDim.x) {
++        const uint32_t pos = base + r;
++        if (pos >= q8c_max_pos) {
++            q8c_overflow = 1;
++            continue;
++        }
++        uint32_t m[16] = { pos, n_tokens, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++        uint32_t d[8];
++        q8c_compress(q8c_iv, m, 0, 8, B3_CHUNK_START | B3_CHUNK_END | B3_ROOT, d);
++        q8c_put_leaf(pos, (int) q8c_nl - 1, d);
++        q8c_ubatch[pos] = n_tokens;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        q8c_pos_base = base + n_tokens;
++    }
++}
++
++// --- host side ---
++
++struct q8c_product {
++    int  form;
++    int  bias;
++    bool head;
++    int  layout;
++};
++
++struct q8c_graph {
++    std::vector<q8c_zc> ents;
++    uint32_t nchunks  = 0;
++    uint32_t n_tokens = 0;
++    q8c_zc * d_ents   = nullptr;
++    size_t   d_cap    = 0;
++    bool     dirty    = false;
++};
++
++struct q8c_dev {
++    bool on = false;
++    std::unordered_map<std::string, int> rank;
++    std::vector<q8c_product> prod;
++    uint32_t n_products = 0;
++    uint32_t n_layers   = 0;
++    uint32_t n_router   = 0;
++    uint32_t nl         = 0;
++    uint32_t max_pos    = 0;
++    uint8_t * stage     = nullptr;
++    void *    h_leaves  = nullptr;
++    void *    h_ubatch  = nullptr;
++    uint8_t * cap_buf   = nullptr;
++    size_t    cap_bytes = 0;
++    uint32_t  cap_n     = 0;
++    uint32_t  cap_slot  = 0;
++    std::unordered_map<const void *, q8c_graph> graphs;
++    q8c_graph * cur = nullptr;
++    uint64_t    off = 0;
++    bool        short_of_stage = false;
++};
++
++static q8c_dev        q8c_devs[Q8C_MAX_DEVICES];
++static std::mutex     q8c_mtx;
++
++static q8c_dev * q8c_current() {
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= Q8C_MAX_DEVICES) {
++        return nullptr;
++    }
++    return &q8c_devs[dev];
++}
++
++struct q8c_scoped_device {
++    int prev = -1;
++    bool ok = false;
++    explicit q8c_scoped_device(int dev) {
++        if (cudaGetDevice(&prev) == cudaSuccess && cudaSetDevice(dev) == cudaSuccess) {
++            ok = true;
++        }
++    }
++    ~q8c_scoped_device() {
++        if (ok && prev >= 0) {
++            cudaSetDevice(prev);
++        }
++    }
++};
++
++static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
++    if (len < 16 || (memcmp(b, "KXMANIF1", 8) != 0 && memcmp(b, "KXMANIF2", 8) != 0)) {
++        return false;
++    }
++    const bool chain = b[7] == '2';
++    uint32_t n_entries, n_products;
++    memcpy(&n_entries, &b[8], 4);
++    memcpy(&n_products, &b[12], 4);
++    if (n_products == 0 || n_products > n_entries) {
++        return false;
++    }
++    uint32_t n_layers = 0;
++    bool moe = false;
++    size_t o = 16;
++    for (uint32_t i = 0; i < n_entries; ++i) {
++        if (o + 2 > len) {
++            return false;
++        }
++        uint16_t nl;
++        memcpy(&nl, &b[o], 2);
++        if (o + 2 + nl + 55 > len) {
++            return false;
++        }
++        std::string name((const char *) &b[o + 2], nl);
++        const uint8_t * r = &b[o + 2 + nl];
++        uint8_t role = r[44], form = r[46];
++        uint32_t bias, n_exp;
++        memcpy(&bias, &r[51], 4);
++        memcpy(&n_exp, &r[20], 4);
++        if (i < n_products) {
++            const int layout = role == 7 ? Q8C_HEADS : n_exp > 1 ? Q8C_EXPERTS : Q8C_DENSE;
++            s.rank[name] = (int) i;
++            s.prod.push_back({ form, bias == Q8C_NONE ? -1 : (int) bias, role == 2, layout });
++        }
++        o += 2 + nl + 55;
++        if (chain) {
++            if (o >= len) {
++                return false;
++            }
++            const uint8_t tag = b[o];
++            const size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : 0;
++            if (ext == 0 || o + ext > len) {
++                return false;
++            }
++            if (tag >= 2) {
++                uint32_t layer;
++                memcpy(&layer, &b[o + 1], 4);
++                if (layer != n_layers) {
++                    return false;
++                }
++                n_layers++;
++                moe = moe || tag == 3;
++            }
++            o += ext;
++        }
++    }
++    s.n_products = n_products;
++    s.n_layers   = n_layers;
++    s.n_router   = moe ? n_layers : 0;
++    s.nl = 2*n_products + 2*n_layers + s.n_router + 1;
++    return true;
++}
++
++static void q8c_free_dev(q8c_dev & s) {
++    for (auto & g : s.graphs) {
++        if (g.second.d_ents) {
++            cudaFree(g.second.d_ents);
++        }
++    }
++    s.graphs.clear();
++    if (s.stage) {
++        cudaFree(s.stage);
++    }
++    if (s.cap_buf) {
++        cudaFree(s.cap_buf);
++    }
++    if (s.h_leaves) {
++        cudaFreeHost(s.h_leaves);
++    }
++    if (s.h_ubatch) {
++        cudaFreeHost(s.h_ubatch);
++    }
++    s = q8c_dev();
++}
++
++static int q8c_set_symbols(q8c_dev & s) {
++    void * d_leaves = nullptr, * d_ubatch = nullptr;
++    if (cudaHostGetDevicePointer(&d_leaves, s.h_leaves, 0) != cudaSuccess ||
++        cudaHostGetDevicePointer(&d_ubatch, s.h_ubatch, 0) != cudaSuccess) {
++        return -3;
++    }
++    const uint32_t zero = 0;
++    if (cudaMemcpyToSymbol(q8c_leaves, &d_leaves, sizeof(d_leaves)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_ubatch, &d_ubatch, sizeof(d_ubatch)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_n, &zero, 4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_nl, &s.nl, 4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_max_pos, &s.max_pos, 4) != cudaSuccess) {
++        return -3;
++    }
++    return 0;
++}
++
++extern "C" int ggml_cuda_q8c_configure(int device, const void * manifest, size_t manifest_len, uint32_t max_pos) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !manifest || max_pos == 0) {
++        return -1;
++    }
++    std::lock_guard<std::mutex> lock(q8c_mtx);
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    cudaDeviceSynchronize();
++    q8c_dev & s = q8c_devs[device];
++    q8c_free_dev(s);
++    if (!q8c_load_manifest(s, (const uint8_t *) manifest, manifest_len)) {
++        s = q8c_dev();
++        return -4;
++    }
++    s.max_pos = max_pos;
++    const size_t leaves_bytes = (size_t) max_pos*s.nl*32;
++    if (cudaHostAlloc(&s.h_leaves, leaves_bytes, cudaHostAllocMapped) != cudaSuccess ||
++        cudaHostAlloc(&s.h_ubatch, (size_t) max_pos*4, cudaHostAllocMapped) != cudaSuccess ||
++        cudaMalloc((void **) &s.stage, Q8C_STAGE_BYTES) != cudaSuccess) {
++        q8c_free_dev(s);
++        return -3;
++    }
++    if (q8c_set_symbols(s) != 0) {
++        q8c_free_dev(s);
++        return -3;
++    }
++    s.on = true;
++    return 0;
++}
++
++extern "C" void ggml_cuda_q8c_release(int device) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(q8c_mtx);
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return;
++    }
++    cudaDeviceSynchronize();
++    q8c_free_dev(q8c_devs[device]);
++}
++
++extern "C" int ggml_cuda_q8c_leaf_count(int device) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on) {
++        return -1;
++    }
++    return (int) q8c_devs[device].nl;
++}
++
++bool ggml_cuda_q8c_enabled() {
++    const q8c_dev * s = q8c_current();
++    return s && s->on;
++}
++
++int ggml_cuda_q8c_rank(const char * name) {
++    const q8c_dev * s = q8c_current();
++    if (!s || !s->on) {
++        return -1;
++    }
++    auto it = s->rank.find(name);
++    return it == s->rank.end() ? -1 : it->second;
++}
++
++int ggml_cuda_q8c_layout(int rank) {
++    const q8c_dev * s = q8c_current();
++    if (!s || !s->on || rank < 0 || (size_t) rank >= s->prod.size()) {
++        return Q8C_DENSE;
++    }
++    return s->prod[rank].layout;
++}
++
++bool ggml_cuda_q8c_plain(int rank) {
++    const q8c_dev * s = q8c_current();
++    if (!s || !s->on || rank < 0 || (size_t) rank >= s->prod.size()) {
++        return false;
++    }
++    const q8c_product & p = s->prod[rank];
++    return p.form == 0 && p.bias < 0;
++}
++
++int ggml_cuda_q8c_row_shift(int rank, int64_t nrows) {
++    const q8c_dev * s = q8c_current();
++    if (!s || !s->on || rank < 0 || (size_t) rank >= s->prod.size() || !s->prod[rank].head || !s->cur) {
++        return 0;
++    }
++    return (int) s->cur->n_tokens - (int) nrows;
++}
++
++void ggml_cuda_q8c_begin(const void * graph_key) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on) {
++        return;
++    }
++    q8c_graph & g = s->graphs[graph_key];
++    g.ents.clear();
++    g.nchunks  = 0;
++    g.n_tokens = 0;
++    g.dirty    = true;
++    s->cur = &g;
++    s->off = 0;
++}
++
++static void q8c_note_tokens(q8c_dev & s, int leaf_a, int64_t nrows) {
++    if (s.cur && s.cur->n_tokens == 0 && leaf_a >= 0 && leaf_a % 2 == 0 && (uint32_t) leaf_a < 2*s.n_products) {
++        s.cur->n_tokens = (uint32_t) nrows;
++    }
++}
++
++// A staging slot for `nrows` rows hashed at commit time, or null when the rows must be hashed inline.
++void * ggml_cuda_q8c_slot(int64_t nrows, int64_t row_bytes, int leaf_a, int leaf_b, int row_shift) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on || !s->cur) {
++        return nullptr;
++    }
++    q8c_note_tokens(*s, leaf_a, nrows);
++    const uint64_t nbytes = (uint64_t) nrows*row_bytes;
++    const uint64_t off    = (s->off + 255) & ~255ull;
++    const uint32_t nch    = (uint32_t) ((row_bytes + Q8C_CHUNK - 1) / Q8C_CHUNK);
++    if (row_bytes % 4 != 0 || nch > Q8C_MAX_CHUNKS || off + nbytes > Q8C_STAGE_BYTES || s->cur->nchunks + nrows*nch > Q8C_MAX_SCHUNKS) {
++        s->short_of_stage = true;
++        return nullptr;
++    }
++    s->cur->ents.push_back({ off, (uint32_t) nrows, (uint32_t) row_bytes, leaf_a, leaf_b, row_shift, s->cur->nchunks });
++    s->cur->nchunks += (uint32_t) nrows*nch;
++    s->off = off + nbytes;
++    return s->stage + off;
++}
++
++void ggml_cuda_q8c_rows(const void * data, int kind, int64_t nrows, int64_t row_bytes, int64_t rows_per_channel,
++                        int leaf_a, int leaf_b, int row_shift, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on || !s->cur || nrows <= 0) {
++        return;
++    }
++    if (row_bytes % 4 != 0 || (row_bytes + Q8C_CHUNK - 1) / Q8C_CHUNK > Q8C_MAX_CHUNKS) {
++        // Unsupported row: its leaf stays unwritten and the trace is reported incomplete.
++        return;
++    }
++    q8c_note_tokens(*s, leaf_a, nrows);
++    q8c_rows_kernel<<<(unsigned) nrows, 256, 0, stream>>>((const uint8_t *) data, kind, row_bytes,
++                                                          kind == Q8C_MMQ ? rows_per_channel : nrows, leaf_a, leaf_b, row_shift);
++}
++
++void ggml_cuda_q8c_gather_rows(const void * base, int kind, int64_t n_leaves, int64_t row_bytes, int64_t rpc, int64_t n_sub,
++                               int64_t leaf_stride, int64_t sub_stride, const void * tail, int64_t tail_bytes, int64_t tail_pitch,
++                               int leaf_a, int leaf_b, int row_shift, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on || !s->cur || n_leaves <= 0 || leaf_a < 0) {
++        return;
++    }
++    const int64_t bytes = n_sub*row_bytes + (tail ? tail_bytes : 0);
++    if (row_bytes % 4 != 0 || tail_bytes % 4 != 0 || (bytes + Q8C_CHUNK - 1) / Q8C_CHUNK > Q8C_MAX_CHUNKS) {
++        return;
++    }
++    q8c_note_tokens(*s, leaf_a, n_leaves);
++    const q8c_gather g = { (const uint8_t *) base, kind, row_bytes, rpc, n_sub, leaf_stride, sub_stride,
++                           (const uint8_t *) tail, tail ? tail_bytes : 0, tail_pitch };
++    q8c_gather_kernel<<<(unsigned) n_leaves, 256, 0, stream>>>(g, leaf_a, leaf_b, row_shift);
++}
++
++void ggml_cuda_q8c_out(const void * data, int64_t nrows, int64_t row_bytes, int leaf, int row_shift, bool stage,
++                       cudaStream_t stream) {
++    if (leaf < 0 || !ggml_cuda_q8c_enabled()) {
++        return;
++    }
++    if (stage) {
++        void * slot = ggml_cuda_q8c_slot(nrows, row_bytes, leaf, -1, row_shift);
++        if (slot) {
++            cudaMemcpyAsync(slot, data, (size_t) nrows*row_bytes, cudaMemcpyDeviceToDevice, stream);
++            return;
++        }
++    }
++    ggml_cuda_q8c_rows(data, Q8C_ROWS, nrows, row_bytes, 0, leaf, -1, row_shift, stream);
++}
++
++// Residual leaf of a layer-stream node named `<kind>-<layer>`, or -1.
++static int q8c_resid_leaf(const q8c_dev & s, const char * name) {
++    const char * dash = strrchr(name, '-');
++    if (s.n_layers == 0 || !dash || dash[1] < '0' || dash[1] > '9') {
++        return -1;
++    }
++    char * end = nullptr;
++    const unsigned long il = strtoul(dash + 1, &end, 10);
++    if (*end != '\0' || il >= s.n_layers) {
++        return -1;
++    }
++    const size_t n = (size_t) (dash - name);
++    auto is = [&](const char * k) { return strlen(k) == n && strncmp(name, k, n) == 0; };
++    const int base = (int) (2*s.n_products + 2*il);
++    if (is("l_out")) {
++        return base + 1;
++    }
++    if (is("attn_residual") || is("ffn_inp") || is("attn_out")) {
++        return base;
++    }
++    if (s.n_router > 0 && is("ffn_moe_logits")) {
++        return (int) (2*s.n_products + 2*s.n_layers + il);
++    }
++    return -1;
++}
++
++bool ggml_cuda_q8c_is_resid(const ggml_tensor * node) {
++    const q8c_dev * s = q8c_current();
++    return s && s->on && q8c_resid_leaf(*s, node->name) >= 0;
++}
++
++bool ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on) {
++        return false;
++    }
++    const int leaf = q8c_resid_leaf(*s, node->name);
++    if (leaf < 0) {
++        return false;
++    }
++    if (!ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
++        return true;
++    }
++    const int64_t nrows = ggml_nrows(node);
++    const int shift = s->cur && (int64_t) s->cur->n_tokens > nrows ? (int) (s->cur->n_tokens - nrows) : 0;
++    ggml_cuda_q8c_out(node->data, nrows, node->ne[0]*sizeof(float), leaf, shift, nrows <= 8, stream);
++    return true;
++}
++
++void ggml_cuda_q8c_node(const ggml_tensor * node, cudaStream_t stream) {
++    if (!ggml_cuda_q8c_enabled() || ggml_cuda_q8c_resid(node, stream) || !ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
++        return;
++    }
++    const ggml_tensor * mm = node->src[0];
++    if (!mm || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID) || !mm->src[0]) {
++        return;
++    }
++    const int r = ggml_cuda_q8c_rank(mm->src[0]->name);
++    if (r < 0) {
++        return;
++    }
++    const q8c_product & p = q8c_current()->prod[r];
++    if (mm->op == GGML_OP_MUL_MAT_ID) {
++        const ggml_tensor * ids = mm->src[2];
++        if (node->op == GGML_OP_GLU && p.form != 0 && p.layout == Q8C_EXPERTS && ids && node->ne[3] == 1) {
++            const int64_t n_used = node->ne[1], n_leaves = node->ne[2];
++            ggml_cuda_q8c_gather_rows(node->data, Q8C_ROWS, n_leaves, node->ne[0]*sizeof(float), 0, n_used, n_used, 1,
++                                      ids->data, n_used*sizeof(int32_t), ids->nb[1], 2*r + 1,
++                                      -1, ggml_cuda_q8c_row_shift(r, n_leaves), stream);
++        }
++        return;
++    }
++    bool y = false;
++    if (node->op == GGML_OP_GLU) {
++        y = p.form != 0;
++    } else if (node->op == GGML_OP_ADD && node->src[1]) {
++        const char * bn = node->src[1]->name;
++        const size_t l = strlen(bn);
++        y = p.bias >= 0 && p.form == 0 && l > 5 && strcmp(bn + l - 5, ".bias") == 0;
++    }
++    if (y) {
++        const int64_t nrows = ggml_nrows(node);
++        ggml_cuda_q8c_out(node->data, nrows, node->ne[0]*sizeof(float), 2*r + 1, ggml_cuda_q8c_row_shift(r, nrows),
++                          nrows <= 8, stream);
++    }
++}
++
++void ggml_cuda_q8c_commit(const void * graph_key, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on) {
++        return;
++    }
++    s->cur = nullptr;
++    auto it = s->graphs.find(graph_key);
++    if (it == s->graphs.end()) {
++        return;
++    }
++    q8c_graph & g = it->second;
++    const uint32_t nents = (uint32_t) g.ents.size();
++    if (g.dirty && nents > 0) {
++        if (g.d_cap < nents) {
++            if (g.d_ents) {
++                cudaFree(g.d_ents);
++            }
++            g.d_ents = nullptr;
++            g.d_cap  = 0;
++            if (cudaMalloc((void **) &g.d_ents, nents*sizeof(q8c_zc)) != cudaSuccess) {
++                g.d_ents = nullptr;
++                return;
++            }
++            g.d_cap = nents;
++        }
++        cudaMemcpyAsync(g.d_ents, g.ents.data(), nents*sizeof(q8c_zc), cudaMemcpyHostToDevice, stream);
++    }
++    g.dirty = false;
++    if (nents > 0 && g.d_ents) {
++        q8c_zc_chunks_kernel<<<512, 128, 0, stream>>>(g.d_ents, nents, g.nchunks, s->stage);
++        q8c_zc_rows_kernel<<<nents, 256, 0, stream>>>(g.d_ents, s->stage);
++    }
++    if (g.n_tokens > 0) {
++        q8c_advance_kernel<<<1, 256, 0, stream>>>(g.n_tokens);
++    }
++}
++
++extern "C" int ggml_cuda_q8c_begin_response(int device) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on) {
++        return -1;
++    }
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    q8c_dev & s = q8c_devs[device];
++    const uint32_t zero = 0;
++    cudaDeviceSynchronize();
++    memset(s.h_leaves, 0, (size_t) s.max_pos*s.nl*32);
++    memset(s.h_ubatch, 0, (size_t) s.max_pos*4);
++    s.short_of_stage = false;
++    s.cap_n = 0;
++    if (cudaMemcpyToSymbol(q8c_pos_base, &zero, 4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_overflow, &zero, 4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_n, &zero, 4) != cudaSuccess) {
++        return -3;
++    }
++    return 0;
++}
++
++extern "C" int ggml_cuda_q8c_arm_captures(int device, const uint32_t * pos, const uint32_t * leaf, uint32_t n,
++                                          uint32_t slot_bytes) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !pos || !leaf || n == 0 ||
++        n > Q8C_MAX_CAPS || slot_bytes == 0 || slot_bytes > Q8C_CAP_BYTES || slot_bytes % 4 != 0) {
++        return -1;
++    }
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    q8c_dev & s = q8c_devs[device];
++    const uint32_t zero = 0;
++    const uint32_t lens[Q8C_MAX_CAPS] = {};
++    cudaDeviceSynchronize();
++    s.cap_n = 0;
++    if (cudaMemcpyToSymbol(q8c_cap_n, &zero, 4) != cudaSuccess) {
++        return -3;
++    }
++    const size_t need = (size_t) n*slot_bytes;
++    if (s.cap_bytes < need) {
++        if (s.cap_buf) {
++            cudaFree(s.cap_buf);
++        }
++        s.cap_buf   = nullptr;
++        s.cap_bytes = 0;
++        if (cudaMalloc((void **) &s.cap_buf, need) != cudaSuccess) {
++            s.cap_buf = nullptr;
++            return -3;
++        }
++        s.cap_bytes = need;
++    }
++    if (cudaMemcpyToSymbol(q8c_cap_buf, &s.cap_buf, sizeof(s.cap_buf)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_slot, &slot_bytes, 4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_pos, pos, (size_t) n*4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_leaf, leaf, (size_t) n*4) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_len, lens, sizeof(lens)) != cudaSuccess ||
++        cudaMemcpyToSymbol(q8c_cap_n, &n, 4) != cudaSuccess) {
++        return -3;
++    }
++    s.cap_n    = n;
++    s.cap_slot = slot_bytes;
++    return 0;
++}
++
++extern "C" int ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y) {
++    const uint32_t p[2] = { pos, pos }, l[2] = { leaf_x, leaf_y };
++    return ggml_cuda_q8c_arm_captures(device, p, l, 2, Q8C_CAP_BYTES);
++}
++
++extern "C" int ggml_cuda_q8c_read(int device, uint8_t * leaves, size_t leaves_cap, uint32_t * ubatch, size_t ubatch_cap,
++                                  uint32_t * n_pos) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !n_pos) {
++        return -1;
++    }
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    q8c_dev & s = q8c_devs[device];
++    cudaDeviceSynchronize();
++    uint32_t pos = 0, overflow = 0;
++    if (cudaMemcpyFromSymbol(&pos, q8c_pos_base, 4) != cudaSuccess || cudaMemcpyFromSymbol(&overflow, q8c_overflow, 4) != cudaSuccess) {
++        return -3;
++    }
++    *n_pos = pos;
++    if (overflow || pos > s.max_pos) {
++        return -5;
++    }
++    if (!leaves || !ubatch) {
++        return 0;
++    }
++    const size_t need = (size_t) pos*s.nl*32;
++    if (leaves_cap < need || ubatch_cap < pos) {
++        return -6;
++    }
++    memcpy(leaves, s.h_leaves, need);
++    memcpy(ubatch, s.h_ubatch, (size_t) pos*4);
++    return 0;
++}
++
++// Copies the armed captures into `outs[k]` (capacity `caps[k]`), sets `lens[k]`, then disarms
++// and frees the capture buffer.
++static int q8c_take_captures(int device, uint8_t * const * outs, const size_t * caps, uint32_t * lens, uint32_t n) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !outs || !caps || !lens) {
++        return -1;
++    }
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    q8c_dev & s = q8c_devs[device];
++    if (n == 0 || n != s.cap_n) {
++        return -1;
++    }
++    cudaDeviceSynchronize();
++    uint32_t got[Q8C_MAX_CAPS] = {};
++    if (cudaMemcpyFromSymbol(got, q8c_cap_len, (size_t) n*4) != cudaSuccess) {
++        return -3;
++    }
++    int rc = 0;
++    for (uint32_t k = 0; k < n; ++k) {
++        lens[k] = got[k];
++        if (got[k] == 0) {
++            rc = rc ? rc : -7;
++        } else if (!outs[k] || caps[k] < got[k]) {
++            rc = rc ? rc : -6;
++        }
++    }
++    for (uint32_t k = 0; rc == 0 && k < n; ++k) {
++        if (cudaMemcpy(outs[k], s.cap_buf + (size_t) k*s.cap_slot, got[k], cudaMemcpyDeviceToHost) != cudaSuccess) {
++            rc = -3;
++        }
++    }
++    const uint32_t zero = 0;
++    cudaMemcpyToSymbol(q8c_cap_n, &zero, 4);
++    s.cap_n = 0;
++    if (s.cap_buf) {
++        cudaFree(s.cap_buf);
++    }
++    s.cap_buf   = nullptr;
++    s.cap_bytes = 0;
++    return rc;
++}
++
++extern "C" int ggml_cuda_q8c_read_captures(int device, uint8_t * out, size_t out_cap, uint32_t * lens, uint32_t n) {
++    if (!out || !lens || n == 0 || n > Q8C_MAX_CAPS || device < 0 || device >= Q8C_MAX_DEVICES) {
++        return -1;
++    }
++    const size_t slot = q8c_devs[device].cap_slot;
++    uint8_t * outs[Q8C_MAX_CAPS];
++    size_t    caps[Q8C_MAX_CAPS];
++    for (uint32_t k = 0; k < n; ++k) {
++        const size_t off = (size_t) k*slot;
++        outs[k] = off < out_cap ? out + off : nullptr;
++        caps[k] = off < out_cap ? std::min(slot, out_cap - off) : 0;
++    }
++    return q8c_take_captures(device, outs, caps, lens, n);
++}
++
++extern "C" int ggml_cuda_q8c_read_capture(int device, uint8_t * x, size_t x_cap, uint8_t * y, size_t y_cap,
++                                          uint32_t * x_len, uint32_t * y_len) {
++    if (!x || !y || !x_len || !y_len) {
++        return -1;
++    }
++    uint8_t * outs[2] = { x, y };
++    const size_t caps[2] = { x_cap, y_cap };
++    uint32_t lens[2] = { 0, 0 };
++    const int rc = q8c_take_captures(device, outs, caps, lens, 2);
++    *x_len = lens[0];
++    *y_len = lens[1];
++    return rc;
++}
+diff --git a/ggml/src/ggml-cuda/q8canon.cuh b/ggml/src/ggml-cuda/q8canon.cuh
+new file mode 100644
+index 0000000..d138cba
+--- /dev/null
++++ b/ggml/src/ggml-cuda/q8canon.cuh
+@@ -0,0 +1,60 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cuda_runtime.h>
++
++struct ggml_tensor;
++
++// Canonical trace leaves of verifiable inference: BLAKE3 of the Q8_1 input rows and of the
++// output rows of every manifest product, and of the layer residual rows, written per position
++// into host-mapped memory.
++
++enum q8c_kind {
++    Q8C_ROWS = 0,
++    Q8C_MMQ  = 1,
++};
++
++// Leaf layout of a product: one row per position, one row per active expert, one row per head.
++enum q8c_layout {
++    Q8C_DENSE   = 0,
++    Q8C_EXPERTS = 1,
++    Q8C_HEADS   = 2,
++};
++
++// Hooks (current device).
++bool   ggml_cuda_q8c_enabled();
++int    ggml_cuda_q8c_rank(const char * name);
++bool   ggml_cuda_q8c_plain(int rank);
++int    ggml_cuda_q8c_layout(int rank);
++int    ggml_cuda_q8c_row_shift(int rank, int64_t nrows);
++void   ggml_cuda_q8c_begin(const void * graph_key);
++void * ggml_cuda_q8c_slot(int64_t nrows, int64_t row_bytes, int leaf_a, int leaf_b, int row_shift);
++void   ggml_cuda_q8c_rows(const void * data, int kind, int64_t nrows, int64_t row_bytes, int64_t rows_per_channel,
++                          int leaf_a, int leaf_b, int row_shift, cudaStream_t stream);
++void   ggml_cuda_q8c_gather_rows(const void * base, int kind, int64_t n_leaves, int64_t row_bytes, int64_t rpc, int64_t n_sub,
++                                 int64_t leaf_stride, int64_t sub_stride, const void * tail, int64_t tail_bytes, int64_t tail_pitch,
++                                 int leaf_a, int leaf_b, int row_shift, cudaStream_t stream);
++void   ggml_cuda_q8c_out(const void * data, int64_t nrows, int64_t row_bytes, int leaf, int row_shift, bool stage,
++                         cudaStream_t stream);
++void   ggml_cuda_q8c_node(const ggml_tensor * node, cudaStream_t stream);
++bool   ggml_cuda_q8c_is_resid(const ggml_tensor * node);
++bool   ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream);
++void   ggml_cuda_q8c_commit(const void * graph_key, cudaStream_t stream);
++
++// Control (any device). Every call returns 0 on success and a negative value otherwise.
++extern "C" {
++    int  ggml_cuda_q8c_configure(int device, const void * manifest, size_t manifest_len, uint32_t max_pos);
++    void ggml_cuda_q8c_release(int device);
++    int  ggml_cuda_q8c_leaf_count(int device);
++    int  ggml_cuda_q8c_begin_response(int device);
++    int  ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y);
++    // Up to 32 (position, leaf) captures of at most `slot_bytes` each; read back slot-strided.
++    int  ggml_cuda_q8c_arm_captures(int device, const uint32_t * pos, const uint32_t * leaf, uint32_t n,
++                                    uint32_t slot_bytes);
++    int  ggml_cuda_q8c_read_captures(int device, uint8_t * out, size_t out_cap, uint32_t * lens, uint32_t n);
++    int  ggml_cuda_q8c_read(int device, uint8_t * leaves, size_t leaves_cap, uint32_t * ubatch, size_t ubatch_cap,
++                            uint32_t * n_pos);
++    int  ggml_cuda_q8c_read_capture(int device, uint8_t * x, size_t x_cap, uint8_t * y, size_t y_cap,
++                                    uint32_t * x_len, uint32_t * y_len);
++}

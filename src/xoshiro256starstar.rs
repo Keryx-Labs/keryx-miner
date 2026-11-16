@@ -9,8 +9,8 @@ pub struct Xoshiro256StarStarStateIter {
     current: Xoshiro256StarStar,
 }
 
-fn rotl(x: u64, k: i32) -> u64 {
-    (x << k) | (x >> (64 - k))
+fn rotl(x: u64, k: u32) -> u64 {
+    x.rotate_left(k)
 }
 
 impl Xoshiro256StarStar {

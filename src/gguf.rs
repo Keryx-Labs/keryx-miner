@@ -115,8 +115,8 @@ fn skip_value(f: &mut File, vt: u32) -> Result<Option<u64>> {
             let fixed: Option<i64> = match elem_vt {
                 0 | 1 | 7 => Some(1),
                 2 | 3 => Some(2),
-                4 | 5 | 6 => Some(4),
-                10 | 11 | 12 => Some(8),
+                4..=6 => Some(4),
+                10..=12 => Some(8),
                 _ => None,
             };
             if let Some(sz) = fixed {
@@ -187,7 +187,7 @@ impl GgufMeta {
                 .with_context(|| format!("tensor '{}'", name))?;
             // ggml lays blocks out per row; sizes divide cleanly only when ne0 is a whole
             // number of blocks (true for every model llama.cpp can write).
-            if ne0 % block != 0 {
+            if !ne0.is_multiple_of(block) {
                 bail!("GGUF: tensor '{}' row size {} not divisible by block {}", name, ne0, block);
             }
             let nbytes = nelements / block * ts;

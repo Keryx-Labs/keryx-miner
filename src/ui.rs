@@ -367,7 +367,8 @@ pub fn spawn_ui(
         let mut last_size: Option<(u16, u16)> = None;
         let mut pending_resize: Option<(u16, u16)> = None;
         let mut first_frame = true;
-        let mut last_draw_key: Option<(u16, u16, bool, bool, u64, usize, u64, u64, u64, bool, bool)> = None;
+        type DrawKey = (u16, u16, bool, bool, u64, usize, u64, u64, u64, bool, bool);
+        let mut last_draw_key: Option<DrawKey> = None;
         let mut last_drawn_at = Instant::now();
         #[cfg(feature = "block-celebration")]
         let mut last_block_coin_frame = None;
@@ -577,6 +578,8 @@ fn draw_frame(
     let compact = total_width < 132;
 
     let hashrate_value = format_hashrate(snapshot.total_hashrate_hs);
+    // Rig-wide power draw across all GPUs; "--" until any GPU reports a reading.
+    let power_total_value = snapshot.total_power_draw_w.map(|w| format!("{:.0} W", w.round())).unwrap_or_else(|| "--".to_string());
     let opoi_pause_value = if snapshot.opoi_challenge_active { "Active" } else { "Idle" };
     let accepted_blocks_value = snapshot.accepted_blocks;
     let rejected_value = snapshot.rejected_blocks;
@@ -742,6 +745,11 @@ fn draw_frame(
             bold: true,
         },
         metric_row("Hashrate", hashrate_value.clone(), palette().ok),
+        metric_row(
+            "Power Draw",
+            power_total_value.clone(),
+            if snapshot.total_power_draw_w.is_some() { palette().text } else { palette().dim },
+        ),
         metric_row("Uptime", uptime_value.clone(), palette().text),
         PanelRow::Segments(vec![
             (format!(" {:<16}", "Address"), palette().dim),
@@ -1273,7 +1281,8 @@ fn draw_colored_segments_cell(
 
 fn color_for_log_line(line: &str) -> Color {
     let lower = line.to_ascii_lowercase();
-    if lower.contains("[error") || lower.contains(" error ") {
+    let without_error_false = strip_error_false(&lower);
+    if without_error_false.contains("[error") || without_error_false.contains(" error ") {
         palette().err
     } else if lower.contains("[warn") || lower.contains(" warning ") {
         palette().warn
@@ -1281,13 +1290,46 @@ fn color_for_log_line(line: &str) -> Color {
         palette().bright
     } else if lower.contains("inference") {
         palette().mid
-    } else if lower.contains("escrowwatcher") && lower.contains("claim accepted") {
-        palette().bright
-    } else if lower.contains("found a block") || lower.contains("found a share") || lower.contains("block submitted successfully") {
+    } else if (lower.contains("escrowwatcher") && lower.contains("claim accepted"))
+        || lower.contains("found a block")
+        || lower.contains("found a share")
+        || lower.contains("block submitted successfully")
+    {
         palette().bright
     } else {
         palette().text
     }
+}
+
+/// Removes "error false" style phrases (e.g. `error false`, `error=false`, `"error": false`)
+/// from an already-lowercased line so they don't trigger error coloring.
+fn strip_error_false(lower: &str) -> String {
+    let bytes = lower.as_bytes();
+    let mut out = String::with_capacity(lower.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if lower[i..].starts_with("error") {
+            let mut j = i + "error".len();
+            if lower[j..].starts_with('s') {
+                j += 1;
+            }
+            let sep_start = j;
+            while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b':' | b'=' | b'"' | b'\'' | b'`') {
+                j += 1;
+            }
+            let end = j + "false".len();
+            let word_ends = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if j > sep_start && lower[j..].starts_with("false") && word_ends {
+                out.push(' ');
+                i = end;
+                continue;
+            }
+        }
+        let ch = lower[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn seconds_since(epoch_s: u64) -> u64 {
@@ -1577,7 +1619,7 @@ fn format_efficiency(hashrate_hs: u64, power_w: f32) -> String {
         (efficiency / 1_000_000_000_000.0, "TH/W")
     };
 
-    format!("{:.0} {}", scaled_value, unit)
+    format!("{:.2} {}", scaled_value, unit)
 }
 
 fn parse_device_id(worker_id: &str) -> Option<u32> {
@@ -1678,5 +1720,24 @@ mod wrap_tests {
             assert!(!rows.is_empty());
         }
         assert_eq!(wrap_segments(&[("Strike: —".to_string(), Color::Reset)], 40, 2).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod error_false_color_tests {
+    use super::*;
+
+    #[test]
+    fn error_false_is_not_red() {
+        for l in ["[INFO] status error false done", "[INFO] got error=false ok", "[INFO] {\"error\": false}", "[INFO] Error: FALSE x", "[INFO] errors = false"] {
+            assert_ne!(color_for_log_line(l), palette().err, "{l}");
+        }
+    }
+
+    #[test]
+    fn real_errors_still_red() {
+        for l in ["[ERROR] boom", "[INFO] an error occurred", "[ERROR] error=false but failed", "[INFO] error true then error x"] {
+            assert_eq!(color_for_log_line(l), palette().err, "{l}");
+        }
     }
 }

@@ -1,4 +1,4 @@
-/// OPoI task and result types.
+//! OPoI task and result types.
 
 /// Seed for the deterministic MLP model weights.
 /// ASCII for "KeryxOP" — identifies this as the Optimistic Proof of Inference v1 model.

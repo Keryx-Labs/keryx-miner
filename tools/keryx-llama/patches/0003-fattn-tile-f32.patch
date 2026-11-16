@@ -1,0 +1,44 @@
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 3e07a9f..a808e77 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -2,6 +2,10 @@
+ #include "fattn-common.cuh"
+ #include "fattn-wmma-f16.cuh"
+ 
++// f32 accumulators on every GPU.
++#pragma push_macro("FAST_FP16_AVAILABLE")
++#undef FAST_FP16_AVAILABLE
++
+ // nbatch_fa == number of KQ rows to process per iteration
+ // nbatch_K == number of K columns to load in parallel for KQ calculation
+ 
+@@ -320,9 +324,6 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
+         }
+         return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
+     }
+-    if (fast_fp16_available(cc)) {
+-        return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
+-    }
+     return ggml_cuda_fattn_tile_get_config_nvidia_fp32(DKQ, DV, ncols);
+ }
+ 
+@@ -1359,3 +1360,5 @@ extern DECL_FATTN_TILE_CASE(256, 256);
+ extern DECL_FATTN_TILE_CASE(320, 256);
+ extern DECL_FATTN_TILE_CASE(512, 512);
+ extern DECL_FATTN_TILE_CASE(576, 512);
++
++#pragma pop_macro("FAST_FP16_AVAILABLE")
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 00ffacf..7922364 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -455,6 +455,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+         return BEST_FATTN_KERNEL_NONE;
+     }
+ 
++    return BEST_FATTN_KERNEL_TILE;
++
+     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
+     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;

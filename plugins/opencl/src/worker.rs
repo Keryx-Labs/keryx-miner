@@ -160,7 +160,7 @@ impl Worker for OpenCLGPUWorker {
     }
 
     fn get_workload(&self) -> usize {
-        self.workload as usize
+        self.workload
     }
 
     fn copy_output_to(&mut self, nonces: &mut Vec<u64>) -> Result<(), Error> {
@@ -220,6 +220,7 @@ impl OpenCLGPUWorker {
             }
         };
         info!("{}: Chosen workload is {}", name, chosen_workload);
+        #[allow(clippy::arc_with_non_send_sync)]
         let context =
             Arc::new(Context::from_device(&device).unwrap_or_else(|_| panic!("{}::Context::from_device failed", name)));
         let context_ref = unsafe { Arc::as_ptr(&context).as_ref().unwrap() };

@@ -1,6 +1,6 @@
 use crate::proto::{
     kaspad_message::Payload, GetBlockDagInfoRequestMessage, GetBlockRequestMessage, GetBlockTemplateRequestMessage,
-    GetInfoRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
+    GetAwaitedOpeningsRequestMessage, GetInfoRequestMessage, GetServiceProvidersRequestMessage, GetServiceStrikesRequestMessage, KaspadMessage, NotifyBlockAddedRequestMessage,
     NotifyNewBlockTemplateRequestMessage,
     NotifyVirtualSelectedParentChainChangedRequestMessage, RpcBlock, RpcTransaction,
     SubmitBlockRequestMessage, SubmitTransactionRequestMessage,
@@ -69,9 +69,27 @@ impl From<GetServiceStrikesRequestMessage> for KaspadMessage {
     }
 }
 
+impl From<GetServiceProvidersRequestMessage> for KaspadMessage {
+    fn from(a: GetServiceProvidersRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetServiceProvidersRequest(a)) }
+    }
+}
+
+impl From<GetAwaitedOpeningsRequestMessage> for KaspadMessage {
+    fn from(a: GetAwaitedOpeningsRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetAwaitedOpeningsRequest(a)) }
+    }
+}
+
 impl From<GetBlockRequestMessage> for KaspadMessage {
     fn from(a: GetBlockRequestMessage) -> Self {
         KaspadMessage { payload: Some(Payload::GetBlockRequest(a)) }
+    }
+}
+
+impl From<crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage> for KaspadMessage {
+    fn from(a: crate::proto::GetVirtualSelectedParentChainFromBlockRequestMessage) -> Self {
+        KaspadMessage { payload: Some(Payload::GetVirtualSelectedParentChainFromBlockRequest(a)) }
     }
 }
 

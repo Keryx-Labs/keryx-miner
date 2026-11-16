@@ -1,0 +1,122 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index eaf3f35..94e4e10 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -36,6 +36,104 @@
+ #include <string>
+ #include <vector>
+ 
++#include <algorithm>
++#include <unordered_map>
++#include <unordered_set>
++
++// keryx: canonical weight layout. When set (by the miner's engine, before loading), a model's weights
++// on a non-host (GPU) buffer type are placed so that every GGUF tensor's whole 32-byte chunks sit back
++// to back in name order — the PoM walk's canonical stream — inside ONE buffer, so the walk can address
++// tile t at base + t KiB with no lookup. Tensors of the stream that this buffer does not hold (kept on
++// the host, or in another context) leave a zeroed hole the miner fills; tensors that are not part of
++// the stream (fewer than 32 bytes, not whole chunks, or a second tensor of the same name) go after it.
++// A zeroed slack after the stream absorbs the last tensor's row padding.
++// Thread-local: engines for different cards load concurrently, each in its own thread.
++extern "C" {
++thread_local bool   keryx_llama_canonical_weights = false;
++thread_local void * keryx_llama_canonical_base    = nullptr;  // this thread's last canonical buffer base
++thread_local size_t keryx_llama_canonical_bytes   = 0;        // bytes of the canonical stream at that base
++}
++
++static ggml_backend_buffer_t keryx_canonical_alloc(llama_model_loader & ml, ggml_context * ctx, ggml_backend_buffer_type_t buft) {
++    std::unordered_map<std::string, std::pair<size_t, size_t>> canon;   // name -> (offset, bytes)
++    size_t total = 0;
++    std::vector<std::pair<std::string, size_t>> names;                   // canonical = bytewise name order
++    for (const auto & [name, w] : ml.weights_map) names.emplace_back(name, ggml_nbytes(w.tensor));
++    std::sort(names.begin(), names.end());                               // char_traits<char>: unsigned bytes
++    std::vector<std::string> stream;                                     // names of the stream, in order
++    for (const auto & [name, nb] : names) {
++        const size_t whole = nb / 32 * 32;
++        if (whole == 0) continue;
++        canon.emplace(name, std::make_pair(total, nb));
++        stream.push_back(name);
++        total += whole;
++    }
++    // ggml reads past a quantised tensor's end (row padding, zeroed in an ordinary buffer). Packed
++    // tightly, that padding is the next stream tensors' first bytes: if they decode to non-finite block
++    // scales (an Inf/NaN times a zero activation is NaN), llama gets a separate copy of that tensor with
++    // zeroed padding and its stream range stays a hole the miner fills.
++    std::unordered_set<std::string> unsafe;
++    {
++        std::unordered_map<std::string, size_t> pos;
++        for (size_t i = 0; i < stream.size(); i++) pos[stream[i]] = i;
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++            const size_t nb = ggml_nbytes(t), pad = ggml_backend_buft_get_alloc_size(buft, t) - nb;
++            auto it = pos.find(ggml_get_name(t));
++            if (pad == 0 || it == pos.end() || !ggml_is_quantized(t->type)) continue;
++            std::vector<uint8_t> tail;
++            for (size_t j = it->second + 1; j < stream.size() && tail.size() < pad; j++) {
++                const auto & w = ml.weights_map.at(stream[j]);
++                const size_t take = std::min(canon.at(stream[j]).second / 32 * 32, pad - tail.size());
++                const size_t at = tail.size();
++                tail.resize(at + take);
++                ml.files.at(w.idx)->seek(w.offs, SEEK_SET);
++                ml.files.at(w.idx)->read_raw(tail.data() + at, take);
++            }
++            const size_t whole_blocks = tail.size() / ggml_type_size(t->type) * ggml_type_size(t->type);
++            if (tail.size() < pad || !ggml_validate_row_data(t->type, tail.data(), whole_blocks)) {
++                unsafe.insert(ggml_get_name(t));
++            }
++        }
++    }
++    const size_t align = std::max<size_t>(ggml_backend_buft_get_alignment(buft), 32);
++    size_t max_pad = 0;
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++        max_pad = std::max(max_pad, ggml_backend_buft_get_alloc_size(buft, t) - ggml_nbytes(t));
++    }
++    const size_t slack = GGML_PAD(std::max<size_t>(max_pad, 64 * 1024), align);
++    const size_t extra0 = GGML_PAD(total, align) + slack;
++    std::unordered_set<std::string> placed;
++    std::vector<std::pair<ggml_tensor *, size_t>> where;
++    size_t extra = extra0;
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++        const std::string name = ggml_get_name(t);
++        const size_t nb = ggml_nbytes(t);
++        auto it = canon.find(name);
++        if (it != canon.end() && it->second.second == nb && nb % 32 == 0 && !unsafe.count(name) && placed.insert(name).second) {
++            where.emplace_back(t, it->second.first);
++        } else {
++            extra = GGML_PAD(extra, align);
++            where.emplace_back(t, extra);
++            extra += ggml_backend_buft_get_alloc_size(buft, t);
++        }
++    }
++    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, GGML_PAD(extra, align));
++    if (!buf) return nullptr;
++    ggml_backend_buffer_clear(buf, 0);
++    char * base = (char *) ggml_backend_buffer_get_base(buf);
++    for (auto & [t, off] : where) {
++        if (ggml_backend_tensor_alloc(buf, t, base + off) != GGML_STATUS_SUCCESS) {
++            ggml_backend_buffer_free(buf);
++            return nullptr;
++        }
++    }
++    keryx_llama_canonical_base  = base;
++    keryx_llama_canonical_bytes = total;
++    LLAMA_LOG_INFO("%s: keryx canonical weights: %zu tensors, stream %.2f MiB at %p (+%.2f MiB slack/extra, %zu padded tensors copied)\n", __func__,
++        where.size(), total / 1048576.0, (void *) base, (extra - total) / 1048576.0, unsafe.size());
++    return buf;
++}
++
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+     switch (arch) {
+         case LLM_ARCH_LLAMA:
+@@ -1570,7 +1668,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                 }
+             } else {
+-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                if (keryx_llama_canonical_weights && !ggml_backend_buft_is_host(buft)) {
++                    buf = keryx_canonical_alloc(ml, ctx, buft); // keryx: canonical walk layout
++                } else {
++                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                }
+             }
+             if (buf == nullptr) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

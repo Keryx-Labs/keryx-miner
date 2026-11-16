@@ -154,7 +154,7 @@ fn base58btc_encode(input: &[u8]) -> String {
     }
     let leading_zeros = input.iter().take_while(|&&b| b == 0).count();
     let mut out = String::with_capacity(leading_zeros + digits.len());
-    out.extend(std::iter::repeat('1').take(leading_zeros));
+    out.extend(std::iter::repeat_n('1', leading_zeros));
     out.extend(digits.iter().rev().map(|&d| ALPHABET[d as usize] as char));
     out
 }
@@ -284,12 +284,12 @@ fn url_host(url: &str) -> Option<&str> {
         Some((_, authority)) => authority,
         None => rest,
     };
-    let authority = authority.split(|c: char| c == '/' || c == '?' || c == '#').next()?;
+    let authority = authority.split(['/', '?', '#']).next()?;
     if authority.is_empty() {
         return None;
     }
-    if authority.starts_with('[') {
-        let mut parts = authority[1..].split(']');
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let mut parts = bracketed.split(']');
         let host = parts.next()?;
         let suffix = parts.next()?;
         if parts.next().is_some() {
@@ -320,7 +320,7 @@ fn url_host(url: &str) -> Option<&str> {
 }
 
 fn nonblank_os(value: &OsStr) -> bool {
-    !value.is_empty() && value.to_str().map_or(true, |value| !value.trim().is_empty())
+    !value.is_empty() && value.to_str().is_none_or(|value| !value.trim().is_empty())
 }
 
 fn resolve_home(
