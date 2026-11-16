@@ -170,6 +170,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         .args([
             "-DGGML_CUDA=ON",
             "-DGGML_RPC=ON",
+            "-DGGML_RPC_RDMA=OFF",
             &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
             "-DBUILD_SHARED_LIBS=OFF",
             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
