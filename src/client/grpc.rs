@@ -1198,9 +1198,9 @@ impl KeryxdHandler {
         // Hard gate: if no models are ready, refuse to accept any AiRequest.
         // Prevents miners with missing/truncated model files from ever queuing inference work.
         let ready_ids = keryx_miner::llm::loaded_model_ids();
-        if ready_ids.is_empty() {
+        let serving = !ready_ids.is_empty();
+        if !serving {
             log::warn!("Inference: no models ready — skipping AiRequest scan (run miner with valid model files)");
-            return;
         }
         log::debug!(
             "scan_ai: {} txs, subnetwork_ids: {:?}",
@@ -1215,6 +1215,20 @@ impl KeryxdHandler {
                 if let Some(resp) = hex::decode(&tx.payload).ok().and_then(|raw| keryx_inference::AiResponsePayload::deserialize(&raw)) {
                     keryx_miner::pipeline::note_response_seen(resp.request_hash);
                 }
+                continue;
+            }
+            // Shards declare for a network-model request they cannot open: only its heads read it.
+            if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX {
+                if let Some(raw) = hex::decode(&tx.payload).ok() {
+                    let target = keryx_inference::AiRequestPayload::deserialize(&raw).map(|r| r.model_id);
+                    if target == Some(keryx_miner::models::network_model().whole.model_id) {
+                        if let Some(request_hash) = Self::request_identity(tx, &raw, txid_identity) {
+                            self.declare_available(request_hash, &hex::encode(&request_hash[..8]), block_daa);
+                        }
+                    }
+                }
+            }
+            if !serving {
                 continue;
             }
             // (raw, model_id, prompt, plaintext prompt length, max_tokens, inference_reward, private state)
@@ -1264,9 +1278,6 @@ impl KeryxdHandler {
                     blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap()
                 };
                 let stable_id = hex::encode(&request_hash[..8]);
-                if model_id == keryx_miner::models::network_model().whole.model_id {
-                    self.declare_available(request_hash, &stable_id, block_daa);
-                }
                 if !ready_ids.contains(&model_id) {
                     log::debug!("Inference: skipping AiRequest id={} — model not supported or files not ready", stable_id);
                     self.ai_skipped_unready.insert(stable_id);
@@ -1395,6 +1406,21 @@ impl KeryxdHandler {
     /// Opens a private request with the escrow key. `None` when the request is not for this
     /// miner (no escrow key, or not among the recipients); an addressed request that cannot be
     /// opened is still queued, to be answered with a plaintext error body.
+    /// Identity of an AiRequest under the node's gate: its transaction id, or its payload digest
+    /// before the gate.
+    fn request_identity(tx: &crate::proto::RpcTransaction, raw: &[u8], txid_identity: bool) -> Option<[u8; 32]> {
+        if !txid_identity {
+            return blake2b_simd::blake2b(raw).as_bytes()[..32].try_into().ok();
+        }
+        tx.verbose_data
+            .as_ref()
+            .map(|v| v.transaction_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| Self::compute_rpc_txid(tx))
+            .and_then(|h| hex::decode(h).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    }
+
     fn open_private_request(
         req: &keryx_inference::AiRequestPayload,
         escrow_secret: Option<&[u8; 32]>,
@@ -4178,6 +4204,28 @@ mod tests {
         let ids = super::KeryxdHandler::own_answered_request_ids(&txs, &mine);
         assert_eq!(ids, vec![hex::encode([1u8; 8]), hex::encode([3u8; 8])]);
         assert!(super::KeryxdHandler::own_answered_request_ids(&txs, &[0xCCu8; 32]).is_empty());
+    }
+
+    #[test]
+    fn request_identity_follows_the_gate() {
+        let raw = b"request payload".to_vec();
+        let mut tx = crate::proto::RpcTransaction {
+            version: 0,
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: 0,
+            subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_REQUEST_HEX.to_string(),
+            gas: 0,
+            payload: hex::encode(&raw),
+            mass: 0,
+            verbose_data: None,
+        };
+        let digest: [u8; 32] = blake2b_simd::blake2b(&raw).as_bytes()[..32].try_into().unwrap();
+        assert_eq!(super::KeryxdHandler::request_identity(&tx, &raw, false), Some(digest));
+        let computed = super::KeryxdHandler::request_identity(&tx, &raw, true).unwrap();
+        assert_eq!(Some(hex::encode(computed)), super::KeryxdHandler::compute_rpc_txid(&tx));
+        tx.verbose_data = Some(crate::proto::RpcTransactionVerboseData { transaction_id: hex::encode([7u8; 32]), ..Default::default() });
+        assert_eq!(super::KeryxdHandler::request_identity(&tx, &raw, true), Some([7u8; 32]));
     }
 
     /// A private request is opened for a named recipient, skipped for anyone else, and queued as
