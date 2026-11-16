@@ -32,7 +32,7 @@ pub const MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN: usize = 65_536;
 /// Fixed 78 bytes — result is stored off-chain on IPFS, CID pinned by the miner.
 ///
 /// V2 (service-bond era) appends `[responder_escrow_pubkey: 32] [schnorr_signature: 64]`,
-/// the signature covering the 78 v1 bytes.
+/// the signature covering [`AiResponsePayload::signed_bytes`] (the 78 v1 bytes for a body-less V2).
 ///
 /// A V2 payload may append one extension (private-inference era, gated by
 /// `private_inference_activation`): `[ext_kind: 1 = AI_RESPONSE_EXT_PRIVATE_BODY] [ext_len: 4 LE]
@@ -46,7 +46,9 @@ pub const MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN: usize = 65_536;
 pub const AI_RESPONSE_PAYLOAD_LEN: usize = 78;
 pub const AI_RESPONSE_PAYLOAD_V2_LEN: usize = AI_RESPONSE_PAYLOAD_LEN + 32 + 64;
 /// V3 (model-split era) appends `[n_links: 1] n × [tier: 1] [link_escrow_pubkey: 32] [link_signature: 64]`
-/// to the V2 bytes: the pipeline links that served the response, each signing the 78 v1 bytes.
+/// to the V2 bytes: the pipeline links that served the response. Each link signs
+/// [`AiResponsePayload::link_signed_bytes`] (its tier, the head's key, the v1 and extension
+/// bytes); the head signs [`AiResponsePayload::signed_bytes`], which covers the link section.
 /// `n` is 1..=MAX_AI_RESPONSE_LINKS; a V3 payload with no links is not a V3 payload.
 pub const AI_RESPONSE_LINK_LEN: usize = 1 + 32 + 64;
 pub const MAX_AI_RESPONSE_LINKS: usize = 15;
@@ -173,8 +175,8 @@ impl AiRequestPayload {
     }
 }
 
-/// Responder identity of a V2 AiResponse: the miner's escrow pubkey and its schnorr
-/// signature over the 78 v1 payload bytes.
+/// Responder identity of a V2/V3 AiResponse: the miner's escrow pubkey and its schnorr
+/// signature over [`AiResponsePayload::signed_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AiResponder {
     pub escrow_pubkey: [u8; 32],
@@ -182,7 +184,7 @@ pub struct AiResponder {
 }
 
 /// One pipeline link of a V3 AiResponse: the shard tier it served, its escrow pubkey and its
-/// schnorr signature over the 78 v1 payload bytes.
+/// schnorr signature over [`AiResponsePayload::link_signed_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AiResponseLink {
     pub tier: u8,
@@ -351,11 +353,39 @@ impl AiResponsePayload {
         }
     }
 
-    /// The message covered by the V2 responder signature: the 78 v1 bytes, followed by the
-    /// extension bytes when an inline body is attached (so the body cannot be swapped under a
-    /// signed head). Byte-identical to the v1 bytes for every body-less payload.
+    /// The link section of a V3 payload (`[n] n × [tier] [key] [signature]`), empty otherwise.
+    fn links_bytes(&self) -> Vec<u8> {
+        if self.links.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(1 + self.links.len() * AI_RESPONSE_LINK_LEN);
+        out.push(self.links.len() as u8);
+        for l in &self.links {
+            out.push(l.tier);
+            out.extend_from_slice(&l.escrow_pubkey);
+            out.extend_from_slice(&l.signature);
+        }
+        out
+    }
+
+    /// The message covered by the responder signature: the 78 v1 bytes, the link section of a
+    /// V3 payload, then the extension bytes when an inline body is attached, so neither the
+    /// links nor the body can be changed under a signed head. Byte-identical to the v1 bytes for
+    /// every body-less V2 payload.
     pub fn signed_bytes(&self) -> Vec<u8> {
         let mut out = self.v1_bytes();
+        out.extend_from_slice(&self.links_bytes());
+        out.extend_from_slice(&self.extension_bytes());
+        out
+    }
+
+    /// The message a pipeline link signs: the shard `tier` it served, the head's escrow key,
+    /// then the v1 and extension bytes.
+    pub fn link_signed_bytes(&self, tier: u8, head_pubkey: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 32 + AI_RESPONSE_PAYLOAD_LEN);
+        out.push(tier);
+        out.extend_from_slice(head_pubkey);
+        out.extend_from_slice(&self.v1_bytes());
         out.extend_from_slice(&self.extension_bytes());
         out
     }
@@ -366,14 +396,7 @@ impl AiResponsePayload {
             out.reserve(32 + 64 + 1 + self.links.len() * AI_RESPONSE_LINK_LEN);
             out.extend_from_slice(&r.escrow_pubkey);
             out.extend_from_slice(&r.signature);
-            if !self.links.is_empty() {
-                out.push(self.links.len() as u8);
-                for l in &self.links {
-                    out.push(l.tier);
-                    out.extend_from_slice(&l.escrow_pubkey);
-                    out.extend_from_slice(&l.signature);
-                }
-            }
+            out.extend_from_slice(&self.links_bytes());
         }
         out.extend_from_slice(&self.extension_bytes());
         out
@@ -807,7 +830,14 @@ mod tests {
         assert!(bytes.len() <= MAX_AI_RESPONSE_PAYLOAD_LEN);
         let parsed = AiResponsePayload::deserialize(&bytes).unwrap();
         assert_eq!(resp, parsed);
-        assert_eq!(&bytes[..AI_RESPONSE_PAYLOAD_LEN], resp.signed_bytes().as_slice());
+        // the head signs the v1 bytes and the link section; each link its tier and the head key
+        let mut head_signed = bytes[..AI_RESPONSE_PAYLOAD_LEN].to_vec();
+        head_signed.extend_from_slice(&bytes[AI_RESPONSE_PAYLOAD_V2_LEN..]);
+        assert_eq!(resp.signed_bytes(), head_signed);
+        let link_signed = resp.link_signed_bytes(6, &[0x33u8; 32]);
+        assert_eq!(link_signed[0], 6);
+        assert_eq!(&link_signed[1..33], &[0x33u8; 32]);
+        assert_eq!(&link_signed[33..], &bytes[..AI_RESPONSE_PAYLOAD_LEN]);
         // v2 stays byte-identical to a v3 payload with no links
         let v2 = AiResponsePayload::new_v2([7u8; 32], 900_000, cid, 128, responder);
         assert!(!v2.is_v3());

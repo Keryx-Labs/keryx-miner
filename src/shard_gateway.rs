@@ -26,6 +26,8 @@ const VERSION: u8 = 1;
 const CLIENT_DOMAIN: &[u8] = b"KeryxGatewayClientV1";
 const SERVER_DOMAIN: &[u8] = b"KeryxGatewayServerV1";
 const RESPONDER_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
+/// Must equal the node's `LINK_SIG_DOMAIN`.
+const LINK_DOMAIN: &[u8] = b"KeryxPipelineLinkV1";
 const HELLO_LEN: usize = 4 + 1 + 32 + 33 + 32 + 64;
 const REPLY_LEN: usize = 1 + 33 + 32 + 1 + 64;
 const MAX_FRAME: usize = 16 << 20;
@@ -92,11 +94,12 @@ impl GatewayIdentity {
         *self.secp.sign_schnorr_no_aux_rand(&msg, &keypair).as_ref()
     }
 
-    /// Link signature over the 78 v1 response bytes — same domain as the node's
-    /// `verify_responder_signature`.
-    pub fn sign_response(&self, signed_bytes: &[u8]) -> [u8; 64] {
-        self.sign_digest(&domain_hash(RESPONDER_DOMAIN, &[signed_bytes]))
-    }
+}
+
+/// Digest a link signs: its served `tier`, the head's key, then the response's v1 and extension
+/// bytes (`AiResponsePayload::link_signed_bytes`).
+fn link_digest(tier: u8, head_pubkey: &[u8; 32], message: &[u8]) -> [u8; 32] {
+    domain_hash(LINK_DOMAIN, &[&[tier], head_pubkey, message])
 }
 
 fn domain_hash(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -298,10 +301,10 @@ pub async fn serve(listen: String, identity: Arc<GatewayIdentity>, resolve: Shar
         let resolve = resolve.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &identity, &resolve)).await {
-                Ok(Ok((stream, keys, local, client_pk))) => {
+                Ok(Ok((stream, keys, local, client_pk, tier))) => {
                     log::info!("shard gateway: session from {} (head {})", peer, hex::encode(client_pk));
                     let _pause = ShardSessionGuard::new();
-                    if let Err(e) = server_session(stream, keys, local, identity).await {
+                    if let Err(e) = server_session(stream, keys, local, identity, tier, client_pk).await {
                         log::debug!("shard gateway: session {} ended: {}", peer, e);
                     }
                 }
@@ -316,7 +319,7 @@ async fn server_handshake(
     mut stream: TcpStream,
     identity: &GatewayIdentity,
     resolve: &ShardResolver,
-) -> Result<(TcpStream, SessionKeys, String, [u8; 32]), String> {
+) -> Result<(TcpStream, SessionKeys, String, [u8; 32], u8), String> {
     let mut hello = [0u8; HELLO_LEN];
     stream.read_exact(&mut hello).await.map_err(|e| e.to_string())?;
     if &hello[..4] != MAGIC || hello[4] != VERSION {
@@ -351,10 +354,17 @@ async fn server_handshake(
     stream.write_all(&reply).await.map_err(|e| e.to_string())?;
     let shared = SharedSecret::new(&client_eph_pk, &eph_secret);
     let keys = session_keys(&shared, &transcript(&model_id, &client_eph, &server_eph, &client_pk, &identity.pubkey));
-    Ok((stream, keys, local, client_pk))
+    Ok((stream, keys, local, client_pk, tier))
 }
 
-async fn server_session(stream: TcpStream, keys: SessionKeys, local: String, identity: Arc<GatewayIdentity>) -> std::io::Result<()> {
+async fn server_session(
+    stream: TcpStream,
+    keys: SessionKeys,
+    local: String,
+    identity: Arc<GatewayIdentity>,
+    tier: u8,
+    head_pubkey: [u8; 32],
+) -> std::io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let mut rx = Sealer::new(&keys.c2s);
     let mut tx = Sealer::new(&keys.s2c);
@@ -416,11 +426,12 @@ async fn server_session(stream: TcpStream, keys: SessionKeys, local: String, ide
                 let _ = out_tx.send((FRAME_PONG, payload)).await;
             }
             FRAME_SIGN => {
-                if payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
+                // The served tier and the authenticated head are bound here, not taken from the head.
+                if payload.len() < keryx_inference::AI_RESPONSE_PAYLOAD_LEN || payload.len() > keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN {
                     let _ = out_tx.send((FRAME_ERROR, b"sign: bad length".to_vec())).await;
                     continue;
                 }
-                let sig = identity.sign_response(&payload);
+                let sig = identity.sign_digest(&link_digest(tier, &head_pubkey, &payload));
                 let mut reply = Vec::with_capacity(32 + 64);
                 reply.extend_from_slice(&identity.pubkey);
                 reply.extend_from_slice(&sig);
@@ -440,7 +451,7 @@ async fn server_session(stream: TcpStream, keys: SessionKeys, local: String, ide
 // ── Client (pipeline head) ─────────────────────────────────────────────────────────────────────
 
 enum Ctl {
-    Sign([u8; 78], oneshot::Sender<Result<keryx_inference::AiResponseLink, String>>),
+    Sign(Vec<u8>, oneshot::Sender<Result<keryx_inference::AiResponseLink, String>>),
     Ping(oneshot::Sender<Result<Duration, String>>),
 }
 
@@ -451,6 +462,8 @@ pub struct LinkSession {
     pub model_id: [u8; 32],
     pub tier: u8,
     pub peer_pubkey: [u8; 32],
+    /// This head's escrow key, which the link binds into its signature.
+    pub head_pubkey: [u8; 32],
     pub local_port: u16,
     ctl: mpsc::Sender<Ctl>,
 }
@@ -530,7 +543,7 @@ pub async fn connect_link(remote: &str, model_id: [u8; 32], identity: Arc<Gatewa
             });
         }
     });
-    Ok(LinkSession { remote: remote.to_string(), model_id, tier, peer_pubkey, local_port, ctl: ctl_tx })
+    Ok(LinkSession { remote: remote.to_string(), model_id, tier, peer_pubkey, head_pubkey: identity.pubkey, local_port, ctl: ctl_tx })
 }
 
 async fn control_loop(t: Tunnel, mut ctl: mpsc::Receiver<Ctl>) {
@@ -659,12 +672,16 @@ async fn data_tunnel(local: TcpStream, t: Tunnel) -> std::io::Result<()> {
 }
 
 impl LinkSession {
-    /// Asks the shard to sign the 78 v1 bytes of a response it served.
-    pub async fn sign(&self, signed_bytes: [u8; 78]) -> Result<keryx_inference::AiResponseLink, String> {
+    /// Has the link sign `message` (the response's v1 and extension bytes) for its tier under
+    /// this head.
+    pub async fn sign(&self, message: &[u8]) -> Result<keryx_inference::AiResponseLink, String> {
         let (tx, rx) = oneshot::channel();
-        self.ctl.send(Ctl::Sign(signed_bytes, tx)).await.map_err(|_| "control tunnel closed".to_string())?;
+        self.ctl.send(Ctl::Sign(message.to_vec(), tx)).await.map_err(|_| "control tunnel closed".to_string())?;
         let link = tokio::time::timeout(Duration::from_secs(30), rx).await.map_err(|_| "sign timeout".to_string())?.map_err(|_| "control tunnel closed".to_string())??;
-        if !verify_response_signature(&link.escrow_pubkey, &link.signature, &signed_bytes) || link.escrow_pubkey != self.peer_pubkey {
+        if link.escrow_pubkey != self.peer_pubkey
+            || link.tier != self.tier
+            || !verify_schnorr(&link.escrow_pubkey, &link.signature, &link_digest(self.tier, &self.head_pubkey, message))
+        {
             return Err("link signature does not verify".into());
         }
         Ok(link)
@@ -780,9 +797,23 @@ mod tests {
         assert_eq!(link.tier, 9);
         assert_eq!(link.peer_pubkey, shard.pubkey);
         assert!(link.ping().await.unwrap() < Duration::from_secs(1));
-        let signed = link.sign([5u8; 78]).await.unwrap();
+        let message = [5u8; 120];
+        let signed = link.sign(&message).await.unwrap();
         assert_eq!(signed.tier, 9);
-        assert!(verify_response_signature(&signed.escrow_pubkey, &signed.signature, &[5u8; 78]));
+        assert!(verify_schnorr(&signed.escrow_pubkey, &signed.signature, &link_digest(9, &head.pubkey, &message)));
+        // bound to this head and tier, and not a responder signature
+        assert!(!verify_schnorr(&signed.escrow_pubkey, &signed.signature, &link_digest(8, &head.pubkey, &message)));
+        assert!(!verify_schnorr(&signed.escrow_pubkey, &signed.signature, &link_digest(9, &shard.pubkey, &message)));
+        assert!(!verify_response_signature(&signed.escrow_pubkey, &signed.signature, &message));
+        // the node's message layout: tier, head key, then the payload bytes
+        let payload = keryx_inference::AiResponsePayload::new([7u8; 32], 9, [1u8; 34], 3).with_private_body(vec![4u8; 50]);
+        let mut node_bytes = payload.link_signed_bytes(9, &head.pubkey);
+        let signed = link.sign(&node_bytes[33..]).await.unwrap();
+        assert!(verify_schnorr(&signed.escrow_pubkey, &signed.signature, &domain_hash(LINK_DOMAIN, &[&node_bytes])));
+        node_bytes[0] = 8;
+        assert!(!verify_schnorr(&signed.escrow_pubkey, &signed.signature, &domain_hash(LINK_DOMAIN, &[&node_bytes])));
+        // shorter than a v1 payload is refused by the link
+        assert!(link.sign(&[5u8; 10]).await.is_err());
 
         // data tunnel: bytes reach the shard server and come back
         let mut c = TcpStream::connect(("127.0.0.1", link.local_port)).await.unwrap();

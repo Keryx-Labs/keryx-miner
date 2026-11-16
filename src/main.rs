@@ -997,7 +997,7 @@ fn main() -> Result<(), Error> {
                     return 46;
                 }
             }
-            match link.sign([7u8; 78]).await {
+            match link.sign(&[7u8; 78]).await {
                 Ok(l) => println!("link proxy: SIGN ok (tier {}, key {})", l.tier, hex::encode(l.escrow_pubkey)),
                 Err(e) => {
                     eprintln!("link proxy: SIGN failed: {}", e);

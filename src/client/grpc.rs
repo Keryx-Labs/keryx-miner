@@ -3164,7 +3164,7 @@ impl KeryxdHandler {
 
     /// Builds and submits the zero-input/zero-output AiResponse for a confirmed CID. A
     /// `private_body` rides inline under the responder signature; the `links` of a pipeline
-    /// head each sign the v1 bytes (V3).
+    /// head each sign their tier under this head, and the head signs the links (V3).
     async fn submit_ai_response(
         &mut self,
         request_hash: [u8; 32],
@@ -3185,17 +3185,17 @@ impl KeryxdHandler {
         let v2 = self.last_known_daa >= keryx_miner::pom::pom_v3_activation_daa();
         let resp = match (&self.escrow_watcher, v2) {
             (Some(w), true) if !links.is_empty() => {
-                // Pipeline response (V3): every link signs the v1 bytes; the head signs them
-                // followed by the inline body, if any. A pipeline answer carries no trace.
-                let mut unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
-                let v1_bytes: [u8; 78] = unsigned.signed_bytes().try_into().expect("78 v1 bytes");
-                if let Some(body) = &private_body {
-                    unsigned = unsigned.with_private_body(body.clone());
-                }
-                let responder = w.sign_responder(&unsigned.signed_bytes());
+                // Pipeline response (V3): each link signs its tier under this head over the v1 and
+                // body bytes, then the head signs everything, links included. No trace.
+                let with_body = |r: keryx_inference::AiResponsePayload| match &private_body {
+                    Some(body) => r.with_private_body(body.clone()),
+                    None => r,
+                };
+                let base = with_body(keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length));
+                let mut message = base.signed_bytes();
                 let mut signed_links = Vec::with_capacity(links.len());
                 for link in links {
-                    match link.sign(v1_bytes).await {
+                    match link.sign(&message).await {
                         Ok(l) => signed_links.push(l),
                         Err(e) => {
                             warn!("Inference: link {} (tier {}) did not sign the response: {} — AiResponse skipped", link.remote, link.tier, e);
@@ -3203,12 +3203,18 @@ impl KeryxdHandler {
                         }
                     }
                 }
-                let resp =
-                    keryx_inference::AiResponsePayload::new_v3(request_hash, challenge_window_end, cid, response_length, responder, signed_links);
-                match private_body {
-                    Some(body) => resp.with_private_body(body),
-                    None => resp,
-                }
+                message.clear();
+                let unsigned = keryx_inference::AiResponder { escrow_pubkey: w.pubkey_bytes(), signature: [0; 64] };
+                let draft = with_body(keryx_inference::AiResponsePayload::new_v3(
+                    request_hash,
+                    challenge_window_end,
+                    cid,
+                    response_length,
+                    unsigned,
+                    signed_links.clone(),
+                ));
+                let responder = w.sign_responder(&draft.signed_bytes());
+                with_body(keryx_inference::AiResponsePayload::new_v3(request_hash, challenge_window_end, cid, response_length, responder, signed_links))
             }
             (Some(w), true) => {
                 let mut unsigned = keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length);
