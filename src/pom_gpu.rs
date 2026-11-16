@@ -2324,6 +2324,12 @@ fn release_failed_model(device_id: u32, failed_model: &[u8; 32], keep_gguf: Opti
     }
 }
 
+/// Whether two PoM tiers are both network-model shards or both lineup tiers: an OOM fallback
+/// stays within its family, the two tier ranges do not grow in VRAM together.
+fn same_tier_family(a: u8, b: u8) -> bool {
+    (a > crate::models::NETWORK_MODEL_TIER) == (b > crate::models::NETWORK_MODEL_TIER)
+}
+
 /// After a GPU fails to load its assigned tier (OOM), reassign it to the largest **already-downloaded**
 /// PoM model strictly smaller than the failed one that hasn't itself been banlisted on this GPU — so a
 /// card whose VRAM estimate was optimistic (driver overhead + KV cache + fragmentation) mines a
@@ -2336,6 +2342,7 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
     let pick = crate::llm::downloaded_pom_specs()
         .into_iter()
         .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
+        .filter(|(t, _)| same_tier_family(*t, failed_tier))
         .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(device_id, &s.model_id))
         .max_by_key(|(t, _)| *t);
     match pick {
@@ -2683,6 +2690,15 @@ mod tests {
 
     fn t(name: &str, ptr: u64, nbytes: usize, dev: bool) -> (String, u64, usize, bool) {
         (name.into(), ptr, nbytes, dev)
+    }
+
+    #[test]
+    fn an_oom_fallback_stays_within_its_tier_family() {
+        let shard = crate::models::NETWORK_MODEL_TIER + 4;
+        assert!(same_tier_family(shard, crate::models::NETWORK_MODEL_TIER + 1));
+        assert!(!same_tier_family(shard, 2));
+        assert!(!same_tier_family(2, shard));
+        assert!(same_tier_family(4, 0));
     }
 
     #[test]

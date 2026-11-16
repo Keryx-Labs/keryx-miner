@@ -181,10 +181,10 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
 };
 
 // ── H14 network model ───────────────────────────────────────────────────────────────────────────
-// Active at `crate::pom::model_split_activation_daa()`. The lineup above stays in the registry for the
-// blocks that mined it but is paused: from the gate a GPU walks and mines ONE shard of
-// DeepSeek-V4-Flash (Q2), picked by its VRAM class. The whole model is the id AiRequests target;
-// nobody mines it. model_id bytes MUST equal the node's `POM_TIERS_H14` / `NETWORK_MODEL_SHARDS`.
+// Active at `crate::pom::model_split_activation_daa()`. The lineup above stays mineable; from the
+// gate a rig run with `--mine-shards` walks and mines ONE shard of DeepSeek-V4-Flash (Q2) per GPU
+// instead, picked by its VRAM class. The whole model is the id AiRequests target; nobody mines it.
+// model_id bytes MUST equal the node's `POM_TIERS_H14` / `NETWORK_MODEL_SHARDS`.
 
 /// The whole network model — DeepSeek-V4-Flash abliterated (huihui-ai, ds4, Q2). Request target
 /// and pipeline-head capability only; never downloaded, walked or mined as such.
@@ -445,6 +445,17 @@ pub fn network_model() -> &'static NetworkModelSpec {
 pub const NETWORK_MODEL_TIER: u8 = 5;
 
 
+/// Whether this rig mines network-model shards past the gate (`--mine-shards`) instead of the lineup.
+static MINE_SHARDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_mine_shards(on: bool) {
+    MINE_SHARDS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn mine_shards() -> bool {
+    MINE_SHARDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Which of the two 12 GB shards (1 or 2) a `Tier::Light` GPU mines. Spread by the mining
 /// address at startup so the two are served without coordination; `--force-model shard-2`
 /// pins it.
@@ -485,14 +496,16 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
 /// Mirror of the node's per-block tier table (`POM_TIERS_H6`, `POM_TIERS_H14` from the
 /// private-inference gate, then the model-split table), recomputed from the block DAA. Below the
 /// H6 gate this binary refuses to mine (None) — it never produces a pre-H6-era block. From the
-/// model-split gate only a shard has a tier: the lineup is paused and the whole network model is
-/// never mined.
+/// model-split gate the shards add their tiers after the lineup; the whole network model is never
+/// mined.
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa < crate::pom::pom_v3_activation_daa() {
         return None;
     }
     if daa >= crate::pom::model_split_activation_daa() {
-        return shard_index(model_id).map(|k| NETWORK_MODEL_TIER + 1 + k);
+        if let Some(k) = shard_index(model_id) {
+            return Some(NETWORK_MODEL_TIER + 1 + k);
+        }
     }
     if *model_id == QWEN3_5_9B_ABLITERATED.model_id {
         Some(0)
@@ -568,7 +581,7 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
     if daa < crate::pom::pom_v3_activation_daa() {
         return None;
     }
-    if daa >= crate::pom::model_split_activation_daa() {
+    if daa >= crate::pom::model_split_activation_daa() && mine_shards() {
         return Some(shard_for_tier(tier));
     }
     Some(match tier {
@@ -774,22 +787,29 @@ mod tests {
         }
     }
 
-    /// The H14 era — mirror of the node's `POM_TIERS_H14`: shards are tiers 6-11, the lineup is
-    /// paused, the whole model is never a mined tier. `u64::MAX` is at/after the gate on any
-    /// network, scheduled or not.
+    /// The model-split era — mirror of the node's `POM_TIERS_MODEL_SPLIT`: the lineup keeps tiers
+    /// 0-4 and stays the default, shards are tiers 6-11 mined only with `--mine-shards`, the whole
+    /// model is never a mined tier. `u64::MAX` is at/after the gate on any network.
     #[test]
-    fn model_split_era_mines_shards_only() {
+    fn model_split_era_keeps_the_lineup_and_adds_shards() {
         let daa = u64::MAX;
+        assert!(daa >= crate::pom::model_split_activation_daa());
         for (k, spec) in V4_FLASH_SHARDS.iter().enumerate() {
             assert_eq!(pom_tier_index(&spec.model_id, daa), Some(NETWORK_MODEL_TIER + 1 + k as u8), "{}", spec.name);
             assert_eq!(shard_index(&spec.model_id), Some(k as u8));
             assert_eq!(spec.dir_name, format!("V4-Flash-shard-{}", k));
         }
         assert_eq!(pom_tier_index(&V4_FLASH.model_id, daa), None);
-        for spec in REGISTRY.iter().take(6) {
-            assert_eq!(pom_tier_index(&spec.model_id, daa), None, "{} must be paused", spec.name);
-        }
-        // one shard per card class; the 12 GB class follows the light-shard choice
+        assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), Some(0));
+        assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), Some(4));
+        // the lineup by default
+        assert!(!mine_shards());
+        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
+        // the switch changes nothing before the gate
+        let before = crate::pom::model_split_activation_daa().saturating_sub(1).max(crate::pom::pom_v3_activation_daa());
+        set_mine_shards(true);
+        assert_eq!(pom_model_for_tier(before, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
+        // with --mine-shards: one shard per card class; the 12 GB class follows the light-shard choice
         assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, V4_FLASH_SHARD_0.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, V4_FLASH_SHARD_3.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, V4_FLASH_SHARD_4.model_id);
@@ -800,6 +820,7 @@ mod tests {
         assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, V4_FLASH_SHARD_1.model_id);
         set_light_shard(7);
         assert_eq!(light_shard(), 1);
+        set_mine_shards(false);
         // every network-model CID decodes to its model_id (CIDv0[2..34])
         for spec in REGISTRY.iter().skip(6) {
             let raw = base58btc_decode(spec.weight_cids[0]);

@@ -1400,6 +1400,11 @@ async fn run() -> Result<(), Error> {
         );
     }
     let forced_max_rank = forced_tiers.iter().flatten().map(|t| tier_rank(*t)).max();
+    let forced_shard = opt.force_model.as_deref().is_some_and(|s| s.split(',').any(|m| m.trim().to_ascii_lowercase().starts_with("shard-")));
+    keryx_miner::models::set_mine_shards(opt.mine_shards || forced_shard);
+    if keryx_miner::models::mine_shards() {
+        info!("Model split: this rig mines network-model shards from the gate (lineup otherwise).");
+    }
 
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.

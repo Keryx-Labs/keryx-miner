@@ -1340,10 +1340,7 @@ impl KeryxdHandler {
         let Some(w) = self.escrow_watcher.as_ref() else { return };
         let tiers = keryx_miner::pipeline::served_tiers();
         if tiers.is_empty() {
-            log::warn!(
-                "Inference: network-model request id={} — no shard served by this miner, nothing declared (is the shard engine up?)",
-                stable_id
-            );
+            log::debug!("Inference: network-model request id={} — no shard served by this miner, nothing declared", stable_id);
             return;
         }
         let now = std::time::Instant::now();

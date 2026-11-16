@@ -45,8 +45,9 @@ pub struct Opt {
         value_name = "TIER[,TIER...]",
         help = "Force the model tier per GPU (CUDA-driver order, CSV): e.g. --force-model light,very-high \
                 → GPU0=light, GPU1=very-high. Names: very-light|light|default|high|very-high, or a network-model \
-                shard shard-0..shard-5 (its card class is implied). Bypasses the per-card VRAM check (an \
-                undersized card will OOM); unlisted/extra cards keep auto best-fit.",
+                shard shard-0..shard-5 (its card class is implied; a shard name turns the whole rig to shards, \
+                see --mine-shards). Bypasses the per-card VRAM check (an undersized card will OOM); unlisted/extra \
+                cards keep auto best-fit.",
         help_heading = "Inference"
     )]
     pub force_model: Option<String>,
@@ -59,6 +60,14 @@ pub struct Opt {
         help_heading = "Model split"
     )]
     pub shard_port: u16,
+
+    #[clap(
+        long = "mine-shards",
+        help = "From the model-split gate, every GPU of the rig mines the network-model shard of its card class \
+                instead of its lineup model. Implied by --force-model shard-N.",
+        help_heading = "Model split"
+    )]
+    pub mine_shards: bool,
 
     #[clap(
         long = "shard-gateway",
