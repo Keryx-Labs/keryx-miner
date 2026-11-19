@@ -180,6 +180,61 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     ctx_cap: 131_072,
 };
 
+// ── H18 lineup ──────────────────────────────────────────────────────────────────────────────────
+// Tiers 0 and 1 from `crate::pom::model_split_activation_daa()`; tiers 2-4 are unchanged.
+// model_id bytes MUST equal the node's `POM_TIERS_MODEL_SPLIT` constants.
+
+/// H18 tier-0 model — NVIDIA-Nemotron-3.5-Bolt-E4B heretic Q6_K (Losew GGUF, arch gemma4).
+/// `model_id` MUST equal the node's `BOLT_E4B_MODEL_ID`.
+pub const BOLT_E4B: ModelSpec = ModelSpec {
+    name: "nemotron-3.5-bolt-e4b",
+    model_id: [
+        0xf9, 0x10, 0x8e, 0xb1, 0xc6, 0x7b, 0x3e, 0xe0,
+        0xd4, 0x4c, 0x96, 0xf2, 0x59, 0xe3, 0xfd, 0x93,
+        0xee, 0x50, 0x75, 0x19, 0x4b, 0x54, 0x43, 0x61,
+        0x65, 0xcf, 0x19, 0x87, 0xab, 0xaf, 0x5a, 0xc9,
+    ],
+    format: ModelFormat::GgufGemma4,
+    tokenizer_cid: "",
+    weight_cids: &["Qmf6tsQ2DDMLSrQKwuL2NfmJUBkeV9GGwZUu8Co9JfJJ4G"],
+    dir_name: "Bolt-E4B",
+    min_vram_mb: 8_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
+/// H18 tier-1 model — Qwen3.5-9B-abliterated Q8_0 (huihui-ai abliteration, mradermacher GGUF).
+/// `model_id` MUST equal the node's `QWEN3_5_9B_Q8_MODEL_ID`.
+pub const QWEN3_5_9B_Q8: ModelSpec = ModelSpec {
+    name: "qwen3.5-9b-q8",
+    model_id: [
+        0x25, 0xdd, 0x00, 0x1c, 0xa8, 0x01, 0x70, 0x8f,
+        0xa8, 0x2a, 0x9d, 0x2a, 0x77, 0xe7, 0xba, 0xec,
+        0x4f, 0x27, 0x43, 0xae, 0xbe, 0xe9, 0x9d, 0xc6,
+        0x04, 0xc3, 0xbf, 0xbc, 0xf6, 0x71, 0x64, 0x57,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmQtTFMQYvnoZ1ZxNsuth8zzLWoBVKnCDVoW2ViCn8H6na"],
+    dir_name: "Qwen3.5-9B-Q8_0",
+    min_vram_mb: 12_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
+/// Lineup the per-tier rules of tiers 0-4 follow — mirror of the node's `Lineup`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lineup {
+    H14,
+    H18,
+}
+
+/// Lineup of a lineup model: tiers 0 and 1 changed models at H18, tiers 2-4 did not, so the
+/// model alone decides it.
+pub fn lineup_of(model_id: &[u8; 32]) -> Lineup {
+    if *model_id == BOLT_E4B.model_id || *model_id == QWEN3_5_9B_Q8.model_id { Lineup::H18 } else { Lineup::H14 }
+}
+
 // ── H14 network model ───────────────────────────────────────────────────────────────────────────
 // Active at `crate::pom::model_split_activation_daa()`. The lineup above stays mineable; from the
 // gate a rig run with `--mine-shards` walks and mines ONE shard of DeepSeek-V4-Flash (Q2) per GPU
@@ -490,6 +545,8 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
         || *model_id == QWEN3_6_27B.model_id
         || *model_id == QWEN3_8_27B.model_id
         || *model_id == KIMI_LINEAR_48B.model_id
+        || *model_id == BOLT_E4B.model_id
+        || *model_id == QWEN3_5_9B_Q8.model_id
         || shard_index(model_id).is_some()
 }
 
@@ -502,12 +559,19 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa < crate::pom::pom_v3_activation_daa() {
         return None;
     }
-    if daa >= crate::pom::model_split_activation_daa() {
+    let split = daa >= crate::pom::model_split_activation_daa();
+    if split {
         if let Some(k) = shard_index(model_id) {
             return Some(NETWORK_MODEL_TIER + 1 + k);
         }
     }
-    if *model_id == QWEN3_5_9B_ABLITERATED.model_id {
+    if *model_id == BOLT_E4B.model_id {
+        split.then_some(0)
+    } else if *model_id == QWEN3_5_9B_Q8.model_id {
+        split.then_some(1)
+    } else if split && (*model_id == QWEN3_5_9B_ABLITERATED.model_id || *model_id == GLM_4_9B_0414.model_id) {
+        None
+    } else if *model_id == QWEN3_5_9B_ABLITERATED.model_id {
         Some(0)
     } else if *model_id == GLM_4_9B_0414.model_id {
         Some(1)
@@ -581,11 +645,14 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
     if daa < crate::pom::pom_v3_activation_daa() {
         return None;
     }
-    if daa >= crate::pom::model_split_activation_daa() && mine_shards() {
+    let split = daa >= crate::pom::model_split_activation_daa();
+    if split && mine_shards() {
         return Some(shard_for_tier(tier));
     }
     Some(match tier {
+        Tier::VeryLight if split => &BOLT_E4B,
         Tier::VeryLight => &QWEN3_5_9B_ABLITERATED,
+        Tier::Light if split => &QWEN3_5_9B_Q8,
         Tier::Light => &GLM_4_9B_0414,
         Tier::Default => &GEMMA_4_12B_ABLITERATED,
         Tier::High if daa >= crate::pom::private_inference_activation_daa() => &QWEN3_8_27B,
@@ -671,6 +738,8 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &QWEN3_6_27B,
     &QWEN3_8_27B,
     &KIMI_LINEAR_48B,
+    &BOLT_E4B,
+    &QWEN3_5_9B_Q8,
     &V4_FLASH,
     &V4_FLASH_SHARD_0,
     &V4_FLASH_SHARD_1,
@@ -737,6 +806,8 @@ mod tests {
         assert_eq!(pom_tier_index(&QWEN3_8_27B.model_id, daa), Some(3));
         assert_eq!(pom_tier_index(&QWEN3_6_27B.model_id, daa), None);
         assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), Some(4));
+        assert_eq!(pom_tier_index(&BOLT_E4B.model_id, daa), None);
+        assert_eq!(pom_tier_index(&QWEN3_5_9B_Q8.model_id, daa), None);
 
         // The hardware-tier -> model map agrees with the table, tier for tier.
         assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, QWEN3_5_9B_ABLITERATED.model_id);
@@ -755,9 +826,11 @@ mod tests {
 
         // Every lineup model is a mineable tier in some lineup era; the network model and its
         // shards are not.
-        for spec in REGISTRY.iter().take(6) {
+        for spec in REGISTRY.iter().take(8) {
             assert!(is_pom_model(&spec.model_id), "{} is not a PoM model", spec.name);
-            let tier = pom_tier_index(&spec.model_id, daa).or_else(|| pom_tier_index(&spec.model_id, pre_h14));
+            let tier = pom_tier_index(&spec.model_id, daa)
+                .or_else(|| pom_tier_index(&spec.model_id, pre_h14))
+                .or_else(|| pom_tier_index(&spec.model_id, u64::MAX));
             assert!(tier.is_some(), "{} has no tier", spec.name);
         }
         assert!(!is_pom_model(&V4_FLASH.model_id));
@@ -800,11 +873,21 @@ mod tests {
             assert_eq!(spec.dir_name, format!("V4-Flash-shard-{}", k));
         }
         assert_eq!(pom_tier_index(&V4_FLASH.model_id, daa), None);
-        assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), Some(0));
+        // the H18 lineup replaces tiers 0 and 1, the retired models are no tier at all
+        assert_eq!(pom_tier_index(&BOLT_E4B.model_id, daa), Some(0));
+        assert_eq!(pom_tier_index(&QWEN3_5_9B_Q8.model_id, daa), Some(1));
+        assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), None);
+        assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, daa), None);
+        assert_eq!(pom_tier_index(&GEMMA_4_12B_ABLITERATED.model_id, daa), Some(2));
+        assert_eq!(pom_tier_index(&QWEN3_8_27B.model_id, daa), Some(3));
         assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), Some(4));
+        assert_eq!(lineup_of(&BOLT_E4B.model_id), Lineup::H18);
+        assert_eq!(lineup_of(&QWEN3_5_9B_Q8.model_id), Lineup::H18);
+        assert_eq!(lineup_of(&GEMMA_4_12B_ABLITERATED.model_id), Lineup::H14);
         // the lineup by default
         assert!(!mine_shards());
-        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, BOLT_E4B.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, QWEN3_5_9B_Q8.model_id);
         // the switch changes nothing before the gate
         let before = crate::pom::model_split_activation_daa().saturating_sub(1).max(crate::pom::pom_v3_activation_daa());
         set_mine_shards(true);

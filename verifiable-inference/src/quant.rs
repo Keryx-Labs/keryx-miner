@@ -8,6 +8,7 @@ pub const Q8_0: u32 = 8;
 pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
+pub const BF16: u32 = 30;
 
 /// (bytes per block, values per block).
 pub fn block_size(wtype: u32) -> Option<(usize, usize)> {
@@ -18,6 +19,7 @@ pub fn block_size(wtype: u32) -> Option<(usize, usize)> {
         Q4_K => Some((144, 256)),
         Q5_K => Some((176, 256)),
         Q6_K => Some((210, 256)),
+        BF16 => Some((2, 1)),
         _ => None,
     }
 }
@@ -31,6 +33,20 @@ pub fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 { (q[j] & 63, q[j + 4] & 63) } else { ((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4)) }
 }
 
+pub fn bf16_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// `v` rounded to the nearest bfloat16, ties to even.
+pub fn round_bf16(v: f32) -> f32 {
+    if v.is_nan() {
+        return v;
+    }
+    let bits = v.to_bits();
+    let r = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    f32::from_bits(r & 0xffff_0000)
+}
+
 /// Dequantize one weight row of `k` values.
 pub fn dequant_row(wtype: u32, row: &[u8], k: usize) -> Option<Vec<f32>> {
     let (bb, bv) = block_size(wtype)?;
@@ -41,6 +57,7 @@ pub fn dequant_row(wtype: u32, row: &[u8], k: usize) -> Option<Vec<f32>> {
     for (b, out) in y.chunks_mut(bv).enumerate() {
         let blk = &row[b * bb..(b + 1) * bb];
         match wtype {
+            BF16 => out[0] = bf16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
             Q8_0 => {
                 let d = f16::read(blk, 0);
                 for j in 0..32 {

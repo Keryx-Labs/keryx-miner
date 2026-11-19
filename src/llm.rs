@@ -340,7 +340,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "split9b-shard-0" | "split9b-shard-1" => format!(
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "split9b-shard-0" | "split9b-shard-1" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -355,6 +355,14 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
             "<|turn>system\n{}<turn|>\n\
              <|turn>user\n{}<turn|>\n\
              <|turn>model\n<|channel>thought\n<channel|>",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
+        // Bolt's template turns reasoning off by opening the model turn bare, with no thought
+        // channel. BOS comes from the tokenizer (add_bos_token).
+        "nemotron-3.5-bolt-e4b" => format!(
+            "<|turn>system\n{}<turn|>\n\
+             <|turn>user\n{}<turn|>\n\
+             <|turn>model\n",
             SYSTEM_PROMPT_NEXT, prompt
         ),
         "kimi-linear-48b" => format!(
@@ -388,7 +396,7 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
             "[gMASK]<sop><|user|>\nRequest id:".to_string(),
             format!("\n{}\n\n{}\n<|assistant|>\n", SYSTEM_PROMPT_NEXT, prompt),
         ),
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" => (
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" => (
             "<|im_start|>system\nRequest id:".to_string(),
             format!(
                 "\n{}<|im_end|>\n\
@@ -403,6 +411,15 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
                 "\n{}<turn|>\n\
                  <|turn>user\n{}<turn|>\n\
                  <|turn>model\n<|channel>thought\n<channel|>",
+                SYSTEM_PROMPT_NEXT, prompt
+            ),
+        ),
+        "nemotron-3.5-bolt-e4b" => (
+            "<|turn>system\nRequest id:".to_string(),
+            format!(
+                "\n{}<turn|>\n\
+                 <|turn>user\n{}<turn|>\n\
+                 <|turn>model\n",
                 SYSTEM_PROMPT_NEXT, prompt
             ),
         ),
@@ -1006,7 +1023,7 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
 /// What a traced inference commits: tier, plaintext prompt length, request id and stage.
 #[derive(Clone, Copy)]
 struct Traced {
-    tier: u8,
+    tier: crate::trace::TraceTier,
     prompt_len: u32,
     request_hash: [u8; 32],
     chain: bool,
@@ -1036,6 +1053,7 @@ pub fn load_and_run_traced_inference(
     chain: bool,
     attention: bool,
 ) -> Option<Generated> {
+    let tier = crate::trace::TraceTier::of(model_id, tier);
     run_inference(model_id, prompt, max_tokens, Some(Traced { tier, prompt_len, request_hash: *request_hash, chain, attention: chain && attention }))
 }
 
@@ -1103,7 +1121,7 @@ static PREFIX_CHECKED: std::sync::Mutex<std::collections::BTreeSet<(String, u32,
 
 /// Traces a fixed prompt carrying a known request id on the engine hosting `spec`, replays two
 /// prefix positions and verifies their points as the node would.
-fn prefix_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8) -> Result<(), String> {
+fn prefix_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: crate::trace::TraceTier) -> Result<(), String> {
     use crate::trace::{build_prefix_point, draw_prefix, prefix_ctx, prefix_tokens, TierManifest, TraceRecord};
     use keryx_verifiable_inference::prefix::verify_prefix_point;
     use keryx_verifiable_inference::verify::{ResponseCtx, TierCtx};
@@ -1294,7 +1312,7 @@ fn open_chain(
     use keryx_verifiable_inference::opening::MAX_BODY_LEN;
     let rec = &trace.record;
     let d = draw_chain(m, pctx, rec, seed).ok_or("no stage-2 draw")?;
-    let caps = replay_captures(gguf, dev_id, m, trace, &d.captures(m.n_products as u64))?;
+    let caps = replay_captures(gguf, dev_id, m, trace, &d.captures())?;
     let (mut o, mut r) = chain_opening(m, pctx, rec, &trace.tokens, seed, request_hash, response_txid, &d, &caps, index).ok_or_else(|| "no stage-2 opening".to_string())?;
     o.roots = trace.seq.as_ref().map(|seq| (rec.trace_root, seq.root));
     r.roots = o.roots;
@@ -1312,7 +1330,7 @@ fn open_chain(
 
 /// Traces a fixed prompt under the stage-2 manifest, then opens and verifies it under two seeds
 /// as the node would.
-fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attention: bool) -> Result<(), String> {
+fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: crate::trace::TraceTier, attention: bool) -> Result<(), String> {
     use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, SeqTrace, TierManifest, TraceRecord, STAGE_CHAIN};
     let key = if attention { STAGE_CHAIN | 0x80 } else { STAGE_CHAIN };
     if PREFIX_CHECKED.lock().unwrap().contains(&(gguf.to_string(), dev_id, key)) {
@@ -1351,7 +1369,7 @@ fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attenti
 /// Arms the canonical trace of `tier` on the engine hosting `spec`, under the stage-2 manifest
 /// when `chain`; `false` when the tier has no manifest or the engine cannot trace. A tier that
 /// cannot pass its self-check stops the miner.
-fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, chain: bool, attention: bool) -> bool {
+fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: crate::trace::TraceTier, chain: bool, attention: bool) -> bool {
     use crate::trace::TierManifest;
     let manifest = if attention {
         TierManifest::raw_attn(tier)
@@ -1546,6 +1564,7 @@ pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> 
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let tier = crate::trace::TraceTier::of(model_id, tier);
     let (gguf, dev_id) = resident_engine(spec)?;
     if !arm_trace(spec, &gguf, dev_id, tier, true, false) {
         return None;
@@ -1574,6 +1593,7 @@ pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::Resp
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let tier = crate::trace::TraceTier::of(model_id, tier);
     let (gguf, dev_id) = resident_engine(spec)?;
     if !arm_trace(spec, &gguf, dev_id, tier, true, false) {
         return None;
@@ -1616,6 +1636,7 @@ pub fn open_attention_phase(
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let tier = crate::trace::TraceTier::of(model_id, tier);
     let (gguf, dev_id) = resident_engine(spec)?;
     if trace.seq.is_none() || !arm_trace(spec, &gguf, dev_id, tier, true, true) {
         return None;
@@ -1644,6 +1665,7 @@ pub fn open_trace(
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    let tier = crate::trace::TraceTier::of(model_id, tier);
     let chain = trace.record.stage == crate::trace::STAGE_CHAIN;
     let attention = chain && trace.seq.is_some();
     let (gguf, dev_id) = resident_engine(spec)?;
@@ -1739,7 +1761,7 @@ mod tests {
         let is_network =
             |m: &crate::models::ModelSpec| m.model_id == net.whole.model_id || net.shards.iter().any(|s| s.model_id == m.model_id);
         for m in crate::models::REGISTRY.iter().filter(|m| !is_network(m)) {
-            let expected = if m.name.starts_with("qwen3.5-9b") { 8_192 } else { 32_768 };
+            let expected = if m.name == "qwen3.5-9b-abliterated" { 8_192 } else { 32_768 };
             assert_eq!(m.ctx_floor, expected, "{}", m.name);
         }
     }
@@ -1766,7 +1788,7 @@ mod tests {
     /// role line, for every audited model.
     #[test]
     fn prefix_parts_rebuild_the_plain_template() {
-        for name in ["qwen3.5-9b-abliterated", "glm-4-9b-0414", "gemma-4-12b-abliterated", "qwen3.8-27b", "kimi-linear-48b"] {
+        for name in ["qwen3.5-9b-abliterated", "glm-4-9b-0414", "gemma-4-12b-abliterated", "qwen3.8-27b", "kimi-linear-48b", "nemotron-3.5-bolt-e4b", "qwen3.5-9b-q8"] {
             let (head, rest) = format_prompt_parts(name, "hi").unwrap();
             assert!(head.ends_with("Request id:"), "{name}: {head:?}");
             assert!(rest.starts_with('\n'), "{name}: {rest:?}");
@@ -1814,6 +1836,7 @@ mod tests {
         let gguf = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
         let spec = crate::models::spec_for_gguf(&gguf).expect("registry model");
         let tier = crate::models::pom_tier_index(&spec.model_id, u64::MAX).expect("tiered model");
+        let tier = crate::trace::TraceTier::of(&spec.model_id, tier);
         let m = TierManifest::for_attn(tier).expect("attention manifest");
         let ctx = m.chain.unwrap();
         let (_, pctx) = chain_ctx(tier).expect("stage-2 context");
@@ -1880,6 +1903,7 @@ mod tests {
         let gguf = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
         let spec = crate::models::spec_for_gguf(&gguf).expect("registry model");
         let tier = crate::models::pom_tier_index(&spec.model_id, u64::MAX).expect("tiered model");
+        let tier = crate::trace::TraceTier::of(&spec.model_id, tier);
         let m = TierManifest::for_chain(tier).expect("stage-2 manifest");
         let (ctx, pctx) = chain_ctx(tier).expect("stage-2 context");
         let index = crate::pom::WeightIndex::build_from_gguf(&gguf, spec.model_id).unwrap();
@@ -1953,6 +1977,12 @@ mod tests {
         assert!(gemma.contains("<|turn>user\nhi<turn|>"), "{gemma}");
         // The tokenizer prepends BOS (add_bos_token), so the template must not carry one.
         assert!(!gemma.contains("<bos>"), "{gemma}");
+
+        let bolt = format_prompt_by_name("nemotron-3.5-bolt-e4b", "hi");
+        assert!(bolt.ends_with("<|turn>user\nhi<turn|>\n<|turn>model\n"), "{bolt}");
+        assert!(!bolt.contains("<|channel>") && !bolt.contains("<bos>"), "{bolt}");
+        let q8 = format_prompt_by_name("qwen3.5-9b-q8", "hi");
+        assert_eq!(q8, qwen);
     }
 
     fn write_minimal_gguf(path: &Path) {

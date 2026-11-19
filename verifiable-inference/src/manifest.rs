@@ -21,6 +21,10 @@ pub const ROLE_LAYER: u8 = 5;
 pub const ROLE_ROUTER: u8 = 6;
 /// One product per head: `n_exp` heads of `m` rows of `k` weights, head `h` reads input slice `h`.
 pub const ROLE_HEADS: u8 = 7;
+/// Per-layer input projection: `m` rows (layers × per-layer width) of `k` values, not a product.
+pub const ROLE_PLE_PROJ: u8 = 8;
+/// Per-layer token embedding table: `m` rows of `k` values (layers × per-layer width).
+pub const ROLE_PLE_EMBD: u8 = 9;
 
 pub const LINK_NONE: u8 = 0;
 pub const LINK_ATTN_IN: u8 = 1;
@@ -30,6 +34,10 @@ pub const LINK_HEAD: u8 = 4;
 pub const LINK_DIRECT: u8 = 5;
 /// Per-head input: head `h` reads `[h * stride, h * stride + k)` of the source output, `stride` = source rows / heads.
 pub const LINK_HEAD_SLICE: u8 = 6;
+/// Input is the layer's residual before its per-layer input, unnormed.
+pub const LINK_RESID_IN: u8 = 7;
+/// Input is `gelu(src output) * per-layer input of the layer`.
+pub const LINK_PLE: u8 = 8;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
@@ -39,6 +47,13 @@ const TAG_ATTN_LAYER: u8 = 4;
 const TAG_ATTN_MOE_LAYER: u8 = 5;
 const TAG_RECUR_LAYER: u8 = 6;
 const TAG_RECUR_MOE_LAYER: u8 = 7;
+const TAG_LAYER_EXT: u8 = 8;
+const TAG_PLE: u8 = 9;
+
+const EXT_MOE: u8 = 1;
+const EXT_ATTN: u8 = 2;
+const EXT_RECUR: u8 = 4;
+const EXT_PLE: u8 = 8;
 
 /// Source of a product's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +76,32 @@ pub struct LayerLinks {
     pub moe: Option<MoeLinks>,
     pub attn: Option<AttnLinks>,
     pub recur: Option<RecurLinks>,
+    pub ple: Option<PleLayer>,
 }
 
-/// Routed experts of a layer.
+/// Per-layer input of a layer: `proj(gelu(gate(x)) * input)`, normed by `post_norm`, added to the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PleLayer {
+    pub gate: u32,
+    pub proj: u32,
+    pub post_norm: u32,
+}
+
+/// Per-layer inputs of the model, carried by the `ROLE_PLE_PROJ` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PleLinks {
+    /// `ROLE_PLE_EMBD` entry.
+    pub embd: u32,
+    /// Norm-role entry shared by every layer slice of the projection.
+    pub norm: u32,
+    pub width: u32,
+    /// f32 bits.
+    pub embd_scale: u32,
+    /// f32 bits.
+    pub proj_scale: u32,
+    /// f32 bits.
+    pub out_scale: u32,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeLinks {
     pub down_exps: u32,
@@ -112,6 +150,8 @@ pub struct AttnLinks {
     pub absorb: u32,
     /// Product whose input is the attention output; NONE = the layer's output projection.
     pub out: u32,
+    /// Attention slot whose cache the layer reads; `slot` unless the cache is shared.
+    pub kv_slot: u32,
 }
 
 /// Fields of an attention descriptor.
@@ -127,7 +167,7 @@ impl AttnLinks {
 
     fn from_fields(f: [u32; ATTN_FIELDS]) -> Self {
         let [q, k, v, q_norm, k_norm, n_head, n_head_kv, head_dim, rope_kind, n_rot, rope_base, kq_scale, swa_window, softcap, rope_freqs, v_norm, gated, slot, mla_rank, absorb, out] = f;
-        Self { q, k, v, q_norm, k_norm, n_head, n_head_kv, head_dim, rope_kind, n_rot, rope_base, kq_scale, swa_window, softcap, rope_freqs, v_norm, gated, slot, mla_rank, absorb, out }
+        Self { q, k, v, q_norm, k_norm, n_head, n_head_kv, head_dim, rope_kind, n_rot, rope_base, kq_scale, swa_window, softcap, rope_freqs, v_norm, gated, slot, mla_rank, absorb, out, kv_slot: slot }
     }
 }
 
@@ -192,6 +232,7 @@ pub enum Chain {
     None,
     Product(ProductLink),
     Layer(LayerLinks),
+    Ple(PleLinks),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -212,9 +253,51 @@ pub struct Entry {
     pub chain: Chain,
 }
 
+fn parse_ext_layer(b: &[u8]) -> Option<(Chain, usize)> {
+    let flags = *b.get(1)?;
+    if flags & !(EXT_MOE | EXT_ATTN | EXT_RECUR | EXT_PLE) != 0 || flags & (EXT_ATTN | EXT_RECUR) == EXT_ATTN | EXT_RECUR {
+        return None;
+    }
+    let mut o = 2;
+    let mut rd = |n: usize| -> Option<Vec<u32>> {
+        let v = b.get(o..o + 4 * n)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        o += 4 * n;
+        Some(v)
+    };
+    let h = rd(6)?;
+    let moe = if flags & EXT_MOE != 0 {
+        let m = rd(6)?;
+        Some(MoeLinks { down_exps: m[0], router: m[1], probs_bias: m[2], w_scale: m[3], ffn_norm: m[4], gate_exps: m[5] })
+    } else {
+        None
+    };
+    let attn = if flags & EXT_ATTN != 0 {
+        let f = rd(ATTN_FIELDS + 1)?;
+        let mut a = AttnLinks::from_fields(f[..ATTN_FIELDS].try_into().unwrap());
+        a.kv_slot = f[ATTN_FIELDS];
+        Some(a)
+    } else {
+        None
+    };
+    let recur = if flags & EXT_RECUR != 0 { Some(RecurLinks::from_fields(rd(RECUR_FIELDS)?.try_into().unwrap())) } else { None };
+    let ple = if flags & EXT_PLE != 0 {
+        let p = rd(3)?;
+        Some(PleLayer { gate: p[0], proj: p[1], post_norm: p[2] })
+    } else {
+        None
+    };
+    let l = LayerLinks { layer: h[0], proj: h[1], down: h[2], post_attn: h[3], post_ffn: h[4], scale: h[5], moe, attn, recur, ple };
+    Some((Chain::Layer(l), o))
+}
+
 fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
     let u32a = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
     match b.first() {
+        Some(&TAG_LAYER_EXT) => parse_ext_layer(b),
+        Some(&TAG_PLE) => Some((
+            Chain::Ple(PleLinks { embd: u32a(1)?, norm: u32a(5)?, width: u32a(9)?, embd_scale: u32a(13)?, proj_scale: u32a(17)?, out_scale: u32a(21)? }),
+            25,
+        )),
         None => None,
         Some(&TAG_NONE) => Some((Chain::None, 1)),
         Some(&TAG_PRODUCT) => {
@@ -257,6 +340,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                     moe,
                     attn,
                     recur,
+                    ple: None,
                 }),
                 base + if attn.is_some() { 4 * ATTN_FIELDS } else { 0 } + if recur.is_some() { 4 * RECUR_FIELDS } else { 0 },
             ))
@@ -276,6 +360,40 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             b.push(p.link);
             b.extend_from_slice(&p.norm.to_le_bytes());
             b.extend_from_slice(&p.src.to_le_bytes());
+        }
+        Chain::Ple(p) => {
+            b.push(TAG_PLE);
+            for v in [p.embd, p.norm, p.width, p.embd_scale, p.proj_scale, p.out_scale] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Chain::Layer(l) if l.ple.is_some() || l.attn.is_some_and(|a| a.kv_slot != a.slot) => {
+            let flags = if l.moe.is_some() { EXT_MOE } else { 0 }
+                | if l.attn.is_some() { EXT_ATTN } else if l.recur.is_some() { EXT_RECUR } else { 0 }
+                | if l.ple.is_some() { EXT_PLE } else { 0 };
+            b.extend_from_slice(&[TAG_LAYER_EXT, flags]);
+            for v in [l.layer, l.proj, l.down, l.post_attn, l.post_ffn, l.scale] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            if let Some(m) = l.moe {
+                for v in [m.down_exps, m.router, m.probs_bias, m.w_scale, m.ffn_norm, m.gate_exps] {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            if let Some(a) = l.attn {
+                for v in a.fields().into_iter().chain([a.kv_slot]) {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            } else if let Some(r) = l.recur {
+                for v in r.fields() {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            if let Some(p) = l.ple {
+                for v in [p.gate, p.proj, p.post_norm] {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
         }
         Chain::Layer(l) => {
             b.push(match (l.moe.is_some(), l.attn.is_some(), l.recur.is_some()) {
@@ -448,15 +566,15 @@ mod tests {
     #[test]
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
-        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None });
+        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, ple: None });
         let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13 };
-        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None });
+        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, ple: None });
         let attn = AttnLinks {
             q: 1, k: 2, v: 3, q_norm: NONE, k_norm: NONE, n_head: 32, n_head_kv: 2, head_dim: 128, rope_kind: 0, n_rot: 128,
-            rope_base: 10_000f32.to_bits(), kq_scale: (1.0f32 / 128f32.sqrt()).to_bits(), swa_window: 0, softcap: 0, rope_freqs: NONE, v_norm: 0, gated: 0, slot: 0, mla_rank: 0, absorb: NONE, out: NONE,
+            rope_base: 10_000f32.to_bits(), kq_scale: (1.0f32 / 128f32.sqrt()).to_bits(), swa_window: 0, softcap: 0, rope_freqs: NONE, v_norm: 0, gated: 0, slot: 0, mla_rank: 0, absorb: NONE, out: NONE, kv_slot: 0,
         };
-        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None });
-        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None });
+        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, ple: None });
+        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None, ple: None });
         assert_eq!(chain_bytes(&l).len(), 25);
         assert_eq!(chain_bytes(&lm).len(), 49);
         assert_eq!(chain_bytes(&la).len(), 25 + 84);
@@ -465,8 +583,8 @@ mod tests {
             kind: RECUR_KDA, slot: 2, n_v_heads: 32, n_k_heads: 32, head_dim: 128, q: 40, k: 41, v: 42, conv_q: 300, conv_k: 301,
             conv_v: 302, beta: 43, decay: 44, dt: 303, a: 304, norm: 305, gate: 45, interval: 48, conv_len: 4,
         };
-        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur) });
-        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur) });
+        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur), ple: None });
+        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur), ple: None });
         assert_eq!(chain_bytes(&lr).len(), 25 + 76);
         assert_eq!(chain_bytes(&lmr).len(), 49 + 76);
         for c in [Chain::None, p, l, lm, la, lma, lr, lmr] {
@@ -476,8 +594,44 @@ mod tests {
             assert_eq!((len, e.chain), (b.len(), c));
         }
         let mut bad = base_bytes("x", ROLE_PRODUCT);
-        bad.push(9);
+        bad.push(10);
         assert!(Entry::parse(&bad).is_none());
+    }
+
+    #[test]
+    fn ple_and_shared_cache_layers_round_trip() {
+        let attn = AttnLinks {
+            q: 1, k: 2, v: 3, q_norm: 40, k_norm: 41, n_head: 8, n_head_kv: 2, head_dim: 256, rope_kind: 2, n_rot: 256,
+            rope_base: 10_000f32.to_bits(), kq_scale: 1f32.to_bits(), swa_window: 512, softcap: 0, rope_freqs: NONE, v_norm: 1, gated: 0, slot: 24, mla_rank: 0, absorb: NONE, out: NONE, kv_slot: 24,
+        };
+        let shared = AttnLinks { kv_slot: 22, ..attn };
+        let ple = PleLayer { gate: 50, proj: 51, post_norm: 60 };
+        let layer = |attn: AttnLinks, ple: Option<PleLayer>| Chain::Layer(LayerLinks {
+            layer: 24, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: 22, moe: None, attn: Some(attn), recur: None, ple,
+        });
+        assert_eq!(chain_bytes(&layer(attn, None))[0], TAG_ATTN_LAYER);
+        assert_eq!(chain_bytes(&layer(attn, None)).len(), 25 + 84);
+        assert_eq!(chain_bytes(&layer(shared, None)).len(), 26 + 88);
+        assert_eq!(chain_bytes(&layer(attn, Some(ple))).len(), 26 + 88 + 12);
+        let only_ple = Chain::Layer(LayerLinks {
+            layer: 0, proj: 4, down: 9, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: None, ple: Some(ple),
+        });
+        let g = Chain::Ple(PleLinks {
+            embd: 300, norm: 301, width: 256, embd_scale: 16f32.to_bits(), proj_scale: (1.0f32 / 2560f32.sqrt()).to_bits(),
+            out_scale: std::f32::consts::FRAC_1_SQRT_2.to_bits(),
+        });
+        for c in [layer(attn, None), layer(shared, None), layer(shared, Some(ple)), layer(attn, Some(ple)), only_ple, g] {
+            let mut b = base_bytes("x", ROLE_LAYER);
+            b.extend_from_slice(&chain_bytes(&c));
+            let (e, len) = Entry::parse(&b).unwrap();
+            assert_eq!((len, e.chain), (b.len(), c));
+        }
+        for flags in [EXT_ATTN | EXT_RECUR, 16] {
+            let mut b = base_bytes("x", ROLE_LAYER);
+            b.extend_from_slice(&[TAG_LAYER_EXT, flags]);
+            b.extend_from_slice(&[0u8; 4 * (6 + RECUR_FIELDS + ATTN_FIELDS + 1)]);
+            assert!(Entry::parse(&b).is_none());
+        }
     }
 
     #[test]
@@ -518,6 +672,10 @@ mod tests {
             for (i, (e, b)) in entries.iter().enumerate() {
                 let (p, len) = Entry::parse(b).unwrap();
                 assert_eq!((&p, len), (e, b.len()));
+                if data.starts_with(b"KXMANIF2") {
+                    let base = len - chain_bytes(&p.chain).len();
+                    assert_eq!(&b[base..], &chain_bytes(&p.chain)[..]);
+                }
                 let path = crate::merkle::rt_range_proof(&leaves, i as u64, 1).1;
                 assert!(verify_entry(&m_t, entries.len() as u64, i as u64, b, &path));
             }

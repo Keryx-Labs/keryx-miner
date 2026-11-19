@@ -55,7 +55,7 @@ fn attn_layer<'a>(
     a: &AttnLinks,
     n_pos_max: u64,
 ) -> Result<(), String> {
-    if ctx.n_attn == 0 || ctx.n_attn > ctx.n_layers || ctx.seq_heads == 0 || a.slot >= ctx.n_attn {
+    if ctx.n_attn == 0 || ctx.n_attn > ctx.n_layers || ctx.seq_heads == 0 || a.slot >= ctx.n_attn || a.kv_slot > a.slot {
         return Err("context or slot".into());
     }
     if a.softcap != 0 || a.v_norm > 1 || a.gated > 1 {
@@ -90,7 +90,7 @@ fn attn_layer<'a>(
         if oe.k as usize != r || oe.n_exp as usize != nh || oe.role != manifest::ROLE_HEADS {
             return Err("output heads".into());
         }
-        sl.kcache(a.slot as u64, 0).zip(sl.lse(a.slot as u64, 0)).ok_or("key cache or mass leaf")?;
+        sl.kcache(a.kv_slot as u64, 0).zip(sl.lse(a.slot as u64, 0)).ok_or("key cache or mass leaf")?;
     } else {
         if a.absorb != none || a.out != none {
             return Err("grouped-query links".into());
@@ -109,7 +109,7 @@ fn attn_layer<'a>(
             return Err("norm widths".into());
         }
         for kv in 0..a.n_head_kv as u64 {
-            sl.kcache(a.slot as u64, kv).zip(sl.lse(a.slot as u64, kv)).ok_or("cache or mass leaf")?;
+            sl.kcache(a.kv_slot as u64, kv).zip(sl.lse(a.slot as u64, kv)).ok_or("cache or mass leaf")?;
         }
     }
     Ok(())

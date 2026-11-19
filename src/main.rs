@@ -392,7 +392,9 @@ fn nvidia_driver_major(version: &str) -> Option<u32> {
 ///
 /// VRAM requirements (GGUF weights only, not counting CUDA workspace):
 ///   Qwen3.5-9B-abliterated  →  ~6.5 GB  (requires ≥8 GB card)
+///   Nemotron-3.5-Bolt-E4B   →  ~5.7 GB  (requires ≥8 GB card, H18)
 ///   GLM-4-9B                →  ~8.3 GB  (requires ≥12 GB card)
+///   Qwen3.5-9B Q8_0         →  ~9.5 GB  (requires ≥12 GB card, H18)
 ///   Gemma-4-12B-abliterated →  ~9.8 GB  (requires ≥16 GB card)
 ///   Qwen3.6/3.8-27B         → ~16.5 GB  (requires ≥24 GB card)
 ///   Kimi-Linear-48B         → ~29.7 GB  (requires ≥32 GB card)
@@ -1377,8 +1379,8 @@ async fn run() -> Result<(), Error> {
     // PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
-    //   --very-light → Qwen3.5-9B-abliterated
-    //   --light      → GLM-4-9B
+    //   --very-light → Qwen3.5-9B-abliterated, Nemotron-3.5-Bolt-E4B from H18
+    //   --light      → GLM-4-9B, Qwen3.5-9B Q8_0 from H18
     //   (no flag)    → Gemma-4-12B-abliterated   [default]
     //   --high       → Qwen3.6-27B, Qwen3.8-27B from H14
     //   --very-high  → Kimi-Linear-48B
@@ -1420,10 +1422,10 @@ async fn run() -> Result<(), Error> {
         info!("--high mode: high tier — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::High).dir_name);
         keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: light tier — mines GLM-4-9B under PoM.");
+        info!("--light mode: light tier — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::Light).dir_name);
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: smallest tier — mines Qwen3.5-9B-abliterated under PoM.");
+        info!("--very-light mode: smallest tier — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::VeryLight).dir_name);
         keryx_miner::models::Tier::VeryLight
     } else {
         info!("default mode: mines Gemma-4-12B-abliterated under PoM.");

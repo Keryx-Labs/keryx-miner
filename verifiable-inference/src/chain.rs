@@ -3,7 +3,7 @@
 use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
-use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, PlePoint, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::attn::Partial;
 use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
 use crate::opening::{AttnOpening, PrefixPoint};
@@ -37,6 +37,10 @@ pub struct ChainCtx {
     pub n_recur: u32,
     /// Heads per layer in the sequence tree (the largest key/value or recurrent head count).
     pub seq_heads: u32,
+    /// `ROLE_PLE_PROJ` entry of a model with per-layer inputs; `manifest::NONE` = none.
+    pub ple_entry: u32,
+    /// Per-layer input width; 0 = no per-layer inputs.
+    pub ple_width: u32,
 }
 /// Relative tolerance of a residual addition, per element.
 pub const EPS_RESID: f64 = 1e-6;
@@ -45,28 +49,103 @@ pub const EPS_RESID: f64 = 1e-6;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resid {
     Attn,
+    /// Before the per-layer input, on a model with per-layer inputs.
+    PeIn,
     Out,
 }
 
-/// Leaves of a stage-2 position: `X`/`Y` per product, two residuals per layer, `n_router` router
-/// leaves, then the meta leaf.
+/// Leaves of a stage-2 position: `X`/`Y` per product, two residuals per layer (three with
+/// per-layer inputs), `n_router` router leaves, the per-layer projection and inputs when the
+/// model has them, then the meta leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PosLeaves {
+    pub n_products: u64,
+    pub n_layers: u64,
+    pub n_router: u64,
+    pub ple: bool,
+}
+
+impl PosLeaves {
+    pub fn of(tier: &TierCtx, ctx: &ChainCtx) -> Self {
+        Self { n_products: tier.n_products, n_layers: ctx.n_layers as u64, n_router: n_router(ctx), ple: ctx.ple_width > 0 }
+    }
+
+    /// Residual leaves per layer.
+    pub fn per_layer(&self) -> u64 {
+        if self.ple { 3 } else { 2 }
+    }
+
+    /// Leaf index of a residual of `layer`.
+    pub fn resid(&self, layer: u64, kind: Resid) -> u64 {
+        let base = 2 * self.n_products + self.per_layer() * layer;
+        base + match kind {
+            Resid::Attn => 0,
+            Resid::PeIn => 1,
+            Resid::Out => self.per_layer() - 1,
+        }
+    }
+
+    /// Layer and kind of residual site `sel` among `per_layer() * n_layers`.
+    pub fn resid_at(&self, sel: u64) -> (u64, Resid) {
+        let per = self.per_layer();
+        let kind = match sel % per {
+            0 => Resid::Attn,
+            1 if self.ple => Resid::PeIn,
+            _ => Resid::Out,
+        };
+        (sel / per, kind)
+    }
+
+    fn after_resid(&self) -> u64 {
+        2 * self.n_products + self.per_layer() * self.n_layers
+    }
+
+    /// Leaf index of the router scores of `layer`.
+    pub fn router(&self, layer: u64) -> u64 {
+        self.after_resid() + layer
+    }
+
+    /// Leaf index of the per-layer projection, before its norm.
+    pub fn ple_proj(&self) -> u64 {
+        self.after_resid() + self.n_router
+    }
+
+    /// Leaf index of the per-layer inputs of every layer.
+    pub fn ple_inputs(&self) -> u64 {
+        self.ple_proj() + 1
+    }
+
+    pub fn meta(&self) -> u64 {
+        self.after_resid() + self.n_router + if self.ple { 2 } else { 0 }
+    }
+
+    pub fn n(&self) -> u64 {
+        self.meta() + 1
+    }
+}
+
+fn plain(n_products: u64, n_layers: u64, n_router: u64) -> PosLeaves {
+    PosLeaves { n_products, n_layers, n_router, ple: false }
+}
+
+/// [`PosLeaves::n`] of a model without per-layer inputs.
 pub fn n_pos_leaves(n_products: u64, n_layers: u64, n_router: u64) -> u64 {
-    2 * n_products + 2 * n_layers + n_router + 1
+    plain(n_products, n_layers, n_router).n()
 }
 
-/// Leaf index of the router scores of `layer`.
+/// [`PosLeaves::router`] of a model without per-layer inputs.
 pub fn router_leaf(n_products: u64, n_layers: u64, layer: u64) -> u64 {
-    2 * n_products + 2 * n_layers + layer
+    plain(n_products, n_layers, 0).router(layer)
 }
 
-/// Leaf index of a residual of `layer`.
+/// [`PosLeaves::resid`] of a model without per-layer inputs.
 pub fn resid_leaf(n_products: u64, layer: u64, kind: Resid) -> u64 {
-    2 * n_products + 2 * layer + if kind == Resid::Attn { 0 } else { 1 }
+    plain(n_products, 0, 0).resid(layer, kind)
 }
 
-/// Leaf index of the meta leaf.
+/// [`PosLeaves::meta`] of a model without per-layer inputs.
 pub fn meta_leaf(n_products: u64, n_layers: u64, n_router: u64) -> u64 {
-    2 * n_products + 2 * n_layers + n_router
+    plain(n_products, n_layers, n_router).meta()
 }
 
 pub(crate) fn n_router(ctx: &ChainCtx) -> u64 {
@@ -276,10 +355,10 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
 
 /// Leaf layout of a stage-2 position consuming `tok`.
 pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
-    let n_layers = ctx.n_layers as u64;
+    let leaves = PosLeaves::of(tier, ctx);
     PosShape {
-        n_leaves: n_pos_leaves(tier.n_products, n_layers, n_router(ctx)),
-        meta_index: meta_leaf(tier.n_products, n_layers, n_router(ctx)),
+        n_leaves: leaves.n(),
+        meta_index: leaves.meta(),
         tok: Some(tok),
         n_used: ctx.n_used,
     }
@@ -363,7 +442,8 @@ pub fn verify_chain_point(
     let Chain::Product(pl) = o.input.chain else {
         return Err(Fail::Manifest);
     };
-    let (k, np, n_layers) = (o.input.k, tier.n_products, ctx.n_layers as u64);
+    let (k, n_layers) = (o.input.k, ctx.n_layers as u64);
+    let leaves = PosLeaves::of(tier, ctx);
     let layer = pl.layer as u64;
     if pl.link != manifest::LINK_HEAD && layer >= n_layers {
         return Err(Fail::Manifest);
@@ -382,9 +462,9 @@ pub fn verify_chain_point(
         }
         (manifest::LINK_ATTN_IN | manifest::LINK_FFN_IN | manifest::LINK_HEAD, LinkOpening::Norm { src, norm }) => {
             let leaf = match pl.link {
-                manifest::LINK_ATTN_IN if layer > 0 => resid_leaf(np, layer - 1, Resid::Out),
-                manifest::LINK_FFN_IN => resid_leaf(np, layer, Resid::Attn),
-                manifest::LINK_HEAD if n_layers > 0 => resid_leaf(np, n_layers - 1, Resid::Out),
+                manifest::LINK_ATTN_IN if layer > 0 => leaves.resid(layer - 1, Resid::Out),
+                manifest::LINK_FFN_IN => leaves.resid(layer, Resid::Attn),
+                manifest::LINK_HEAD if n_layers > 0 => leaves.resid(n_layers - 1, Resid::Out),
                 _ => return Err(Fail::Shape),
             };
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
@@ -462,6 +542,37 @@ pub fn verify_chain_point(
             let vals = h.get((lo - c * per_chunk) as usize..(hi - c * per_chunk) as usize).ok_or(Fail::Shape)?;
             glu_link(xs, o.layout, k as usize, ((lo - start) / 32) as usize, vals)?;
         }
+        (manifest::LINK_RESID_IN, LinkOpening::Resid(chunk)) if leaves.ple && o.input.n_exp == 1 => {
+            let c = link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)? / CHUNK_BLOCKS;
+            let h = leaf_chunk(&o.pos_root, &shape, leaves.resid(layer, Resid::PeIn), chunk, 4 * k, c)?;
+            glu_link(&p.x, o.layout, k as usize, (c * CHUNK_BLOCKS) as usize, &h)?;
+        }
+        (manifest::LINK_PLE, LinkOpening::Ple { src, y, inputs }) if leaves.ple && o.input.n_exp == 1 => {
+            let se = open_entry(tier, src, pl.src as u64)?;
+            let width = ctx.ple_width as u64;
+            let trimmed = ctx.trim_last && layer + 1 == n_layers;
+            let gate_of_layer = matches!(se.chain, Chain::Product(g) if g.link == manifest::LINK_RESID_IN && g.layer == pl.layer);
+            if !gate_of_layer || !layer_role(se.role, trimmed) || se.glu_form != manifest::FORM_NONE || se.n_exp != 1 || se.m != k || k != width {
+                return Err(Fail::Manifest);
+            }
+            let per_layer = 4 * width / B3_CHUNK as u64;
+            if per_layer == 0 || (4 * width) % B3_CHUNK as u64 != 0 {
+                return Err(Fail::Shape);
+            }
+            let c = link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)? / CHUNK_BLOCKS;
+            let g = leaf_chunk(&o.pos_root, &shape, 2 * pl.src as u64 + 1, y, 4 * k, c)?;
+            let inp = leaf_chunk(&o.pos_root, &shape, leaves.ple_inputs(), inputs, 4 * width * n_layers, layer * per_layer + c)?;
+            if g.len() != inp.len() {
+                return Err(Fail::Shape);
+            }
+            let v = g
+                .iter()
+                .zip(&inp)
+                .map(|(&a, &b)| crate::verify::glu(manifest::GLU_GEGLU, a as f64).map(|(h, _)| h * b as f64))
+                .collect::<Option<Vec<f64>>>()
+                .ok_or(Fail::Shape)?;
+            within(block_deviation(&p.x, o.layout, k as usize, (c * CHUNK_BLOCKS) as usize, &v))?;
+        }
         _ => return Err(Fail::Shape),
     }
     Ok(report)
@@ -533,7 +644,7 @@ struct MoeCheck<'a> {
 
 impl MoeCheck<'_> {
     fn verify(&self, moe: &manifest::MoeLinks, m: &crate::opening::MoeAdd, dst: &[f32], src: &[f32], off: usize, n: usize) -> Result<(), Fail> {
-        let (tier, ctx, np) = (self.tier, self.ctx, self.tier.n_products);
+        let (tier, ctx) = (self.tier, self.ctx);
         let n_used = ctx.n_used as u64;
         if n_used == 0 || m.slots.len() as u64 != n_used {
             return Err(Fail::Shape);
@@ -543,7 +654,7 @@ impl MoeCheck<'_> {
             return Err(Fail::Manifest);
         }
         let n_exp = re.m;
-        let scores = whole_leaf(self.pos_root, self.shape, router_leaf(np, ctx.n_layers as u64, self.layer), &m.scores, 4 * n_exp)?;
+        let scores = whole_leaf(self.pos_root, self.shape, PosLeaves::of(self.tier, ctx).router(self.layer), &m.scores, 4 * n_exp)?;
         let bias = f32_weights(tier, &m.bias, moe.probs_bias, n_exp, 0, n_exp)?;
 
         let body = n_used * self.dim * 4;
@@ -560,7 +671,7 @@ impl MoeCheck<'_> {
         let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let w = route_weights(&scores, &bias, &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
 
-        let h = whole_leaf(self.pos_root, self.shape, resid_leaf(np, self.layer, Resid::Attn), &m.resid, 4 * self.dim)?;
+        let h = whole_leaf(self.pos_root, self.shape, PosLeaves::of(self.tier, ctx).resid(self.layer, Resid::Attn), &m.resid, 4 * self.dim)?;
         let w_norm = f32_weights(tier, &m.norm, moe.ffn_norm, self.dim, 0, self.dim)?;
         let v = rms_norm(&h, &w_norm, ctx.eps);
         let row = draw::point(self.seed, RESID_POINT)[3] % n_exp;
@@ -623,15 +734,39 @@ pub fn resid_site(d1: u64, n_sites: u64) -> u64 {
     0
 }
 
+/// How residual `kind` of a layer is built: the product whose output it adds, the norm applied
+/// to that output, the residual it adds to (`None` = the previous layer's output or the token
+/// embedding), and whether the layer output scale applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidRule {
+    pub rank: u32,
+    pub post: u32,
+    pub src: Option<Resid>,
+    pub scaled: bool,
+}
+
+pub fn resid_rule(ll: &manifest::LayerLinks, kind: Resid, ple: bool) -> Result<ResidRule, Fail> {
+    if ll.ple.is_some() != ple || (ple && ll.moe.is_some()) {
+        return Err(Fail::Manifest);
+    }
+    Ok(match (kind, ll.ple) {
+        (Resid::Attn, _) => ResidRule { rank: ll.proj, post: ll.post_attn, src: None, scaled: false },
+        (Resid::Out, None) => ResidRule { rank: ll.down, post: ll.post_ffn, src: Some(Resid::Attn), scaled: true },
+        (Resid::PeIn, Some(_)) => ResidRule { rank: ll.down, post: ll.post_ffn, src: Some(Resid::Attn), scaled: false },
+        (Resid::Out, Some(p)) => ResidRule { rank: p.proj, post: p.post_norm, src: Some(Resid::PeIn), scaled: true },
+        (Resid::PeIn, None) => return Err(Fail::Manifest),
+    })
+}
+
 /// Verify the residual point of a stage-2 opening.
 pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, p: &ResidPoint) -> Result<(), Fail> {
-    let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
+    let n_layers = ctx.n_layers as u64;
     if resp.n_pos == 0 || n_layers == 0 {
         return Err(Fail::Shape);
     }
+    let leaves = PosLeaves::of(tier, ctx);
     let d = draw::point(seed, RESID_POINT);
-    let sel = resid_site(d[1], 2 * n_layers);
-    let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
+    let (layer, kind) = leaves.resid_at(resid_site(d[1], leaves.per_layer() * n_layers));
     let t = resid_position(ctx, resp, layer, d[0])?;
     let shape = shape(tier, ctx, p.tok);
 
@@ -640,7 +775,8 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         Chain::Layer(ll) if le.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => ll,
         _ => return Err(Fail::Manifest),
     };
-    let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
+    let rule = resid_rule(&ll, kind, leaves.ple)?;
+    let rank = rule.rank as u64;
     let pe = open_entry(tier, &p.product, rank)?;
     let trimmed = ctx.trim_last && layer + 1 == n_layers;
     if !layer_role(pe.role, trimmed) || pe.glu_form != manifest::FORM_NONE || pe.n_exp != 1 {
@@ -651,7 +787,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     let c = d[2] % n_chunks(total);
 
     let dst_leaf = chunk_leaf(&p.dst, total, c)?;
-    let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    let pos_root = b3_fold(shape.n_leaves, leaves.resid(layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
     if p.n_ubatch != crate::verify::expected_ubatch(t, resp.n_prompt) {
         return Err(Fail::Mismatch);
     }
@@ -666,16 +802,16 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     }
     let (off, n) = (c as usize * B3_CHUNK / 4, dst.len());
 
-    let src = match (kind, &p.src) {
-        (Resid::Attn, ResidSrc::Token(e, r)) if layer == 0 => {
+    let src = match (rule.src, &p.src) {
+        (None, ResidSrc::Token(e, r)) if layer == 0 => {
             let row = embedding(tier, ctx, &(e.clone(), r.clone()), p.tok, dim)?;
             row[off..off + n].iter().map(|&v| (v as f64 * ctx.embd_scale) as f32).collect()
         }
-        (Resid::Attn, ResidSrc::Chunk(sc)) if layer > 0 => leaf_chunk(&pos_root, &shape, resid_leaf(np, layer - 1, Resid::Out), sc, total, c)?,
-        (Resid::Out, ResidSrc::Chunk(sc)) => leaf_chunk(&pos_root, &shape, resid_leaf(np, layer, Resid::Attn), sc, total, c)?,
+        (None, ResidSrc::Chunk(sc)) if layer > 0 => leaf_chunk(&pos_root, &shape, leaves.resid(layer - 1, Resid::Out), sc, total, c)?,
+        (Some(from), ResidSrc::Chunk(sc)) => leaf_chunk(&pos_root, &shape, leaves.resid(layer, from), sc, total, c)?,
         _ => return Err(Fail::Shape),
     };
-    let post = if kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
+    let post = rule.post;
     if ll.moe.is_some() && kind == Resid::Out && post == manifest::NONE && !matches!(p.add, ResidAdd::Moe(_)) {
         return Err(Fail::Shape);
     }
@@ -695,7 +831,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     };
     let scale = match ll.scale {
         manifest::NONE => 1.0,
-        _ if kind == Resid::Attn => 1.0,
+        _ if !rule.scaled => 1.0,
         bits => f32::from_bits(bits) as f64,
     };
     if !scale.is_finite() {
@@ -709,21 +845,26 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
 pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &ResidOpening) -> Result<(), Fail> {
     let p = &op.resid;
     verify_resid_point(tier, ctx, resp, seed, p)?;
-    let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
+    match (&op.ple, ctx.ple_width > 0) {
+        (Some(pp), true) => verify_ple_point(tier, ctx, resp, seed, p, pp)?,
+        (None, false) => {}
+        _ => return Err(Fail::Shape),
+    }
+    let n_layers = ctx.n_layers as u64;
+    let leaves = PosLeaves::of(tier, ctx);
     let d = draw::point(seed, RESID_POINT);
-    let sel = resid_site(d[1], 2 * n_layers);
-    let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
+    let (layer, kind) = leaves.resid_at(resid_site(d[1], leaves.per_layer() * n_layers));
     let shape = shape(tier, ctx, p.tok);
     let ll = match open_entry(tier, &p.layer, ctx.layer_base as u64 + layer)?.chain {
         Chain::Layer(ll) => ll,
         _ => return Err(Fail::Manifest),
     };
-    let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
+    let rank = resid_rule(&ll, kind, leaves.ple)?.rank as u64;
     let pe = open_entry(tier, &p.product, rank)?;
     let (dim, per) = (pe.m, (B3_CHUNK / 4) as u64);
     let c = d[2] % n_chunks(4 * dim);
     let dst_leaf = chunk_leaf(&p.dst, 4 * dim, c)?;
-    let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    let pos_root = b3_fold(shape.n_leaves, leaves.resid(layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
     let lo = c * per;
     let row = lo + (d[3] >> 32) % per.min(dim.checked_sub(lo).filter(|&n| n > 0).ok_or(Fail::Shape)?);
     let y_at = |b: &[u8], i: u64| -> Result<f64, Fail> {
@@ -755,6 +896,86 @@ pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, 
         (ResidAdd::Moe(_), None) | (_, Some(_)) => Err(Fail::Shape),
         (_, None) => Ok(()),
     }
+}
+
+/// Draw index of the per-layer input point.
+pub const PLE_POINT: u32 = crate::recur::RECUR_POINT + 1;
+/// Relative tolerance of a per-layer input, per element.
+pub const EPS_PLE: f64 = 1e-5;
+
+/// Verify the per-layer input point at the residual point's position: the drawn layer's inputs
+/// from its projection slice, norm and token table slice, and one projection element from its
+/// weight row and the scaled token embedding (input in f32 or rounded to bf16).
+pub fn verify_ple_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, rp: &ResidPoint, pp: &PlePoint) -> Result<(), Fail> {
+    let leaves = PosLeaves::of(tier, ctx);
+    let (n_layers, width) = (ctx.n_layers as u64, ctx.ple_width as u64);
+    if !leaves.ple || n_layers == 0 || 4 * width != B3_CHUNK as u64 {
+        return Err(Fail::Shape);
+    }
+    let d = draw::point(seed, RESID_POINT);
+    let (resid_layer, _) = leaves.resid_at(resid_site(d[1], leaves.per_layer() * n_layers));
+    let t = resid_position(ctx, resp, resid_layer, d[0])?;
+    let q = draw::point(seed, PLE_POINT);
+    let (layer, jj) = (q[1] % n_layers, (q[2] % width) as usize);
+    let shape = shape(tier, ctx, rp.tok);
+    let total = 4 * width * n_layers;
+
+    let proj_leaf = chunk_leaf(&pp.proj, total, layer)?;
+    let pos_root = b3_fold(shape.n_leaves, leaves.ple_proj(), &proj_leaf, &pp.proj.leaf_path).ok_or(Fail::Trace)?;
+    if rp.n_ubatch != crate::verify::expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
+    if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &rp.pos_path)
+        || !b3_verify(&pos_root, shape.n_leaves, shape.meta_index, &shape.meta_hash(t, rp.n_ubatch), &rp.meta_path)
+    {
+        return Err(Fail::Trace);
+    }
+    let proj = finite_f32s(&pp.proj.chunk)?;
+    let inputs = leaf_chunk(&pos_root, &shape, leaves.ple_inputs(), &pp.inputs, total, layer)?;
+    if proj.len() != width as usize || inputs.len() != width as usize {
+        return Err(Fail::Shape);
+    }
+
+    let pe = open_entry(tier, &pp.proj_entry, ctx.ple_entry as u64)?;
+    let pl = match pe.chain {
+        Chain::Ple(pl) if pe.role == manifest::ROLE_PLE_PROJ && pe.n_exp == 1 && pe.m == width * n_layers && pl.width as u64 == width => pl,
+        _ => return Err(Fail::Manifest),
+    };
+    let f = |bits: u32| Some(f32::from_bits(bits)).filter(|v| v.is_finite()).map(|v| v as f64).ok_or(Fail::Manifest);
+    let (embd_scale, proj_scale, out_scale) = (f(pl.embd_scale)?, f(pl.proj_scale)?, f(pl.out_scale)?);
+
+    let w = f32_weights(tier, &pp.norm, pl.norm, width, 0, width)?;
+    let te = open_entry(tier, &pp.table.0, pl.embd as u64)?;
+    if te.role != manifest::ROLE_PLE_EMBD || te.n_exp != 1 || te.k != width * n_layers || rp.tok as u64 >= te.m {
+        return Err(Fail::Manifest);
+    }
+    let (bb, bv) = quant::block_size(te.wtype).ok_or(Fail::Unsupported)?;
+    if !width.is_multiple_of(bv as u64) {
+        return Err(Fail::Shape);
+    }
+    let slice = width / bv as u64 * bb as u64;
+    let bytes = open_bytes(tier, &te, &pp.table.1, rp.tok as u64 * te.row_bytes as u64 + layer * slice, slice)?;
+    let table = quant::dequant_row(te.wtype, &bytes, width as usize).ok_or(Fail::Unsupported)?;
+    let normed = rms_scaled(&proj, ctx.eps, 1.0);
+    for i in 0..width as usize {
+        let pn = normed[i] * w[i] as f64;
+        let e = (table[i] as f64 * embd_scale) as f32 as f64;
+        let want = (pn + e) * out_scale;
+        let tol = EPS_PLE * (pn.abs() + e.abs()) * out_scale.abs() + f32::MIN_POSITIVE as f64;
+        if !((inputs[i] as f64 - want).abs() <= tol) {
+            return Err(Fail::Mismatch);
+        }
+    }
+
+    let row = open_row(tier, &pe, &pp.proj_row, layer * width + jj as u64)?;
+    let wr = quant::dequant_row(pe.wtype, &row, pe.k as usize).ok_or(Fail::Unsupported)?;
+    let x: Vec<f32> = embedding(tier, ctx, &pp.embd, rp.tok, pe.k)?.iter().map(|&v| (v as f64 * ctx.embd_scale) as f32).collect();
+    let dot = |xs: &mut dyn Iterator<Item = f32>| wr.iter().zip(xs).fold((0.0, 0.0), |(y, s), (&a, b)| (y + a as f64 * b as f64, s + (a as f64 * b as f64).abs()));
+    let full = dot(&mut x.iter().copied());
+    let rounded = dot(&mut x.iter().map(|&v| quant::round_bf16(v)));
+    let got = proj[jj] as f64;
+    let close = |(y, s): (f64, f64)| (got - proj_scale * y).abs() <= crate::verify::EPS * proj_scale.abs() * s + f32::MIN_POSITIVE as f64;
+    if close(full) || close(rounded) { Ok(()) } else { Err(Fail::Mismatch) }
 }
 
 /// Checks `y` against row `row` of expert `exp` of product `e` over its committed input, slot
@@ -837,6 +1058,37 @@ mod tests {
         assert_eq!(resid_leaf(3, 1, Resid::Out), 9);
         assert_eq!(meta_leaf(3, 2, 0), 10);
         assert_eq!(&meta(7, 512, 42)[8..], &42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn per_layer_input_leaves() {
+        let p = PosLeaves { n_products: 3, n_layers: 2, n_router: 0, ple: true };
+        assert_eq!([p.resid(0, Resid::Attn), p.resid(0, Resid::PeIn), p.resid(0, Resid::Out)], [6, 7, 8]);
+        assert_eq!([p.resid(1, Resid::Attn), p.resid(1, Resid::Out)], [9, 11]);
+        assert_eq!((p.ple_proj(), p.ple_inputs(), p.meta(), p.n()), (12, 13, 14, 15));
+        let sites: Vec<_> = (0..6).map(|s| p.resid_at(s)).collect();
+        assert_eq!(sites, [(0, Resid::Attn), (0, Resid::PeIn), (0, Resid::Out), (1, Resid::Attn), (1, Resid::PeIn), (1, Resid::Out)]);
+        let q = PosLeaves { ple: false, ..p };
+        assert_eq!((q.n(), q.meta(), q.resid(1, Resid::Out)), (n_pos_leaves(3, 2, 0), meta_leaf(3, 2, 0), resid_leaf(3, 1, Resid::Out)));
+        assert_eq!([q.resid_at(1), q.resid_at(2)], [(0, Resid::Out), (1, Resid::Attn)]);
+    }
+
+    #[test]
+    fn per_layer_input_residual_rules() {
+        use manifest::{LayerLinks, NONE, PleLayer};
+        let base = LayerLinks { layer: 4, proj: 10, down: 11, post_attn: 20, post_ffn: 21, scale: 1f32.to_bits(), moe: None, attn: None, recur: None, ple: None };
+        let ple = LayerLinks { ple: Some(PleLayer { gate: 12, proj: 13, post_norm: 22 }), ..base };
+        let r = |ll: &LayerLinks, kind, on| resid_rule(ll, kind, on);
+        assert_eq!(r(&base, Resid::Attn, false), Ok(ResidRule { rank: 10, post: 20, src: None, scaled: false }));
+        assert_eq!(r(&base, Resid::Out, false), Ok(ResidRule { rank: 11, post: 21, src: Some(Resid::Attn), scaled: true }));
+        assert_eq!(r(&ple, Resid::Attn, true), Ok(ResidRule { rank: 10, post: 20, src: None, scaled: false }));
+        assert_eq!(r(&ple, Resid::PeIn, true), Ok(ResidRule { rank: 11, post: 21, src: Some(Resid::Attn), scaled: false }));
+        assert_eq!(r(&ple, Resid::Out, true), Ok(ResidRule { rank: 13, post: 22, src: Some(Resid::PeIn), scaled: true }));
+        assert_eq!(r(&base, Resid::PeIn, false), Err(Fail::Manifest));
+        assert_eq!(r(&base, Resid::Out, true), Err(Fail::Manifest));
+        assert_eq!(r(&ple, Resid::Out, false), Err(Fail::Manifest));
+        let moe = manifest::MoeLinks { down_exps: 1, router: 2, probs_bias: 3, w_scale: 0, ffn_norm: NONE, gate_exps: 4 };
+        assert_eq!(r(&LayerLinks { moe: Some(moe), ..ple }, Resid::Out, true), Err(Fail::Manifest));
     }
 
     #[test]
@@ -1064,7 +1316,7 @@ fn attn_site(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op
         Chain::Layer(ll) if le.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => (ll, ll.attn.ok_or(Fail::Shape)?),
         _ => return Err(Fail::Manifest),
     };
-    if a.slot as u64 != slot {
+    if a.slot as u64 != slot || a.kv_slot > a.slot {
         return Err(Fail::Manifest);
     }
     let t = resid_position(ctx, resp, layer, d[0])?;
@@ -1304,8 +1556,8 @@ fn gqa_phase(
     }
     let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
     let sl = seq_layout(ctx);
-    let krows = cache_rows(ctx, &op.seq_root, sl.kcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.kcache)?;
-    let vrows = cache_rows(ctx, &op.seq_root, sl.vcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.vcache)?;
+    let krows = cache_rows(ctx, &op.seq_root, sl.kcache(a.kv_slot as u64, kv as u64), n_pos, hd, p0, p1, &op.kcache)?;
+    let vrows = cache_rows(ctx, &op.seq_root, sl.vcache(a.kv_slot as u64, kv as u64), n_pos, hd, p0, p1, &op.vcache)?;
     let keys = krows.iter().map(|r| dequant_head(r, hd)).collect::<Result<Vec<_>, _>>()?;
     let values = vrows.iter().map(|r| dequant_head(r, hd)).collect::<Result<Vec<_>, _>>()?;
     let ok = match parent {
@@ -1399,7 +1651,7 @@ fn mla_phase(
     let k_norm = f32_weights(tier, &w, a.k_norm, r as u64, 0, r as u64)?;
     let q = mla_query(tier, ctx, resp, op, s)?;
     let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
-    let rows = cache_rows(ctx, &op.seq_root, seq_layout(ctx).kcache(s.slot, 0), n_pos, hd, p0, p1, &op.kcache)?;
+    let rows = cache_rows(ctx, &op.seq_root, seq_layout(ctx).kcache(s.a.kv_slot as u64, 0), n_pos, hd, p0, p1, &op.kcache)?;
     let keys = rows.iter().map(|row| dequant_head(row, hd)).collect::<Result<Vec<_>, _>>()?;
     let values: Vec<Vec<f32>> = keys.iter().map(|k| k[..r].to_vec()).collect();
     let scale = f32::from_bits(a.kq_scale) as f64;

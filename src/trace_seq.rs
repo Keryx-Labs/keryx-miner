@@ -239,7 +239,7 @@ impl AttnDraw {
 
 /// Draw weights of the children whose partials the attention phase `body` committed, as the node
 /// computes them.
-pub fn attn_child_weights(tier: u8, rec: &TraceRecord, seed: &Hash, body: &[u8]) -> Option<Vec<u16>> {
+pub fn attn_child_weights(tier: crate::trace::TraceTier, rec: &TraceRecord, seed: &Hash, body: &[u8]) -> Option<Vec<u16>> {
     use keryx_verifiable_inference::attn_blocks::{child_weights, decode_partials};
     use keryx_verifiable_inference::opening::inner_body;
     let m = TierManifest::for_attn(tier)?;
@@ -249,7 +249,7 @@ pub fn attn_child_weights(tier: u8, rec: &TraceRecord, seed: &Hash, body: &[u8])
 }
 
 /// Children of the node of `path` of the attention point of `seed`.
-pub fn attn_children(tier: u8, rec: &TraceRecord, seed: &Hash, path: &[u64]) -> Option<u64> {
+pub fn attn_children(tier: crate::trace::TraceTier, rec: &TraceRecord, seed: &Hash, path: &[u64]) -> Option<u64> {
     let m = TierManifest::for_attn(tier)?;
     Some(draw_attn(&m, rec, seed)?.tree.children(path)?.len() as u64)
 }
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn every_attention_layer_of_every_tier_opens_in_at_most_three_phases() {
         for tier in 0..5u8 {
-            let m = TierManifest::for_attn(tier).unwrap();
+            let m = TierManifest::for_attn(crate::trace::TraceTier::h14(tier)).unwrap();
             let ctx = m.chain.unwrap();
             let mut shapes = std::collections::BTreeSet::new();
             for l in 0..ctx.n_layers as u64 {

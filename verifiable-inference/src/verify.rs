@@ -162,7 +162,7 @@ pub fn x_len(k: u64, layout: u8) -> u64 {
     if layout == q8::MMVQ { kp / 32 * 36 } else { kp / 128 * 144 }
 }
 
-fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
+pub(crate) fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
     match op {
         manifest::GLU_SWIGLU => {
             let s = 1.0 / (1.0 + libm::exp(-g));

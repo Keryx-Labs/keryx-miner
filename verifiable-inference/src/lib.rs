@@ -13,6 +13,8 @@ pub mod f16;
 pub mod manifest;
 pub mod merkle;
 pub mod opening;
+#[cfg(test)]
+mod plekit;
 pub mod prefix;
 pub mod q8;
 pub mod quant;

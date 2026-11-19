@@ -120,6 +120,10 @@ pub enum LinkOpening {
     Norm { src: LeafBytes, norm: (EntryOpening, ChunkRange) },
     Token { embd: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
     Source { src: EntryOpening, y: LeafChunk, ids: Option<ExpertIds> },
+    /// A chunk of the layer's residual before its per-layer input.
+    Resid(LeafChunk),
+    /// The gate product, a chunk of its output and the matching chunk of the per-layer inputs.
+    Ple { src: EntryOpening, y: LeafChunk, inputs: LeafChunk },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +191,24 @@ pub struct ResidOpening {
     pub feed: FeedRow,
     /// One row of a routed expert, when the residual adds routed experts.
     pub expert: Option<ExpertRow>,
+    /// The per-layer input point of a model with per-layer inputs, at the residual's position.
+    pub ple: Option<PlePoint>,
+}
+
+/// One layer's per-layer inputs and one element of the projection before its norm.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlePoint {
+    /// The `ROLE_PLE_PROJ` entry and the weight row of the drawn element.
+    pub proj_entry: EntryOpening,
+    pub proj_row: ChunkRange,
+    /// The token embedding row.
+    pub embd: (EntryOpening, ChunkRange),
+    /// The layer's slice of the per-layer token embedding row.
+    pub table: (EntryOpening, ChunkRange),
+    pub norm: (EntryOpening, ChunkRange),
+    /// The layer's chunk of the projection leaf and of the per-layer inputs leaf.
+    pub proj: LeafChunk,
+    pub inputs: LeafChunk,
 }
 
 /// Input and one weight row of the product feeding a residual.
@@ -362,6 +384,16 @@ impl W {
                     None => self.u8(0),
                 }
             }
+            LinkOpening::Resid(c) => {
+                self.u8(4);
+                self.leaf_chunk(c);
+            }
+            LinkOpening::Ple { src, y, inputs } => {
+                self.u8(5);
+                self.entry(src);
+                self.leaf_chunk(y);
+                self.leaf_chunk(inputs);
+            }
         }
     }
     fn resid(&mut self, p: &ResidPoint) {
@@ -487,6 +519,8 @@ impl R<'_> {
                     _ => return None,
                 },
             },
+            4 => LinkOpening::Resid(self.leaf_chunk()?),
+            5 => LinkOpening::Ple { src: self.entry()?, y: self.leaf_chunk()?, inputs: self.leaf_chunk()? },
             _ => return None,
         })
     }
@@ -728,6 +762,16 @@ impl ResidOpening {
             }
             None => w.u8(0),
         }
+        if let Some(p) = &self.ple {
+            w.u8(1);
+            w.entry(&p.proj_entry);
+            w.range(&p.proj_row);
+            w.weights(&p.embd);
+            w.weights(&p.table);
+            w.weights(&p.norm);
+            w.leaf_chunk(&p.proj);
+            w.leaf_chunk(&p.inputs);
+        }
         w.0
     }
 
@@ -758,7 +802,23 @@ impl ResidOpening {
             1 => Some(ExpertRow { entry: r.entry()?, x: r.bytes32()?, x_path: r.hashes()?, row: r.range()? }),
             _ => return None,
         };
-        (r.o == b.len()).then_some(ResidOpening { response_txid, roots, resid, feed, expert })
+        let ple = if r.o < b.len() {
+            if r.u8()? != 1 {
+                return None;
+            }
+            Some(PlePoint {
+                proj_entry: r.entry()?,
+                proj_row: r.range()?,
+                embd: r.weights()?,
+                table: r.weights()?,
+                norm: r.weights()?,
+                proj: r.leaf_chunk()?,
+                inputs: r.leaf_chunk()?,
+            })
+        } else {
+            None
+        };
+        (r.o == b.len()).then_some(ResidOpening { response_txid, roots, resid, feed, expert, ple })
     }
 }
 
@@ -1075,7 +1135,7 @@ mod resid_opening_tests {
         let feed = FeedRow { x: vec![3; 4608], x_path: vec![[3; 32]; 9], row: range(4), bias: Some((e.clone(), range(5))) };
         let expert = ExpertRow { entry: e, x: vec![6; 9216], x_path: vec![[6; 32]; 9], row: range(7) };
         for (roots, expert) in [(None, None), (Some(([5; 32], [6; 32])), Some(expert))] {
-            let o = ResidOpening { response_txid: [1; 32], roots, resid: point(), feed: feed.clone(), expert };
+            let o = ResidOpening { response_txid: [1; 32], roots, resid: point(), feed: feed.clone(), expert, ple: None };
             let b = o.encode();
             assert_eq!(b[0], VERSION_RESID);
             assert_eq!(ResidOpening::decode(&b), Some(o));
@@ -1107,6 +1167,25 @@ mod resid_opening_tests {
             assert_eq!(b[0], VERSION_ROOTS);
             assert_eq!(Opening::decode(&b), Some(o));
         }
+    }
+
+    #[test]
+    fn per_layer_input_links_round_trip() {
+        let chunk = |s: u8| LeafChunk { total_len: 43_008, index: s as u32, chunk: vec![s; 1024], chunk_path: vec![[s; 32]; 6], leaf_path: vec![[s ^ 1; 32]; 10] };
+        let p = Point { x: vec![1; 576], ..Default::default() };
+        let gate = EntryOpening { index: 7, bytes: vec![7; 60], path: vec![[7; 32]; 10] };
+        let o = Opening {
+            response_txid: [1; 32],
+            points: vec![p.clone(), p],
+            prefix: Some(PrefixPoint::default()),
+            links: vec![(3, LinkOpening::Resid(chunk(2))), (4, LinkOpening::Ple { src: gate, y: chunk(3), inputs: chunk(4) })],
+            experts: vec![None, None],
+            resid: None,
+            roots: None,
+        };
+        let b = o.encode();
+        assert_eq!(Opening::decode(&b), Some(o));
+        assert!(Opening::decode(&b[..b.len() - 1]).is_none());
     }
 }
 

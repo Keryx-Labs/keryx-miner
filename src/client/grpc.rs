@@ -1565,7 +1565,7 @@ impl KeryxdHandler {
         };
         let tier = keryx_miner::models::pom_tier_index(model_id, self.last_known_daa).unwrap_or(u8::MAX);
         let (n_prompt, max_tokens) = (*prompt_len as u32, *max_tokens as u32);
-        let work = keryx_miner::trace::OPEN_AUDIT_WORK_PASSES * keryx_miner::trace::service_work_daa(tier, n_prompt, max_tokens);
+        let work = keryx_miner::trace::OPEN_AUDIT_WORK_PASSES * keryx_miner::trace::service_work_daa(keryx_miner::trace::TraceTier::of(model_id, tier), n_prompt, max_tokens);
         let backlog = keryx_miner::trace::OPENING_BACKLOG_CAP_DAA;
         let phase = keryx_miner::trace::TRACE_SEED_DELAY_DAA
             + keryx_miner::trace::attn_phase_window_daa(tier, max_tokens, n_prompt, n_prompt.saturating_add(max_tokens))
@@ -2632,7 +2632,7 @@ impl KeryxdHandler {
             let (Some(txid_bytes), Some(seed_block)) = (hash32(txid), hash32(seed_hash)) else { continue };
             let seed = keryx_miner::trace::trace_seed(&seed_block, &txid_bytes);
             let audited = keryx_miner::trace::audit_all_active(accepted_daa) || keryx_miner::trace::audited(&seed);
-            let attention = keryx_miner::trace::attention_active(accepted_daa) && keryx_miner::trace::TierManifest::for_attn(p.tier).is_some();
+            let attention = keryx_miner::trace::attention_active(accepted_daa) && keryx_miner::trace::TierManifest::for_attn(keryx_miner::trace::TraceTier::of(&p.model_id, p.tier)).is_some();
             let prompt = if attention { keryx_miner::trace::attn_first_prompt_daa(p.trace.record.n_prompt) } else { 0 };
             let deadline_daa = daa + keryx_miner::trace::opening_window_daa(p.tier, p.max_tokens) + prompt;
             drawn.push((
@@ -2667,7 +2667,7 @@ impl KeryxdHandler {
         for (txid, d) in drawn.iter_mut().filter(|(_, d)| d.audited) {
             let Some(p) = self.pending_traces.get(txid) else { continue };
             let r = &p.trace.record;
-            let work = keryx_miner::trace::service_work_daa(p.tier, r.n_prompt, r.n_pos.saturating_sub(r.n_prompt));
+            let work = keryx_miner::trace::service_work_daa(keryx_miner::trace::TraceTier::of(&p.model_id, p.tier), r.n_prompt, r.n_pos.saturating_sub(r.n_prompt));
             d.deadline_daa = keryx_miner::trace::chained_deadline(d.deadline_daa, &open, d.seed_daa, work);
             open.push(d.deadline_daa);
         }
@@ -2687,8 +2687,8 @@ impl KeryxdHandler {
             let Some((block, _, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
             let (Some(txid_bytes), Some(block_bytes)) = (hash32(txid), hash32(block)) else { continue };
             let phase = a.path.len();
-            let Some(n) = keryx_miner::trace_seq::attn_children(p.tier, &p.trace.record, &d.seed, &a.path) else { continue };
-            let Some(weights) = a.bodies.last().and_then(|b| keryx_miner::trace_seq::attn_child_weights(p.tier, &p.trace.record, &d.seed, b)).filter(|w| w.len() as u64 == n) else {
+            let Some(n) = keryx_miner::trace_seq::attn_children(keryx_miner::trace::TraceTier::of(&p.model_id, p.tier), &p.trace.record, &d.seed, &a.path) else { continue };
+            let Some(weights) = a.bodies.last().and_then(|b| keryx_miner::trace_seq::attn_child_weights(keryx_miner::trace::TraceTier::of(&p.model_id, p.tier), &p.trace.record, &d.seed, b)).filter(|w| w.len() as u64 == n) else {
                 warn!("Trace: response {} — no draw weights for attention phase {}", txid, phase + 1);
                 continue;
             };
