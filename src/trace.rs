@@ -691,7 +691,7 @@ pub fn chained_deadline(own: u64, open_ends: &[u64], seed_daa: u64, work: u64) -
 /// Serving work of one request under the node's v3 window. MUST equal the node's `service_work_daa`.
 pub fn service_work_daa(t: TraceTier, n_prompt: u32, generated: u32) -> u64 {
     const RATE_H14: [u64; 5] = [90, 180, 85, 70, 35];
-    const RATE_H18: [u64; 5] = [90, 90, 85, 70, 35];
+    const RATE_H18: [u64; 5] = [90, 208, 85, 70, 35];
     const MAX_TOKENS_CAP: u32 = 4_096;
     let table = if t.lineup == Lineup::H18 { &RATE_H18 } else { &RATE_H14 };
     let rate = table[(t.tier as usize).min(table.len() - 1)];
@@ -1522,7 +1522,7 @@ mod tests {
         }
         let q8 = crate::models::QWEN3_5_9B_Q8.model_id;
         assert_eq!(TraceTier::of(&q8, 1), t(1));
-        assert_eq!(service_work_daa(t(1), 0, 100), 90);
+        assert_eq!(service_work_daa(t(1), 0, 100), 208);
         assert_eq!(service_work_daa(TraceTier::h14(1), 0, 100), 180);
     }
 
