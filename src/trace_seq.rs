@@ -186,9 +186,10 @@ impl AttnDraw {
         let kv = if a.mla_rank > 0 { 0 } else { self.head };
         let (p0, p1) = self.tree.node(path)?;
         let (lo, hi, total) = (p0 * bb, p1 * bb, n_pos * bb);
-        let mut out = vec![SpanPlan::new(layout.kcache(self.slot, kv)?, total, lo, hi)?];
+        let kv_slot = a.kv_slot as u64;
+        let mut out = vec![SpanPlan::new(layout.kcache(kv_slot, kv)?, total, lo, hi)?];
         if a.mla_rank == 0 {
-            out.push(SpanPlan::new(layout.vcache(self.slot, kv)?, total, lo, hi)?);
+            out.push(SpanPlan::new(layout.vcache(kv_slot, kv)?, total, lo, hi)?);
         }
         if path.is_empty() {
             let (g, qi) = if a.mla_rank > 0 { (a.n_head as u64, self.qh) } else { let g = (a.n_head / a.n_head_kv) as u64; (g, self.qh - kv * g) };

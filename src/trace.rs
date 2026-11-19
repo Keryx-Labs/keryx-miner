@@ -30,6 +30,10 @@ pub use crate::models::Lineup;
 
 /// Manifest row of the H18 tier 1; its context rows are those of tier 0.
 const H18_TIER1: usize = 5;
+/// Manifest row of the H18 tier 0.
+const H18_TIER0: usize = 6;
+/// Context row of the H18 tier 0.
+const H18_TIER0_CTX: usize = 5;
 
 /// A tier of a lineup, the key of the trace tables.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +54,7 @@ impl TraceTier {
     /// Manifest row; `None` = not traced.
     fn row(self) -> Option<usize> {
         match (self.lineup, self.tier) {
-            (Lineup::H18, 0) => None,
+            (Lineup::H18, 0) => Some(H18_TIER0),
             (Lineup::H18, 1) => Some(H18_TIER1),
             (_, t) => Some(t as usize),
         }
@@ -58,22 +62,47 @@ impl TraceTier {
 
     /// Chain, prefix and sequence context row.
     fn ctx_row(self) -> Option<usize> {
-        self.row().map(|r| if r == H18_TIER1 { 0 } else { r })
+        self.row().map(|r| match r {
+            H18_TIER1 => 0,
+            H18_TIER0 => H18_TIER0_CTX,
+            _ => r,
+        })
     }
 }
 
 /// Serialized manifests by row; `None` = no manifest.
-const MANIFESTS: [Option<&[u8]>; 6] = [
+const MANIFESTS: [Option<&[u8]>; 7] = [
     Some(include_bytes!("../assets/trace-manifests/tier0.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier1.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier2.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier3.bin")),
     None,
     Some(include_bytes!("../assets/trace-manifests/tier1-h18.bin")),
+    Some(include_bytes!("../assets/trace-manifests/tier0-h18.bin")),
+];
+
+/// Prefix table of the Gemma 4 tokenizer.
+const GEMMA4_PREFIX_TABLE: [u32; 256] = [
+    238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 107, 249, 250, 251, 252, 253,
+    254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
+    270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
+    286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
+    302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+    318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+    334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349,
+    350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365,
+    366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381,
+    382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397,
+    398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
+    414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429,
+    430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445,
+    446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461,
+    462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+    478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493,
 ];
 
 /// Prefix contexts of the audited tiers, in tier order. MUST equal the node's `TRACE_PREFIXES`.
-const PREFIXES: [Option<PrefixCtx>; 5] = [
+const PREFIXES: [Option<PrefixCtx>; 6] = [
     Some(PrefixCtx {
         table: [
             188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
@@ -125,24 +154,7 @@ const PREFIXES: [Option<PrefixCtx>; 5] = [
         embd_scale: 1.0,
     }),
     Some(PrefixCtx {
-        table: [
-            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 107, 249, 250, 251, 252, 253,
-            254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
-            270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
-            286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
-            302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
-            318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
-            334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349,
-            350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365,
-            366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381,
-            382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397,
-            398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
-            414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429,
-            430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445,
-            446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461,
-            462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
-            478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493,
-        ],
+        table: GEMMA4_PREFIX_TABLE,
         offset: 7,
         embd_entry: 329,
         norm_entry: 330,
@@ -175,6 +187,14 @@ const PREFIXES: [Option<PrefixCtx>; 5] = [
         embd_scale: 1.0,
     }),
     None,
+    Some(PrefixCtx {
+        table: GEMMA4_PREFIX_TABLE,
+        offset: 7,
+        embd_entry: 343,
+        norm_entry: 344,
+        eps: 9.999999974752427e-07,
+        embd_scale: 50.59644317626953,
+    }),
 ];
 
 /// Stage committed once `trace_chain_activation` is live: products, chain leaves and links.
@@ -182,41 +202,44 @@ pub const STAGE_CHAIN: u8 = keryx_verifiable_inference::chain::STAGE_CHAIN;
 
 /// Serialized stage-2 manifests (`KXMANIF2`), in tier order. MUST equal the node's
 /// `TRACE_CHAINS_H15` manifests.
-const CHAIN_MANIFESTS: [&[u8]; 6] = [
+const CHAIN_MANIFESTS: [&[u8]; 7] = [
     include_bytes!("../assets/trace-manifests/chain-tier0.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier1.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier2.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier3.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier4.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier1-h18.bin"),
+    include_bytes!("../assets/trace-manifests/chain-tier0-h18.bin"),
 ];
 
 /// Serialized manifests under the attention rule (attention and recurrent descriptors), in tier
 /// order. MUST equal the node's `TRACE_ATTN_H_NEXT` manifests.
-const ATTN_MANIFESTS: [&[u8]; 6] = [
+const ATTN_MANIFESTS: [&[u8]; 7] = [
     include_bytes!("../assets/trace-manifests/attn-tier0.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier1.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier2.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier3.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier4.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier1-h18.bin"),
+    include_bytes!("../assets/trace-manifests/attn-tier0-h18.bin"),
 ];
 
 /// Attention layers, recurrent layers and sequence heads of each manifest under the attention
 /// rule. MUST equal the node's `TRACE_ATTN_H_NEXT`.
-const ATTN_SEQ: [(u32, u32, u32); 5] = [(8, 24, 32), (40, 0, 2), (48, 0, 8), (16, 48, 48), (7, 20, 32)];
+const ATTN_SEQ: [(u32, u32, u32); 6] = [(8, 24, 32), (40, 0, 2), (48, 0, 8), (16, 48, 48), (7, 20, 32), (42, 0, 2)];
 
 /// Positions between recurrent state checkpoints when a manifest has no recurrent layer.
 const DEFAULT_INTERVAL: u32 = 48;
 
 /// Stage-2 chain context of each tier, with the prefix embedding and norm entries of its
 /// manifest. MUST equal the node's `TRACE_CHAINS_H15`.
-const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 5] = [
+const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 6] = [
     Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 }, 249, 250)),
     Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 }, 361, 362)),
     Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 }, 329, 330)),
     Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 }, 497, 498)),
     Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 }, 395, 396)),
+    Some((ChainCtx { n_layers: 42, layer_base: 558, embd_entry: 343, eps: 9.999999974752427e-07, embd_scale: 50.59644317626953, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: 557, ple_width: 256 }, 343, 344)),
 ];
 
 /// Entries of the stage-2 manifest of `t` and its product count.
@@ -1473,9 +1496,10 @@ mod tests {
     #[test]
     fn h18_lineup_trace_tables_match_the_node() {
         let t = |tier| TraceTier { tier, lineup: Lineup::H18 };
-        assert!(TierManifest::for_tier(t(0)).is_none() && TierManifest::for_chain(t(0)).is_none() && TierManifest::for_attn(t(0)).is_none());
-        assert!(prefix_ctx(t(0)).is_none() && chain_ctx(t(0)).is_none());
         let pins = [
+            (TierManifest::for_tier(t(0)).unwrap().m_t, "6d12b7a477dfc7c4e125f55cbe2d51c332c1dd2a706d7b21ed9b1eb8237ddf8f"),
+            (TierManifest::for_chain(t(0)).unwrap().m_t, "20f59fb57e2a5462fa95204edcabd58d8c7b2f752ac765e1f4c87162464a0905"),
+            (TierManifest::for_attn(t(0)).unwrap().m_t, "24a787f66b021ab645ed828854d561ffcbf562a5a0e864aa970d0fc14399f409"),
             (TierManifest::for_tier(t(1)).unwrap().m_t, "8047cc475c0273252a4c07b1fa438487ee20aad3c13a5e99f4b385becb2cf52d"),
             (TierManifest::for_chain(t(1)).unwrap().m_t, "07b6944852d310a631d574a3adb39e915b47de8d01896627690be62a9af92137"),
             (TierManifest::for_attn(t(1)).unwrap().m_t, "fb02fbaca5d528f6d320430937a960ec752c0723c45e7c273d9800f0876c05e2"),
@@ -1485,6 +1509,12 @@ mod tests {
         }
         assert_eq!(chain_ctx(t(1)).unwrap().1.table, chain_ctx(TraceTier::h14(0)).unwrap().1.table);
         assert_eq!(prefix_ctx(t(1)).unwrap().offset, 6);
+        assert_eq!(prefix_ctx(t(0)).unwrap().table, prefix_ctx(TraceTier::h14(2)).unwrap().table);
+        assert_eq!(prefix_ctx(t(0)).unwrap().offset, 7);
+        let c = TierManifest::for_attn(t(0)).unwrap().chain.unwrap();
+        assert_eq!((c.n_layers, c.layer_base, c.n_attn, c.n_recur, c.seq_heads, c.ple_entry, c.ple_width), (42, 558, 42, 0, 2, 557, 256));
+        let bolt = crate::models::BOLT_E4B.model_id;
+        assert_eq!(TraceTier::of(&bolt, 0), t(0));
         let c = TierManifest::for_attn(t(1)).unwrap().chain.unwrap();
         assert_eq!((c.n_layers, c.layer_base, c.n_attn, c.n_recur, c.seq_heads), (32, 315, 8, 24, 32));
         for tier in 2..5u8 {
