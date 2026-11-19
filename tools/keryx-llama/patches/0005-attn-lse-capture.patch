@@ -1,4 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index e67cc7f..09749b6 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -6,6 +6,28 @@
@@ -30,7 +31,7 @@ diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-comm
  #define FATTN_KQ_STRIDE       256
  #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
  #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
-@@ -1184,6 +1206,11 @@
+@@ -1184,6 +1206,11 @@ void launch_fattn(
          }
      }
  
@@ -42,7 +43,7 @@ diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-comm
      float scale         = 1.0f;
      float max_bias      = 0.0f;
      float logit_softcap = 0.0f;
-@@ -1270,5 +1297,9 @@
+@@ -1270,5 +1297,9 @@ void launch_fattn(
          ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
              dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
      }
@@ -53,9 +54,10 @@ diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-comm
      CUDA_CHECK(cudaGetLastError());
  }
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index a808e77..2ffc068 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
-@@ -1134,7 +1134,7 @@
+@@ -1134,7 +1134,7 @@ static __global__ void flash_attn_tile(
          }
  #endif // FAST_FP16_AVAILABLE
  
@@ -65,6 +67,7 @@ diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.c
          }
      }
 diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
+index b087a87..ca4ae29 100644
 --- a/ggml/src/ggml-cuda/q8seq.cu
 +++ b/ggml/src/ggml-cuda/q8seq.cu
 @@ -15,6 +15,7 @@
@@ -75,7 +78,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
  
  #define QS_CHUNK_START 1u
  #define QS_CHUNK_END   2u
-@@ -335,6 +336,11 @@
+@@ -335,6 +336,11 @@ struct qs_dev {
      uint32_t    ub_tokens = 0;
      std::unordered_set<uint32_t> seen;
      bool        overflow = false;
@@ -87,17 +90,27 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
  };
  
  static qs_dev     qs_devs[QS_MAX_DEVICES];
-@@ -498,9 +504,63 @@
+@@ -498,9 +504,73 @@ static bool qs_capturing(qs_dev & s, cudaStream_t stream) {
      return false;
  }
  
++static bool qs_is_attn(const qs_dev & s, int il) {
++    return il >= 0 && il < (int) s.layer.size() && (s.layer[il].kind == Q8S_ATTN || s.layer[il].kind == Q8S_MLA);
++}
++
++// A layer may read another layer's cache: the query names the layer.
++static int qs_attn_layer(const qs_dev & s, const ggml_tensor * kqv) {
++    const int iq = qs_layer_of(kqv->src[0], "Qcur_pos-");
++    return qs_is_attn(s, iq) ? iq : qs_layer_of(kqv->src[1], "cache_k_l");
++}
++
 +float * ggml_cuda_q8s_lse_target(const ggml_tensor * kqv, bool stream_k) {
 +    qs_dev * s = qs_current();
 +    if (!s) {
 +        return nullptr;
 +    }
-+    const int il = qs_layer_of(kqv->src[1], "cache_k_l");
-+    if (il < 0 || il >= (int) s->layer.size() || (s->layer[il].kind != Q8S_ATTN && s->layer[il].kind != Q8S_MLA)) {
++    const int il = qs_attn_layer(*s, kqv);
++    if (!qs_is_attn(*s, il)) {
 +        return nullptr;
 +    }
 +    const uint32_t n_head = (uint32_t) kqv->ne[1], n_tokens = (uint32_t) (kqv->ne[2]*kqv->ne[3]);
@@ -123,8 +136,8 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
 +}
 +
 +static void qs_lse(qs_dev & s, const ggml_tensor * node, cudaStream_t stream) {
-+    const int il = qs_layer_of(node->src[1], "cache_k_l");
-+    if (s.lse_layer < 0 && (il < 0 || il >= (int) s.layer.size() || (s.layer[il].kind != Q8S_ATTN && s.layer[il].kind != Q8S_MLA))) {
++    const int il = qs_attn_layer(s, node);
++    if (s.lse_layer < 0 && !qs_is_attn(s, il)) {
 +        return;
 +    }
 +    if (il != s.lse_layer) {
@@ -152,7 +165,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
          return;
      }
      if (node->op == GGML_OP_SET_ROWS) {
-@@ -515,6 +575,7 @@
+@@ -515,6 +585,7 @@ void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
  }
  
  static void qs_free(qs_dev & s) {
@@ -160,7 +173,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
      cudaFree(s.streams);
      cudaFree(s.scratch);
      cudaFree(s.ckpt);
-@@ -559,8 +620,11 @@
+@@ -559,8 +630,11 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
      s.seq_heads = seq_heads;
      s.interval = interval;
      s.max_tokens = max_tokens;
@@ -174,7 +187,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
          || cudaMalloc(&s.scratch, std::max<size_t>(scratch, 4)) != cudaSuccess
          || cudaMalloc(&s.ckpt, std::max<size_t>(ckpt, 4)) != cudaSuccess
          || cudaMalloc(&s.roots, (size_t) s.n_leaves*32) != cudaSuccess
-@@ -570,6 +634,7 @@
+@@ -570,6 +644,7 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
      }
      s.scratch_bytes = scratch;
      s.ckpt_bytes = ckpt;
@@ -182,7 +195,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
      s.on = true;
      return 0;
  }
-@@ -596,6 +661,8 @@
+@@ -596,6 +671,8 @@ extern "C" int ggml_cuda_q8s_begin_response(int device) {
      s.ub_tokens = 0;
      s.seen.clear();
      s.overflow = false;
@@ -191,7 +204,7 @@ diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
      if (cudaMemset(s.streams, 0, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess) {
          return -2;
      }
-@@ -624,6 +691,12 @@
+@@ -624,6 +701,12 @@ extern "C" int ggml_cuda_q8s_roots(int device, uint8_t * out, size_t out_cap, ui
      if (s.overflow) {
          return -4;
      }

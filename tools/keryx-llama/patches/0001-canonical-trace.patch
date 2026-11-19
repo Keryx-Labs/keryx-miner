@@ -234,10 +234,10 @@ index e18ada5..d136adb 100644
  void ggml_cuda_op_mul_mat_vec_q(
 diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
 new file mode 100644
-index 0000000..923ecca
+index 0000000..0f10791
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cu
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1041 @@
 +#include "q8canon.cuh"
 +
 +#include "ggml.h"
@@ -639,6 +639,7 @@ index 0000000..923ecca
 +    uint32_t n_products = 0;
 +    uint32_t n_layers   = 0;
 +    uint32_t n_router   = 0;
++    bool     ple        = false;
 +    uint32_t nl         = 0;
 +    uint32_t max_pos    = 0;
 +    uint8_t * stage     = nullptr;
@@ -693,6 +694,7 @@ index 0000000..923ecca
 +    }
 +    uint32_t n_layers = 0;
 +    bool moe = false;
++    bool ple = false;
 +    size_t o = 16;
 +    for (uint32_t i = 0; i < n_entries; ++i) {
 +        if (o + 2 > len) {
@@ -739,7 +741,8 @@ index 0000000..923ecca
 +    s.n_products = n_products;
 +    s.n_layers   = n_layers;
 +    s.n_router   = moe ? n_layers : 0;
-+    s.nl = 2*n_products + 2*n_layers + s.n_router + 1;
++    s.ple        = ple;
++    s.nl = 2*n_products + (ple ? 3 : 2)*n_layers + s.n_router + (ple ? 2 : 0) + 1;
 +    return true;
 +}
 +
@@ -962,6 +965,14 @@ index 0000000..923ecca
 +
 +// Residual leaf of a layer-stream node named `<kind>-<layer>`, or -1.
 +static int q8c_resid_leaf(const q8c_dev & s, const char * name) {
++    const uint32_t per = s.ple ? 3 : 2;
++    const int after = (int) (2*s.n_products + per*s.n_layers);
++    if (s.ple && strcmp(name, "ple_proj") == 0) {
++        return after + (int) s.n_router;
++    }
++    if (s.ple && strcmp(name, "inp_per_layer") == 0) {
++        return after + (int) s.n_router + 1;
++    }
 +    const char * dash = strrchr(name, '-');
 +    if (s.n_layers == 0 || !dash || dash[1] < '0' || dash[1] > '9') {
 +        return -1;
@@ -973,15 +984,18 @@ index 0000000..923ecca
 +    }
 +    const size_t n = (size_t) (dash - name);
 +    auto is = [&](const char * k) { return strlen(k) == n && strncmp(name, k, n) == 0; };
-+    const int base = (int) (2*s.n_products + 2*il);
++    const int base = (int) (2*s.n_products + per*il);
 +    if (is("l_out")) {
++        return base + (int) per - 1;
++    }
++    if (s.ple && is("pe_in")) {
 +        return base + 1;
 +    }
 +    if (is("attn_residual") || is("ffn_inp") || is("attn_out")) {
 +        return base;
 +    }
 +    if (s.n_router > 0 && is("ffn_moe_logits")) {
-+        return (int) (2*s.n_products + 2*s.n_layers + il);
++        return after + (int) il;
 +    }
 +    return -1;
 +}
@@ -1003,9 +1017,15 @@ index 0000000..923ecca
 +    if (!ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
 +        return true;
 +    }
-+    const int64_t nrows = ggml_nrows(node);
++    int64_t nrows = ggml_nrows(node);
++    int64_t row_bytes = node->ne[0]*sizeof(float);
++    const int ple_leaf = (int) (2*s->n_products + 3*s->n_layers + s->n_router);
++    if (s->ple && leaf >= ple_leaf) {
++        nrows = leaf == ple_leaf ? node->ne[1] : node->ne[2];
++        row_bytes = (int64_t) ggml_nbytes(node) / nrows;
++    }
 +    const int shift = s->cur && (int64_t) s->cur->n_tokens > nrows ? (int) (s->cur->n_tokens - nrows) : 0;
-+    ggml_cuda_q8c_out(node->data, nrows, node->ne[0]*sizeof(float), leaf, shift, nrows <= 8, stream);
++    ggml_cuda_q8c_out(node->data, nrows, row_bytes, leaf, shift, nrows <= 8, stream);
 +    return true;
 +}
 +
@@ -1325,3 +1345,15 @@ index 0000000..d138cba
 +    int  ggml_cuda_q8c_read_capture(int device, uint8_t * x, size_t x_cap, uint8_t * y, size_t y_cap,
 +                                    uint32_t * x_len, uint32_t * y_len);
 +}
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index 6a96979..9c69ea8 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -493,6 +493,7 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor *
+     ggml_tensor * per_layer_proj;
+     per_layer_proj = ggml_mul_mat   (ctx0, model.per_layer_model_proj, inp_batch);
+     per_layer_proj = ggml_scale     (ctx0, per_layer_proj, per_layer_projection_scale);
++    cb(per_layer_proj, "ple_proj", -1);
+     per_layer_proj = ggml_reshape_3d(ctx0, per_layer_proj, n_embd_per_layer, n_layer, n_tokens);
+ 
+     per_layer_proj = build_norm(per_layer_proj, model.per_layer_proj_norm, nullptr, LLM_NORM_RMS, -1);
