@@ -489,19 +489,6 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "default" => Some(Tier::Default),
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
-        "shard-0" => Some(Tier::VeryLight),
-        "shard-1" if keryx_miner::pom::is_devnet() => Some(Tier::VeryHigh),
-        "shard-1" => {
-            keryx_miner::models::set_light_shard(1);
-            Some(Tier::Light)
-        }
-        "shard-2" => {
-            keryx_miner::models::set_light_shard(2);
-            Some(Tier::Light)
-        }
-        "shard-3" => Some(Tier::Default),
-        "shard-4" => Some(Tier::High),
-        "shard-5" => Some(Tier::VeryHigh),
         _ => None,
     }
 }
@@ -1302,6 +1289,11 @@ async fn run() -> Result<(), Error> {
         });
     }
 
+    if let Some(key) = escrow_privkey.as_deref().and_then(|k| escrow::pubkey_hex_from_privkey(k).ok()).and_then(|h| hex::decode(h).ok()) {
+        if let Ok(key) = <[u8; 32]>::try_from(key.as_slice()) {
+            keryx_miner::models::set_range_escrow_key(key);
+        }
+    }
     let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
         (Some(privkey), Some(address)) => {
             let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;
@@ -1385,12 +1377,6 @@ async fn run() -> Result<(), Error> {
     //   --high       → Qwen3.6-27B, Qwen3.8-27B from H14
     //   --very-high  → Kimi-Linear-48B
 
-    // 12 GB cards split between the two 12 GB shards by the mining address, so both are served
-    // without coordination; `--force-model shard-1|shard-2` (parsed next) overrides it.
-    if let Some(addr) = opt.mining_address.as_deref() {
-        let parity = addr.bytes().fold(0u8, |acc, b| acc ^ b) & 1;
-        keryx_miner::models::set_light_shard(1 + parity);
-    }
     // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
     // warning below and the per-GPU assignment both need them.
     let forced_tiers: Vec<Option<keryx_miner::models::Tier>> =
@@ -1402,12 +1388,6 @@ async fn run() -> Result<(), Error> {
         );
     }
     let forced_max_rank = forced_tiers.iter().flatten().map(|t| tier_rank(*t)).max();
-    let forced_shard = opt.force_model.as_deref().is_some_and(|s| s.split(',').any(|m| m.trim().to_ascii_lowercase().starts_with("shard-")));
-    keryx_miner::models::set_mine_shards(opt.mine_shards || forced_shard);
-    if keryx_miner::models::mine_shards() {
-        info!("Model split: this rig mines network-model shards from the gate (lineup otherwise).");
-    }
-
     // Warn if GPU power limit is below safe threshold for the selected model tier.
     // Low PL causes CUDA FIFO instability (Xid 32) under large GEMM workloads.
     check_gpu_power_limit(
@@ -1458,7 +1438,13 @@ async fn run() -> Result<(), Error> {
     // hashing while a model is still downloading.
     let prefetch_specs = prefetch_lineup_from_assignments(&pom_assignments, tier, chain_daa);
     match tokio::task::spawn_blocking(move || keryx_miner::llm::prefetch_models(prefetch_specs)).await {
-        Ok(Ok(())) => info!("Model files ready ({}) — starting mining.", prefetch_specs.len()),
+        Ok(Ok(())) => {
+            info!("Model files ready ({}) — starting mining.", prefetch_specs.len());
+            // Any range may be assigned the head range, so its packed head is fetched up front.
+            if prefetch_specs.iter().any(|s| keryx_miner::models::shard_index(&s.model_id).is_some()) {
+                std::thread::spawn(keryx_miner::llm::ensure_head_file);
+            }
+        }
         Ok(Err(e)) => {
             error!("Model prefetch failed — refusing to mine without the lineup: {}", e);
             return Err(e.into());

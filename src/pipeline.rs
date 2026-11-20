@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn layer_map_covers_every_layer_and_the_output() {
-        assert_eq!(layer_map(), "0-2:0,3-7:1,8-12:2,13-19:3,20-29:4,30-42:5,43-43:6");
-        assert_eq!(head_tier(), 11);
+        assert_eq!(layer_map(), "0-10:0,11-21:1,22-32:2,33-42:3,43-43:4");
+        assert_eq!(head_tier(), 9);
     }
 }

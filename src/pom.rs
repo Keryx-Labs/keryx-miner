@@ -1706,8 +1706,8 @@ pub fn h10_activation_daa() -> u64 {
     gate(87_360_000, 1)
 }
 
-/// Model-split gate. At/after this score (the TEMPLATE's daa_score) the shards of the network
-/// model (tiers 6-11) are mineable next to the lineup; a rig run with `--mine-shards` mines them.
+/// Model-split gate. At/after this score (the TEMPLATE's daa_score) tier 4 is retired and a 32 GB
+/// card mines the network-model range (tiers 6-9) the chain assigns to its escrow key.
 /// MUST equal the node's `model_split_activation` on every network; `u64::MAX` until it is
 /// scheduled.
 pub fn model_split_activation_daa() -> u64 {

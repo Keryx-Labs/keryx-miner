@@ -224,6 +224,17 @@ impl State {
         }
     }
 
+    /// Pruning point of the template header, when the template carries one.
+    pub fn pruning_point(&self) -> Option<[u8; 32]> {
+        let header = match &*self.block {
+            BlockSeed::FullBlock { block, .. } => block.header.as_ref()?,
+            BlockSeed::PartialBlock { header, .. } => header.as_deref()?,
+        };
+        let mut pp = [0u8; 32];
+        decode_to_slice(&header.pruning_point, &mut pp).ok()?;
+        Some(pp)
+    }
+
     /// `block_task::parents_key` of the template's direct parents.
     pub fn parents_key(&self) -> Option<String> {
         let header = match &*self.block {

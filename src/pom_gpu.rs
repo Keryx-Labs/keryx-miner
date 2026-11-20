@@ -2004,6 +2004,10 @@ pub fn advance_mining_tier_if_due(daa: u64) {
             if current == Some(spec.model_id) {
                 continue;
             }
+            // A range change waits for the pipelines this range is serving to end.
+            if current.is_some_and(|id| crate::models::shard_index(&id).is_some()) && shard_sessions() > 0 {
+                continue;
+            }
             let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
             mt.insert(dev, (spec.model_id, gguf.clone()));
             (current, spec, gguf)

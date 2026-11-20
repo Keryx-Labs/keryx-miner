@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn a_multi_gpu_rig_resolves_the_copy_that_serves() {
-        let shard = "/models/V4-Flash-shard-0/model.gguf";
+        let shard = "/models/V4-Flash-0731-range-0/model.gguf";
         let rig = [(shard, None), (shard, None), (shard, Some("127.0.0.1:50054")), (shard, None)];
         assert_eq!(super::pick_serving(rig.iter().copied(), shard), Some("127.0.0.1:50054".to_string()));
 

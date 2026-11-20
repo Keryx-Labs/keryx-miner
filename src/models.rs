@@ -235,149 +235,110 @@ pub fn lineup_of(model_id: &[u8; 32]) -> Lineup {
     if *model_id == BOLT_E4B.model_id || *model_id == QWEN3_5_9B_Q8.model_id { Lineup::H18 } else { Lineup::H14 }
 }
 
-// ── H14 network model ───────────────────────────────────────────────────────────────────────────
-// Active at `crate::pom::model_split_activation_daa()`. The lineup above stays mineable; from the
-// gate a rig run with `--mine-shards` walks and mines ONE shard of DeepSeek-V4-Flash (Q2) per GPU
-// instead, picked by its VRAM class. The whole model is the id AiRequests target; nobody mines it.
-// model_id bytes MUST equal the node's `POM_TIERS_H14` / `NETWORK_MODEL_SHARDS`.
+// ── Network model ───────────────────────────────────────────────────────────────────────────────
+// Active at `crate::pom::model_split_activation_daa()`. Tier 4 is retired: from the gate a 32 GB card
+// mines one of the four ranges of DeepSeek-V4-Flash-0731 (Q2), the one the chain assigns to its
+// escrow key under the template's pruning point (`assigned_range`). The whole model is the id
+// AiRequests target; nobody mines it. model_id bytes MUST equal the node's `POM_TIERS_MODEL_SPLIT`.
 
-/// The whole network model — DeepSeek-V4-Flash abliterated (huihui-ai, ds4, Q2). Request target
-/// and pipeline-head capability only; never downloaded, walked or mined as such.
+/// The whole network model — DeepSeek-V4-Flash-0731 abliterated (huihui-ai, ds4, Q2). Request
+/// target and pipeline-head capability only; never downloaded, walked or mined as such.
 /// `model_id` MUST equal the node's `NETWORK_MODEL_V4_FLASH_MODEL_ID`.
 pub const V4_FLASH: ModelSpec = ModelSpec {
-    name: "v4-flash",
+    name: "v4-flash-0731",
     model_id: [
-        0x91, 0x85, 0x70, 0xa8, 0x4e, 0x9e, 0x18, 0x32,
-        0x21, 0x10, 0x17, 0x03, 0x32, 0xf8, 0x0a, 0x92,
-        0x25, 0xe0, 0x78, 0xca, 0x7f, 0xc7, 0xb5, 0x4f,
-        0xcd, 0xa3, 0xa7, 0xf4, 0x5a, 0xb6, 0x58, 0x10,
+        0xf9, 0xe0, 0x9f, 0xc3, 0x78, 0x23, 0xa0, 0x3d,
+        0x20, 0x9b, 0x1e, 0xe8, 0x4c, 0x49, 0x67, 0x28,
+        0x54, 0x6c, 0xab, 0x62, 0x41, 0x87, 0x01, 0xa0,
+        0xf0, 0xa3, 0xda, 0xa6, 0xd3, 0x2a, 0xb8, 0xdf,
     ],
     format: ModelFormat::GgufDeepSeekV4,
     tokenizer_cid: "",
-    weight_cids: &["QmY8hqif5NA9S7nWRpGHLNkDV6hue7QtSk7cKGSK8wpPq1"],
-    dir_name: "V4-Flash",
+    weight_cids: &["QmfA4tHEStL5poiBvHm1rid4b3cbQbhJ8v83RjE3Uytksg"],
+    dir_name: "V4-Flash-0731",
     min_vram_mb: 0,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash shard 0: layers 0-2, 8 GB class. `model_id` MUST equal the node's
+/// V4-Flash-0731 range 0: layers 0-10, 32 GB class. `model_id` MUST equal the node's
 /// `V4_FLASH_SHARD_0_MODEL_ID`.
 pub const V4_FLASH_SHARD_0: ModelSpec = ModelSpec {
-    name: "v4-flash-shard-0",
+    name: "v4-flash-0731-range-0",
     model_id: [
-        0xd1, 0x63, 0x3f, 0x54, 0xd8, 0x57, 0x4c, 0x86,
-        0xff, 0xe6, 0x14, 0x99, 0x4c, 0xf2, 0xd6, 0x10,
-        0x01, 0x99, 0x4e, 0x75, 0x18, 0x61, 0xe3, 0x59,
-        0xb9, 0xc7, 0x04, 0x83, 0x40, 0xdb, 0x10, 0x80,
+        0x22, 0x7b, 0x7a, 0x33, 0xbf, 0x60, 0x86, 0xfe,
+        0xca, 0xeb, 0xf6, 0xc2, 0x74, 0xf7, 0x42, 0xa9,
+        0x9e, 0x75, 0x21, 0x70, 0x0e, 0x26, 0x25, 0x3a,
+        0xe7, 0xf5, 0x77, 0x82, 0x20, 0x08, 0x54, 0xf8,
     ],
     format: ModelFormat::GgufDeepSeekV4,
     tokenizer_cid: "",
-    weight_cids: &["QmcS1hAPeJvfE7VbHu5Kmb9rESEQFYuvE92daGVrC2H5QB"],
-    dir_name: "V4-Flash-shard-0",
-    min_vram_mb: 6_000,
+    weight_cids: &["QmQfFmvDm4SFxuFi2rMXEAWH29dfiTUaajdpFDpYHeLqy1"],
+    dir_name: "V4-Flash-0731-range-0",
+    min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash shard 1: layers 3-7, 12 GB class. `model_id` MUST equal the node's
+/// V4-Flash-0731 range 1: layers 11-21, 32 GB class. `model_id` MUST equal the node's
 /// `V4_FLASH_SHARD_1_MODEL_ID`.
 pub const V4_FLASH_SHARD_1: ModelSpec = ModelSpec {
-    name: "v4-flash-shard-1",
+    name: "v4-flash-0731-range-1",
     model_id: [
-        0xad, 0x0b, 0x32, 0x63, 0x12, 0x42, 0xca, 0x0c,
-        0x42, 0xde, 0xaa, 0x97, 0x79, 0x58, 0x50, 0xb1,
-        0x4a, 0x73, 0x4e, 0x7e, 0xd3, 0x30, 0xfa, 0xc7,
-        0x3c, 0xa4, 0xff, 0x04, 0x7a, 0xf9, 0xaa, 0xb5,
+        0xa6, 0xab, 0x8d, 0x41, 0x50, 0x86, 0x04, 0x40,
+        0xf3, 0xe0, 0x9a, 0x8a, 0x91, 0x70, 0x13, 0xc1,
+        0x6f, 0x55, 0x67, 0x16, 0x11, 0x13, 0xa3, 0x87,
+        0x2a, 0x7f, 0x58, 0x71, 0x02, 0x2d, 0x13, 0xfd,
     ],
     format: ModelFormat::GgufDeepSeekV4,
     tokenizer_cid: "",
-    weight_cids: &["QmZz99HvaeEAysHeX4ToJ7FAE4BdZqFXwWcCoiL5dww7A4"],
-    dir_name: "V4-Flash-shard-1",
-    min_vram_mb: 10_500,
+    weight_cids: &["QmZZG7FgKAyobfSnQfLrEiXyewicskH41AoLrSB1oEgPAt"],
+    dir_name: "V4-Flash-0731-range-1",
+    min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash shard 2: layers 8-12, 12 GB class. `model_id` MUST equal the node's
+/// V4-Flash-0731 range 2: layers 22-32, 32 GB class. `model_id` MUST equal the node's
 /// `V4_FLASH_SHARD_2_MODEL_ID`.
 pub const V4_FLASH_SHARD_2: ModelSpec = ModelSpec {
-    name: "v4-flash-shard-2",
+    name: "v4-flash-0731-range-2",
     model_id: [
-        0x28, 0x74, 0x21, 0x89, 0x10, 0x1a, 0x56, 0x75,
-        0x94, 0xe7, 0x85, 0x58, 0xe4, 0xdb, 0xbd, 0x21,
-        0xb1, 0xa8, 0x74, 0xb5, 0xfb, 0x3d, 0xcf, 0xac,
-        0x77, 0xad, 0xf1, 0xac, 0x45, 0x54, 0x35, 0xff,
+        0xc0, 0x9b, 0x96, 0xe1, 0xa7, 0xa4, 0x69, 0x15,
+        0x0b, 0xf9, 0x9e, 0xaf, 0x6e, 0xe8, 0xcc, 0x43,
+        0xeb, 0x97, 0xf6, 0x3a, 0xff, 0x57, 0xa8, 0x3b,
+        0x29, 0x9b, 0x6e, 0xe8, 0x82, 0x82, 0x3e, 0xdb,
     ],
     format: ModelFormat::GgufDeepSeekV4,
     tokenizer_cid: "",
-    weight_cids: &["QmR4ZixmaPkPd2nKKuKKRHZJsNnoPwzWbyjRr8bSrVHcJS"],
-    dir_name: "V4-Flash-shard-2",
-    min_vram_mb: 10_500,
+    weight_cids: &["QmbJWbGDBaS8RuYLkw74qqNaJseEf4hgKeNLk8rqBLMmjQ"],
+    dir_name: "V4-Flash-0731-range-2",
+    min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash shard 3: layers 13-19, 16 GB class. `model_id` MUST equal the node's
+/// V4-Flash-0731 range 3: layers 33-42, 32 GB class. `model_id` MUST equal the node's
 /// `V4_FLASH_SHARD_3_MODEL_ID`.
 pub const V4_FLASH_SHARD_3: ModelSpec = ModelSpec {
-    name: "v4-flash-shard-3",
+    name: "v4-flash-0731-range-3",
     model_id: [
-        0x8d, 0x64, 0x04, 0x5e, 0xf4, 0x40, 0xa8, 0x09,
-        0xc7, 0x18, 0x9e, 0xc0, 0x6c, 0x5b, 0xe3, 0xff,
-        0xc2, 0x8b, 0x06, 0x94, 0x67, 0xe7, 0x8e, 0x78,
-        0x0a, 0xbf, 0xd1, 0xd8, 0x4f, 0xf7, 0x3d, 0x90,
+        0xa4, 0x9c, 0xdb, 0xb0, 0x81, 0xe0, 0xeb, 0xe8,
+        0x86, 0x63, 0xd8, 0x40, 0x4b, 0xa7, 0x7b, 0xe8,
+        0x61, 0xdb, 0x2b, 0x9e, 0x85, 0x7b, 0xbd, 0xa2,
+        0x3b, 0x5e, 0xba, 0xba, 0xc1, 0x9e, 0x36, 0x17,
     ],
     format: ModelFormat::GgufDeepSeekV4,
     tokenizer_cid: "",
-    weight_cids: &["QmXraegdj7Co3YJAmoWM3wR8dwKCP548UaXGRHwDSRQXRq"],
-    dir_name: "V4-Flash-shard-3",
-    min_vram_mb: 14_500,
+    weight_cids: &["QmZREJF9HZyZQdvDUGiCdUDuAjABW8wmyYLGpbfcjSLi8v"],
+    dir_name: "V4-Flash-0731-range-3",
+    min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash shard 4: layers 20-29, 24 GB class. `model_id` MUST equal the node's
-/// `V4_FLASH_SHARD_4_MODEL_ID`.
-pub const V4_FLASH_SHARD_4: ModelSpec = ModelSpec {
-    name: "v4-flash-shard-4",
-    model_id: [
-        0x9e, 0xb2, 0x3e, 0x53, 0x97, 0x6d, 0xfb, 0x66,
-        0x05, 0xaa, 0x65, 0x7d, 0xec, 0x94, 0x7c, 0xa7,
-        0x87, 0x7a, 0x21, 0x35, 0xc5, 0x12, 0x27, 0x04,
-        0x9c, 0xa4, 0xd1, 0x62, 0x5e, 0x84, 0xeb, 0x19,
-    ],
-    format: ModelFormat::GgufDeepSeekV4,
-    tokenizer_cid: "",
-    weight_cids: &["QmZ28mLQbMkf3vg4aYA3XDYvnhPL6HAodLWoU1HZ2rubeY"],
-    dir_name: "V4-Flash-shard-4",
-    min_vram_mb: 21_000,
-    ctx_floor: 4_096,
-    ctx_cap: 4_096,
-};
-
-/// V4-Flash shard 5: layers 30-42, 32 GB class. `model_id` MUST equal the node's
-/// `V4_FLASH_SHARD_5_MODEL_ID`.
-pub const V4_FLASH_SHARD_5: ModelSpec = ModelSpec {
-    name: "v4-flash-shard-5",
-    model_id: [
-        0xc4, 0x81, 0x8f, 0x6b, 0x13, 0x76, 0x69, 0xb3,
-        0xf0, 0x01, 0x78, 0x5b, 0xa1, 0x09, 0xf2, 0x55,
-        0x92, 0x0a, 0x66, 0xfa, 0x21, 0x9f, 0xcf, 0x32,
-        0x86, 0xb0, 0xbe, 0x0f, 0xde, 0x50, 0x97, 0x42,
-    ],
-    format: ModelFormat::GgufDeepSeekV4,
-    tokenizer_cid: "",
-    weight_cids: &["QmbZjCfrPdi3tvAYg9bZKqsyaxeBN98huSiq8V7xSSmsG5"],
-    dir_name: "V4-Flash-shard-5",
-    min_vram_mb: 30_000,
-    ctx_floor: 4_096,
-    ctx_cap: 4_096,
-};
-
-/// The six mainnet shards, layer order (`V4_FLASH_SHARDS[k]` is tier `6 + k`).
-pub const V4_FLASH_SHARDS: [&ModelSpec; 6] =
-    [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5];
+/// The four mainnet ranges, layer order (`V4_FLASH_SHARDS[k]` is tier `6 + k`).
+pub const V4_FLASH_SHARDS: [&ModelSpec; 4] = [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3];
 
 // Devnet bench network model: Qwen3.5-9B in two shards ─ mirror of the node's
 // `POM_TIERS_H14_SPLIT9B`: the whole pipeline on one card.
@@ -436,8 +397,8 @@ pub const SPLIT9B_WHOLE: ModelSpec = ModelSpec {
     ctx_cap: 4_096,
 };
 
-/// The network model of one network: the whole model requests target, its shards in tier
-/// order, their layer ranges, the layer count and the packed head.
+/// The network model of one network: the whole model requests target, its ranges in tier
+/// order, their layer spans, the layer count and the packed head.
 pub struct NetworkModelSpec {
     pub whole: &'static ModelSpec,
     pub shards: &'static [&'static ModelSpec],
@@ -445,35 +406,15 @@ pub struct NetworkModelSpec {
     pub n_layer: u32,
     pub head_cid: &'static str,
     pub head_digest_hex: &'static str,
-    /// Hardware tier → shard index.
-    pub shard_of_tier: fn(Tier) -> usize,
-}
-
-fn mainnet_shard_of_tier(tier: Tier) -> usize {
-    match tier {
-        Tier::VeryLight => 0,
-        Tier::Light => light_shard() as usize,
-        Tier::Default => 3,
-        Tier::High => 4,
-        Tier::VeryHigh => 5,
-    }
-}
-
-fn devnet_shard_of_tier(tier: Tier) -> usize {
-    match tier {
-        Tier::VeryLight | Tier::Light | Tier::Default => 0,
-        Tier::High | Tier::VeryHigh => 1,
-    }
 }
 
 pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
     whole: &V4_FLASH,
-    shards: &[&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3, &V4_FLASH_SHARD_4, &V4_FLASH_SHARD_5],
-    layers: &[(0, 2), (3, 7), (8, 12), (13, 19), (20, 29), (30, 42)],
+    shards: &V4_FLASH_SHARDS,
+    layers: &[(0, 10), (11, 21), (22, 32), (33, 42)],
     n_layer: 43,
-    head_cid: "QmZU3jvigYXpCVFSzfjJoJA3Yy27ryujyvp67gWhcq37iZ",
-    head_digest_hex: "a555a9dcb5dac4d7c8c2609781d7013d8a8d8b6416429ae50254a093c1181df2",
-    shard_of_tier: mainnet_shard_of_tier,
+    head_cid: "QmVEZUvJF9e2FRMf5aW6MxWGENgqmhbo2dr87em2hK4QFp",
+    head_digest_hex: "667269bca5045390ff0ed3084a224c3d29666ee5fffa1a19e9e97fd6312ec56f",
 };
 
 pub static NETWORK_MODEL_SPLIT9B: NetworkModelSpec = NetworkModelSpec {
@@ -483,10 +424,9 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelSpec = NetworkModelSpec {
     n_layer: 32,
     head_cid: "QmQSC2sjKaAqZH4E6HGbtkowWqGKBrHx4JvAWmXsTpNdDC",
     head_digest_hex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
-    shard_of_tier: devnet_shard_of_tier,
 };
 
-/// The network model of the selected network: split V4-Flash, or the two-shard 9B bench
+/// The network model of the selected network: split V4-Flash-0731, or the two-range 9B bench
 /// on devnet (`--devnet`).
 pub fn network_model() -> &'static NetworkModelSpec {
     if crate::pom::is_devnet() {
@@ -499,35 +439,60 @@ pub fn network_model() -> &'static NetworkModelSpec {
 /// First tier index of the network model — mirror of the node's `NETWORK_MODEL_TIER`.
 pub const NETWORK_MODEL_TIER: u8 = 5;
 
-
-/// Whether this rig mines network-model shards past the gate (`--mine-shards`) instead of the lineup.
-static MINE_SHARDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_mine_shards(on: bool) {
-    MINE_SHARDS.store(on, std::sync::atomic::Ordering::Relaxed);
+/// Range index assigned to an escrow key under a pruning point — mirror of the node's
+/// `network_model_range`.
+pub fn network_model_range(pruning_point: &[u8; 32], escrow_pubkey: &[u8; 32], n_shards: usize) -> u8 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"KeryxRangeV1");
+    h.update(pruning_point);
+    h.update(escrow_pubkey);
+    let word = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
+    (word % n_shards.max(1) as u64) as u8
 }
 
-pub fn mine_shards() -> bool {
-    MINE_SHARDS.load(std::sync::atomic::Ordering::Relaxed)
+/// Escrow key of the coinbase this miner builds; the range is keyed on it.
+static RANGE_ESCROW_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+pub fn set_range_escrow_key(key: [u8; 32]) {
+    let _ = RANGE_ESCROW_KEY.set(key);
 }
 
-/// Which of the two 12 GB shards (1 or 2) a `Tier::Light` GPU mines. Spread by the mining
-/// address at startup so the two are served without coordination; `--force-model shard-2`
-/// pins it.
-static LIGHT_SHARD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+/// Range assigned under the latest template's pruning point; `NO_RANGE` until one is seen.
+static ASSIGNED_RANGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(NO_RANGE);
+const NO_RANGE: u8 = u8::MAX;
 
-pub fn set_light_shard(k: u8) {
-    LIGHT_SHARD.store(if k == 2 { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+/// Records the pruning point of a block template and returns the range it assigns, `None` without
+/// an escrow key. Returns whether it changed through the second value.
+pub fn note_template_pruning_point(pruning_point: &[u8; 32]) -> Option<(u8, bool)> {
+    let key = RANGE_ESCROW_KEY.get()?;
+    let range = network_model_range(pruning_point, key, network_model().shards.len());
+    let prev = ASSIGNED_RANGE.swap(range, std::sync::atomic::Ordering::Relaxed);
+    Some((range, prev != range))
 }
 
-pub fn light_shard() -> u8 {
-    LIGHT_SHARD.load(std::sync::atomic::Ordering::Relaxed)
+/// Range a pruning point assigns this miner's escrow key, `None` without a key.
+pub fn range_for(pruning_point: &[u8; 32]) -> Option<u8> {
+    Some(network_model_range(pruning_point, RANGE_ESCROW_KEY.get()?, network_model().shards.len()))
 }
 
-/// The shard a hardware tier mines under H14 on the selected network.
-pub fn shard_for_tier(tier: Tier) -> &'static ModelSpec {
-    let nm = network_model();
-    nm.shards[(nm.shard_of_tier)(tier)]
+/// Whether a block mined by `model_id` under `pruning_point` carries the range the node expects:
+/// true for any lineup model, and for a range only when it is the assigned one.
+pub fn range_matches(model_id: &[u8; 32], pruning_point: Option<&[u8; 32]>) -> bool {
+    let Some(k) = shard_index(model_id) else { return true };
+    pruning_point.and_then(range_for) == Some(k)
+}
+
+/// The range the latest template assigns this miner, if known.
+pub fn assigned_range() -> Option<u8> {
+    match ASSIGNED_RANGE.load(std::sync::atomic::Ordering::Relaxed) {
+        NO_RANGE => None,
+        k => Some(k),
+    }
+}
+
+/// The range a 32 GB card mines past the gate: the assigned one, `None` until a template is seen.
+pub fn assigned_range_spec() -> Option<&'static ModelSpec> {
+    network_model().shards.get(assigned_range()? as usize).copied()
 }
 
 /// Shard index of a network-model shard id on the selected network.
@@ -582,7 +547,7 @@ pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     } else if *model_id == QWEN3_8_27B.model_id {
         (daa >= crate::pom::private_inference_activation_daa()).then_some(3)
     } else if *model_id == KIMI_LINEAR_48B.model_id {
-        Some(4)
+        (!split).then_some(4)
     } else {
         None
     }
@@ -646,8 +611,8 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
         return None;
     }
     let split = daa >= crate::pom::model_split_activation_daa();
-    if split && mine_shards() {
-        return Some(shard_for_tier(tier));
+    if split && tier == Tier::VeryHigh {
+        return assigned_range_spec();
     }
     Some(match tier {
         Tier::VeryLight if split => &BOLT_E4B,
@@ -678,9 +643,16 @@ pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static M
     }
     let mut out: Vec<&'static ModelSpec> = Vec::new();
     for gate in reachable_gates(gates, chain_daa) {
-        let Some(s) = pom_model_for_tier(gate, tier) else { continue };
-        if !out.iter().any(|x| x.model_id == s.model_id) {
-            out.push(s);
+        // A 32 GB card keeps every range on disk: the chain may assign any of them.
+        let specs: Vec<&'static ModelSpec> = if tier == Tier::VeryHigh && gate >= crate::pom::model_split_activation_daa() {
+            network_model().shards.to_vec()
+        } else {
+            pom_model_for_tier(gate, tier).into_iter().collect()
+        };
+        for s in specs {
+            if !out.iter().any(|x| x.model_id == s.model_id) {
+                out.push(s);
+            }
         }
     }
     out
@@ -727,7 +699,11 @@ pub fn spec_for_tier(tier: Tier) -> &'static ModelSpec {
             return spec;
         }
     }
-    pom_model_for_tier(staging_daa(), tier).expect("the staging era carries every tier")
+    // A 32 GB card past the gate learns its range from the first template; until then it stages
+    // the first range, swapped before any load if the template assigns another.
+    pom_model_for_tier(staging_daa(), tier)
+        .or_else(|| (tier == Tier::VeryHigh).then(|| network_model().shards[0]))
+        .expect("the staging era carries every tier")
 }
 
 /// Resolves a model name/id.
@@ -745,8 +721,6 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &V4_FLASH_SHARD_1,
     &V4_FLASH_SHARD_2,
     &V4_FLASH_SHARD_3,
-    &V4_FLASH_SHARD_4,
-    &V4_FLASH_SHARD_5,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -846,10 +820,6 @@ mod tests {
             for w in nm.layers.windows(2) {
                 assert_eq!(w[0].1 + 1, w[1].0);
             }
-            for t in [Tier::VeryLight, Tier::Light, Tier::Default, Tier::High, Tier::VeryHigh] {
-                assert!((nm.shard_of_tier)(t) < nm.shards.len());
-            }
-            assert_eq!((nm.shard_of_tier)(Tier::VeryHigh), nm.shards.len() - 1);
         }
 
         // Below the gate the miner produces nothing rather than a block the node would reject.
@@ -860,56 +830,67 @@ mod tests {
         }
     }
 
-    /// The model-split era — mirror of the node's `POM_TIERS_MODEL_SPLIT`: the lineup keeps tiers
-    /// 0-4 and stays the default, shards are tiers 6-11 mined only with `--mine-shards`, the whole
-    /// model is never a mined tier. `u64::MAX` is at/after the gate on any network.
+    /// The model-split era — mirror of the node's `POM_TIERS_MODEL_SPLIT`: tiers 0-3 keep the H18
+    /// lineup, tier 4 is retired, ranges are tiers 6-9 and a 32 GB card mines the one assigned to
+    /// its escrow key. `u64::MAX` is at/after the gate on any network.
     #[test]
-    fn model_split_era_keeps_the_lineup_and_adds_shards() {
+    fn model_split_era_retires_tier_4_for_the_assigned_range() {
         let daa = u64::MAX;
         assert!(daa >= crate::pom::model_split_activation_daa());
         for (k, spec) in V4_FLASH_SHARDS.iter().enumerate() {
             assert_eq!(pom_tier_index(&spec.model_id, daa), Some(NETWORK_MODEL_TIER + 1 + k as u8), "{}", spec.name);
             assert_eq!(shard_index(&spec.model_id), Some(k as u8));
-            assert_eq!(spec.dir_name, format!("V4-Flash-shard-{}", k));
+            assert_eq!(spec.dir_name, format!("V4-Flash-0731-range-{}", k));
         }
         assert_eq!(pom_tier_index(&V4_FLASH.model_id, daa), None);
-        // the H18 lineup replaces tiers 0 and 1, the retired models are no tier at all
+        assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), None);
         assert_eq!(pom_tier_index(&BOLT_E4B.model_id, daa), Some(0));
         assert_eq!(pom_tier_index(&QWEN3_5_9B_Q8.model_id, daa), Some(1));
         assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), None);
         assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, daa), None);
         assert_eq!(pom_tier_index(&GEMMA_4_12B_ABLITERATED.model_id, daa), Some(2));
         assert_eq!(pom_tier_index(&QWEN3_8_27B.model_id, daa), Some(3));
-        assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), Some(4));
         assert_eq!(lineup_of(&BOLT_E4B.model_id), Lineup::H18);
         assert_eq!(lineup_of(&QWEN3_5_9B_Q8.model_id), Lineup::H18);
         assert_eq!(lineup_of(&GEMMA_4_12B_ABLITERATED.model_id), Lineup::H14);
-        // the lineup by default
-        assert!(!mine_shards());
         assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, BOLT_E4B.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, QWEN3_5_9B_Q8.model_id);
-        // the switch changes nothing before the gate
-        let before = crate::pom::model_split_activation_daa().saturating_sub(1).max(crate::pom::pom_v3_activation_daa());
-        set_mine_shards(true);
-        assert_eq!(pom_model_for_tier(before, Tier::Light).unwrap().model_id, GLM_4_9B_0414.model_id);
-        // with --mine-shards: one shard per card class; the 12 GB class follows the light-shard choice
-        assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, V4_FLASH_SHARD_0.model_id);
-        assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, V4_FLASH_SHARD_3.model_id);
-        assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, V4_FLASH_SHARD_4.model_id);
-        assert_eq!(pom_model_for_tier(daa, Tier::VeryHigh).unwrap().model_id, V4_FLASH_SHARD_5.model_id);
-        set_light_shard(2);
-        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, V4_FLASH_SHARD_2.model_id);
-        set_light_shard(1);
-        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, V4_FLASH_SHARD_1.model_id);
-        set_light_shard(7);
-        assert_eq!(light_shard(), 1);
-        set_mine_shards(false);
+        assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, GEMMA_4_12B_ABLITERATED.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, QWEN3_8_27B.model_id);
+        // once the gate is scheduled, a 32 GB card keeps every range on disk
+        if model_split_staged() {
+            let all = pom_models_all_eras(Tier::VeryHigh, Some(daa));
+            for spec in V4_FLASH_SHARDS {
+                assert!(all.iter().any(|s| s.model_id == spec.model_id), "{}", spec.name);
+            }
+        }
         // every network-model CID decodes to its model_id (CIDv0[2..34])
         for spec in REGISTRY.iter().skip(6) {
             let raw = base58btc_decode(spec.weight_cids[0]);
             assert_eq!(&raw[..2], &[0x12, 0x20], "{}", spec.name);
             assert_eq!(&raw[2..34], &spec.model_id, "{}", spec.name);
         }
+        let head = base58btc_decode(NETWORK_MODEL_MAINNET.head_cid);
+        assert_eq!(hex::encode(&head[2..34]), NETWORK_MODEL_MAINNET.head_digest_hex);
+    }
+
+    /// Same keying as the node: pruning point and escrow key, four ranges, spread evenly.
+    #[test]
+    fn range_follows_the_pruning_point_and_the_escrow_key() {
+        let (pp, key) = ([7u8; 32], [9u8; 32]);
+        let r = network_model_range(&pp, &key, 4);
+        assert!(r < 4);
+        assert_eq!(network_model_range(&pp, &key, 4), r);
+        assert_eq!(network_model_range(&pp, &key, 1), 0);
+        let mut seen = [0u32; 4];
+        for b in 0..=255u8 {
+            seen[network_model_range(&pp, &[b; 32], 4) as usize] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 40), "{:?}", seen);
+        assert!((0..64u8).any(|b| network_model_range(&[b; 32], &key, 4) != r));
+        // lineup models are never range-checked; a range needs the assigned one
+        assert!(range_matches(&BOLT_E4B.model_id, None));
+        assert!(!range_matches(&V4_FLASH_SHARD_0.model_id, None));
     }
 
     fn base58btc_decode(s: &str) -> Vec<u8> {

@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <string>
@@ -1443,6 +1444,13 @@ KERYX_EXPORT int keryx_shard_serve(KeryxShard* h, const char* endpoint, int n_th
     ggml_backend_rpc_set_resident(0, h->buf, names.size(), names.data(), datas.data(), sizes.data());
     h->endpoint = endpoint;
     std::string ep = h->endpoint;
+    // A server never stops: a shard loaded after another one on the same endpoint reuses it.
+    static std::mutex started_mu;
+    static std::set<std::string> started;
+    {
+        std::lock_guard<std::mutex> lk(started_mu);
+        if (!started.insert(ep).second) return 0;
+    }
     int threads = n_threads > 0 ? n_threads : 4;
     std::thread([ep, threads, dev]() {
         ggml_backend_dev_t devs[1] = { dev };

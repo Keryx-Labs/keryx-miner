@@ -500,6 +500,12 @@ impl MinerManager {
                         // at its gate so an already-running (installed) miner crosses over without
                         // a restart — the swap uninstalls the device, and the reload below brings
                         // up the era-correct model. No-op until a gate actually flips a model.
+                        let pruning_point = state.as_ref().and_then(|s| s.pruning_point());
+                        if daa >= keryx_miner::pom::model_split_activation_daa() {
+                            if let Some((range, true)) = pruning_point.as_ref().and_then(keryx_miner::models::note_template_pruning_point) {
+                                info!("PoM[gpu{}]: network-model range {} assigned under the template's pruning point.", worker_device_id, range);
+                            }
+                        }
                         keryx_miner::pom_gpu::advance_mining_tier_if_due(daa);
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
@@ -522,6 +528,14 @@ impl MinerManager {
                         }
                         if !installed {
                             std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
+                        // A range is valid only under the pruning point that assigns it: a template
+                        // from before a swap is not mined.
+                        if keryx_miner::pom_gpu::mining_model_id(worker_device_id)
+                            .is_some_and(|m| !keryx_miner::models::range_matches(&m, pruning_point.as_ref()))
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
                             continue;
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
