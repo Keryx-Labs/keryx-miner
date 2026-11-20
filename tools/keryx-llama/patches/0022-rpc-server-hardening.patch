@@ -1,0 +1,227 @@
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -353,6 +353,9 @@
+ static std::mutex keryx_resident_mutex;
+ static std::vector<keryx_resident_set> keryx_residents;
+ 
++// Every buffer ever registered as resident: a client may still name one after it was freed.
++static std::unordered_set<ggml_backend_buffer_t> keryx_ever_resident;
++
+ static bool keryx_is_resident_buffer(ggml_backend_buffer_t buffer) {
+     std::lock_guard<std::mutex> lock(keryx_resident_mutex);
+     for (const auto & r : keryx_residents) {
+@@ -363,6 +366,25 @@
+     return false;
+ }
+ 
++// A buffer that was resident and is not any more: never touched again.
++static bool keryx_is_retired_buffer(ggml_backend_buffer_t buffer) {
++    std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++    if (keryx_ever_resident.find(buffer) == keryx_ever_resident.end()) {
++        return false;
++    }
++    for (const auto & r : keryx_residents) {
++        if (r.buffer == buffer) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool keryx_was_resident_buffer(ggml_backend_buffer_t buffer) {
++    std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++    return keryx_ever_resident.find(buffer) != keryx_ever_resident.end();
++}
++
+ void ggml_backend_rpc_set_resident(uint32_t device, ggml_backend_buffer_t buffer, size_t n_tensors,
+                                    const char ** names, const void ** datas, const size_t * nbytes) {
+     std::lock_guard<std::mutex> lock(keryx_resident_mutex);
+@@ -376,6 +398,7 @@
+     if (buffer == nullptr) {
+         return;
+     }
++    keryx_ever_resident.insert(buffer);
+     keryx_resident_set set;
+     set.device = device;
+     set.buffer = buffer;
+@@ -417,11 +440,17 @@
+     return sock->recv_data(msg, msg_size);
+ }
+ 
++static const uint64_t KERYX_RPC_MAX_MSG = 256ull << 20;
++
+ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+     uint64_t size;
+     if (!sock->recv_data(&size, sizeof(size))) {
+         return false;
+     }
++    if (size > KERYX_RPC_MAX_MSG) {
++        GGML_LOG_ERROR("rpc message of %" PRIu64 " bytes refused\n", size);
++        return false;
++    }
+     try {
+         input.resize(size);
+     } catch (const std::bad_alloc & e) {
+@@ -1212,6 +1241,9 @@
+ private:
+     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
++    bool usable(ggml_backend_buffer_t buffer) const {
++        return buffers.find(buffer) != buffers.end() && !keryx_is_retired_buffer(buffer);
++    }
+     ggml_tensor * create_node(uint64_t id,
+                               struct ggml_context * ctx,
+                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
+@@ -1287,6 +1319,9 @@
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
+             __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
+         buffers.insert(buffer);
++        // a fresh allocation may reuse the address of a retired resident buffer
++        std::lock_guard<std::mutex> lock(keryx_resident_mutex);
++        keryx_ever_resident.erase(buffer);
+     } else {
+         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+     }
+@@ -1320,7 +1355,7 @@
+ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
+     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
+     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+-    if (buffers.find(buffer) == buffers.end()) {
++    if (!usable(buffer)) {
+         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+         return false;
+     }
+@@ -1332,11 +1367,11 @@
+ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
+     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+-    if (buffers.find(buffer) == buffers.end()) {
++    if (!usable(buffer)) {
+         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+         return false;
+     }
+-    if (keryx_is_resident_buffer(buffer)) {
++    if (keryx_was_resident_buffer(buffer)) {
+         return true;
+     }
+     ggml_backend_buffer_free(buffer);
+@@ -1347,7 +1382,7 @@
+ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
+     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
+     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
+-    if (buffers.find(buffer) == buffers.end()) {
++    if (!usable(buffer)) {
+         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
+         return false;
+     }
+@@ -1371,6 +1406,12 @@
+         return nullptr;
+     }
+ 
++    // ggml asserts a row is a whole number of blocks
++    if (tensor->ne[0] % ggml_blck_size((enum ggml_type)tensor->type) != 0) {
++        GGML_LOG_ERROR("[%s] row of %u elements is not a whole number of blocks\n", __func__, tensor->ne[0]);
++        return nullptr;
++    }
++
+     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
+         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+ 
+@@ -1384,7 +1425,7 @@
+         result->nb[i] = tensor->nb[i];
+     }
+     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
+-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
++    if (result->buffer && !usable(result->buffer)) {
+         result->buffer = nullptr;
+     }
+ 
+@@ -1393,8 +1434,11 @@
+         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
+         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
+         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
+-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
+-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
++        if (tensor->data + tensor_size < tensor->data ||
++            tensor->data < buffer_start || tensor->data + tensor_size > buffer_start + buffer_size) {
++            GGML_LOG_ERROR("[%s] tensor data out of its buffer\n", __func__);
++            return nullptr;
++        }
+     }
+ 
+     result->op = (ggml_op) tensor->op;
+@@ -1764,8 +1808,35 @@
+             return false;
+         }
+     }
++    // resident weights are read, never written: no computing node may land in a resident buffer
++    for (uint32_t i = 0; i < n_nodes; i++) {
++        const ggml_tensor * node = graph->nodes[i];
++        if (node == nullptr) {
++            continue;
++        }
++        switch (node->op) {
++            case GGML_OP_NONE:
++            case GGML_OP_VIEW:
++            case GGML_OP_RESHAPE:
++            case GGML_OP_PERMUTE:
++            case GGML_OP_TRANSPOSE:
++                continue;
++            default:
++                break;
++        }
++        for (const ggml_tensor * t = node; t != nullptr; t = t->view_src) {
++            if (t->buffer && keryx_was_resident_buffer(t->buffer)) {
++                GGML_LOG_ERROR("[%s] node %u writes into resident weights\n", __func__, i);
++                return false;
++            }
++        }
++    }
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    if (status != GGML_STATUS_SUCCESS) {
++        GGML_LOG_ERROR("[%s] graph compute failed: %d\n", __func__, (int) status);
++        stored_graphs[device].graph = nullptr;
++        return false;
++    }
+     stored_graphs[device].graph = graph;
+     return true;
+ }
+@@ -1781,7 +1852,10 @@
+     ggml_cgraph * graph = stored_graphs[device].graph;
+     LOG_DBG("[%s] device: %u\n", __func__, device);
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    if (status != GGML_STATUS_SUCCESS) {
++        GGML_LOG_ERROR("[%s] graph compute failed: %d\n", __func__, (int) status);
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -1801,7 +1875,7 @@
+ 
+ rpc_server::~rpc_server() {
+     for (auto buffer : buffers) {
+-        if (keryx_is_resident_buffer(buffer)) {
++        if (keryx_was_resident_buffer(buffer)) {
+             continue;
+         }
+         ggml_backend_buffer_free(buffer);
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -594,6 +594,14 @@
+         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+         return nullptr;
+     }
++    // a client that stalls must not hold the single-threaded server forever
++#ifdef _WIN32
++    DWORD timeout_ms = 600000;
++    setsockopt(client_socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
++#else
++    struct timeval tv = { 600, 0 };
++    setsockopt(client_socket_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
++#endif
+     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+ }
+ 

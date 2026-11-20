@@ -936,14 +936,28 @@ fn main() -> Result<(), Error> {
             let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(&privkey).expect("identity"));
             println!("shard test: gateway identity {}", hex::encode(identity.pubkey));
             let local = endpoint.clone();
-            let resolve: keryx_miner::shard_gateway::ShardResolver = std::sync::Arc::new(move |_id: &[u8; 32]| Some((local.clone(), 9u8)));
+            let resolve: keryx_miner::shard_gateway::ShardResolver = std::sync::Arc::new(move |_id: &[u8; 32]| Some((local.clone(), 8u8)));
             rt.spawn(async move {
-                if let Err(e) = keryx_miner::shard_gateway::serve(listen, identity, resolve).await {
+                // bench only: every head is accepted
+                let any: keryx_miner::shard_gateway::HeadAuthorizer = std::sync::Arc::new(|_: &[u8; 32], _: &[u8; 32], _: u8, _: Option<&[u8; 32]>| true);
+                if let Err(e) = keryx_miner::shard_gateway::serve(listen, identity, resolve, any).await {
                     eprintln!("shard test: gateway failed: {}", e);
                 }
             });
         }
         std::process::exit(keryx_miner::llama_engine::run_shard_test(&gguf, gpu, &endpoint));
+    }
+    // Hidden layer-range check: --range-test <gguf> --range-layers <n> --range-split <k> [--range-gpu <g>]
+    // [--range-prompt <n>] [--range-gen <n>]: the whole model against ranges [0,k] + [k+1,n-1].
+    if let Some(i) = argv.iter().position(|a| a == "--range-test") {
+        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
+        let gguf = argv.get(i + 1).cloned().unwrap_or_default();
+        let n_layer: u32 = val("--range-layers").and_then(|s| s.parse().ok()).unwrap_or(43);
+        let split: u32 = val("--range-split").and_then(|s| s.parse().ok()).unwrap_or(n_layer / 2);
+        let gpu: usize = val("--range-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let n_prompt: usize = val("--range-prompt").and_then(|s| s.parse().ok()).unwrap_or(64);
+        let n_gen: usize = val("--range-gen").and_then(|s| s.parse().ok()).unwrap_or(8);
+        std::process::exit(keryx_miner::llama_engine::run_range_test(&gguf, gpu, n_layer, split, n_prompt, n_gen));
     }
     // Hidden sparse unpack: --unpack-head <head.krxh> <out.gguf>
     if let Some(i) = argv.iter().position(|a| a == "--unpack-head") {
@@ -959,19 +973,21 @@ fn main() -> Result<(), Error> {
             }
         }
     }
-    // Hidden link-proxy check: --link-proxy <gateway host:port> [--link-model <hex64>] [--link-port <n>]
-    // [--link-key <escrow.key>]: opens the tunnel, pings, self-tests SIGN, then proxies 127.0.0.1:<n>.
+    // Hidden link-proxy check: --link-proxy <gateway host:port> --link-peer <shard key hex64> [--link-tier <n>]
+    // [--link-model <hex64>] [--link-port <n>] [--link-key <escrow.key>]: opens the tunnel, pings, self-tests SIGN, then proxies 127.0.0.1:<n>.
     if let Some(i) = argv.iter().position(|a| a == "--link-proxy") {
         let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
         let remote = argv.get(i + 1).cloned().unwrap_or_default();
         let model: [u8; 32] = val("--link-model").and_then(|h| hex::decode(h).ok()).and_then(|v| v.try_into().ok()).unwrap_or([0xABu8; 32]);
         let port: u16 = val("--link-port").and_then(|s| s.parse().ok()).unwrap_or(0);
         let key = val("--link-key").unwrap_or_else(|| "link-test-escrow.key".to_string());
+        let peer: [u8; 32] = val("--link-peer").and_then(|h| hex::decode(h).ok()).and_then(|v| v.try_into().ok()).unwrap_or([0u8; 32]);
+        let tier: u8 = val("--link-tier").and_then(|s| s.parse().ok()).unwrap_or(9);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let code = rt.block_on(async move {
             let privkey = escrow::load_or_generate_key(&key).expect("escrow key");
             let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(&privkey).expect("identity"));
-            let link = match keryx_miner::shard_gateway::connect_link(&remote, model, identity, port).await {
+            let link = match keryx_miner::shard_gateway::connect_link(&remote, model, identity, port, peer, tier).await {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("link proxy: {}", e);
@@ -1283,7 +1299,7 @@ async fn run() -> Result<(), Error> {
         let resolve: keryx_miner::shard_gateway::ShardResolver = std::sync::Arc::new(|id: &[u8; 32]| keryx_miner::pom_gpu::shard_local_endpoint(id));
         info!("Shard gateway: listening on {}, announced as {}.", listen, public);
         tokio::spawn(async move {
-            if let Err(e) = keryx_miner::shard_gateway::serve(listen, identity, resolve).await {
+            if let Err(e) = keryx_miner::shard_gateway::serve(listen, identity, resolve, keryx_miner::shard_gateway::assignment_authorizer()).await {
                 error!("Shard gateway: {}", e);
             }
         });

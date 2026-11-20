@@ -112,6 +112,15 @@ pub fn response_seen(request_hash: &[u8; 32]) -> bool {
     responses_seen().lock().map(|g| g.contains(request_hash)).unwrap_or(false)
 }
 
+/// Whether `head` heads a live assignment (`request` when given) in which `own` declared `tier`.
+pub fn authorizes(head: &[u8; 32], own: &[u8; 32], tier: u8, request: Option<&[u8; 32]>) -> bool {
+    let Ok(g) = assignments().lock() else { return false };
+    let head_tier = head_tier();
+    g.values()
+        .filter(|a| request.is_none_or(|r| a.request_hash == *r))
+        .any(|a| a.declared_keys(head_tier).contains(head) && a.declared_keys(tier).contains(own))
+}
+
 /// The shard tiers this miner serves right now.
 pub fn served_tiers() -> Vec<u8> {
     network_model().shards.iter().filter_map(|spec| crate::pom_gpu::shard_local_endpoint(&spec.model_id).map(|(_, t)| t)).collect()
@@ -228,8 +237,8 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
         let mut session = None;
         for (key, endpoint) in candidates {
             let t_connect = std::time::Instant::now();
-            match shard_gateway::connect_link(&endpoint, spec.model_id, identity.clone(), 0).await {
-                Ok(s) if s.peer_pubkey == key && s.tier == tier => {
+            match shard_gateway::connect_link(&endpoint, spec.model_id, identity.clone(), 0, key, tier).await {
+                Ok(s) => {
                     log::info!(
                         "pipeline head timing: link shard {} (tier {}) {} → 127.0.0.1:{} connected in {} ms",
                         k,
@@ -241,7 +250,6 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
                     session = Some(s);
                     break;
                 }
-                Ok(s) => log::warn!("pipeline: {} answered as tier {} key {} — skipped", endpoint, s.tier, hex::encode(s.peer_pubkey)),
                 Err(e) => log::warn!("pipeline: shard {} at {}: {}", k, endpoint, e),
             }
         }
@@ -333,6 +341,6 @@ mod tests {
     #[test]
     fn layer_map_covers_every_layer_and_the_output() {
         assert_eq!(layer_map(), "0-10:0,11-21:1,22-32:2,33-42:3,43-43:4");
-        assert_eq!(head_tier(), 9);
+        assert_eq!(head_tier(), 8);
     }
 }

@@ -28,6 +28,7 @@
 #endif
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -520,7 +521,7 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 10; }
+KERYX_EXPORT int keryx_llama_abi() { return 11; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -1470,6 +1471,209 @@ KERYX_EXPORT void keryx_shard_free(KeryxShard* h) {
     if (h->ctx) ggml_free(h->ctx);
     if (h->gguf) gguf_free(h->gguf);
     delete h;
+}
+
+// ── Layer range of the network model (protocol-restricted pipeline) ──────────────────────────────
+// A link runs its own layers on a received hyper-connection residual and hands the residual (or,
+// on the last range, the logits) back; nothing but numbers crosses the network.
+
+#ifndef __APPLE__
+extern "C" {
+extern thread_local int32_t keryx_llama_range_start;
+extern thread_local int32_t keryx_llama_range_end;
+extern thread_local ggml_backend_buffer_t keryx_llama_local_resident_buf;
+extern thread_local size_t                keryx_llama_local_resident_n;
+extern thread_local const char * const *  keryx_llama_local_resident_names;
+extern thread_local void * const *        keryx_llama_local_resident_datas;
+extern thread_local const size_t *        keryx_llama_local_resident_nbytes;
+}
+#endif
+
+struct KeryxRange {
+    llama_model*   model = nullptr;
+    llama_context* ctx   = nullptr;
+    int  first = 0, last = 0;
+    bool head  = false;          // runs the output head: returns logits
+    int  n_hc  = 0;              // residual floats per token
+    int  n_vocab = 0;
+    int  n_ctx = 0;              // per sequence
+    int  n_seq = 0;
+    int  n_ubatch = 0;
+    std::vector<int32_t> len;    // tokens held per sequence
+    std::mutex mu;
+};
+
+static const int KERYX_RANGE_MAX_UBATCH = 512;
+
+// Loads layers [first, last] of `gguf_path`, binding every tensor of `resident` (the shard this
+// miner already holds on `gpu`) in place. `n_ctx` tokens per sequence, `n_seq` sequences.
+KERYX_EXPORT KeryxRange* keryx_range_load(const char* gguf_path, int gpu, int first, int last, KeryxShard* resident,
+                                          int n_ctx, int n_seq) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+#ifdef __APPLE__
+    (void)gguf_path; (void)gpu; (void)first; (void)last; (void)resident; (void)n_ctx; (void)n_seq;
+    keryx_set_error("range", "layer ranges are CUDA-only");
+    return nullptr;
+#else
+    if (!gguf_path || first < 0 || last < first || n_ctx <= 0 || n_seq <= 0 || n_seq > 16) {
+        keryx_set_error("range", "bad range parameters");
+        return nullptr;
+    }
+    llama_backend_init();
+    std::vector<const char*> names;
+    std::vector<void*> datas;
+    std::vector<size_t> nbytes;
+    if (resident) {
+        for (size_t i = 0; i < resident->names.size(); i++) {
+            names.push_back(resident->names[i].c_str());
+            datas.push_back(resident->tensors[i]->data);
+            nbytes.push_back(ggml_nbytes(resident->tensors[i]));
+        }
+    }
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 999;
+    mp.main_gpu = gpu;
+    mp.split_mode = LLAMA_SPLIT_MODE_NONE;
+    keryx_llama_canonical_weights = false;
+    keryx_llama_range_start = first;
+    keryx_llama_range_end = last;
+    keryx_llama_local_resident_buf = resident ? resident->buf : nullptr;
+    keryx_llama_local_resident_n = names.size();
+    keryx_llama_local_resident_names = names.data();
+    keryx_llama_local_resident_datas = datas.data();
+    keryx_llama_local_resident_nbytes = nbytes.data();
+    llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    keryx_llama_range_start = -1;
+    keryx_llama_range_end = -1;
+    keryx_llama_local_resident_buf = nullptr;
+    keryx_llama_local_resident_n = 0;
+    keryx_llama_local_resident_names = nullptr;
+    keryx_llama_local_resident_datas = nullptr;
+    keryx_llama_local_resident_nbytes = nullptr;
+    if (!model) {
+        keryx_set_error("range", std::string("llama_model_load_from_file failed for ") + gguf_path);
+        return nullptr;
+    }
+    const int n_layer = llama_model_n_layer(model);
+    if (last >= n_layer) {
+        keryx_set_error("range", "range beyond the model's layers");
+        llama_model_free(model);
+        return nullptr;
+    }
+    const bool head = last == n_layer - 1;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_seq_max = (uint32_t) n_seq;
+    cp.n_ctx = (uint32_t) n_ctx * (uint32_t) n_seq;
+    cp.n_batch = KERYX_RANGE_MAX_UBATCH;
+    cp.n_ubatch = KERYX_RANGE_MAX_UBATCH;
+    cp.swa_full = false;
+    cp.kv_unified = false;
+    cp.embeddings = !head;
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        ctx = llama_init_from_model(model, cp);
+    }
+    if (!ctx) {
+        keryx_set_error("range", "llama_init_from_model failed");
+        llama_model_free(model);
+        return nullptr;
+    }
+    auto* r = new KeryxRange();
+    r->model = model;
+    r->ctx = ctx;
+    r->first = first;
+    r->last = last;
+    r->head = head;
+    r->n_hc = head ? (int) llama_model_n_embd_inp(model) : (int) llama_model_n_embd_out(model);
+    r->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    r->n_ctx = n_ctx;
+    r->n_seq = n_seq;
+    r->n_ubatch = KERYX_RANGE_MAX_UBATCH;
+    r->len.assign((size_t) n_seq, 0);
+    return r;
+#endif
+}
+
+// Residual floats per token and vocabulary size of a loaded range.
+KERYX_EXPORT void keryx_range_dims(KeryxRange* r, int* n_hc, int* n_vocab, int* head) {
+    if (!r) return;
+    if (n_hc) *n_hc = r->n_hc;
+    if (n_vocab) *n_vocab = r->n_vocab;
+    if (head) *head = r->head ? 1 : 0;
+}
+
+// Forgets sequence `seq`.
+KERYX_EXPORT void keryx_range_clear(KeryxRange* r, int seq) {
+    if (!r || seq < 0 || seq >= r->n_seq) return;
+    std::lock_guard<std::mutex> lock(r->mu);
+    llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+    r->len[(size_t) seq] = 0;
+}
+
+// Runs `n` tokens at positions [pos0, pos0+n) of sequence `seq` through the range. The first
+// range takes `tokens`, the others the residual `in` (n × n_hc floats). Writes the residual
+// (n × n_hc floats) or, for the head range, the last token's logits (n_vocab floats) to `out`.
+// 0 on success; a negative code leaves the sequence cleared.
+KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                  float* out, size_t out_floats) {
+    if (!r) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    if (seq < 0 || seq >= r->n_seq || n <= 0 || n > r->n_ubatch) return -2;
+    if (pos0 != r->len[(size_t) seq] || pos0 + n > r->n_ctx) return -3;
+    const bool from_tokens = r->first == 0;
+    if (from_tokens ? (tokens == nullptr || in != nullptr) : (in == nullptr || tokens != nullptr)) return -4;
+    if (from_tokens) {
+        for (int i = 0; i < n; i++) {
+            if (tokens[i] < 0 || tokens[i] >= r->n_vocab) return -5;
+        }
+    } else {
+        const size_t m = (size_t) n * (size_t) r->n_hc;
+        for (size_t i = 0; i < m; i++) {
+            if (!std::isfinite(in[i])) return -6;
+        }
+    }
+    const size_t want = r->head ? (size_t) r->n_vocab : (size_t) n * (size_t) r->n_hc;
+    if (!out || out_floats != want) return -7;
+
+    llama_batch batch = llama_batch_init(n, from_tokens ? 0 : r->n_hc, 1);
+    batch.n_tokens = n;
+    for (int i = 0; i < n; i++) {
+        if (from_tokens) batch.token[i] = tokens[i];
+        batch.pos[i] = pos0 + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = seq;
+        batch.logits[i] = r->head ? (i == n - 1) : 1;
+    }
+    if (!from_tokens) {
+        std::memcpy(batch.embd, in, (size_t) n * (size_t) r->n_hc * sizeof(float));
+    }
+    const int rc = llama_decode(r->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+        r->len[(size_t) seq] = 0;
+        return -8;
+    }
+    const float* res = r->head ? llama_get_logits_ith(r->ctx, n - 1) : llama_get_embeddings(r->ctx);
+    if (!res) {
+        llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+        r->len[(size_t) seq] = 0;
+        return -9;
+    }
+    std::memcpy(out, res, want * sizeof(float));
+    r->len[(size_t) seq] += n;
+    return 0;
+}
+
+KERYX_EXPORT void keryx_range_free(KeryxRange* r) {
+    if (!r) return;
+    if (r->ctx) llama_free(r->ctx);
+    if (r->model) llama_model_free(r->model);
+    delete r;
 }
 
 } // extern "C"

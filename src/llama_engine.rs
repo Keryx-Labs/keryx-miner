@@ -105,7 +105,7 @@ type SeqReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-pub(crate) const ABI: c_int = 10;
+pub(crate) const ABI: c_int = 11;
 /// Context kept for the block task while the context pad is resident.
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
@@ -1523,5 +1523,211 @@ mod tests {
         assert!(active_for(&model, 0));
         assert!(generate(&model, 0, "Reply with only OK.", 16).is_ok());
         unload(0);
+    }
+}
+
+// ── Layer ranges of the network model ─────────────────────────────────────────────────────────
+
+type RangeLoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, *mut c_void, c_int, c_int) -> *mut c_void;
+type RangeDimsFn = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int, *mut c_int);
+type RangeStepFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const i32, *const f32, *mut f32, usize) -> c_int;
+type RangeClearFn = unsafe extern "C" fn(*mut c_void, c_int);
+
+/// The range entry points of `libkeryx-llama.so`.
+#[derive(Clone, Copy)]
+struct RangeLib {
+    load: RangeLoadFn,
+    dims: RangeDimsFn,
+    step: RangeStepFn,
+    clear: RangeClearFn,
+    free: FreeFn,
+    last_error: ErrorFn,
+}
+
+fn range_lib() -> Result<RangeLib, String> {
+    static LIB: OnceLock<Result<RangeLib, String>> = OnceLock::new();
+    LIB.get_or_init(|| {
+        let so = so_path().ok_or("keryx-llama shared library not found")?;
+        let lib: &'static libloading::Library =
+            Box::leak(Box::new(unsafe { libloading::Library::new(&so) }.map_err(|e| format!("load({}): {}", so.display(), e))?));
+        unsafe {
+            let abi = sym::<AbiFn>(lib, "keryx_llama_abi").ok_or("missing keryx_llama_abi")?;
+            if abi() != ABI {
+                return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), ABI));
+            }
+            Ok(RangeLib {
+                load: sym(lib, "keryx_range_load").ok_or("missing keryx_range_load")?,
+                dims: sym(lib, "keryx_range_dims").ok_or("missing keryx_range_dims")?,
+                step: sym(lib, "keryx_range_step").ok_or("missing keryx_range_step")?,
+                clear: sym(lib, "keryx_range_clear").ok_or("missing keryx_range_clear")?,
+                free: sym(lib, "keryx_range_free").ok_or("missing keryx_range_free")?,
+                last_error: sym(lib, "keryx_llama_last_error").ok_or("missing keryx_llama_last_error")?,
+            })
+        }
+    })
+    .clone()
+}
+
+/// Layers [first, last] of the network model, running on received residuals (or tokens for the
+/// first range) and handing back the residual (or the last token's logits for the head range).
+pub struct LayerRange {
+    lib: RangeLib,
+    ptr: *mut c_void,
+    pub first: u32,
+    pub last: u32,
+    pub n_hc: usize,
+    pub n_vocab: usize,
+    pub head: bool,
+}
+
+unsafe impl Send for LayerRange {}
+
+impl LayerRange {
+    /// Loads the range from `gguf`; `resident` is the shard engine of `gpu` whose weights the
+    /// range binds in place (None loads them from the file).
+    pub fn load(gguf: &str, gpu: usize, first: u32, last: u32, resident: Option<*mut c_void>, n_ctx: u32, n_seq: u32) -> Result<Self, String> {
+        let lib = range_lib()?;
+        let path = CString::new(gguf).map_err(|_| "path contains a NUL byte".to_string())?;
+        let ptr = unsafe {
+            (lib.load)(path.as_ptr(), gpu as c_int, first as c_int, last as c_int, resident.unwrap_or(std::ptr::null_mut()), n_ctx as c_int, n_seq as c_int)
+        };
+        if ptr.is_null() {
+            let e = unsafe { CStr::from_ptr((lib.last_error)()) }.to_string_lossy().into_owned();
+            return Err(format!("range {}-{} of {}: {}", first, last, gguf, e));
+        }
+        let (mut n_hc, mut n_vocab, mut head) = (0 as c_int, 0 as c_int, 0 as c_int);
+        unsafe { (lib.dims)(ptr, &mut n_hc, &mut n_vocab, &mut head) };
+        Ok(Self { lib, ptr, first, last, n_hc: n_hc as usize, n_vocab: n_vocab as usize, head: head != 0 })
+    }
+
+    /// Floats `step` writes for `n` tokens.
+    pub fn out_len(&self, n: usize) -> usize {
+        if self.head {
+            self.n_vocab
+        } else {
+            n * self.n_hc
+        }
+    }
+
+    /// Runs `n` tokens of sequence `seq` from position `pos0`: `tokens` for the first range,
+    /// `input` (n × n_hc floats) for the others.
+    pub fn step(&self, seq: u32, pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<Vec<f32>, i32> {
+        let n = tokens.map(|t| t.len()).or(input.map(|i| i.len() / self.n_hc.max(1))).unwrap_or(0);
+        if let Some(i) = input {
+            if i.len() != n * self.n_hc {
+                return Err(-100);
+            }
+        }
+        let mut out = vec![0f32; self.out_len(n)];
+        let rc = unsafe {
+            (self.lib.step)(
+                self.ptr,
+                seq as c_int,
+                pos0 as c_int,
+                n as c_int,
+                tokens.map_or(std::ptr::null(), |t| t.as_ptr()),
+                input.map_or(std::ptr::null(), |i| i.as_ptr()),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if rc == 0 {
+            Ok(out)
+        } else {
+            Err(rc)
+        }
+    }
+
+    /// Forgets sequence `seq`.
+    pub fn clear(&self, seq: u32) {
+        unsafe { (self.lib.clear)(self.ptr, seq as c_int) };
+    }
+}
+
+impl Drop for LayerRange {
+    fn drop(&mut self) {
+        unsafe { (self.lib.free)(self.ptr) };
+    }
+}
+
+/// Equivalence check of the layer ranges: runs `n_prompt` tokens then `n_gen` greedy steps through
+/// the whole model as one range, then through the ranges [0, split] and [split+1, last], and
+/// compares the logits. Exit code for the hidden `--range-test` mode: 0 equal within tolerance,
+/// 41 load, 42 step, 43 mismatch.
+pub fn run_range_test(gguf: &str, gpu: usize, n_layer: u32, split: u32, n_prompt: usize, n_gen: usize) -> i32 {
+    let last = n_layer - 1;
+    let prompt: Vec<i32> = (0..n_prompt).map(|i| 1000 + ((i as i32 * 7919) % 30_000)).collect();
+    let argmax = |v: &[f32]| v.iter().enumerate().fold((0usize, f32::MIN), |b, (i, x)| if *x > b.1 { (i, *x) } else { b }).0 as i32;
+
+    // whole model
+    let whole = match LayerRange::load(gguf, gpu, 0, last, None, 4096, 1) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("range test: {}", e);
+            return 41;
+        }
+    };
+    let mut reference: Vec<Vec<f32>> = Vec::new();
+    let mut tokens = prompt.clone();
+    let mut pos = 0u32;
+    let mut feed = prompt.clone();
+    for _ in 0..=n_gen {
+        let logits = match whole.step(0, pos, Some(&feed), None) {
+            Ok(l) => l,
+            Err(rc) => {
+                eprintln!("range test: whole step failed ({})", rc);
+                return 42;
+            }
+        };
+        pos += feed.len() as u32;
+        let next = argmax(&logits);
+        reference.push(logits);
+        tokens.push(next);
+        feed = vec![next];
+    }
+    drop(whole);
+
+    // two ranges
+    let (a, b) = match (LayerRange::load(gguf, gpu, 0, split, None, 4096, 1), LayerRange::load(gguf, gpu, split + 1, last, None, 4096, 1)) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("range test: {}", e);
+            return 41;
+        }
+    };
+    println!("range test: ranges 0-{} ({} floats/token out) and {}-{} loaded", split, a.n_hc, split + 1, last);
+    let mut pos = 0u32;
+    let mut feed: Vec<i32> = prompt.clone();
+    let mut worst = 0f32;
+    for (step, want) in reference.iter().enumerate() {
+        let hc = match a.step(0, pos, Some(&feed), None) {
+            Ok(h) => h,
+            Err(rc) => {
+                eprintln!("range test: first range failed ({})", rc);
+                return 42;
+            }
+        };
+        let logits = match b.step(0, pos, None, Some(&hc)) {
+            Ok(l) => l,
+            Err(rc) => {
+                eprintln!("range test: head range failed ({})", rc);
+                return 42;
+            }
+        };
+        let diff = logits.iter().zip(want.iter()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        worst = worst.max(diff);
+        println!("range test: step {:>2}: max |Δlogit| = {:.3e}, argmax {} vs {}", step, diff, argmax(&logits), argmax(want));
+        pos += feed.len() as u32;
+        feed = vec![tokens[prompt.len() + step]];
+    }
+    // the guard rails: a wrong position and a non-finite residual are refused
+    let stale = a.step(0, 0, Some(&[1]), None);
+    let nan = b.step(0, pos, None, Some(&vec![f32::NAN; b.n_hc]));
+    println!("range test: wrong position → {:?}, non-finite residual → {:?}", stale.as_ref().err(), nan.as_ref().err());
+    println!("range test: worst max |Δlogit| = {:.3e}", worst);
+    if worst <= 1e-3 && stale.is_err() && nan.is_err() {
+        0
+    } else {
+        43
     }
 }
