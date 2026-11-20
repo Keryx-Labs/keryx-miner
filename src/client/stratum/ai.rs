@@ -363,13 +363,32 @@ mod tests {
 /// POSTs a trace record to `{url}/{request_hash}`. Blocking.
 pub(super) fn upload_record(url: &str, request_hash_hex: &str, blob: &[u8]) -> Result<u16, String> {
     let target = format!("{}/{}", url.trim_end_matches('/'), request_hash_hex.to_ascii_lowercase());
+    post_record(&target, blob, UPLOAD_IDLE, UPLOAD_REPLY, UPLOAD_ATTEMPTS, std::time::Duration::from_secs(5))
+}
+
+/// Longest a record upload may make no progress. No total deadline: a large record on a slow
+/// uplink goes through as long as bytes keep moving.
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait for the reply once the body is written; the socket buffer may still be draining.
+const UPLOAD_REPLY: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn post_record(
+    target: &str,
+    blob: &[u8],
+    idle: std::time::Duration,
+    reply: std::time::Duration,
+    attempts: u32,
+    backoff: std::time::Duration,
+) -> Result<u16, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout_read(reply)
+        .timeout_write(idle)
         .build();
     let mut last = String::new();
-    for attempt in 1..=UPLOAD_ATTEMPTS {
-        match agent.post(&target).set("Content-Type", "application/octet-stream").send_bytes(blob) {
+    for attempt in 1..=attempts {
+        match agent.post(target).set("Content-Type", "application/octet-stream").send_bytes(blob) {
             Ok(r) => return Ok(r.status()),
             Err(ureq::Error::Status(code, _)) if code < 500 && code != 408 && code != 429 => {
                 return Err(format!("HTTP {code}"));
@@ -377,9 +396,71 @@ pub(super) fn upload_record(url: &str, request_hash_hex: &str, blob: &[u8]) -> R
             Err(ureq::Error::Status(code, _)) => last = format!("HTTP {code}"),
             Err(e) => last = e.to_string(),
         }
-        if attempt < UPLOAD_ATTEMPTS {
-            std::thread::sleep(std::time::Duration::from_secs(5 * attempt as u64));
+        if attempt < attempts {
+            std::thread::sleep(backoff * attempt);
         }
     }
     Err(last)
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::post_record;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    /// Serves one POST, reading the body in `chunk`-byte steps with `pause` between them, then 200.
+    fn slow_server(chunk: usize, pause: Duration) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut buf = vec![0u8; chunk];
+            let mut got = 0;
+            while got < len {
+                std::thread::sleep(pause);
+                let n = r.read(&mut buf[..chunk.min(len - got)]).unwrap();
+                got += n;
+            }
+            let mut s = s;
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+        });
+        format!("http://{}/r", addr)
+    }
+
+    #[test]
+    fn a_slow_upload_that_keeps_moving_outlasts_the_idle_limit() {
+        let url = slow_server(256 * 1024, Duration::from_millis(40));
+        let blob = vec![7u8; 16 * 1024 * 1024];
+        let t = std::time::Instant::now();
+        assert_eq!(post_record(&url, &blob, Duration::from_millis(500), Duration::from_secs(30), 1, Duration::ZERO), Ok(200));
+        assert!(t.elapsed() > Duration::from_millis(1500), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_stalled_upload_is_cut() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/r", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (_s, _) = l.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+        let blob = vec![7u8; 64 * 1024 * 1024];
+        let t = std::time::Instant::now();
+        assert!(post_record(&url, &blob, Duration::from_millis(500), Duration::from_secs(30), 1, Duration::ZERO).is_err());
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
 }
