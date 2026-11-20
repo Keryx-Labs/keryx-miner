@@ -351,3 +351,14 @@
      cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
      cb(cur, "hc_head", -1);
  
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -324,6 +324,7 @@
+ 
+         // always create Hadamard rotation tensors for DeepSeek lightning indexers
+         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
++                n_embd_head_k_all > 0 &&
+                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+             attn_rot_k = true;
+         }
