@@ -172,7 +172,8 @@ pub enum HeadDecision {
 }
 
 /// Serve right away as the chosen head once every tier has declared, as a substitute after
-/// [`SUBSTITUTE_DELAY`] without a response on chain; wait meanwhile, mining on.
+/// [`SUBSTITUTE_DELAY`] without a response on chain; wait meanwhile, mining on. Only declared
+/// signers count on chain, so an incomplete pipeline is never served.
 pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa: u64) -> HeadDecision {
     let Some(identity) = identity() else { return HeadDecision::Drop("no escrow identity") };
     if response_seen(request_hash) {
@@ -189,13 +190,10 @@ pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa
     if !a.declared_keys(head_tier).contains(&identity.pubkey) {
         return if waited > ASSIGNMENT_WAIT { HeadDecision::Drop("own declaration not in the audit") } else { HeadDecision::Wait };
     }
-    if a.chosen_key(head_tier) == Some(identity.pubkey) {
-        if a.complete() || waited > ASSIGNMENT_WAIT {
-            HeadDecision::Serve
-        } else {
-            HeadDecision::Wait
-        }
-    } else if waited > SUBSTITUTE_DELAY {
+    if !a.complete() {
+        return HeadDecision::Wait;
+    }
+    if a.chosen_key(head_tier) == Some(identity.pubkey) || waited > SUBSTITUTE_DELAY {
         HeadDecision::Serve
     } else {
         HeadDecision::Wait
@@ -221,17 +219,12 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
             endpoints.push(own);
             continue;
         }
-        // the declared keys in order (chosen first), then any recent advertiser of the shard
-        let mut candidates: Vec<([u8; 32], String)> = assignment
+        // the declared keys in order, chosen first: only a declared link counts on chain
+        let candidates: Vec<([u8; 32], String)> = assignment
             .declared_keys(tier)
             .into_iter()
             .filter_map(|k| shard_gateway::peer_endpoint(&k).map(|ep| (k, ep)))
             .collect();
-        for (k, ep) in shard_gateway::peers_for(&spec.model_id) {
-            if !candidates.iter().any(|(c, _)| *c == k) {
-                candidates.push((k, ep));
-            }
-        }
         let mut session = None;
         for (key, endpoint) in candidates {
             let t_connect = std::time::Instant::now();

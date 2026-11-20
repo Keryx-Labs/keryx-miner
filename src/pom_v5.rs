@@ -19,12 +19,14 @@ pub const POM_V5_P_ROUNDS: u32 = 1_920;
 pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
 /// Context pad tiles of each H14 tier from the node `pad_margin_activation`. Mirror of `POM_V5_PAD_TILES_H16`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
-/// Context pad tiles of each H18 lineup tier from the model split. Mirror of `POM_V5_PAD_TILES_H18`.
-pub const POM_V5_PAD_TILES_H18: [u64; 5] = [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632];
+/// Context pad tiles of each model-split tier (H18 lineup, whole model, four ranges). Mirror of
+/// `POM_V5_PAD_TILES_H18`.
+pub const POM_V5_PAD_TILES_H18: [u64; 10] =
+    [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
 
 /// Context pad tiles of `tier` at `daa`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
-    let table = if daa >= crate::pom::model_split_activation_daa() {
+    let table: &[u64] = if daa >= crate::pom::model_split_activation_daa() {
         &POM_V5_PAD_TILES_H18
     } else if daa >= crate::pom::pad_margin_activation_daa() {
         &POM_V5_PAD_TILES_H16
@@ -249,7 +251,13 @@ mod tests {
     fn pad_tables_are_frozen() {
         assert_eq!(POM_V5_PAD_TILES_H14, [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432]);
         assert_eq!(POM_V5_PAD_TILES_H16, [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632]);
-        assert_eq!(POM_V5_PAD_TILES_H18, [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632]);
+        assert_eq!(
+            POM_V5_PAD_TILES_H18,
+            [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240]
+        );
+        for k in 0..4u8 {
+            assert!(pom_v5_pad_tiles(crate::models::NETWORK_MODEL_TIER + 1 + k, u64::MAX) > 0);
+        }
         assert_eq!(pom_v5_pad_tiles(1, u64::MAX), POM_V5_PAD_TILES_H18[1]);
         for t in 0..POM_V5_PAD_TILES_H14.len() {
             assert_eq!(POM_V5_PAD_TILES_H16[t], POM_V5_PAD_TILES_H14[t] - 204_800);
