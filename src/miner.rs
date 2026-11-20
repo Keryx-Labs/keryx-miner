@@ -76,7 +76,7 @@ fn pom_v5_pad(device_id: u32, daa: u64) -> Option<([u8; 32], u64)> {
     let n = keryx_miner::pom_v5::pom_v5_pad_tiles(tier, daa);
     if n == 0 {
         if !NO_PAD_WARNED.swap(true, Ordering::AcqRel) {
-            warn!("PoM v5: tier {} has no context pad — this tier cannot be mined", tier);
+            warn!("PoM v5: tier {} has no context pad — this tier cannot be mined", keryx_miner::models::tier_label(tier));
         }
         return None;
     }

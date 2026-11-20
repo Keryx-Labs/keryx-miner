@@ -337,7 +337,7 @@ pub const V4_FLASH_SHARD_3: ModelSpec = ModelSpec {
     ctx_cap: 4_096,
 };
 
-/// The four mainnet ranges, layer order (`V4_FLASH_SHARDS[k]` is tier `6 + k`).
+/// The four mainnet ranges, layer order (`V4_FLASH_SHARDS[k]` is tier `5 + k`).
 pub const V4_FLASH_SHARDS: [&ModelSpec; 4] = [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3];
 
 // Devnet bench network model: Qwen3.5-9B in two shards ─ mirror of the node's
@@ -437,7 +437,16 @@ pub fn network_model() -> &'static NetworkModelSpec {
 }
 
 /// First tier index of the network model — mirror of the node's `NETWORK_MODEL_TIER`.
-pub const NETWORK_MODEL_TIER: u8 = 5;
+pub const NETWORK_MODEL_TIER: u8 = 4;
+
+/// Tier as shown to users: a network-model range reads `4 range k`.
+pub fn tier_label(tier: u8) -> String {
+    if tier > NETWORK_MODEL_TIER {
+        format!("{} range {}", NETWORK_MODEL_TIER, tier - NETWORK_MODEL_TIER - 1)
+    } else {
+        tier.to_string()
+    }
+}
 
 /// Range index assigned to an escrow key under a pruning point — mirror of the node's
 /// `network_model_range`.
@@ -831,10 +840,10 @@ mod tests {
     }
 
     /// The model-split era — mirror of the node's `POM_TIERS_MODEL_SPLIT`: tiers 0-3 keep the H18
-    /// lineup, tier 4 is retired, ranges are tiers 6-9 and a 32 GB card mines the one assigned to
+    /// lineup, tier 4 is the network model, ranges are tiers 5-8 and a 32 GB card mines the one assigned to
     /// its escrow key. `u64::MAX` is at/after the gate on any network.
     #[test]
-    fn model_split_era_retires_tier_4_for_the_assigned_range() {
+    fn model_split_era_mines_the_assigned_range() {
         let daa = u64::MAX;
         assert!(daa >= crate::pom::model_split_activation_daa());
         for (k, spec) in V4_FLASH_SHARDS.iter().enumerate() {

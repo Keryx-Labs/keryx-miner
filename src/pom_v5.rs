@@ -19,10 +19,10 @@ pub const POM_V5_P_ROUNDS: u32 = 1_920;
 pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
 /// Context pad tiles of each H14 tier from the node `pad_margin_activation`. Mirror of `POM_V5_PAD_TILES_H16`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
-/// Context pad tiles of each model-split tier (H18 lineup, whole model, four ranges). Mirror of
+/// Context pad tiles of each model-split tier (tiers 0-3, whole network model, four ranges). Mirror of
 /// `POM_V5_PAD_TILES_H18`.
-pub const POM_V5_PAD_TILES_H18: [u64; 10] =
-    [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
+pub const POM_V5_PAD_TILES_H18: [u64; 9] =
+    [780_288, 1_778_688, 4_599_808, 6_266_880, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
 
 /// Context pad tiles of `tier` at `daa`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(POM_V5_PAD_TILES_H16, [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632]);
         assert_eq!(
             POM_V5_PAD_TILES_H18,
-            [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240]
+            [780_288, 1_778_688, 4_599_808, 6_266_880, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240]
         );
         for k in 0..4u8 {
             assert!(pom_v5_pad_tiles(crate::models::NETWORK_MODEL_TIER + 1 + k, u64::MAX) > 0);

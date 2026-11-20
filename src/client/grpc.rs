@@ -3195,7 +3195,7 @@ impl KeryxdHandler {
                     match link.sign(&message).await {
                         Ok(l) => signed_links.push(l),
                         Err(e) => {
-                            warn!("Inference: link {} (tier {}) did not sign the response: {} — AiResponse skipped", link.remote, link.tier, e);
+                            warn!("Inference: link {} (tier {}) did not sign the response: {} — AiResponse skipped", link.remote, keryx_miner::models::tier_label(link.tier), e);
                             return;
                         }
                     }

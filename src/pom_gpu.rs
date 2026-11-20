@@ -2353,7 +2353,7 @@ fn downgrade_after_oom(device_id: u32, failed_model: &[u8; 32], daa: u64) -> boo
         Some((tier, spec)) => {
             let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
             let Some(hw_tier) = crate::models::tier_from_index(tier) else { return false };
-            info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, failed_tier, tier, spec.name);
+            info!("PoM[gpu{}]: OOM on tier {} — downgrading to tier {} ({}).", device_id, crate::models::tier_label(failed_tier), crate::models::tier_label(tier), spec.name);
             if let Ok(mut mt) = mining_tiers().lock() {
                 if let Ok(mut dt) = device_tiers().lock() {
                     dt.insert(device_id, hw_tier);
@@ -2446,7 +2446,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
             Err(p) => p.into_inner(),
         };
         if crate::pom::active_index_for_model(&model_id).is_none() {
-            info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", tier, device_id);
+            info!("PoM: building host weight index for tier {} (gpu{}) - this can take a while...", crate::models::tier_label(tier), device_id);
             match crate::pom::WeightIndex::build_from_gguf(&gguf, model_id) {
                 Ok(mut idx) => {
                     // Opt-in: hold the full Merkle tree in RAM for lookup-time proof build.
@@ -2459,16 +2459,16 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
                                 avail / 1_000_000_000, need_gb, tier
                             ),
                             _ => {
-                                info!("PoM: building resident tree for tier {} (~{} GB RAM)...", tier, need_gb);
+                                info!("PoM: building resident tree for tier {} (~{} GB RAM)...", crate::models::tier_label(tier), need_gb);
                                 idx.build_dense();
                             }
                         }
                     }
-                    info!("PoM: tier {} host index ready — N={} chunks", tier, idx.n_chunks);
+                    info!("PoM: tier {} host index ready — N={} chunks", crate::models::tier_label(tier), idx.n_chunks);
                     crate::pom::set_index(model_id, idx);
                 }
                 Err(e) => {
-                    log::error!("PoM: host index build failed for tier {} on gpu{}: {}", tier, device_id, e);
+                    log::error!("PoM: host index build failed for tier {} on gpu{}: {}", crate::models::tier_label(tier), device_id, e);
                     return false;
                 }
             }
@@ -2609,7 +2609,7 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     // N-guard: the gather must match the host index, else blocks would be rejected.
     if let Some(idx) = crate::pom::active_index_for_model(&model_id) {
         if n != idx.n_chunks {
-            log::error!("PoM[gpu{}]: gather N={} != tier {} index N={} — refusing to mine", device_id, n, tier, idx.n_chunks);
+            log::error!("PoM[gpu{}]: gather N={} != tier {} index N={} — refusing to mine", device_id, n, crate::models::tier_label(tier), idx.n_chunks);
             return false;
         }
     }
