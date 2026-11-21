@@ -1868,14 +1868,16 @@ impl KeryxdHandler {
                 info!("Inference: heading a pipeline for id={} (max_tokens={})", stable_id, max_tokens);
                 tokio::spawn(async move {
                     let started = std::time::Instant::now();
-                    let (result, links) = match keryx_miner::pipeline::run_head(request_hash, prompt, max_tokens).await {
-                        Ok(r) => (Some(keryx_miner::llm::Generated { text: r.text, trace: None, device: 0 }), r.links),
+                    let (result, links, transient) = match keryx_miner::pipeline::run_head(request_hash, prompt, max_tokens).await {
+                        Ok(r) => (Some(keryx_miner::llm::Generated { text: r.text, trace: None, device: 0 }), r.links, false),
                         Err(e) => {
-                            log::warn!("Inference: pipeline head failed for id={} — {}; AiResponse skipped", stable_id, e);
-                            (None, Vec::new())
+                            // a link not reachable yet may be by the next try; a prompt too long never fits
+                            let transient = !e.contains("do not fit");
+                            log::warn!("Inference: pipeline head failed for id={} — {}{}", stable_id, e, if transient { " (retried)" } else { "; AiResponse skipped" });
+                            (None, Vec::new(), transient)
                         }
                     };
-                    let _ = tx_done.send((result, started.elapsed().as_secs_f64(), false, links));
+                    let _ = tx_done.send((result, started.elapsed().as_secs_f64(), transient, links));
                 });
                 self.inference_rx = Some(job);
                 return Ok(());

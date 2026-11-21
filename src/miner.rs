@@ -521,14 +521,30 @@ impl MinerManager {
                             return Err("CUDA fault during PoM rebuild — this GPU is abandoned".into());
                         }
                         if !installed {
-                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            if let Some(cmd) = block_channel.get_changed()? {
+                                state = match cmd {
+                                    Some(WorkerCommand::Job(ns)) => Some(ns),
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    None => None,
+                                };
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
                             continue;
                         }
                         // A range is mined only while the node assigns it to this escrow key.
                         if keryx_miner::pom_gpu::mining_model_id(worker_device_id)
                             .is_some_and(|m| !keryx_miner::models::range_matches(&m))
                         {
-                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            if let Some(cmd) = block_channel.get_changed()? {
+                                state = match cmd {
+                                    Some(WorkerCommand::Job(ns)) => Some(ns),
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    None => None,
+                                };
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
                             continue;
                         }
                         let h3 = daa >= keryx_miner::pom::pom_level_activation_daa();
@@ -563,7 +579,15 @@ impl MinerManager {
                                     model.and_then(|m| keryx_miner::pom::active_index_for_model(&m)).is_some()
                                 )
                             });
-                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            if let Some(cmd) = block_channel.get_changed()? {
+                                state = match cmd {
+                                    Some(WorkerCommand::Job(ns)) => Some(ns),
+                                    Some(WorkerCommand::Close) => return Ok(()),
+                                    None => None,
+                                };
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                            }
                             continue;
                         }
                         let found = keryx_miner::pom_gpu::mine(worker_device_id, &pph, time, &target_le, pom_nonce, batch, h3, walk_v2, h5_1, h5_2, v3, v4, h10, h14, pad);

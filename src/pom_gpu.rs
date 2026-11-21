@@ -1994,6 +1994,9 @@ pub fn advance_mining_tier_if_due(daa: u64) {
         if device_dead(dev) {
             continue;
         }
+        // Never swap under a build in progress on that card: the next template retries.
+        let lifecycle = device_lifecycle(dev);
+        let Ok(_life) = lifecycle.try_lock() else { continue };
         let (current, spec, gguf) = {
             let Ok(mut mt) = mining_tiers().lock() else { continue };
             let Some(tier) = device_tiers().lock().ok().and_then(|g| g.get(&dev).copied()) else { continue };
@@ -2261,7 +2264,7 @@ pub fn ensure_installed(device_id: u32, daa: u64) -> bool {
     if inference_paused_for(device_id) {
         return false;
     }
-    if mining_model_id(device_id).is_some_and(|m| crate::llm::model_is_unavailable(&m)) {
+    if mining_model_id(device_id).is_some_and(|m| crate::llm::model_is_unavailable(&m) && !crate::llm::shard_retry_due(&m)) {
         park(device_id);
         return false;
     }

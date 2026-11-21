@@ -560,6 +560,11 @@ fn probeable(reason: &str) -> bool {
     matches!(reason, "llama_load_failed" | "llama_load_oom" | "llama_engine_load_failed" | "llama_engine_oom")
 }
 
+/// A network-model range that failed to load: retried by loading it again, never probed.
+fn shard_reason(reason: &str) -> bool {
+    reason.starts_with("shard_engine")
+}
+
 fn probe_backoff(attempts: u32) -> Duration {
     PROBE_BACKOFF_INITIAL.saturating_mul(1u32 << attempts.min(16)).min(PROBE_BACKOFF_MAX)
 }
@@ -572,12 +577,14 @@ pub fn mark_model_unavailable(model_id: &[u8; 32], reason: &str) {
     if models.contains_key(model_id) {
         return;
     }
-    let retry = probeable(reason) && recoveries < MAX_PROBE_RECOVERIES;
+    let retry = (probeable(reason) && recoveries < MAX_PROBE_RECOVERIES) || shard_reason(reason);
     let next_probe = retry.then(|| Instant::now() + PROBE_BACKOFF_INITIAL);
     models.insert(*model_id, Withdrawal { reason: reason.to_string(), attempts: 0, next_probe });
     drop(models);
     let id = hex::encode(model_id);
-    if retry {
+    if shard_reason(reason) {
+        log::warn!("LlmEngine: range {:.8} withdrawn from ai:cap ({}) — load retried in {}s", id, reason, PROBE_BACKOFF_INITIAL.as_secs());
+    } else if retry {
         log::warn!(
             "LlmEngine: model {:.8} withdrawn from ai:cap ({}) — mining on its tier parked until it serves again, first probe in {}s",
             id, reason, PROBE_BACKOFF_INITIAL.as_secs()
@@ -643,7 +650,22 @@ pub fn withdrawn_model_due_for_probe() -> Option<[u8; 32]> {
     }
     let now = Instant::now();
     let models = unavailable_models().read().unwrap();
-    models.iter().filter(|(_, w)| w.next_probe.is_some_and(|t| t <= now)).map(|(id, _)| *id).min()
+    models.iter().filter(|(_, w)| !shard_reason(&w.reason) && w.next_probe.is_some_and(|t| t <= now)).map(|(id, _)| *id).min()
+}
+
+/// Whether a range withdrawn after a failed load is due for another load attempt; each attempt
+/// pushes the next one further out.
+pub fn shard_retry_due(model_id: &[u8; 32]) -> bool {
+    let mut models = unavailable_models().write().unwrap();
+    let Some(w) = models.get_mut(model_id) else { return false };
+    if !shard_reason(&w.reason) || w.next_probe.is_none_or(|t| t > Instant::now()) {
+        return false;
+    }
+    w.attempts += 1;
+    let delay = probe_backoff(w.attempts);
+    w.next_probe = Some(Instant::now() + delay);
+    log::info!("LlmEngine: retrying the load of range {:.8} ({}), next retry in {}s if it fails", hex::encode(model_id), w.reason, delay.as_secs());
+    true
 }
 
 /// Try to serve a withdrawn model again; it is re-announced on success. Blocking.
@@ -2115,6 +2137,28 @@ mod tests {
 
         assert!(discover_model_files(root.path(), &[spec]).is_empty());
         assert!(source.exists());
+    }
+
+    #[test]
+    fn a_range_that_failed_to_load_is_retried_never_probed() {
+        let model_id = [0xa9u8; 32];
+        mark_model_unavailable(&model_id, "shard_engine_load_failed");
+        assert!(model_is_unavailable(&model_id));
+        assert!(!shard_retry_due(&model_id), "not before its first delay");
+        // due now: one attempt is allowed and the next one moves further out
+        unavailable_models().write().unwrap().get_mut(&model_id).unwrap().next_probe = Some(Instant::now());
+        assert_ne!(withdrawn_model_due_for_probe(), Some(model_id), "no inference probe for a range");
+        assert!(shard_retry_due(&model_id));
+        assert!(!shard_retry_due(&model_id));
+        assert_eq!(withdrawal_state(&model_id), Some((1, true)));
+        mark_model_available(&model_id, "shard_engine_loaded");
+        assert!(!model_is_unavailable(&model_id));
+        // an inference model is never retried this way
+        let other = [0xaau8; 32];
+        mark_model_unavailable(&other, "llama_engine_oom");
+        unavailable_models().write().unwrap().get_mut(&other).unwrap().next_probe = Some(Instant::now());
+        assert!(!shard_retry_due(&other));
+        mark_model_available(&other, "test");
     }
 
     #[test]
