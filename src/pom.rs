@@ -907,7 +907,33 @@ struct CacheMetadata {
 }
 
 fn cache_metadata_path(tree_path: &Path) -> PathBuf {
-    tree_path.with_file_name(CACHE_METADATA_FILE)
+    match tree_path.file_name().and_then(|n| n.to_str()) {
+        Some(TREE_FILE) | None => tree_path.with_file_name(CACHE_METADATA_FILE),
+        Some(_) => tree_path.with_extension("json"),
+    }
+}
+
+const TREE_FILE: &str = "pom-tree.bin";
+
+/// Tree cache of a GGUF: `pom-tree.bin` beside `model.gguf`, `<stem>.pom-tree.bin` beside any other
+/// file, so several GGUFs sharing a directory keep separate caches.
+fn tree_path_for(gguf_path: &Path) -> PathBuf {
+    let dir = gguf_path.parent().unwrap_or_else(|| Path::new("."));
+    match gguf_path.file_name().and_then(|n| n.to_str()) {
+        Some("model.gguf") | None => dir.join(TREE_FILE),
+        Some(_) => {
+            let stem = gguf_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+            dir.join(format!("{stem}.{TREE_FILE}"))
+        }
+    }
+}
+
+/// `<tree>.<suffix>` beside a tree cache file.
+fn tree_sibling(tree_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = tree_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(suffix);
+    tree_path.with_file_name(name)
 }
 
 fn validate_cache_metadata(
@@ -1136,7 +1162,7 @@ impl WeightIndex {
     /// subsequent restarts the existing tree is reused (GGUF is immutable), avoiding a rebuild.
     pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
-        let tree_path = dir.join("pom-tree.bin");
+        let tree_path = tree_path_for(std::path::Path::new(path));
 
         // Clean up old PID-named files left by previous versions.
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1151,7 +1177,7 @@ impl WeightIndex {
         }
 
         // One process builds a model's tree at a time; the others wait and reuse it.
-        let _lock = TreeLock::acquire(&dir.join("pom-tree.bin.lock"))?;
+        let _lock = TreeLock::acquire(&tree_sibling(&tree_path, "lock"))?;
 
         // Reuse existing checkpoint tree if valid.
         if tree_path.exists() {
@@ -1179,7 +1205,7 @@ impl WeightIndex {
         let batch_size = 1u64 << k; // 64 for K=6
 
         // Built aside and renamed once complete, so an interrupted build leaves no partial tree.
-        let building_path = dir.join("pom-tree.bin.building");
+        let building_path = tree_sibling(&tree_path, "building");
         let mut writer = BufWriter::new(
             OpenOptions::new()
                 .read(true)
@@ -2082,6 +2108,21 @@ mod tests {
         bytes[0] ^= 1;
         std::fs::write(&tree, bytes).unwrap();
         assert!(validate_cache_metadata(&metadata, &tree, model_id, 123, 456, root).is_err());
+    }
+
+    #[test]
+    fn tree_cache_files_are_per_gguf() {
+        let d = std::path::Path::new("/m/V4-Flash-0731");
+        assert_eq!(tree_path_for(&d.join("model.gguf")), d.join("pom-tree.bin"));
+        assert_eq!(cache_metadata_path(&d.join("pom-tree.bin")), d.join(CACHE_METADATA_FILE));
+        let t0 = tree_path_for(&d.join("shard-0.gguf"));
+        let t1 = tree_path_for(&d.join("shard-1.gguf"));
+        assert_eq!(t0, d.join("shard-0.pom-tree.bin"));
+        assert_ne!(t0, t1);
+        assert_eq!(cache_metadata_path(&t0), d.join("shard-0.pom-tree.json"));
+        assert_ne!(cache_metadata_path(&t0), cache_metadata_path(&t1));
+        assert_eq!(tree_sibling(&t0, "lock"), d.join("shard-0.pom-tree.bin.lock"));
+        assert_eq!(tree_sibling(&d.join("pom-tree.bin"), "building"), d.join("pom-tree.bin.building"));
     }
 
     #[test]

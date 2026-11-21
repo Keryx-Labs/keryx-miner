@@ -1999,7 +1999,12 @@ pub fn advance_mining_tier_if_due(daa: u64) {
             let Some(tier) = device_tiers().lock().ok().and_then(|g| g.get(&dev).copied()) else { continue };
             // No model for this tier in the era being entered: nothing to swap to, the device simply
             // has nothing valid to mine until its own gate.
-            let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else { continue };
+            let Some(spec) = crate::models::pom_model_for_tier(daa, tier) else {
+                if tier == crate::models::Tier::VeryHigh && daa >= crate::pom::model_split_activation_daa() {
+                    warn_no_range(dev);
+                }
+                continue;
+            };
             let current = mt.get(&dev).map(|(id, _)| *id);
             if current == Some(spec.model_id) {
                 continue;
@@ -2047,6 +2052,58 @@ pub fn advance_mining_tier_if_due(daa: u64) {
             // Leaked to satisfy the &'static lineup API — at most once per era crossing.
             crate::llm::init_supported(Box::leak(union.into_boxed_slice()));
         }
+    }
+}
+
+/// A 32 GB card idles until a block template assigns it a range; says so every 10 minutes.
+fn warn_no_range(device_id: u32) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if last.is_some_and(|t| t.elapsed().as_secs() < 600) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    log::warn!(
+        "PoM[gpu{}]: no tier {} range assigned yet — this card idles until the node's block template assigns one (pool mining does not carry range assignments yet).",
+        device_id,
+        crate::models::NETWORK_MODEL_TIER
+    );
+}
+
+/// Builds the on-disk tree cache of the range assigned for the next epoch in the background, so
+/// the switch at the epoch boundary reuses it instead of hashing the whole range. Once per range.
+pub fn prefetch_next_range(range: u8) {
+    static STARTED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    let serves_ranges = device_tiers().lock().is_ok_and(|g| g.values().any(|t| *t == crate::models::Tier::VeryHigh));
+    if !serves_ranges {
+        return;
+    }
+    let Some(spec) = crate::models::network_model().shards.get(range as usize).copied() else { return };
+    if crate::pom::active_index_for_model(&spec.model_id).is_some() {
+        return;
+    }
+    let gguf = crate::llm::gguf_path_for(spec);
+    if !gguf.exists() {
+        return;
+    }
+    {
+        let mut started = STARTED.lock().unwrap_or_else(|p| p.into_inner());
+        if started.contains(&range) {
+            return;
+        }
+        started.push(range);
+    }
+    let label = crate::models::tier_label(crate::models::NETWORK_MODEL_TIER + 1 + range);
+    let spawned = std::thread::Builder::new().name(format!("range-{}-tree", range)).spawn(move || {
+        let _guard = index_build_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let t = std::time::Instant::now();
+        match crate::pom::WeightIndex::build_from_gguf(&gguf.to_string_lossy(), spec.model_id) {
+            Ok(_) => info!("PoM: tier {} weight index prepared for the next epoch ({:.0} s).", label, t.elapsed().as_secs_f64()),
+            Err(e) => log::warn!("PoM: could not prepare the tier {} weight index: {}", label, e),
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("PoM: could not start the range {} index build: {}", range, e);
     }
 }
 

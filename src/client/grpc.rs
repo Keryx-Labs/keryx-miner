@@ -3473,6 +3473,7 @@ impl KeryxdHandler {
                     }
                     if let Some(next) = next {
                         info!("PoM: network-model range {} assigned for the next epoch.", next);
+                        keryx_miner::pom_gpu::prefetch_next_range(next);
                     }
                 }
                 static TEMPLATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
