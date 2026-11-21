@@ -195,6 +195,9 @@ message GetBlockTemplateResponseMessage{
   // H14: armed network-model audits for pipeline heads (";"-separated entries).
   string pipelineAssignments = 11;
 
+  // Model split: network-model range of the template's escrow key, "current:next".
+  string rangeAssignment = 12;
+
   RPCError error = 1000;
 }
 

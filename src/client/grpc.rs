@@ -3467,6 +3467,14 @@ impl KeryxdHandler {
             Payload::GetBlockTemplateResponse(template) => {
                 // H14: the drawn links of every armed network-model audit.
                 keryx_miner::pipeline::note_assignments(&template.pipeline_assignments);
+                if let Some((range, changed, next)) = keryx_miner::models::note_template_range(&template.range_assignment) {
+                    if changed {
+                        info!("PoM: network-model range {} assigned to this escrow key.", range);
+                    }
+                    if let Some(next) = next {
+                        info!("PoM: network-model range {} assigned for the next epoch.", next);
+                    }
+                }
                 static TEMPLATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = TEMPLATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let daa = template.block.as_ref().and_then(|b| b.header.as_ref()).map_or(0, |h| h.daa_score);

@@ -1305,11 +1305,6 @@ async fn run() -> Result<(), Error> {
         });
     }
 
-    if let Some(key) = escrow_privkey.as_deref().and_then(|k| escrow::pubkey_hex_from_privkey(k).ok()).and_then(|h| hex::decode(h).ok()) {
-        if let Ok(key) = <[u8; 32]>::try_from(key.as_slice()) {
-            keryx_miner::models::set_range_escrow_key(key);
-        }
-    }
     let escrow_cert: Option<String> = match (&escrow_privkey, opt.mining_address.as_deref()) {
         (Some(privkey), Some(address)) => {
             let escrow_pubkey_hex = escrow::pubkey_hex_from_privkey(privkey)?;

@@ -236,10 +236,9 @@ pub fn lineup_of(model_id: &[u8; 32]) -> Lineup {
 }
 
 // ── Network model ───────────────────────────────────────────────────────────────────────────────
-// Active at `crate::pom::model_split_activation_daa()`. Tier 4 is retired: from the gate a 32 GB card
-// mines one of the four ranges of DeepSeek-V4-Flash-0731 (Q2), the one the chain assigns to its
-// escrow key under the template's pruning point (`assigned_range`). The whole model is the id
-// AiRequests target; nobody mines it. model_id bytes MUST equal the node's `POM_TIERS_MODEL_SPLIT`.
+// Active at `crate::pom::model_split_activation_daa()`. From the gate a 32 GB card mines one of the
+// four ranges of DeepSeek-V4-Flash-0731 (Q2), the one the node assigns to its escrow key in the
+// template (`assigned_range`). The whole model (tier 4) is the id AiRequests target. model_id bytes MUST equal the node's `POM_TIERS_MODEL_SPLIT`.
 
 /// The whole network model — DeepSeek-V4-Flash-0731 abliterated (huihui-ai, ds4, Q2). Request
 /// target and pipeline-head capability only; never downloaded, walked or mined as such.
@@ -448,47 +447,47 @@ pub fn tier_label(tier: u8) -> String {
     }
 }
 
-/// Range index assigned to an escrow key under a pruning point — mirror of the node's
-/// `network_model_range`.
-pub fn network_model_range(pruning_point: &[u8; 32], escrow_pubkey: &[u8; 32], n_shards: usize) -> u8 {
-    let mut h = blake3::Hasher::new();
-    h.update(b"KeryxRangeV1");
-    h.update(pruning_point);
-    h.update(escrow_pubkey);
-    let word = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
-    (word % n_shards.max(1) as u64) as u8
-}
-
-/// Escrow key of the coinbase this miner builds; the range is keyed on it.
-static RANGE_ESCROW_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-
-pub fn set_range_escrow_key(key: [u8; 32]) {
-    let _ = RANGE_ESCROW_KEY.set(key);
-}
-
-/// Range assigned under the latest template's pruning point; `NO_RANGE` until one is seen.
+/// Range the node assigns this miner's escrow key, from the latest template; `NO_RANGE` until seen.
 static ASSIGNED_RANGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(NO_RANGE);
+/// Range of the next epoch, `NO_RANGE` while unknown.
+static NEXT_RANGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(NO_RANGE);
 const NO_RANGE: u8 = u8::MAX;
 
-/// Records the pruning point of a block template and returns the range it assigns, `None` without
-/// an escrow key. Returns whether it changed through the second value.
-pub fn note_template_pruning_point(pruning_point: &[u8; 32]) -> Option<(u8, bool)> {
-    let key = RANGE_ESCROW_KEY.get()?;
-    let range = network_model_range(pruning_point, key, network_model().shards.len());
-    let prev = ASSIGNED_RANGE.swap(range, std::sync::atomic::Ordering::Relaxed);
-    Some((range, prev != range))
+/// Parses a template's `current:next` range assignment (next may be empty).
+pub fn parse_range_assignment(s: &str) -> Option<(u8, Option<u8>)> {
+    let (current, next) = s.split_once(':')?;
+    let n = network_model().shards.len();
+    let current: u8 = current.parse().ok().filter(|k| (*k as usize) < n)?;
+    let next = match next {
+        "" => None,
+        k => Some(k.parse::<u8>().ok().filter(|k| (*k as usize) < n)?),
+    };
+    Some((current, next))
 }
 
-/// Range a pruning point assigns this miner's escrow key, `None` without a key.
-pub fn range_for(pruning_point: &[u8; 32]) -> Option<u8> {
-    Some(network_model_range(pruning_point, RANGE_ESCROW_KEY.get()?, network_model().shards.len()))
+/// Records a template's range assignment. Returns the current range, whether it changed, and the
+/// next range when it is newly known and differs from the current one.
+pub fn note_template_range(s: &str) -> Option<(u8, bool, Option<u8>)> {
+    let (current, next) = parse_range_assignment(s)?;
+    let prev = ASSIGNED_RANGE.swap(current, std::sync::atomic::Ordering::Relaxed);
+    let prev_next = NEXT_RANGE.swap(next.unwrap_or(NO_RANGE), std::sync::atomic::Ordering::Relaxed);
+    let announce = next.filter(|k| *k != current && *k != prev_next);
+    Some((current, prev != current, announce))
 }
 
-/// Whether a block mined by `model_id` under `pruning_point` carries the range the node expects:
-/// true for any lineup model, and for a range only when it is the assigned one.
-pub fn range_matches(model_id: &[u8; 32], pruning_point: Option<&[u8; 32]>) -> bool {
+/// Whether a block mined by `model_id` carries the range the node expects: true for any lineup
+/// model, and for a range only when it is the assigned one.
+pub fn range_matches(model_id: &[u8; 32]) -> bool {
     let Some(k) = shard_index(model_id) else { return true };
-    pruning_point.and_then(range_for) == Some(k)
+    assigned_range() == Some(k)
+}
+
+/// The range assigned for the next epoch, if known.
+pub fn next_range() -> Option<u8> {
+    match NEXT_RANGE.load(std::sync::atomic::Ordering::Relaxed) {
+        NO_RANGE => None,
+        k => Some(k),
+    }
 }
 
 /// The range the latest template assigns this miner, if known.
@@ -883,23 +882,17 @@ mod tests {
         assert_eq!(hex::encode(&head[2..34]), NETWORK_MODEL_MAINNET.head_digest_hex);
     }
 
-    /// Same keying as the node: pruning point and escrow key, four ranges, spread evenly.
+    /// The range comes from the template: `current:next`, next empty until known.
     #[test]
-    fn range_follows_the_pruning_point_and_the_escrow_key() {
-        let (pp, key) = ([7u8; 32], [9u8; 32]);
-        let r = network_model_range(&pp, &key, 4);
-        assert!(r < 4);
-        assert_eq!(network_model_range(&pp, &key, 4), r);
-        assert_eq!(network_model_range(&pp, &key, 1), 0);
-        let mut seen = [0u32; 4];
-        for b in 0..=255u8 {
-            seen[network_model_range(&pp, &[b; 32], 4) as usize] += 1;
-        }
-        assert!(seen.iter().all(|&n| n > 40), "{:?}", seen);
-        assert!((0..64u8).any(|b| network_model_range(&[b; 32], &key, 4) != r));
+    fn range_assignment_is_parsed_from_the_template() {
+        assert_eq!(parse_range_assignment("2:3"), Some((2, Some(3))));
+        assert_eq!(parse_range_assignment("1:"), Some((1, None)));
+        assert_eq!(parse_range_assignment(""), None);
+        assert_eq!(parse_range_assignment("9:1"), None);
+        assert_eq!(parse_range_assignment("1:9"), None);
+        assert_eq!(parse_range_assignment("x:1"), None);
         // lineup models are never range-checked; a range needs the assigned one
-        assert!(range_matches(&BOLT_E4B.model_id, None));
-        assert!(!range_matches(&V4_FLASH_SHARD_0.model_id, None));
+        assert!(range_matches(&BOLT_E4B.model_id));
     }
 
     fn base58btc_decode(s: &str) -> Vec<u8> {
