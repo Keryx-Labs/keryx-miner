@@ -1,14 +1,9 @@
-//! Gateway in front of the in-process shard rpc servers (H14), and the head-side link proxy.
+//! Gateway of a network-model link (H14), and the head side of it.
 //!
-//! A shard miner listens on one public TCP port. A pipeline head connects, both sides prove
-//! their escrow key over an ephemeral secp256k1 ECDH handshake, and everything after runs in
-//! ChaCha20-Poly1305 frames: tunnelled ggml-rpc bytes to the loopback shard server, plus
-//! control frames (ping, and the link signature of a response). The ggml-rpc server itself is
-//! never exposed: it has no authentication of its own.
-//!
-//! On the head, `connect_link` opens a control tunnel to a shard and a loopback listener whose
-//! every accepted connection is tunnelled to that shard, so the ggml-rpc client in
-//! `libkeryx-llama.so` only ever talks to 127.0.0.1.
+//! A link miner listens on one public TCP port. A pipeline head connects, both sides prove their
+//! escrow key over an ephemeral secp256k1 ECDH handshake, and everything after runs in
+//! ChaCha20-Poly1305 frames. The link only ever runs its own layers: the head sends token ids or
+//! a residual of fixed shape, the link answers with its residual. No graph or code crosses.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,7 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 const MAGIC: &[u8; 4] = b"KRXG";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const CLIENT_DOMAIN: &[u8] = b"KeryxGatewayClientV1";
 const SERVER_DOMAIN: &[u8] = b"KeryxGatewayServerV1";
 const RESPONDER_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
@@ -44,9 +39,6 @@ fn reauth_interval() -> Duration {
 const SIGN_AFTER_DATA: Duration = Duration::from_secs(3600);
 const MAX_FRAME: usize = 16 << 20;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// A link that sends nothing for this long is dead: closing its loopback socket fails the head's
-/// current decode instead of leaving it blocked.
-const LINK_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CONTROL_KEEPALIVE: Duration = Duration::from_secs(30);
 
 // server-side idle limit of a session (a head that vanished must not keep the GPU paused)
@@ -56,8 +48,8 @@ fn session_idle_timeout() -> Duration {
     Duration::from_millis(SESSION_IDLE_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Holds the GPU for the head from its first rpc byte to the end of the session: PoW and PoM
-/// stay paused.
+/// Holds the GPU for the head from its first step to the end of its sequence: PoW and PoM stay
+/// paused.
 struct ShardSessionGuard;
 
 impl ShardSessionGuard {
@@ -75,12 +67,16 @@ impl Drop for ShardSessionGuard {
 /// Recent-coinbase memory of the peer directory, in DAA (the node's eligibility window).
 const PEER_MEMORY_DAA: u64 = 6_000;
 
-const FRAME_DATA: u8 = 0;
 const FRAME_PING: u8 = 1;
 const FRAME_PONG: u8 = 2;
 const FRAME_SIGN: u8 = 3;
 const FRAME_SIGNED: u8 = 4;
 const FRAME_ERROR: u8 = 5;
+const FRAME_OPEN: u8 = 6;
+const FRAME_OPENED: u8 = 7;
+const FRAME_STEP: u8 = 8;
+const FRAME_RESULT: u8 = 9;
+const FRAME_CLOSE: u8 = 10;
 
 const STATUS_OK: u8 = 0;
 const STATUS_NO_SHARD: u8 = 1;
@@ -353,9 +349,34 @@ pub fn peer_endpoint(escrow_pubkey: &[u8; 32]) -> Option<String> {
 
 // ── Server ────────────────────────────────────────────────────────────────────────────────────
 
-/// Resolves a shard model_id to its local rpc endpoint and tier — set by the miner once a shard
-/// is served. Absent = not served here.
-pub type ShardResolver = Arc<dyn Fn(&[u8; 32]) -> Option<(String, u8)> + Send + Sync>;
+/// Shape of a served layer range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeDims {
+    /// Residual floats per token, in and out.
+    pub n_hc: usize,
+    pub n_vocab: usize,
+    /// Tokens one sequence holds.
+    pub n_ctx: u32,
+    /// The range takes token ids instead of a residual.
+    pub from_tokens: bool,
+}
+
+/// The layers a link computes for its heads.
+pub trait RangeCompute: Send + Sync {
+    fn dims(&self) -> RangeDims;
+    /// Reserves a sequence.
+    fn open(&self) -> Result<u32, String>;
+    /// Runs `n` tokens of `seq` from `pos0`: token ids or `n × n_hc` residual floats in, `n × n_hc` floats out.
+    fn step(&self, seq: u32, pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<Vec<f32>, String>;
+    /// Forgets and releases `seq`.
+    fn close(&self, seq: u32);
+}
+
+/// Brings up the range of a served shard (blocking, may load).
+pub type RangeProvider = Arc<dyn Fn() -> Result<Arc<dyn RangeCompute>, String> + Send + Sync>;
+
+/// Resolves a shard model_id to its tier and range — `None` unless this miner mines and serves it.
+pub type ShardResolver = Arc<dyn Fn(&[u8; 32]) -> Option<(u8, RangeProvider)> + Send + Sync>;
 
 /// Whether `head` may use this miner's shard of `tier`: it is the declared head of a live
 /// assignment where `own` declared that tier, for `request` when given.
@@ -365,6 +386,11 @@ pub type HeadAuthorizer = Arc<dyn Fn(&[u8; 32], &[u8; 32], u8, Option<&[u8; 32]>
 pub fn assignment_authorizer() -> HeadAuthorizer {
     Arc::new(|head: &[u8; 32], own: &[u8; 32], tier: u8, request: Option<&[u8; 32]>| crate::pipeline::authorizes(head, own, tier, request))
 }
+
+/// Tokens one `STEP` carries at most.
+pub const MAX_STEP_TOKENS: usize = 128;
+/// How long a head waits for one step of a link.
+const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn open_sessions() -> &'static Mutex<HashMap<[u8; 32], usize>> {
     static S: OnceLock<Mutex<HashMap<[u8; 32], usize>>> = OnceLock::new();
@@ -399,20 +425,20 @@ impl Drop for SessionSlot {
     }
 }
 
-/// Last time each head moved rpc bytes through this gateway.
-fn data_seen() -> &'static Mutex<HashMap<[u8; 32], std::time::Instant>> {
-    static D: OnceLock<Mutex<HashMap<[u8; 32], std::time::Instant>>> = OnceLock::new();
+/// Last time each (head, request) computed through this gateway.
+fn computed() -> &'static Mutex<HashMap<([u8; 32], [u8; 32]), std::time::Instant>> {
+    static D: OnceLock<Mutex<HashMap<([u8; 32], [u8; 32]), std::time::Instant>>> = OnceLock::new();
     D.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn note_data(head: &[u8; 32]) {
-    let mut g = data_seen().lock().unwrap_or_else(|p| p.into_inner());
+fn note_computed(head: &[u8; 32], request: &[u8; 32]) {
+    let mut g = computed().lock().unwrap_or_else(|p| p.into_inner());
     g.retain(|_, t| t.elapsed() < SIGN_AFTER_DATA);
-    g.insert(*head, std::time::Instant::now());
+    g.insert((*head, *request), std::time::Instant::now());
 }
 
-fn computed_recently(head: &[u8; 32]) -> bool {
-    data_seen().lock().map(|g| g.get(head).is_some_and(|t| t.elapsed() < SIGN_AFTER_DATA)).unwrap_or(false)
+fn computed_for(head: &[u8; 32], request: &[u8; 32]) -> bool {
+    computed().lock().map(|g| g.get(&(*head, *request)).is_some_and(|t| t.elapsed() < SIGN_AFTER_DATA)).unwrap_or(false)
 }
 
 /// The one message signed per (request, head): a retry of the same message is signed again,
@@ -428,6 +454,82 @@ fn may_sign(request: [u8; 32], head: [u8; 32], digest: [u8; 32]) -> bool {
         g.clear();
     }
     *g.entry((request, head)).or_insert(digest) == digest
+}
+
+fn f32s_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn bytes_to_f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// Input of one step.
+#[derive(Debug, PartialEq)]
+pub enum StepInput {
+    Tokens(Vec<i32>),
+    Residual(Vec<f32>),
+}
+
+impl StepInput {
+    fn len(&self, n_hc: usize) -> usize {
+        match self {
+            StepInput::Tokens(t) => t.len(),
+            StepInput::Residual(r) => r.len() / n_hc.max(1),
+        }
+    }
+
+    fn encode(&self, pos0: u32, n_hc: usize) -> Vec<u8> {
+        let n = self.len(n_hc) as u32;
+        let mut out = Vec::with_capacity(8 + n as usize * 4 * n_hc.max(1));
+        out.extend_from_slice(&pos0.to_le_bytes());
+        out.extend_from_slice(&n.to_le_bytes());
+        match self {
+            StepInput::Tokens(t) => t.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes())),
+            StepInput::Residual(r) => out.extend_from_slice(&f32s_to_bytes(r)),
+        }
+        out
+    }
+}
+
+/// Decodes and checks a `STEP` against the open sequence: holds `len` tokens of `max_len`.
+fn parse_step(payload: &[u8], dims: &RangeDims, len: u32, max_len: u32) -> Result<(u32, StepInput), &'static str> {
+    if payload.len() < 8 {
+        return Err("step: short frame");
+    }
+    let pos0 = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    let n = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    if n == 0 || n > MAX_STEP_TOKENS {
+        return Err("step: token count");
+    }
+    if pos0 != len {
+        return Err("step: position");
+    }
+    if pos0 as u64 + n as u64 > max_len as u64 {
+        return Err("step: beyond the session length");
+    }
+    let data = &payload[8..];
+    let per_token = if dims.from_tokens { 4 } else { dims.n_hc * 4 };
+    if per_token == 0 || data.len() != n * per_token {
+        return Err("step: size");
+    }
+    if dims.from_tokens {
+        let ids: Vec<i32> = data.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        if ids.iter().any(|&t| t < 0 || t as usize >= dims.n_vocab) {
+            return Err("step: token id");
+        }
+        Ok((pos0, StepInput::Tokens(ids)))
+    } else {
+        let x = bytes_to_f32s(data);
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err("step: non-finite residual");
+        }
+        Ok((pos0, StepInput::Residual(x)))
+    }
 }
 
 /// Runs the gateway listener until the process ends.
@@ -451,9 +553,9 @@ pub async fn serve(listen: String, identity: Arc<GatewayIdentity>, resolve: Shar
         let authorize = authorize.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, server_handshake(stream, &identity, &resolve, &authorize)).await {
-                Ok(Ok((stream, keys, local, client_pk, tier, slot))) => {
+                Ok(Ok((stream, keys, provider, client_pk, tier, slot))) => {
                     log::debug!("shard gateway: session from {} (head {})", peer, hex::encode(client_pk));
-                    if let Err(e) = server_session(stream, keys, local, identity, tier, client_pk, authorize).await {
+                    if let Err(e) = server_session(stream, keys, provider, identity, tier, client_pk, authorize).await {
                         log::debug!("shard gateway: session {} ended: {}", peer, e);
                     }
                     drop(slot);
@@ -470,7 +572,7 @@ async fn server_handshake(
     identity: &GatewayIdentity,
     resolve: &ShardResolver,
     authorize: &HeadAuthorizer,
-) -> Result<(TcpStream, SessionKeys, String, [u8; 32], u8, SessionSlot), String> {
+) -> Result<(TcpStream, SessionKeys, RangeProvider, [u8; 32], u8, SessionSlot), String> {
     let nonce: [u8; 32] = rand::random();
     let mut challenge = Vec::with_capacity(CHALLENGE_LEN);
     challenge.extend_from_slice(MAGIC);
@@ -499,7 +601,7 @@ async fn server_handshake(
         reply.resize(REPLY_LEN, 0);
         reply
     };
-    let Some((local, tier)) = resolve(&model_id) else {
+    let Some((tier, provider)) = resolve(&model_id) else {
         let _ = stream.write_all(&refuse(STATUS_NO_SHARD)).await;
         return Err(format!("no shard {} served here", hex::encode(model_id)));
     };
@@ -527,13 +629,23 @@ async fn server_handshake(
     stream.write_all(&reply).await.map_err(|e| e.to_string())?;
     let shared = SharedSecret::new(&client_eph_pk, &eph_secret);
     let keys = session_keys(&shared, &transcript(&model_id, &client_eph, &server_eph, &client_pk, &identity.pubkey, &nonce, tier));
-    Ok((stream, keys, local, client_pk, tier, slot))
+    Ok((stream, keys, provider, client_pk, tier, slot))
+}
+
+/// The sequence a head holds on this link.
+struct OpenRange {
+    request: [u8; 32],
+    max_len: u32,
+    len: u32,
+    seq: u32,
+    compute: Arc<dyn RangeCompute>,
+    dims: RangeDims,
 }
 
 async fn server_session(
     stream: TcpStream,
     keys: SessionKeys,
-    local: String,
+    provider: RangeProvider,
     identity: Arc<GatewayIdentity>,
     tier: u8,
     head_pubkey: [u8; 32],
@@ -551,9 +663,7 @@ async fn server_session(
             }
         }
     });
-    let (local_done_tx, mut local_done) = mpsc::channel::<()>(1);
-    let mut local_wr: Option<tokio::net::tcp::OwnedWriteHalf> = None;
-    let mut local_reader: Option<tokio::task::JoinHandle<()>> = None;
+    let mut open: Option<OpenRange> = None;
     let mut pause: Option<ShardSessionGuard> = None;
     let mut reauth = tokio::time::interval(reauth_interval());
     reauth.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -561,6 +671,7 @@ async fn server_session(
     let end_of_life = tokio::time::sleep(MAX_SESSION);
     tokio::pin!(end_of_life);
     let mut idle_until = tokio::time::Instant::now() + session_idle_timeout();
+    let refused = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
     let result: std::io::Result<()> = loop {
         let frame = tokio::select! {
             f = frames.recv() => f,
@@ -579,9 +690,6 @@ async fn server_session(
             _ = &mut writer => {
                 break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head stopped reading"));
             }
-            _ = local_done.recv() => {
-                break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "shard server closed the connection"));
-            }
         };
         let (kind, payload) = match frame {
             Some(Ok(f)) => f,
@@ -590,85 +698,144 @@ async fn server_session(
         };
         idle_until = tokio::time::Instant::now() + session_idle_timeout();
         match kind {
-            FRAME_DATA if !payload.is_empty() => {
-                if local_wr.is_none() {
-                    // first data frame: open the loopback rpc connection lazily
-                    let sock = match TcpStream::connect(&local).await {
-                        Ok(s) => {
-                            let _ = s.set_nodelay(true);
-                            s
-                        }
-                        Err(e) => {
-                            let _ = out_tx.try_send((FRAME_ERROR, b"shard server unreachable".to_vec()));
-                            break Err(e);
-                        }
-                    };
-                    let (mut lrd, lwr) = sock.into_split();
-                    let out = out_tx.clone();
-                    let done = local_done_tx.clone();
-                    local_reader = Some(tokio::spawn(async move {
-                        let mut buf = vec![0u8; 256 * 1024];
-                        loop {
-                            match lrd.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if out.send((FRAME_DATA, buf[..n].to_vec())).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        let _ = done.try_send(());
-                    }));
-                    local_wr = Some(lwr);
-                    pause = Some(ShardSessionGuard::new());
+            FRAME_OPEN => {
+                let msg: Option<&'static str> = if open.is_some() {
+                    Some("open: a sequence is already open")
+                } else if payload.len() != 36 {
+                    Some("open: bad length")
+                } else {
+                    None
+                };
+                if let Some(msg) = msg {
+                    let _ = out_tx.send((FRAME_ERROR, msg.as_bytes().to_vec())).await;
+                    break Err(refused(msg));
                 }
-                note_data(&head_pubkey);
-                if let Some(w) = local_wr.as_mut() {
-                    match tokio::time::timeout(WRITE_DEADLINE, w.write_all(&payload)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => break Err(e),
-                        Err(_) => break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "shard server stopped reading")),
+                let request: [u8; 32] = payload[..32].try_into().unwrap();
+                let max_len = u32::from_le_bytes(payload[32..36].try_into().unwrap());
+                if !authorize(&head_pubkey, &identity.pubkey, tier, Some(&request)) {
+                    let _ = out_tx.send((FRAME_ERROR, b"open: request not assigned".to_vec())).await;
+                    break Err(refused("open: request not assigned"));
+                }
+                let p = provider.clone();
+                let compute = match tokio::task::spawn_blocking(move || p()).await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
+                        log::warn!("shard gateway: range unavailable: {}", e);
+                        let _ = out_tx.send((FRAME_ERROR, b"open: range unavailable".to_vec())).await;
+                        break Err(refused("open: range unavailable"));
                     }
+                    Err(_) => {
+                        let _ = out_tx.send((FRAME_ERROR, b"open: range unavailable".to_vec())).await;
+                        break Err(refused("open: range unavailable"));
+                    }
+                };
+                let dims = compute.dims();
+                if max_len == 0 || max_len > dims.n_ctx {
+                    let _ = out_tx.send((FRAME_ERROR, b"open: length".to_vec())).await;
+                    break Err(refused("open: length"));
+                }
+                let seq = match compute.open() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        let _ = out_tx.send((FRAME_ERROR, b"open: busy".to_vec())).await;
+                        break Err(refused("open: busy"));
+                    }
+                };
+                let mut reply = Vec::with_capacity(9);
+                reply.extend_from_slice(&(dims.n_hc as u32).to_le_bytes());
+                reply.extend_from_slice(&(dims.n_vocab as u32).to_le_bytes());
+                reply.push(dims.from_tokens as u8);
+                open = Some(OpenRange { request, max_len, len: 0, seq, compute, dims });
+                if out_tx.send((FRAME_OPENED, reply)).await.is_err() {
+                    break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head stopped reading"));
                 }
             }
+            FRAME_STEP => {
+                let Some(o) = open.as_mut() else {
+                    let _ = out_tx.send((FRAME_ERROR, b"step: no open sequence".to_vec())).await;
+                    break Err(refused("step: no open sequence"));
+                };
+                let (pos0, input) = match parse_step(&payload, &o.dims, o.len, o.max_len) {
+                    Ok(x) => x,
+                    Err(msg) => {
+                        let _ = out_tx.send((FRAME_ERROR, msg.as_bytes().to_vec())).await;
+                        break Err(refused(msg));
+                    }
+                };
+                if pause.is_none() {
+                    pause = Some(ShardSessionGuard::new());
+                }
+                let n = input.len(o.dims.n_hc) as u32;
+                let (compute, seq) = (o.compute.clone(), o.seq);
+                let out = tokio::task::spawn_blocking(move || match &input {
+                    StepInput::Tokens(t) => compute.step(seq, pos0, Some(t), None),
+                    StepInput::Residual(r) => compute.step(seq, pos0, None, Some(r)),
+                })
+                .await;
+                let out = match out {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        log::warn!("shard gateway: step failed: {}", e);
+                        let _ = out_tx.send((FRAME_ERROR, b"step: compute failed".to_vec())).await;
+                        break Err(refused("step: compute failed"));
+                    }
+                    Err(_) => {
+                        let _ = out_tx.send((FRAME_ERROR, b"step: compute failed".to_vec())).await;
+                        break Err(refused("step: compute failed"));
+                    }
+                };
+                o.len += n;
+                note_computed(&head_pubkey, &o.request);
+                if out_tx.send((FRAME_RESULT, f32s_to_bytes(&out))).await.is_err() {
+                    break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head stopped reading"));
+                }
+            }
+            FRAME_CLOSE => {
+                if let Some(o) = open.take() {
+                    o.compute.close(o.seq);
+                }
+                pause = None;
+            }
             FRAME_PING => {
-                let _ = out_tx.try_send((FRAME_PONG, payload));
+                let _ = out_tx.send((FRAME_PONG, payload)).await;
             }
             FRAME_SIGN => {
                 // The served tier and the authenticated head are bound here, not taken from the head;
-                // the request must be assigned to both, and the head must have computed through us.
+                // the request must be assigned to both, and the head must have computed it through us.
                 if payload.len() < keryx_inference::AI_RESPONSE_PAYLOAD_LEN || payload.len() > keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN {
-                    let _ = out_tx.try_send((FRAME_ERROR, b"sign: bad length".to_vec()));
+                    let _ = out_tx.send((FRAME_ERROR, b"sign: bad length".to_vec())).await;
                     continue;
                 }
                 let request: [u8; 32] = payload[..32].try_into().unwrap();
                 let digest = link_digest(tier, &head_pubkey, &payload);
                 let refusal: Option<&[u8]> = if !authorize(&head_pubkey, &identity.pubkey, tier, Some(&request)) {
                     Some(b"sign: request not assigned")
-                } else if !computed_recently(&head_pubkey) {
-                    Some(b"sign: no computation through this link")
+                } else if !computed_for(&head_pubkey, &request) {
+                    Some(b"sign: request not computed through this link")
                 } else if !may_sign(request, head_pubkey, digest) {
                     Some(b"sign: another response already signed")
                 } else {
                     None
                 };
                 if let Some(msg) = refusal {
-                    let _ = out_tx.try_send((FRAME_ERROR, msg.to_vec()));
+                    let _ = out_tx.send((FRAME_ERROR, msg.to_vec())).await;
                     continue;
                 }
                 let sig = identity.sign_digest(&digest);
                 let mut reply = Vec::with_capacity(32 + 64);
                 reply.extend_from_slice(&identity.pubkey);
                 reply.extend_from_slice(&sig);
-                let _ = out_tx.try_send((FRAME_SIGNED, reply));
+                let _ = out_tx.send((FRAME_SIGNED, reply)).await;
             }
-            _ => {}
+            _ => {
+                let _ = out_tx.send((FRAME_ERROR, b"unknown frame".to_vec())).await;
+                break Err(refused("unknown frame"));
+            }
         }
     };
     reader.abort();
-    if let Some(h) = local_reader {
-        h.abort();
+    if let Some(o) = open.take() {
+        o.compute.close(o.seq);
     }
     drop(pause);
     drop(out_tx);
@@ -681,13 +848,31 @@ async fn server_session(
 
 // ── Client (pipeline head) ─────────────────────────────────────────────────────────────────────
 
+type Reply = oneshot::Sender<Result<(u8, Vec<u8>), String>>;
+
 enum Ctl {
-    Sign(Vec<u8>, oneshot::Sender<Result<keryx_inference::AiResponseLink, String>>),
+    /// A frame answered by exactly one frame.
+    Call(u8, Vec<u8>, Reply),
+    /// A frame with no answer.
+    Send(u8, Vec<u8>),
     Ping(oneshot::Sender<Result<Duration, String>>),
 }
 
-/// A shard reached through its gateway: a loopback port the ggml-rpc client connects to, and a
-/// control tunnel for pings and the link signature.
+enum Pending {
+    Ping(std::time::Instant, Option<oneshot::Sender<Result<Duration, String>>>),
+    Reply(Reply),
+}
+
+/// What a link reports when its sequence opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkDims {
+    pub n_hc: usize,
+    pub n_vocab: usize,
+    pub from_tokens: bool,
+}
+
+/// A shard reached through its gateway: one encrypted connection carrying its sequence's steps,
+/// pings and the link signature.
 pub struct LinkSession {
     pub remote: String,
     pub model_id: [u8; 32],
@@ -695,22 +880,13 @@ pub struct LinkSession {
     pub peer_pubkey: [u8; 32],
     /// This head's escrow key, which the link binds into its signature.
     pub head_pubkey: [u8; 32],
-    pub local_port: u16,
     ctl: mpsc::Sender<Ctl>,
-    /// The loopback listener and its tunnels: they end with the session.
-    accept: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for LinkSession {
-    fn drop(&mut self) {
-        self.accept.abort();
-    }
+    dims: Mutex<Option<LinkDims>>,
 }
 
 struct Tunnel {
     stream: TcpStream,
     keys: SessionKeys,
-    tier: u8,
 }
 
 async fn client_handshake(
@@ -747,6 +923,7 @@ async fn client_handshake(
     hello.extend_from_slice(&sig);
     stream.write_all(&hello).await.map_err(|e| e.to_string())?;
     let mut reply = [0u8; REPLY_LEN];
+    // the link may wait for the assignment to reach its own template before answering
     tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut reply))
         .await
         .map_err(|_| "handshake reply timeout".to_string())?
@@ -767,213 +944,165 @@ async fn client_handshake(
     let server_eph_pk = PublicKey::from_slice(&server_eph).map_err(|_| "gateway ephemeral key".to_string())?;
     let shared = SharedSecret::new(&server_eph_pk, &eph_secret);
     let keys = session_keys(&shared, &transcript(model_id, &client_eph, &server_eph, &identity.pubkey, &server_pk, &nonce, tier));
-    Ok(Tunnel { stream, keys, tier })
+    Ok(Tunnel { stream, keys })
 }
 
-/// Opens the control tunnel to `remote` for `model_id`, which must be served by `peer_pubkey`
-/// as `tier`, and a loopback listener whose connections are each tunnelled to the same link.
-pub async fn connect_link(
-    remote: &str,
-    model_id: [u8; 32],
-    identity: Arc<GatewayIdentity>,
-    local_port: u16,
-    peer_pubkey: [u8; 32],
-    tier: u8,
-) -> Result<LinkSession, String> {
-    let control = client_handshake(remote, &model_id, &identity, &peer_pubkey, tier).await?;
-    let listener = TcpListener::bind(("127.0.0.1", local_port)).await.map_err(|e| format!("loopback bind: {}", e))?;
-    let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+/// Connects to `remote` for `model_id`, which must be served by `peer_pubkey` as `tier`.
+pub async fn connect_link(remote: &str, model_id: [u8; 32], identity: Arc<GatewayIdentity>, peer_pubkey: [u8; 32], tier: u8) -> Result<LinkSession, String> {
+    let t = client_handshake(remote, &model_id, &identity, &peer_pubkey, tier).await?;
     let (ctl_tx, ctl_rx) = mpsc::channel::<Ctl>(16);
-    tokio::spawn(control_loop(control, ctl_rx));
-    let remote_s = remote.to_string();
-    let id = identity.clone();
-    let accept = tokio::spawn(async move {
-        let mut tunnels = tokio::task::JoinSet::new();
-        loop {
-            let Ok((local, _)) = listener.accept().await else { break };
-            let _ = local.set_nodelay(true);
-            let remote = remote_s.clone();
-            let id = id.clone();
-            tunnels.spawn(async move {
-                match client_handshake(&remote, &model_id, &id, &peer_pubkey, tier).await {
-                    Ok(t) => {
-                        if let Err(e) = data_tunnel(local, t).await {
-                            log::debug!("link proxy {}: tunnel ended: {}", remote, e);
-                        }
-                    }
-                    Err(e) => log::warn!("link proxy {}: {}", remote, e),
-                }
-            });
-        }
-    });
+    tokio::spawn(control_loop(t, ctl_rx));
     Ok(LinkSession {
         remote: remote.to_string(),
         model_id,
         tier,
         peer_pubkey,
         head_pubkey: identity.pubkey,
-        local_port,
         ctl: ctl_tx,
-        accept,
+        dims: Mutex::new(None),
     })
 }
 
+/// Requests go out in order and the link answers them in order: one queue matches the replies.
 async fn control_loop(t: Tunnel, mut ctl: mpsc::Receiver<Ctl>) {
     let (rd, mut wr) = t.stream.into_split();
     let mut tx = Sealer::new(&t.keys.c2s);
     let (mut frames, reader) = spawn_frame_reader(rd, Sealer::new(&t.keys.s2c));
-    let tier = t.tier;
-    let mut pending_sign: std::collections::VecDeque<oneshot::Sender<Result<keryx_inference::AiResponseLink, String>>> = Default::default();
-    let mut pending_ping: std::collections::VecDeque<(std::time::Instant, Option<oneshot::Sender<Result<Duration, String>>>)> = Default::default();
+    let mut pending: std::collections::VecDeque<Pending> = Default::default();
     let mut keepalive = tokio::time::interval(CONTROL_KEEPALIVE);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
     loop {
         tokio::select! {
             _ = keepalive.tick() => {
                 if write_frame_by(&mut wr, &mut tx, FRAME_PING, &[]).await.is_err() {
                     break;
                 }
-                pending_ping.push_back((std::time::Instant::now(), None));
+                pending.push_back(Pending::Ping(std::time::Instant::now(), None));
             }
             req = ctl.recv() => {
                 let Some(req) = req else { break };
                 match req {
-                    Ctl::Sign(bytes, reply) => {
-                        if write_frame_by(&mut wr, &mut tx, FRAME_SIGN, &bytes).await.is_err() {
-                            let _ = reply.send(Err("control tunnel closed".into()));
+                    Ctl::Call(kind, bytes, reply) => {
+                        if write_frame_by(&mut wr, &mut tx, kind, &bytes).await.is_err() {
+                            let _ = reply.send(Err("link connection closed".into()));
                             break;
                         }
-                        pending_sign.push_back(reply);
+                        pending.push_back(Pending::Reply(reply));
+                    }
+                    Ctl::Send(kind, bytes) => {
+                        if write_frame_by(&mut wr, &mut tx, kind, &bytes).await.is_err() {
+                            break;
+                        }
                     }
                     Ctl::Ping(reply) => {
                         if write_frame_by(&mut wr, &mut tx, FRAME_PING, &[]).await.is_err() {
-                            let _ = reply.send(Err("control tunnel closed".into()));
+                            let _ = reply.send(Err("link connection closed".into()));
                             break;
                         }
-                        pending_ping.push_back((std::time::Instant::now(), Some(reply)));
+                        pending.push_back(Pending::Ping(std::time::Instant::now(), Some(reply)));
                     }
                 }
             }
             frame = frames.recv() => {
                 let Some(Ok((kind, payload))) = frame else { break };
-                match kind {
-                    FRAME_PONG => {
-                        if let Some((t0, Some(reply))) = pending_ping.pop_front() {
+                match (pending.pop_front(), kind) {
+                    (Some(Pending::Ping(t0, reply)), FRAME_PONG) => {
+                        if let Some(reply) = reply {
                             let _ = reply.send(Ok(t0.elapsed()));
                         }
                     }
-                    FRAME_SIGNED => {
-                        if let Some(reply) = pending_sign.pop_front() {
-                            if payload.len() != 96 {
-                                let _ = reply.send(Err("bad signature frame".into()));
-                            } else {
-                                let link = keryx_inference::AiResponseLink {
-                                    tier,
-                                    escrow_pubkey: payload[..32].try_into().unwrap(),
-                                    signature: payload[32..96].try_into().unwrap(),
-                                };
-                                let _ = reply.send(Ok(link));
-                            }
-                        }
+                    (Some(Pending::Reply(reply)), FRAME_ERROR) => {
+                        let _ = reply.send(Err(String::from_utf8_lossy(&payload).into_owned()));
                     }
-                    FRAME_ERROR => {
-                        let msg = String::from_utf8_lossy(&payload).into_owned();
-                        if let Some(reply) = pending_sign.pop_front() {
-                            let _ = reply.send(Err(msg));
-                        }
+                    (Some(Pending::Reply(reply)), _) if kind != FRAME_PONG => {
+                        let _ = reply.send(Ok((kind, payload)));
                     }
-                    _ => {}
+                    _ => break,
                 }
             }
         }
     }
     reader.abort();
-    for reply in pending_sign.drain(..) {
-        let _ = reply.send(Err("control tunnel closed".into()));
-    }
-}
-
-async fn data_tunnel(local: TcpStream, t: Tunnel) -> std::io::Result<()> {
-    let (mut lrd, mut lwr) = local.into_split();
-    let (mut rrd, mut rwr) = t.stream.into_split();
-    let mut tx = Sealer::new(&t.keys.c2s);
-    let mut rx = Sealer::new(&t.keys.s2c);
-    let up = AbortOnDrop(tokio::spawn(async move {
-        let mut buf = vec![0u8; 256 * 1024];
-        // an idle data tunnel (the head loading its own weights) must outlive the server idle limit
-        let mut keepalive = tokio::time::interval(CONTROL_KEEPALIVE);
-        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        keepalive.tick().await;
-        loop {
-            tokio::select! {
-                r = lrd.read(&mut buf) => match r {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if write_frame_by(&mut rwr, &mut tx, FRAME_DATA, &buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                },
-                _ = keepalive.tick() => {
-                    if write_frame_by(&mut rwr, &mut tx, FRAME_PING, &[]).await.is_err() {
-                        break;
-                    }
-                }
+    for p in pending.drain(..) {
+        match p {
+            Pending::Reply(r) => {
+                let _ = r.send(Err("link connection closed".into()));
             }
+            Pending::Ping(_, Some(r)) => {
+                let _ = r.send(Err("link connection closed".into()));
+            }
+            Pending::Ping(_, None) => {}
         }
-    }));
-    let result = loop {
-        let frame = match tokio::time::timeout(LINK_IDLE_TIMEOUT, read_frame(&mut rrd, &mut rx)).await {
-            Ok(f) => f,
-            Err(_) => break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "link silent, dropped")),
-        };
-        match frame {
-            Ok((FRAME_DATA, payload)) => {
-                if let Err(e) = lwr.write_all(&payload).await {
-                    break Err(e);
-                }
-            }
-            Ok((FRAME_ERROR, payload)) => {
-                break Err(std::io::Error::new(std::io::ErrorKind::Other, String::from_utf8_lossy(&payload).into_owned()));
-            }
-            Ok(_) => {}
-            Err(e) => break Err(e),
-        }
-    };
-    drop(up);
-    result
-}
-
-/// Aborts its task when dropped, so a cancelled tunnel leaves nothing running.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
 impl LinkSession {
+    async fn call(&self, kind: u8, payload: Vec<u8>, timeout: Duration) -> Result<(u8, Vec<u8>), String> {
+        let (tx, rx) = oneshot::channel();
+        self.ctl.send(Ctl::Call(kind, payload, tx)).await.map_err(|_| "link connection closed".to_string())?;
+        tokio::time::timeout(timeout, rx).await.map_err(|_| "link timeout".to_string())?.map_err(|_| "link connection closed".to_string())?
+    }
+
+    /// Opens this head's sequence of `max_len` tokens for `request` on the link.
+    pub async fn open(&self, request: &[u8; 32], max_len: u32) -> Result<LinkDims, String> {
+        let mut payload = request.to_vec();
+        payload.extend_from_slice(&max_len.to_le_bytes());
+        let (kind, reply) = self.call(FRAME_OPEN, payload, STEP_TIMEOUT).await?;
+        if kind != FRAME_OPENED || reply.len() != 9 {
+            return Err("bad open reply".into());
+        }
+        let dims = LinkDims {
+            n_hc: u32::from_le_bytes(reply[0..4].try_into().unwrap()) as usize,
+            n_vocab: u32::from_le_bytes(reply[4..8].try_into().unwrap()) as usize,
+            from_tokens: reply[8] != 0,
+        };
+        if dims.n_hc == 0 {
+            return Err("bad open reply".into());
+        }
+        *self.dims.lock().unwrap_or_else(|p| p.into_inner()) = Some(dims);
+        Ok(dims)
+    }
+
+    /// Runs `input` at `pos0` through the link's layers: its `n × n_hc` residual floats.
+    pub async fn step(&self, pos0: u32, input: &StepInput) -> Result<Vec<f32>, String> {
+        let dims = (*self.dims.lock().unwrap_or_else(|p| p.into_inner())).ok_or("link sequence not open")?;
+        let n = input.len(dims.n_hc);
+        let (kind, reply) = self.call(FRAME_STEP, input.encode(pos0, dims.n_hc), STEP_TIMEOUT).await?;
+        if kind != FRAME_RESULT || reply.len() != n * dims.n_hc * 4 {
+            return Err("bad step reply".into());
+        }
+        Ok(bytes_to_f32s(&reply))
+    }
+
+    /// Releases the link's sequence; the connection stays up for the signature.
+    pub async fn close(&self) {
+        let _ = self.ctl.send(Ctl::Send(FRAME_CLOSE, Vec::new())).await;
+    }
+
     /// Has the link sign `message` (the response's v1 and extension bytes) for its tier under
     /// this head.
     pub async fn sign(&self, message: &[u8]) -> Result<keryx_inference::AiResponseLink, String> {
-        let (tx, rx) = oneshot::channel();
-        self.ctl.send(Ctl::Sign(message.to_vec(), tx)).await.map_err(|_| "control tunnel closed".to_string())?;
-        let link = tokio::time::timeout(Duration::from_secs(30), rx).await.map_err(|_| "sign timeout".to_string())?.map_err(|_| "control tunnel closed".to_string())??;
-        if link.escrow_pubkey != self.peer_pubkey
-            || link.tier != self.tier
-            || !verify_schnorr(&link.escrow_pubkey, &link.signature, &link_digest(self.tier, &self.head_pubkey, message))
-        {
+        let (kind, payload) = self.call(FRAME_SIGN, message.to_vec(), Duration::from_secs(30)).await?;
+        if kind != FRAME_SIGNED || payload.len() != 96 {
+            return Err("bad signature frame".into());
+        }
+        let link = keryx_inference::AiResponseLink {
+            tier: self.tier,
+            escrow_pubkey: payload[..32].try_into().unwrap(),
+            signature: payload[32..96].try_into().unwrap(),
+        };
+        if link.escrow_pubkey != self.peer_pubkey || !verify_schnorr(&link.escrow_pubkey, &link.signature, &link_digest(self.tier, &self.head_pubkey, message)) {
             return Err("link signature does not verify".into());
         }
         Ok(link)
     }
 
-    /// Round-trip time of the control tunnel.
+    /// Round-trip time of the link connection.
     pub async fn ping(&self) -> Result<Duration, String> {
         let (tx, rx) = oneshot::channel();
-        self.ctl.send(Ctl::Ping(tx)).await.map_err(|_| "control tunnel closed".to_string())?;
-        tokio::time::timeout(Duration::from_secs(10), rx).await.map_err(|_| "ping timeout".to_string())?.map_err(|_| "control tunnel closed".to_string())?
+        self.ctl.send(Ctl::Ping(tx)).await.map_err(|_| "link connection closed".to_string())?;
+        tokio::time::timeout(Duration::from_secs(10), rx).await.map_err(|_| "ping timeout".to_string())?.map_err(|_| "link connection closed".to_string())?
     }
 }
 
@@ -990,8 +1119,8 @@ mod tests {
         let key = [7u8; 32];
         let mut a = Sealer::new(&key);
         let mut b = Sealer::new(&key);
-        let sealed = a.seal(FRAME_DATA, b"hello");
-        assert_eq!(b.open(&sealed), Some((FRAME_DATA, b"hello".to_vec())));
+        let sealed = a.seal(FRAME_STEP, b"hello");
+        assert_eq!(b.open(&sealed), Some((FRAME_STEP, b"hello".to_vec())));
         let mut tampered = a.seal(FRAME_PING, b"x");
         tampered[3] ^= 1;
         assert!(b.open(&tampered).is_none());
@@ -1024,7 +1153,82 @@ mod tests {
         assert!(peer_endpoint(&pk).is_none());
     }
 
-    /// Tests that open data sessions share the process-wide pause counter: one at a time.
+    const HC: usize = 4;
+
+    fn dims(from_tokens: bool) -> RangeDims {
+        RangeDims { n_hc: HC, n_vocab: 100, n_ctx: 64, from_tokens }
+    }
+
+    #[test]
+    fn steps_are_checked_before_any_compute() {
+        let d = dims(true);
+        let ok = StepInput::Tokens(vec![1, 2, 3]).encode(5, HC);
+        assert_eq!(parse_step(&ok, &d, 5, 64), Ok((5, StepInput::Tokens(vec![1, 2, 3]))));
+        assert_eq!(parse_step(&ok, &d, 4, 64), Err("step: position"));
+        assert_eq!(parse_step(&ok, &d, 5, 7), Err("step: beyond the session length"));
+        assert_eq!(parse_step(&ok[..ok.len() - 1], &d, 5, 64), Err("step: size"));
+        assert_eq!(parse_step(&ok[..6], &d, 5, 64), Err("step: short frame"));
+        assert_eq!(parse_step(&StepInput::Tokens(vec![100]).encode(0, HC), &d, 0, 64), Err("step: token id"));
+        assert_eq!(parse_step(&StepInput::Tokens(vec![-1]).encode(0, HC), &d, 0, 64), Err("step: token id"));
+        assert_eq!(parse_step(&StepInput::Tokens(vec![]).encode(0, HC), &d, 0, 64), Err("step: token count"));
+        let many = StepInput::Tokens(vec![1; MAX_STEP_TOKENS + 1]).encode(0, HC);
+        assert_eq!(parse_step(&many, &dims(true), 0, 4096), Err("step: token count"));
+        // a residual range takes exactly n × n_hc finite floats
+        let r = dims(false);
+        let x = StepInput::Residual(vec![0.5; 2 * HC]).encode(0, HC);
+        assert_eq!(parse_step(&x, &r, 0, 64), Ok((0, StepInput::Residual(vec![0.5; 2 * HC]))));
+        let mut nan = vec![0.5; 2 * HC];
+        nan[3] = f32::NAN;
+        assert_eq!(parse_step(&StepInput::Residual(nan).encode(0, HC), &r, 0, 64), Err("step: non-finite residual"));
+        // tokens sent to a residual range do not have the residual's size
+        assert_eq!(parse_step(&ok, &r, 5, 64), Err("step: size"));
+    }
+
+    /// Adds `bias` to every residual float (or turns ids into floats); two sequences.
+    struct FakeRange {
+        from_tokens: bool,
+        bias: f32,
+        n_ctx: u32,
+        seqs: Mutex<[bool; 2]>,
+        steps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeRange {
+        fn new(from_tokens: bool, bias: f32) -> Arc<Self> {
+            Self::with_ctx(from_tokens, bias, 64)
+        }
+        fn with_ctx(from_tokens: bool, bias: f32, n_ctx: u32) -> Arc<Self> {
+            Arc::new(Self { from_tokens, bias, n_ctx, seqs: Mutex::new([false; 2]), steps: Default::default() })
+        }
+        fn held(&self) -> usize {
+            self.seqs.lock().unwrap().iter().filter(|s| **s).count()
+        }
+    }
+
+    impl RangeCompute for FakeRange {
+        fn dims(&self) -> RangeDims {
+            RangeDims { n_ctx: self.n_ctx, ..dims(self.from_tokens) }
+        }
+        fn open(&self) -> Result<u32, String> {
+            let mut g = self.seqs.lock().unwrap();
+            let i = g.iter().position(|s| !*s).ok_or("busy")?;
+            g[i] = true;
+            Ok(i as u32)
+        }
+        fn step(&self, _seq: u32, _pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<Vec<f32>, String> {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(match (tokens, input) {
+                (Some(t), None) => t.iter().flat_map(|&id| std::iter::repeat(id as f32 + self.bias).take(HC)).collect(),
+                (None, Some(x)) => x.iter().map(|v| v + self.bias).collect(),
+                _ => return Err("bad input".into()),
+            })
+        }
+        fn close(&self, seq: u32) {
+            self.seqs.lock().unwrap()[seq as usize] = false;
+        }
+    }
+
+    /// Tests that compute share the process-wide pause counter: one at a time.
     fn session_tests() -> &'static tokio::sync::Mutex<()> {
         static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         L.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1034,30 +1238,15 @@ mod tests {
         Arc::new(|_: &[u8; 32], _: &[u8; 32], _: u8, _: Option<&[u8; 32]>| true)
     }
 
-    async fn echo_server() -> u16 {
-        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = echo.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let (mut s, _) = echo.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    while let Ok(n) = s.read(&mut buf).await {
-                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        port
-    }
-
-    async fn gateway(shard: Arc<GatewayIdentity>, model: [u8; 32], local: String, authorize: HeadAuthorizer) -> String {
+    async fn gateway(shard: Arc<GatewayIdentity>, model: [u8; 32], range: Arc<FakeRange>, authorize: HeadAuthorizer) -> String {
         let gw = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gw_addr = gw.local_addr().unwrap().to_string();
         drop(gw);
-        let resolve: ShardResolver = Arc::new(move |id: &[u8; 32]| (*id == model).then(|| (local.clone(), 8u8)));
+        let resolve: ShardResolver = Arc::new(move |id: &[u8; 32]| {
+            let r = range.clone();
+            let provider: RangeProvider = Arc::new(move || Ok(r.clone() as Arc<dyn RangeCompute>));
+            (*id == model).then_some((8u8, provider))
+        });
         let listen = gw_addr.clone();
         tokio::spawn(async move { serve(listen, shard, resolve, authorize).await.unwrap() });
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1071,21 +1260,20 @@ mod tests {
         let shard = identity(3);
         let head = identity(4);
         let model = [0xCDu8; 32];
-        let port = echo_server().await;
-        let gw_addr = gateway(shard.clone(), model, format!("127.0.0.1:{}", port), allow_all()).await;
+        let range = FakeRange::new(true, 0.0);
+        let gw_addr = gateway(shard.clone(), model, range.clone(), allow_all()).await;
         let before = crate::pom_gpu::shard_sessions();
-        // a handshake alone does not pause the GPU
-        let tunnel = client_handshake(&gw_addr, &model, &head, &shard.pubkey, 8).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let link = connect_link(&gw_addr, model, head, shard.pubkey, 8).await.unwrap();
+        // opening alone does not pause the GPU
+        link.open(&[1u8; 32], 32).await.unwrap();
+        assert_eq!(range.held(), 1);
         assert_eq!(crate::pom_gpu::shard_sessions(), before);
-        // the first rpc byte does, until the head goes silent
-        let (_rd, mut wr) = tunnel.stream.into_split();
-        let mut tx = Sealer::new(&tunnel.keys.c2s);
-        write_frame(&mut wr, &mut tx, FRAME_DATA, b"x").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // the first step does, until the head goes silent
+        link.step(0, &StepInput::Tokens(vec![3])).await.unwrap();
         assert_eq!(crate::pom_gpu::shard_sessions(), before + 1);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(crate::pom_gpu::shard_sessions(), before);
+        assert_eq!(range.held(), 0);
         SESSION_IDLE_MS.store(120_000, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1096,17 +1284,17 @@ mod tests {
         let shard = identity(8);
         let head = identity(9);
         let model = [0xEFu8; 32];
-        let port = echo_server().await;
-        let gw_addr = gateway(shard.clone(), model, format!("127.0.0.1:{}", port), allow_all()).await;
-        let link = connect_link(&gw_addr, model, head, 0, shard.pubkey, 8).await.unwrap();
-        let mut c = TcpStream::connect(("127.0.0.1", link.local_port)).await.unwrap();
-        // many large writes while the session re-checks its head every few ms
-        let chunk = vec![0x5Au8; 200_000];
-        let mut back = vec![0u8; chunk.len()];
-        for _ in 0..20 {
-            c.write_all(&chunk).await.unwrap();
-            c.read_exact(&mut back).await.unwrap();
-            assert_eq!(back, chunk);
+        let range = FakeRange::with_ctx(false, 1.0, 4096);
+        let gw_addr = gateway(shard.clone(), model, range, allow_all()).await;
+        let link = connect_link(&gw_addr, model, head, shard.pubkey, 8).await.unwrap();
+        link.open(&[2u8; 32], 4096).await.unwrap();
+        // many large steps while the session re-checks its head every few ms
+        let mut pos = 0u32;
+        for i in 0..20 {
+            let x: Vec<f32> = (0..MAX_STEP_TOKENS * HC).map(|j| (i * j) as f32).collect();
+            let out = link.step(pos, &StepInput::Residual(x.clone())).await.unwrap();
+            assert_eq!(out, x.iter().map(|v| v + 1.0).collect::<Vec<_>>());
+            pos += MAX_STEP_TOKENS as u32;
         }
         REAUTH_MS.store(30_000, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1119,44 +1307,71 @@ mod tests {
         let model = [0xEEu8; 32];
         let head_pk = head.pubkey;
         let authorize: HeadAuthorizer = Arc::new(move |h: &[u8; 32], _: &[u8; 32], _: u8, _: Option<&[u8; 32]>| *h == head_pk);
-        let gw_addr = gateway(shard.clone(), model, "127.0.0.1:1".to_string(), authorize).await;
-        assert!(connect_link(&gw_addr, model, stranger, 0, shard.pubkey, 8).await.is_err());
+        let gw_addr = gateway(shard.clone(), model, FakeRange::new(true, 0.0), authorize).await;
+        assert!(connect_link(&gw_addr, model, stranger, shard.pubkey, 8).await.is_err());
         // a hello addressed to another key, or expecting another tier, is refused
-        assert!(connect_link(&gw_addr, model, head.clone(), 0, [9u8; 32], 8).await.is_err());
-        assert!(connect_link(&gw_addr, model, head.clone(), 0, shard.pubkey, 7).await.is_err());
-        assert!(connect_link(&gw_addr, model, head, 0, shard.pubkey, 8).await.is_ok());
+        assert!(connect_link(&gw_addr, model, head.clone(), [9u8; 32], 8).await.is_err());
+        assert!(connect_link(&gw_addr, model, head.clone(), shard.pubkey, 7).await.is_err());
+        assert!(connect_link(&gw_addr, model, head, shard.pubkey, 8).await.is_ok());
     }
 
     #[tokio::test]
-    async fn handshake_tunnel_sign_and_ping_end_to_end() {
+    async fn a_malformed_step_ends_the_session_without_computing() {
         let _serial = session_tests().lock().await;
-        let echo_port = echo_server().await;
+        let shard = identity(10);
+        let head = identity(11);
+        let model = [0xA1u8; 32];
+        let range = FakeRange::new(true, 0.0);
+        let gw_addr = gateway(shard.clone(), model, range.clone(), allow_all()).await;
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
+        // a step before any open is refused
+        assert!(link.step(0, &StepInput::Tokens(vec![1])).await.is_err());
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
+        assert!(link.open(&[3u8; 32], 65).await.is_err(), "longer than the link's context");
+        let link = connect_link(&gw_addr, model, head, shard.pubkey, 8).await.unwrap();
+        link.open(&[3u8; 32], 16).await.unwrap();
+        assert!(link.step(1, &StepInput::Tokens(vec![1])).await.is_err(), "position gap");
+        assert!(link.ping().await.is_err(), "the session is closed after a refused step");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(range.steps.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(range.held(), 0);
+    }
+
+    #[tokio::test]
+    async fn steps_and_sign_end_to_end() {
+        let _serial = session_tests().lock().await;
         let shard = identity(1);
         let head = identity(2);
         let model = [0xABu8; 32];
         let assigned = [7u8; 32];
         let authorize: HeadAuthorizer =
             Arc::new(move |_: &[u8; 32], _: &[u8; 32], _: u8, r: Option<&[u8; 32]>| r.is_none_or(|r| *r == assigned));
-        let gw_addr = gateway(shard.clone(), model, format!("127.0.0.1:{}", echo_port), authorize).await;
+        let range = FakeRange::new(true, 0.5);
+        let gw_addr = gateway(shard.clone(), model, range.clone(), authorize).await;
 
         // unknown shard is refused
-        assert!(connect_link(&gw_addr, [0u8; 32], head.clone(), 0, shard.pubkey, 8).await.is_err());
+        assert!(connect_link(&gw_addr, [0u8; 32], head.clone(), shard.pubkey, 8).await.is_err());
+        // a request not assigned cannot be opened
+        let stray_link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
+        assert!(stray_link.open(&[8u8; 32], 16).await.is_err());
 
-        let link = connect_link(&gw_addr, model, head.clone(), 0, shard.pubkey, 8).await.unwrap();
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
         assert_eq!(link.tier, 8);
-        assert_eq!(link.peer_pubkey, shard.pubkey);
         assert!(link.ping().await.unwrap() < Duration::from_secs(1));
         let payload = keryx_inference::AiResponsePayload::new(assigned, 9, [1u8; 34], 3).with_private_body(vec![4u8; 50]);
         let mut node_bytes = payload.link_signed_bytes(8, &head.pubkey);
-        // no signature before the head computed through this link
+        // no signature before the head computed the request through this link
         assert!(link.sign(&node_bytes[33..]).await.is_err());
 
-        // data tunnel: bytes reach the shard server and come back
-        let mut c = TcpStream::connect(("127.0.0.1", link.local_port)).await.unwrap();
-        c.write_all(b"ping through the tunnel").await.unwrap();
-        let mut buf = [0u8; 64];
-        let n = c.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"ping through the tunnel");
+        let d = link.open(&assigned, 16).await.unwrap();
+        assert_eq!(d, LinkDims { n_hc: HC, n_vocab: 100, from_tokens: true });
+        let out = link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
+        assert_eq!(out, vec![1.5, 1.5, 1.5, 1.5, 2.5, 2.5, 2.5, 2.5]);
+        let out = link.step(2, &StepInput::Tokens(vec![9])).await.unwrap();
+        assert_eq!(out, vec![9.5; HC]);
+        link.close().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(range.held(), 0);
 
         // the node's message layout: tier, head key, then the payload bytes
         let signed = link.sign(&node_bytes[33..]).await.unwrap();

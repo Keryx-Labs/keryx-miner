@@ -2673,29 +2673,21 @@ fn ensure_installed_inner(device_id: u32, daa: u64) -> bool {
     install(device_id, gm);
     info!("PoM[gpu{}]: GPU miner ready — N={} chunks resident (matches shared index)", device_id, n);
     if use_shard {
-        let endpoint = format!("127.0.0.1:{}", shard_port() as u32 + device_id);
-        if let Err(e) = crate::llama_engine::serve_shard(device_id as usize, &endpoint) {
-            warn!("PoM[gpu{}]: shard not served — {}", device_id, e);
-        }
-        // The head shard's miner also needs the head GGUF to lead pipelines.
-        if crate::models::shard_index(&model_id) == Some(crate::models::network_model().shards.len() as u8 - 1) {
-            std::thread::spawn(crate::llm::ensure_head_file);
-        }
+        // every range binds its layers into the head GGUF's tensor table (embedding and output there)
+        std::thread::spawn(crate::llm::ensure_head_file);
     }
     true
 }
 
 static SHARD_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(50052);
 
-/// Loopback endpoint and tier of a served shard, for the gateway: `None` unless this miner
-/// mines and serves `model_id`.
-pub fn shard_local_endpoint(model_id: &[u8; 32]) -> Option<(String, u8)> {
+/// GPU, tier and GGUF of a shard this miner mines and holds resident: `None` otherwise.
+pub fn served_shard(model_id: &[u8; 32]) -> Option<(u32, u8, String)> {
     let k = crate::models::shard_index(model_id)?;
-    device_for_model(model_id)?;
+    let gpu = device_for_model(model_id)?;
     let spec = crate::models::network_model().shards.get(k as usize)?;
     let gguf = crate::llm::gguf_path_for(spec).to_string_lossy().into_owned();
-    let endpoint = crate::llama_engine::serving_endpoint_for(&gguf)?;
-    Some((endpoint, crate::models::NETWORK_MODEL_TIER + 1 + k))
+    crate::llama_engine::shard_active_for(&gguf, gpu as usize).then_some((gpu, crate::models::NETWORK_MODEL_TIER + 1 + k, gguf))
 }
 
 /// Base loopback port of the in-process shard server (base + id of the GPU that serves; one

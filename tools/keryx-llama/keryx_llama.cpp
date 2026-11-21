@@ -521,7 +521,30 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 11; }
+static llama_sampler* keryx_make_sampler(const llama_model* model) {
+    // User-facing sampling (DRY -> repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
+    // text is not consensus-relevant, but keep the flavor consistent.
+    //
+    // The flat repeat penalty alone does not stop these models: it charges a token once for
+    // having appeared, no matter how many times, so a repeated *sentence* pays almost nothing
+    // per token and the loop survives (observed on-chain with GLM-4-9B at 1.10 / 256). DRY
+    // penalises the continuation of an already-seen sequence, growing with its length, which is
+    // the failure mode we actually have. Standard settings: multiplier 0.8, base 1.75, loops
+    // allowed up to 2 tokens, scanning the whole context (-1). The break tokens keep normal
+    // structure (newlines, list markers, quotes) from counting as repetition.
+    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
+    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
+        llama_model_get_vocab(model), llama_model_n_ctx_train(model),
+        0.8f, 1.75f, 2, -1, dry_breakers, sizeof(dry_breakers) / sizeof(dry_breakers[0])));
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+    return smpl;
+}
+
+KERYX_EXPORT int keryx_llama_abi() { return 12; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -606,25 +629,7 @@ static KeryxLlama* keryx_load_with(const char* gguf_path, int gpu, int n_ctx, ll
         return nullptr;
     }
 
-    // User-facing sampling (DRY -> repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
-    // text is not consensus-relevant, but keep the flavor consistent.
-    //
-    // The flat repeat penalty alone does not stop these models: it charges a token once for
-    // having appeared, no matter how many times, so a repeated *sentence* pays almost nothing
-    // per token and the loop survives (observed on-chain with GLM-4-9B at 1.10 / 256). DRY
-    // penalises the continuation of an already-seen sequence, growing with its length, which is
-    // the failure mode we actually have. Standard settings: multiplier 0.8, base 1.75, loops
-    // allowed up to 2 tokens, scanning the whole context (-1). The break tokens keep normal
-    // structure (newlines, list markers, quotes) from counting as repetition.
-    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
-    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
-        llama_model_get_vocab(model), llama_model_n_ctx_train(model),
-        0.8f, 1.75f, 2, -1, dry_breakers, sizeof(dry_breakers) / sizeof(dry_breakers[0])));
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+    llama_sampler* smpl = keryx_make_sampler(model);
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace; h->gpu = gpu;
@@ -1500,6 +1505,8 @@ struct KeryxRange {
     int  n_seq = 0;
     int  n_ubatch = 0;
     std::vector<int32_t> len;    // tokens held per sequence
+    llama_sampler* smpl = nullptr; // head range only
+    int  sample_seq = -1;        // sequence whose logits the last step left, -1 when none
     std::mutex mu;
 };
 
@@ -1594,6 +1601,7 @@ KERYX_EXPORT KeryxRange* keryx_range_load(const char* gguf_path, int gpu, int fi
     r->n_seq = n_seq;
     r->n_ubatch = KERYX_RANGE_MAX_UBATCH;
     r->len.assign((size_t) n_seq, 0);
+    if (head) r->smpl = keryx_make_sampler(model);
     return r;
 #endif
 }
@@ -1622,6 +1630,7 @@ KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const
                                   float* out, size_t out_floats) {
     if (!r) return -1;
     std::lock_guard<std::mutex> lock(r->mu);
+    r->sample_seq = -1;
     if (seq < 0 || seq >= r->n_seq || n <= 0 || n > r->n_ubatch) return -2;
     if (pos0 != r->len[(size_t) seq] || pos0 + n > r->n_ctx) return -3;
     const bool from_tokens = r->first == 0;
@@ -1666,11 +1675,47 @@ KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const
     }
     std::memcpy(out, res, want * sizeof(float));
     r->len[(size_t) seq] += n;
+    if (r->head) r->sample_seq = seq;
     return 0;
+}
+
+// Tokenizes `text` (`len` bytes) with the model's vocabulary, special tokens parsed. Returns the
+// token count, or minus the count needed when `cap` is too small.
+KERYX_EXPORT int keryx_range_tokenize(KeryxRange* r, const char* text, int len, int32_t* out, int cap) {
+    if (!r || !text || len < 0 || cap < 0 || (!out && cap > 0)) return INT32_MIN;
+    const llama_vocab* vocab = llama_model_get_vocab(r->model);
+    return llama_tokenize(vocab, text, len, out, cap, true, true);
+}
+
+// Clears the head range's sampling history (start of a new generation).
+KERYX_EXPORT void keryx_range_sampler_reset(KeryxRange* r) {
+    if (!r || !r->smpl) return;
+    std::lock_guard<std::mutex> lock(r->mu);
+    llama_sampler_reset(r->smpl);
+}
+
+// Samples the next token of `seq` from the logits its last head step left; -1 when there are none.
+KERYX_EXPORT int32_t keryx_range_sample(KeryxRange* r, int seq) {
+    if (!r || !r->smpl) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    if (r->sample_seq != seq || seq < 0) return -1;
+    r->sample_seq = -1;
+    return llama_sampler_sample(r->smpl, r->ctx, -1);
+}
+
+// Text of token `tok` into `buf`: its byte length, -2 for an end-of-generation token, -1 on error.
+KERYX_EXPORT int keryx_range_piece(KeryxRange* r, int32_t tok, char* buf, int cap) {
+    if (!r || !buf || cap <= 0) return -1;
+    const llama_vocab* vocab = llama_model_get_vocab(r->model);
+    if (tok < 0 || tok >= llama_vocab_n_tokens(vocab)) return -1;
+    if (llama_vocab_is_eog(vocab, tok)) return -2;
+    const int n = llama_token_to_piece(vocab, tok, buf, cap, 0, true);
+    return n < 0 ? -1 : n;
 }
 
 KERYX_EXPORT void keryx_range_free(KeryxRange* r) {
     if (!r) return;
+    if (r->smpl) llama_sampler_free(r->smpl);
     if (r->ctx) llama_free(r->ctx);
     if (r->model) llama_model_free(r->model);
     delete r;

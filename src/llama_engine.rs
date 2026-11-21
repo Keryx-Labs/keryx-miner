@@ -105,7 +105,7 @@ type SeqReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-pub(crate) const ABI: c_int = 11;
+pub(crate) const ABI: c_int = 12;
 /// Context kept for the block task while the context pad is resident.
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
@@ -113,7 +113,7 @@ const CAPTURE_CAP: usize = 4 << 20;
 
 /// A pipeline head gives up on a request that does not finish in time, so its links and its
 /// own GPU are freed for the next one; checked between tokens by the engine.
-const HEAD_GENERATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
+pub(crate) const HEAD_GENERATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Why a load attempt failed. `stage` says how far it got; the detail carries the engine's own
 /// message, including the VRAM figures when CUDA reported them.
@@ -256,8 +256,25 @@ struct ShardEngine {
     free: FreeFn,
     gguf: String,
     endpoint: Option<String>,
+    /// The layer range bound to this shard's weights: emptied before the shard is freed.
+    range: SharedRange,
 }
 unsafe impl Send for ShardEngine {}
+
+/// A layer range bound to a resident shard; `None` once the shard is gone.
+pub type SharedRange = Arc<Mutex<Option<LayerRange>>>;
+
+impl ShardEngine {
+    fn release(self) {
+        // waits for a step in flight, then no session can reach the freed weights
+        let range = self.range.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if range.is_some() {
+            let _native = native();
+            drop(range);
+        }
+        unsafe { (self.free)(self.model) };
+    }
+}
 
 fn shards() -> &'static Mutex<std::collections::HashMap<usize, ShardEngine>> {
     static S: OnceLock<Mutex<std::collections::HashMap<usize, ShardEngine>>> = OnceLock::new();
@@ -275,7 +292,7 @@ pub fn ensure_shard_loaded(gguf: &str, gpu: usize) -> Result<(), LoadError> {
         }
     }
     if let Some(e) = g.remove(&gpu) {
-        unsafe { (e.free)(e.model) };
+        e.release();
     }
     let Some(so) = so_path() else {
         return Err(failed("library", "keryx-llama shared library not found".to_string(), false));
@@ -310,7 +327,7 @@ pub fn ensure_shard_loaded(gguf: &str, gpu: usize) -> Result<(), LoadError> {
             );
             return Err(failed("native_load", detail, true));
         }
-        g.insert(gpu, ShardEngine { model, count, info, serve, free, gguf: gguf.to_string(), endpoint: None });
+        g.insert(gpu, ShardEngine { model, count, info, serve, free, gguf: gguf.to_string(), endpoint: None, range: Arc::new(Mutex::new(None)) });
         Ok(())
     }
 }
@@ -383,8 +400,29 @@ pub fn shard_active_for(gguf: &str, gpu: usize) -> bool {
 pub fn unload_shard(gpu: usize) {
     let mut g = shards().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(e) = g.remove(&gpu) {
-        unsafe { (e.free)(e.model) };
+        e.release();
     }
+}
+
+/// The layer range of the shard resident on `gpu` (`first..=last` of `head_gguf`, its layers bound
+/// to the resident weights), loaded on first use with `n_seq` sequences of `n_ctx` tokens.
+pub fn shard_range(gpu: usize, gguf: &str, head_gguf: &str, first: u32, last: u32, n_ctx: u32, n_seq: u32) -> Result<SharedRange, String> {
+    let g = shards().lock().unwrap_or_else(|p| p.into_inner());
+    let e = g.get(&gpu).filter(|e| e.gguf == gguf).ok_or_else(|| format!("no resident shard {} on GPU {}", gguf, gpu))?;
+    let mut slot = e.range.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.as_ref().is_some_and(|r| r.first == first && r.last == last) {
+        return Ok(e.range.clone());
+    }
+    slot.take();
+    let t = std::time::Instant::now();
+    let r = {
+        let _native = native();
+        LayerRange::load(head_gguf, gpu, first, last, Some(e.model), n_ctx, n_seq)?
+    };
+    log::info!("shard engine: layers {}-{} bound on GPU {} in {:.1} s", first, last, gpu, t.elapsed().as_secs_f64());
+    *slot = Some(r);
+    drop(slot);
+    Ok(e.range.clone())
 }
 
 /// `KERYX_LLAMA_SO=<path>` wins; else the platform-native shared library next to our own
@@ -1532,6 +1570,10 @@ type RangeLoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, *mut
 type RangeDimsFn = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int, *mut c_int);
 type RangeStepFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const i32, *const f32, *mut f32, usize) -> c_int;
 type RangeClearFn = unsafe extern "C" fn(*mut c_void, c_int);
+type RangeTokenizeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut i32, c_int) -> c_int;
+type RangeResetFn = unsafe extern "C" fn(*mut c_void);
+type RangeSampleFn = unsafe extern "C" fn(*mut c_void, c_int) -> i32;
+type RangePieceFn = unsafe extern "C" fn(*mut c_void, i32, *mut c_char, c_int) -> c_int;
 
 /// The range entry points of `libkeryx-llama.so`.
 #[derive(Clone, Copy)]
@@ -1540,6 +1582,10 @@ struct RangeLib {
     dims: RangeDimsFn,
     step: RangeStepFn,
     clear: RangeClearFn,
+    tokenize: RangeTokenizeFn,
+    sampler_reset: RangeResetFn,
+    sample: RangeSampleFn,
+    piece: RangePieceFn,
     free: FreeFn,
     last_error: ErrorFn,
 }
@@ -1560,6 +1606,10 @@ fn range_lib() -> Result<RangeLib, String> {
                 dims: sym(lib, "keryx_range_dims").ok_or("missing keryx_range_dims")?,
                 step: sym(lib, "keryx_range_step").ok_or("missing keryx_range_step")?,
                 clear: sym(lib, "keryx_range_clear").ok_or("missing keryx_range_clear")?,
+                tokenize: sym(lib, "keryx_range_tokenize").ok_or("missing keryx_range_tokenize")?,
+                sampler_reset: sym(lib, "keryx_range_sampler_reset").ok_or("missing keryx_range_sampler_reset")?,
+                sample: sym(lib, "keryx_range_sample").ok_or("missing keryx_range_sample")?,
+                piece: sym(lib, "keryx_range_piece").ok_or("missing keryx_range_piece")?,
                 free: sym(lib, "keryx_range_free").ok_or("missing keryx_range_free")?,
                 last_error: sym(lib, "keryx_llama_last_error").ok_or("missing keryx_llama_last_error")?,
             })
@@ -1641,6 +1691,47 @@ impl LayerRange {
     /// Forgets sequence `seq`.
     pub fn clear(&self, seq: u32) {
         unsafe { (self.lib.clear)(self.ptr, seq as c_int) };
+    }
+
+    /// Token ids of `text`, special tokens parsed.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<i32>, String> {
+        let len = c_int::try_from(text.len()).map_err(|_| "prompt too long".to_string())?;
+        let mut out = vec![0i32; text.len() + 16];
+        let mut n = unsafe { (self.lib.tokenize)(self.ptr, text.as_ptr() as *const c_char, len, out.as_mut_ptr(), out.len() as c_int) };
+        if n < 0 && n != i32::MIN {
+            out.resize(n.unsigned_abs() as usize, 0);
+            n = unsafe { (self.lib.tokenize)(self.ptr, text.as_ptr() as *const c_char, len, out.as_mut_ptr(), out.len() as c_int) };
+        }
+        if n <= 0 {
+            return Err("tokenization failed".into());
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    /// Starts a new generation's sampling history (head range).
+    pub fn sampler_reset(&self) {
+        unsafe { (self.lib.sampler_reset)(self.ptr) };
+    }
+
+    /// Next token of `seq` from the logits its last step left (head range).
+    pub fn sample(&self, seq: u32) -> Option<i32> {
+        let t = unsafe { (self.lib.sample)(self.ptr, seq as c_int) };
+        (t >= 0).then_some(t)
+    }
+
+    /// Bytes of token `tok`; `None` for an end-of-generation token.
+    pub fn piece(&self, tok: i32) -> Result<Option<Vec<u8>>, String> {
+        let mut buf = vec![0u8; 256];
+        let n = unsafe { (self.lib.piece)(self.ptr, tok, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int) };
+        match n {
+            -2 => Ok(None),
+            n if n < 0 => Err(format!("token {} has no text", tok)),
+            n => {
+                buf.truncate(n as usize);
+                Ok(Some(buf))
+            }
+        }
     }
 }
 
