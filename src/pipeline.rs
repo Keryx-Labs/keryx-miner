@@ -506,7 +506,8 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     }
     result?;
     log::info!("pipeline head: {} tokens, {} bytes in {:.1} s", produced, answer.len(), t0.elapsed().as_secs_f64());
-    let text = String::from_utf8(answer).map_err(|e| format!("head output is not UTF-8: {}", e))?;
+    // byte tokens can leave a sequence that is not UTF-8, or one cut by the last token
+    let text = String::from_utf8_lossy(&answer).into_owned();
     if text.trim().is_empty() {
         return Err("empty generation".into());
     }

@@ -425,11 +425,75 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelSpec = NetworkModelSpec {
     head_digest_hex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
 };
 
-/// The network model of the selected network: split V4-Flash-0731, or the two-range 9B bench
-/// on devnet (`--devnet`).
+// Devnet bench network model: DeepSeek V4-Flash 0731 cut to 4 layers, in two ranges ─ mirror of
+// the node's `NETWORK_MODEL_V4T`. Files are placed by hand; nothing is downloaded.
+
+pub const V4T_RANGE_0: ModelSpec = ModelSpec {
+    name: "v4t-range-0",
+    model_id: [
+        0x31, 0xf5, 0x12, 0xb8, 0x11, 0x30, 0x81, 0x92,
+        0xea, 0x59, 0xb0, 0x01, 0x80, 0xc5, 0x60, 0x76,
+        0x04, 0x2d, 0xc9, 0x6e, 0xd3, 0x74, 0x68, 0xac,
+        0x7e, 0xca, 0x38, 0x07, 0x89, 0x59, 0x71, 0xf5,
+    ],
+    format: ModelFormat::GgufDeepSeekV4,
+    tokenizer_cid: "",
+    weight_cids: &[],
+    dir_name: "V4T-range-0",
+    min_vram_mb: 3_000,
+    ctx_floor: 4_096,
+    ctx_cap: 4_096,
+};
+
+pub const V4T_RANGE_1: ModelSpec = ModelSpec {
+    name: "v4t-range-1",
+    model_id: [
+        0x97, 0x2d, 0xe9, 0xd9, 0x4b, 0xd9, 0x82, 0xed,
+        0x84, 0x58, 0x4c, 0x1d, 0x20, 0xd6, 0x94, 0x31,
+        0x72, 0x79, 0x75, 0x0a, 0x24, 0x66, 0x42, 0x44,
+        0x0c, 0x90, 0x0c, 0x54, 0x92, 0x30, 0x76, 0x96,
+    ],
+    format: ModelFormat::GgufDeepSeekV4,
+    tokenizer_cid: "",
+    weight_cids: &[],
+    dir_name: "V4T-range-1",
+    min_vram_mb: 3_000,
+    ctx_floor: 4_096,
+    ctx_cap: 4_096,
+};
+
+/// Whole bench model: the packed head's digest; its directory holds `head.gguf`.
+pub const V4T_WHOLE: ModelSpec = ModelSpec {
+    name: "v4t",
+    model_id: [
+        0x49, 0xb0, 0x30, 0x75, 0x40, 0x32, 0x91, 0x73,
+        0xa2, 0xb0, 0xad, 0xd6, 0x77, 0x2b, 0xc5, 0x46,
+        0x6d, 0x7a, 0x5d, 0x4c, 0xd1, 0x0e, 0xee, 0x63,
+        0xd6, 0x2b, 0x41, 0xa8, 0x4b, 0xa2, 0x31, 0xd0,
+    ],
+    format: ModelFormat::GgufDeepSeekV4,
+    tokenizer_cid: "",
+    weight_cids: &[],
+    dir_name: "V4T",
+    min_vram_mb: 0,
+    ctx_floor: 4_096,
+    ctx_cap: 4_096,
+};
+
+pub static NETWORK_MODEL_V4T: NetworkModelSpec = NetworkModelSpec {
+    whole: &V4T_WHOLE,
+    shards: &[&V4T_RANGE_0, &V4T_RANGE_1],
+    layers: &[(0, 2), (3, 3)],
+    n_layer: 4,
+    head_cid: "",
+    head_digest_hex: "49b0307540329173a2b0add6772bc5466d7a5d4cd10eee63d62b41a84ba231d0",
+};
+
+/// The network model of the selected network: split V4-Flash-0731, or the two-range truncated
+/// V4 bench on devnet (`--devnet`).
 pub fn network_model() -> &'static NetworkModelSpec {
     if crate::pom::is_devnet() {
-        &NETWORK_MODEL_SPLIT9B
+        &NETWORK_MODEL_V4T
     } else {
         &NETWORK_MODEL_MAINNET
     }
@@ -729,6 +793,9 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &V4_FLASH_SHARD_1,
     &V4_FLASH_SHARD_2,
     &V4_FLASH_SHARD_3,
+    &V4T_WHOLE,
+    &V4T_RANGE_0,
+    &V4T_RANGE_1,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -872,8 +939,8 @@ mod tests {
                 assert!(all.iter().any(|s| s.model_id == spec.model_id), "{}", spec.name);
             }
         }
-        // every network-model CID decodes to its model_id (CIDv0[2..34])
-        for spec in REGISTRY.iter().skip(6) {
+        // every network-model CID decodes to its model_id (CIDv0[2..34]); bench files have none
+        for spec in REGISTRY.iter().skip(6).filter(|s| !s.weight_cids.is_empty()) {
             let raw = base58btc_decode(spec.weight_cids[0]);
             assert_eq!(&raw[..2], &[0x12, 0x20], "{}", spec.name);
             assert_eq!(&raw[2..34], &spec.model_id, "{}", spec.name);

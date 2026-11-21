@@ -1622,6 +1622,15 @@ fn gate(mainnet: u64, testnet: u64) -> u64 {
     }
 }
 
+/// A gate of H15 or later: never on devnet, whose node runs without them.
+fn gate_h15_on(mainnet: u64, testnet: u64) -> u64 {
+    if is_devnet() {
+        u64::MAX
+    } else {
+        gate(mainnet, testnet)
+    }
+}
+
 /// PoM possession activation DAA score — MUST match the node's `pom_activation`.
 /// `u64::MAX` = never (dormant): mining stays on legacy kHeavyHash, no proof produced.
 ///
@@ -1707,12 +1716,12 @@ pub fn pom_v4_activation_daa() -> u64 {
 
 /// Node `pom_v5_activation`: the walk also reads the tier's context pad.
 pub fn pom_v5_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Node `pad_margin_activation`: the context pad uses `POM_V5_PAD_TILES_H16`.
 pub fn pad_margin_activation_daa() -> u64 {
-    gate(H16_ACTIVATION_DAA, TESTNET_H16_ACTIVATION_DAA)
+    gate_h15_on(H16_ACTIVATION_DAA, TESTNET_H16_ACTIVATION_DAA)
 }
 
 /// Block task gate: headers carry `task_root`, hashed into the pre-PoW and block hashes.
@@ -1724,7 +1733,7 @@ pub fn block_task_activation_daa() -> u64 {
 /// Node `attention_activation`: traces commit sequence leaves and audits open attention and
 /// recurrent points from this DAA.
 pub fn attention_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// H10 gate: walk-seed switch at/after this score. MUST equal the node's `h10_activation`.
@@ -1738,7 +1747,7 @@ pub fn h10_activation_daa() -> u64 {
 /// scheduled.
 pub fn model_split_activation_daa() -> u64 {
     if is_devnet() {
-        1_000
+        1
     } else {
         gate(u64::MAX, u64::MAX)
     }
@@ -1766,28 +1775,28 @@ pub fn private_inference_activation_daa() -> u64 {
 /// and the miner opens the points drawn on it. MUST equal the node's
 /// `verifiable_inference_activation`.
 pub fn verifiable_inference_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Node `trace_prefix_activation`: responses accepted from this DAA are opened against the
 /// prefix-bound manifests, with the request-bound prefix point.
 pub fn trace_prefix_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// DAA from which every traced response is audited (mirror of the node's `trace_audit_activation`).
 pub fn trace_audit_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Node `trace_chain_activation`: responses accepted from this DAA commit the stage-2 trace.
 pub fn trace_chain_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Node `trace_seed_bind_activation`: openings of draws seeded from this DAA name their seed block.
 pub fn trace_seed_bind_activation_daa() -> u64 {
-    gate(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
+    gate_h15_on(H15_ACTIVATION_DAA, TESTNET_H15_ACTIVATION_DAA)
 }
 
 /// Resident possession indices, built lazily when PoM activates, keyed by MODEL (era-stable).

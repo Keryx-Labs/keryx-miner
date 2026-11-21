@@ -941,6 +941,23 @@ fn main() -> Result<(), Error> {
         let n_gen: usize = val("--range-gen").and_then(|s| s.parse().ok()).unwrap_or(8);
         std::process::exit(keryx_miner::llama_engine::run_range_test(&gguf, gpu, n_layer, split, n_prompt, n_gen));
     }
+    // Hidden model id: --digest <file> prints the IPFS UnixFS v0 digest a model_id is made of.
+    if let Some(i) = argv.iter().position(|a| a == "--digest") {
+        let Some(path) = argv.get(i + 1) else {
+            eprintln!("usage: --digest <file>");
+            std::process::exit(2);
+        };
+        match keryx_miner::integrity::unixfs_v0_digest_file(std::path::Path::new(path), |_, _| {}) {
+            Ok(d) => {
+                println!("{}", hex::encode(d));
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("digest: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
     // Hidden sparse unpack: --unpack-head <head.krxh> <out.gguf>
     if let Some(i) = argv.iter().position(|a| a == "--unpack-head") {
         let (Some(src), Some(dst)) = (argv.get(i + 1), argv.get(i + 2)) else {

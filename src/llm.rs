@@ -374,7 +374,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // DeepSeek V4 — the template emits BOS itself (add_bos_token is off in this GGUF); a
         // closed think block in the generation prompt is its `thinking = false` branch. One
         // arm for the whole model and its shards: only a pipeline head ever formats a prompt.
-        n if n.starts_with("v4-flash") => format!(
+        n if n.starts_with("v4-flash") || n.starts_with("v4t") => format!(
             "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜></think>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
@@ -1779,9 +1779,11 @@ mod tests {
 
     #[test]
     fn context_floors_mirror_the_node() {
-        let net = &crate::models::NETWORK_MODEL_MAINNET;
-        let is_network =
-            |m: &crate::models::ModelSpec| m.model_id == net.whole.model_id || net.shards.iter().any(|s| s.model_id == m.model_id);
+        let is_network = |m: &crate::models::ModelSpec| {
+            [&crate::models::NETWORK_MODEL_MAINNET, &crate::models::NETWORK_MODEL_V4T]
+                .iter()
+                .any(|net| m.model_id == net.whole.model_id || net.shards.iter().any(|s| s.model_id == m.model_id))
+        };
         for m in crate::models::REGISTRY.iter().filter(|m| !is_network(m)) {
             let expected = if m.name == "qwen3.5-9b-abliterated" { 8_192 } else { 32_768 };
             assert_eq!(m.ctx_floor, expected, "{}", m.name);

@@ -3513,7 +3513,10 @@ impl KeryxdHandler {
                         if model_id_bytes.len() == 32 {
                             let mut model_id = [0u8; 32];
                             model_id.copy_from_slice(&model_id_bytes);
-                            if keryx_miner::llm::is_model_ready(&model_id) {
+                            if keryx_miner::models::shard_index(&model_id).is_some() {
+                                // a range alone generates nothing: its capability is the PoM walk
+                                log::debug!("Inference: challenge for range {:.8} ignored", model_id_hex);
+                            } else if keryx_miner::llm::is_model_ready(&model_id) {
                                 self.set_opoi_pause(true);
                                 miner.process_block(None).await?;
                                 info!("Inference: challenge received model={:.8} nonce={:.8} — spawning inference", model_id_hex, nonce_hex);

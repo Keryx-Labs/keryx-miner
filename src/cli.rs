@@ -200,7 +200,7 @@ pub struct Opt {
 
     #[clap(
         long,
-        help = "Use the devnet bench instead of mainnet: default port 22610, the testnet activation gates and the two-shard Qwen3.5-9B network model, H14 at 500 [default: false]"
+        help = "Use the devnet bench instead of mainnet: default port 22610, the devnet activation gates and the two-range truncated V4-Flash network model from the first block [default: false]"
     )]
     devnet: bool,
 
