@@ -38,8 +38,26 @@ impl Assignment {
 
     /// Every shard tier has at least one declaration.
     pub fn complete(&self) -> bool {
+        self.pipeline_count() > 0
+    }
+
+    /// Pipelines the declarations make up: pipeline `i` is the `i`-th key declared for each tier.
+    pub fn pipeline_count(&self) -> usize {
         let nm = network_model();
-        (0..nm.shards.len()).all(|k| self.chosen_key(NETWORK_MODEL_TIER + 1 + k as u8).is_some())
+        (0..nm.shards.len()).map(|k| self.declared_keys(NETWORK_MODEL_TIER + 1 + k as u8).len()).min().unwrap_or(0)
+    }
+
+    /// Rank of `key` among the declarations of `tier`.
+    pub fn rank(&self, tier: u8, key: &[u8; 32]) -> Option<usize> {
+        self.declared_keys(tier).iter().position(|k| k == key)
+    }
+
+    /// Keys a head of rank `rank` may use for `tier`, in the order to try them: its own pipeline's,
+    /// then the spares no pipeline holds.
+    pub fn link_candidates(&self, tier: u8, rank: usize) -> Vec<[u8; 32]> {
+        let keys = self.declared_keys(tier);
+        let k = self.pipeline_count();
+        keys.get(rank).copied().into_iter().chain(keys.iter().skip(k.max(rank + 1)).copied()).collect()
     }
 }
 
@@ -90,25 +108,26 @@ pub fn assignment_for(request_hash: &[u8; 32]) -> Option<Assignment> {
     assignments().lock().ok()?.get(request_hash).cloned()
 }
 
-fn responses_seen() -> &'static Mutex<HashSet<[u8; 32]>> {
-    static R: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+fn responses_seen() -> &'static Mutex<HashSet<([u8; 32], [u8; 32])>> {
+    static R: OnceLock<Mutex<HashSet<([u8; 32], [u8; 32])>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 const MAX_RESPONSES_SEEN: usize = 10_000;
 
-/// Records an AiResponse observed in a block: a substitute head stands down for it.
-pub fn note_response_seen(request_hash: [u8; 32]) {
+/// Records an AiResponse observed in a block, by request and responder key.
+pub fn note_response_seen(request_hash: [u8; 32], responder: [u8; 32]) {
     if let Ok(mut g) = responses_seen().lock() {
         if g.len() >= MAX_RESPONSES_SEEN {
             g.clear();
         }
-        g.insert(request_hash);
+        g.insert((request_hash, responder));
     }
 }
 
-pub fn response_seen(request_hash: &[u8; 32]) -> bool {
-    responses_seen().lock().map(|g| g.contains(request_hash)).unwrap_or(false)
+/// Whether `responder` already answered `request_hash` on chain.
+pub fn response_seen(request_hash: &[u8; 32], responder: &[u8; 32]) -> bool {
+    responses_seen().lock().map(|g| g.contains(&(*request_hash, *responder))).unwrap_or(false)
 }
 
 /// Whether `head` heads a live assignment (`request` when given) in which `own` declared `tier`.
@@ -117,7 +136,11 @@ pub fn authorizes(head: &[u8; 32], own: &[u8; 32], tier: u8, request: Option<&[u
     let head_tier = head_tier();
     g.values()
         .filter(|a| request.is_none_or(|r| a.request_hash == *r))
-        .any(|a| a.declared_keys(head_tier).contains(head) && a.declared_keys(tier).contains(own))
+        .any(|a| match (a.rank(head_tier, head), a.rank(tier, own)) {
+            // a link serves its own pipeline's head and the earlier ones, as the chain counts it
+            (Some(h), Some(l)) => h < a.pipeline_count() && l >= h,
+            _ => false,
+        })
 }
 
 /// The shard tiers this miner serves right now.
@@ -245,9 +268,6 @@ pub struct HeadResult {
 /// How long a head waits for its declaration and the other tiers' to reach the audit.
 const ASSIGNMENT_WAIT: Duration = Duration::from_secs(90);
 
-/// How long a substitute head leaves the chosen one alone before serving itself.
-const SUBSTITUTE_DELAY: Duration = Duration::from_secs(150);
-
 /// What a head does with a network-model request first seen at `since`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadDecision {
@@ -256,12 +276,11 @@ pub enum HeadDecision {
     Drop(&'static str),
 }
 
-/// Serve right away as the chosen head once every tier has declared, as a substitute after
-/// [`SUBSTITUTE_DELAY`] without a response on chain; wait meanwhile, mining on. Only declared
-/// signers count on chain, so an incomplete pipeline is never served.
+/// Serve as soon as this head's pipeline is complete: every pipeline serves at once, and each
+/// valid one enters the reward draw. Wait meanwhile, mining on.
 pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa: u64) -> HeadDecision {
     let Some(identity) = identity() else { return HeadDecision::Drop("no escrow identity") };
-    if response_seen(request_hash) {
+    if response_seen(request_hash, &identity.pubkey) {
         return HeadDecision::Drop("already served");
     }
     let waited = since.elapsed();
@@ -275,13 +294,9 @@ pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa
     if !a.declared_keys(head_tier).contains(&identity.pubkey) {
         return if waited > ASSIGNMENT_WAIT { HeadDecision::Drop("own declaration not in the audit") } else { HeadDecision::Wait };
     }
-    if !a.complete() {
-        return HeadDecision::Wait;
-    }
-    if a.chosen_key(head_tier) == Some(identity.pubkey) || waited > SUBSTITUTE_DELAY {
-        HeadDecision::Serve
-    } else {
-        HeadDecision::Wait
+    match a.rank(head_tier, &identity.pubkey) {
+        Some(rank) if rank < a.pipeline_count() => HeadDecision::Serve,
+        _ => HeadDecision::Wait,
     }
 }
 
@@ -408,9 +423,10 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let identity = identity().ok_or("no escrow identity")?;
     let head_tier = head_tier();
     let assignment = assignment_for(&request_hash).ok_or("no assignment published for this request")?;
-    if assignment.chosen_key(head_tier) != Some(identity.pubkey) {
-        log::info!("pipeline: chosen head silent for request {} — serving as substitute", hex::encode(&request_hash[..8]));
-    }
+    let rank = assignment
+        .rank(head_tier, &identity.pubkey)
+        .filter(|r| *r < assignment.pipeline_count())
+        .ok_or("this head has no complete pipeline")?;
     let nm = network_model();
     let n_links = nm.shards.len() - 1;
     let t0 = std::time::Instant::now();
@@ -432,12 +448,17 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let mut links: Vec<HeadLink> = Vec::with_capacity(n_links);
     for (k, spec) in nm.shards.iter().enumerate().take(n_links) {
         let tier = NETWORK_MODEL_TIER + 1 + k as u8;
-        // the declared keys in order, chosen first: only a declared link counts on chain
-        let mut spare: std::collections::VecDeque<[u8; 32]> = assignment.declared_keys(tier).into();
+        let mut spare: std::collections::VecDeque<[u8; 32]> = assignment.link_candidates(tier, rank).into();
         let (session, n_hc) = open_next(&request_hash, max_len, spec.model_id, tier, k, &mut spare, &identity).await?;
         links.push(HeadLink { k, tier, model_id: spec.model_id, session, spare, tokens: Vec::new(), residual: Vec::new(), n_hc });
     }
-    log::info!("pipeline: heading request {} over {} links, {} prompt tokens", hex::encode(&request_hash[..8]), links.len(), prompt_ids.len());
+    log::info!(
+        "pipeline: heading request {} as pipeline {} of {}, {} prompt tokens",
+        hex::encode(&request_hash[..8]),
+        rank + 1,
+        assignment.pipeline_count(),
+        prompt_ids.len()
+    );
 
     let deadline = t0 + crate::llama_engine::HEAD_GENERATION_DEADLINE;
     let mut answer: Vec<u8> = Vec::new();
@@ -496,8 +517,15 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
 mod tests {
     use super::*;
 
+    /// Tests that write the process-wide assignments run one at a time.
+    fn assignments_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: Mutex<()> = Mutex::new(());
+        L.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn assignments_parse_and_index_by_request() {
+        let _serial = assignments_lock();
         let rh = [7u8; 32];
         let k = [9u8; 32];
         let enc = format!("{}:100:6500:6-{},11-{}", hex::encode(rh), hex::encode(k), hex::encode([1u8; 32]));
@@ -525,34 +553,72 @@ mod tests {
         assert_eq!(a.chosen_key(11), Some([9u8; 32]));
         assert_eq!(a.chosen_key(7), None);
         assert!(!a.complete());
+        assert_eq!(a.pipeline_count(), 0);
         let full = Assignment {
             links: (0..network_model().shards.len()).map(|k| (NETWORK_MODEL_TIER + 1 + k as u8, [k as u8; 32])).collect(),
             ..a.clone()
         };
         assert!(full.complete());
-        note_response_seen([5u8; 32]);
-        assert!(response_seen(&[5u8; 32]));
-        assert!(!response_seen(&[6u8; 32]));
+        note_response_seen([5u8; 32], [1u8; 32]);
+        assert!(response_seen(&[5u8; 32], &[1u8; 32]));
+        assert!(!response_seen(&[5u8; 32], &[2u8; 32]));
+    }
+
+    /// `per_tier[k]` keys declared for range `k`, key bytes `16 * k + i`.
+    fn encoded(rh: [u8; 32], per_tier: &[usize], extra_heads: &[[u8; 32]]) -> String {
+        let mut links: Vec<(u8, [u8; 32])> = Vec::new();
+        for (k, n) in per_tier.iter().enumerate() {
+            for i in 0..*n {
+                links.push((NETWORK_MODEL_TIER + 1 + k as u8, [16 * k as u8 + i as u8; 32]));
+            }
+        }
+        links.extend(extra_heads.iter().map(|h| (head_tier(), *h)));
+        format!("{}:1:1000:{}", hex::encode(rh), links.iter().map(|(t, k)| format!("{}-{}", t, hex::encode(k))).collect::<Vec<_>>().join(","))
+    }
+
+    #[test]
+    fn pipelines_follow_declaration_order() {
+        let _serial = assignments_lock();
+        let rh = [0x43u8; 32];
+        let a = parse_assignment(&encoded(rh, &[3, 2, 2, 2], &[])).unwrap();
+        assert_eq!(a.pipeline_count(), 2);
+        let t5 = NETWORK_MODEL_TIER + 1;
+        assert_eq!(a.link_candidates(t5, 0), vec![[0u8; 32], [2u8; 32]], "own key, then the spare");
+        assert_eq!(a.link_candidates(t5, 1), vec![[1u8; 32], [2u8; 32]]);
+        assert_eq!(a.link_candidates(NETWORK_MODEL_TIER + 2, 1), vec![[17u8; 32]]);
+        note_assignments(&encoded(rh, &[3, 2, 2, 2], &[]));
+        let ht = head_tier();
+        let head = |i: u8| [48 + i; 32];
+        // a link serves its own pipeline's head and earlier ones, never a later one
+        assert!(authorizes(&head(0), &[1u8; 32], t5, Some(&rh)));
+        assert!(authorizes(&head(1), &[1u8; 32], t5, Some(&rh)));
+        assert!(!authorizes(&head(1), &[0u8; 32], t5, Some(&rh)));
+        assert!(authorizes(&head(1), &[2u8; 32], t5, Some(&rh)));
+        assert!(!authorizes(&head(1), &[1u8; 32], t5, Some(&[0u8; 32])));
+        assert_eq!(ht, 8);
+        note_assignments("");
     }
 
     #[test]
     fn head_decision_waits_serves_and_drops() {
+        let _serial = assignments_lock();
         let rh = [0x42u8; 32];
         let now = std::time::Instant::now();
-        let long_ago = now.checked_sub(SUBSTITUTE_DELAY + Duration::from_secs(1)).unwrap_or(now);
         set_identity(Arc::new(GatewayIdentity::from_privkey_hex(&"11".repeat(32)).unwrap()));
         let me = identity().unwrap().pubkey;
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Wait);
-        let ht = head_tier();
-        let other = [0xEEu8; 32];
-        let mut links: Vec<(u8, [u8; 32])> = (0..network_model().shards.len() - 1).map(|k| (NETWORK_MODEL_TIER + 1 + k as u8, [k as u8; 32])).collect();
-        links.push((ht, other));
-        links.push((ht, me));
-        let enc = format!("{}:1:1000:{}", hex::encode(rh), links.iter().map(|(t, k)| format!("{}-{}", t, hex::encode(k))).collect::<Vec<_>>().join(","));
-        note_assignments(&enc);
+        // second head key while the other tiers hold one pipeline: wait
+        note_assignments(&encoded(rh, &[1, 1, 1], &[[0xEEu8; 32], me]));
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Wait);
-        assert_eq!(head_decision(&rh, long_ago, 0), HeadDecision::Serve);
-        assert_eq!(head_decision(&rh, now, 1000), HeadDecision::Drop("service window closed"));
+        // a second pipeline completes: serve at once
+        note_assignments(&encoded(rh, &[2, 2, 2], &[[0xEEu8; 32], me]));
+        assert_eq!(head_decision(&rh, now, 0), HeadDecision::Serve);
+        // another pipeline's response does not stand this head down; its own does
+        note_response_seen(rh, [0xEEu8; 32]);
+        assert_eq!(head_decision(&rh, now, 0), HeadDecision::Serve);
+        note_response_seen(rh, me);
+        assert_eq!(head_decision(&rh, now, 0), HeadDecision::Drop("already served"));
+        assert_eq!(head_decision(&[0x41u8; 32], now, 1000), HeadDecision::Wait);
         note_assignments("");
     }
 

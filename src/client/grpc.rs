@@ -1213,7 +1213,9 @@ impl KeryxdHandler {
         for tx in txs {
             if tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_RESPONSE_HEX {
                 if let Some(resp) = hex::decode(&tx.payload).ok().and_then(|raw| keryx_inference::AiResponsePayload::deserialize(&raw)) {
-                    keryx_miner::pipeline::note_response_seen(resp.request_hash);
+                    if let Some(r) = resp.responder.as_ref() {
+                        keryx_miner::pipeline::note_response_seen(resp.request_hash, r.escrow_pubkey);
+                    }
                 }
                 continue;
             }
