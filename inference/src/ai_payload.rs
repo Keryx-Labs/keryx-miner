@@ -60,6 +60,12 @@ pub const AI_RESPONSE_EXT_TRACE: u8 = 0x81;
 pub const AI_RESPONSE_TRACE_LEN: usize = 32 + 4 + 4 + 1;
 /// The trace commitment followed by `[tokens_root: 32]`.
 pub const AI_RESPONSE_TRACE_TOKENS_LEN: usize = AI_RESPONSE_TRACE_LEN + 32;
+/// Extension kind: the link range traces. Follows the trace commitment.
+pub const AI_RESPONSE_EXT_RANGES: u8 = 0x82;
+/// `[n: 1] n × ([tier: 1] [trace_root: 32]) n × [boundary_root: 32]`, `n` the link count.
+pub fn ai_response_ranges_len(n: usize) -> usize {
+    1 + n * (1 + 32 + 32)
+}
 /// `[ext_kind: 1] [ext_len: 4 LE]`.
 pub const AI_RESPONSE_EXT_HEADER_LEN: usize = 1 + 4;
 /// Largest inline body: a 4 096-token answer with its token ids and envelope overhead.
@@ -75,6 +81,9 @@ pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN
     + MAX_AI_RESPONSE_PRIVATE_BODY_LEN
     + AI_RESPONSE_EXT_HEADER_LEN
     + AI_RESPONSE_TRACE_TOKENS_LEN;
+/// Largest AiResponse from `model_split_activation`: the link range traces for every link.
+pub const MAX_AI_RESPONSE_PAYLOAD_LEN_H18: usize =
+    MAX_AI_RESPONSE_PAYLOAD_LEN + AI_RESPONSE_EXT_HEADER_LEN + 1 + MAX_AI_RESPONSE_LINKS * (1 + 32 + 32);
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_AVAIL` transactions:
 /// `[request_hash: 32] [tier: 1] [zone: 1] [escrow_pubkey: 32] [schnorr_signature: 64]`
@@ -281,11 +290,46 @@ pub struct AiResponsePayload {
     pub private_body: Option<Vec<u8>>,
     /// Trace commitment (`AI_RESPONSE_EXT_TRACE`), only after an inline body.
     pub trace: Option<TraceCommitment>,
+    /// Link range traces (`AI_RESPONSE_EXT_RANGES`), only after a trace on a V3 payload.
+    pub ranges: Option<RangeTraces>,
+}
+
+/// Trace roots of the link ranges of a pipeline response, in link order, and of the output of each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeTraces {
+    pub roots: Vec<(u8, [u8; 32])>,
+    pub boundaries: Vec<[u8; 32]>,
+}
+
+impl RangeTraces {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ai_response_ranges_len(self.roots.len()));
+        out.push(self.roots.len() as u8);
+        for (t, r) in &self.roots {
+            out.push(*t);
+            out.extend_from_slice(r);
+        }
+        for b in &self.boundaries {
+            out.extend_from_slice(b);
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let n = *b.first()? as usize;
+        if n == 0 || b.len() != ai_response_ranges_len(n) {
+            return None;
+        }
+        let roots = (0..n).map(|i| (b[1 + 33 * i], b[2 + 33 * i..34 + 33 * i].try_into().unwrap())).collect();
+        let base = 1 + 33 * n;
+        let boundaries = (0..n).map(|i| b[base + 32 * i..base + 32 * i + 32].try_into().unwrap()).collect();
+        Some(Self { roots, boundaries })
+    }
 }
 
 impl AiResponsePayload {
     pub fn new(request_hash: [u8; 32], challenge_window_end: u64, response_ipfs_cid: [u8; 34], response_length: u32) -> Self {
-        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: None, links: Vec::new(), private_body: None, trace: None }
+        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: None, links: Vec::new(), private_body: None, trace: None, ranges: None }
     }
 
     pub fn new_v2(
@@ -304,6 +348,7 @@ impl AiResponsePayload {
             links: Vec::new(),
             private_body: None,
             trace: None,
+            ranges: None,
         }
     }
 
@@ -324,6 +369,7 @@ impl AiResponsePayload {
             links,
             private_body: None,
             trace: None,
+            ranges: None,
         }
     }
 
@@ -367,6 +413,12 @@ impl AiResponsePayload {
                     out.push(AI_RESPONSE_EXT_TRACE);
                     out.extend_from_slice(&(trace.len() as u32).to_le_bytes());
                     out.extend_from_slice(&trace.to_bytes());
+                }
+                if let (Some(_), Some(ranges)) = (&self.trace, &self.ranges) {
+                    let b = ranges.to_bytes();
+                    out.push(AI_RESPONSE_EXT_RANGES);
+                    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&b);
                 }
                 out
             }
@@ -442,6 +494,7 @@ impl AiResponsePayload {
                 links: Vec::new(),
                 private_body: None,
                 trace: None,
+                ranges: None,
             });
         }
         let responder = AiResponder { escrow_pubkey: data[78..110].try_into().ok()?, signature: data[110..174].try_into().ok()? };
@@ -464,7 +517,7 @@ impl AiResponsePayload {
                 pos += AI_RESPONSE_LINK_LEN;
             }
         }
-        let (private_body, trace) = if pos < len {
+        let (private_body, trace, ranges) = if pos < len {
             let ext = &data[pos..];
             if ext.len() < AI_RESPONSE_EXT_HEADER_LEN || ext[0] != AI_RESPONSE_EXT_PRIVATE_BODY {
                 return None;
@@ -475,23 +528,41 @@ impl AiResponsePayload {
                 return None;
             }
             let rest = &ext[body_end..];
-            let trace = if rest.is_empty() {
-                None
+            let (trace, ranges) = if rest.is_empty() {
+                (None, None)
             } else {
-                let n = rest.len().checked_sub(AI_RESPONSE_EXT_HEADER_LEN)?;
-                if (n != AI_RESPONSE_TRACE_LEN && n != AI_RESPONSE_TRACE_TOKENS_LEN)
-                    || rest[0] != AI_RESPONSE_EXT_TRACE
-                    || u32::from_le_bytes(rest[1..5].try_into().ok()?) as usize != n
-                {
+                if rest.len() < AI_RESPONSE_EXT_HEADER_LEN || rest[0] != AI_RESPONSE_EXT_TRACE {
                     return None;
                 }
-                Some(TraceCommitment::from_bytes(&rest[AI_RESPONSE_EXT_HEADER_LEN..])?)
+                let n = u32::from_le_bytes(rest[1..5].try_into().ok()?) as usize;
+                if n != AI_RESPONSE_TRACE_LEN && n != AI_RESPONSE_TRACE_TOKENS_LEN {
+                    return None;
+                }
+                let end = AI_RESPONSE_EXT_HEADER_LEN + n;
+                let trace = TraceCommitment::from_bytes(rest.get(AI_RESPONSE_EXT_HEADER_LEN..end)?)?;
+                let tail = &rest[end..];
+                let ranges = if tail.is_empty() {
+                    None
+                } else {
+                    if tail.len() < AI_RESPONSE_EXT_HEADER_LEN
+                        || tail[0] != AI_RESPONSE_EXT_RANGES
+                        || u32::from_le_bytes(tail[1..5].try_into().ok()?) as usize != tail.len() - AI_RESPONSE_EXT_HEADER_LEN
+                    {
+                        return None;
+                    }
+                    let r = RangeTraces::from_bytes(&tail[AI_RESPONSE_EXT_HEADER_LEN..])?;
+                    if r.roots.len() != links.len() || r.roots.iter().zip(&links).any(|((t, _), l)| *t != l.tier) {
+                        return None;
+                    }
+                    Some(r)
+                };
+                (Some(trace), ranges)
             };
-            (Some(ext[AI_RESPONSE_EXT_HEADER_LEN..body_end].to_vec()), trace)
+            (Some(ext[AI_RESPONSE_EXT_HEADER_LEN..body_end].to_vec()), trace, ranges)
         } else {
-            (None, None)
+            (None, None, None)
         };
-        Some(Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: Some(responder), links, private_body, trace })
+        Some(Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: Some(responder), links, private_body, trace, ranges })
     }
 
     /// Parse from a hex-encoded payload string (keryxd gRPC format).
@@ -988,6 +1059,32 @@ mod tests {
         let at = bytes.len() - AI_RESPONSE_TRACE_TOKENS_LEN - 4;
         bad[at..at + 4].copy_from_slice(&(AI_RESPONSE_TRACE_LEN as u32).to_le_bytes());
         assert!(AiResponsePayload::deserialize(&bad).is_none());
+    }
+
+    #[test]
+    fn ai_response_range_traces_roundtrip() {
+        let links = vec![
+            AiResponseLink { tier: 5, escrow_pubkey: [5u8; 32], signature: [6u8; 64] },
+            AiResponseLink { tier: 6, escrow_pubkey: [7u8; 32], signature: [8u8; 64] },
+        ];
+        let head = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let ranges = RangeTraces { roots: vec![(5, [0xa5u8; 32]), (6, [0xa6u8; 32])], boundaries: vec![[0xb5u8; 32], [0xb6u8; 32]] };
+        let base = AiResponsePayload::new_v3([7u8; 32], 900, [0x12u8; 34], 64, head, links).with_private_body(vec![9u8; 40]).with_trace(trace());
+        let resp = AiResponsePayload { ranges: Some(ranges.clone()), ..base.clone() };
+        let bytes = resp.serialize();
+        assert_eq!(bytes.len(), base.serialize().len() + AI_RESPONSE_EXT_HEADER_LEN + ai_response_ranges_len(2));
+        assert!(bytes.len() <= MAX_AI_RESPONSE_PAYLOAD_LEN_H18);
+        assert_eq!(AiResponsePayload::deserialize(&bytes), Some(resp.clone()));
+        // every link signs the range roots
+        assert_ne!(resp.link_signed_bytes(5, &[0x33u8; 32]), base.link_signed_bytes(5, &[0x33u8; 32]));
+        // tiers must follow the links
+        let swapped = RangeTraces { roots: vec![(6, [0xa5u8; 32]), (5, [0xa6u8; 32])], ..ranges.clone() };
+        assert!(AiResponsePayload::deserialize(&AiResponsePayload { ranges: Some(swapped), ..base.clone() }.serialize()).is_none());
+        let short = RangeTraces { roots: vec![(5, [0xa5u8; 32])], boundaries: vec![[0xb5u8; 32]] };
+        assert!(AiResponsePayload::deserialize(&AiResponsePayload { ranges: Some(short), ..base.clone() }.serialize()).is_none());
+        // no ranges without a trace
+        let untraced = AiResponsePayload { trace: None, ranges: Some(ranges), ..base };
+        assert_eq!(AiResponsePayload::deserialize(&untraced.serialize()).unwrap().ranges, None);
     }
 
     #[test]

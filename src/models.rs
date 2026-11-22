@@ -405,6 +405,8 @@ pub struct NetworkModelSpec {
     pub n_layer: u32,
     pub head_cid: &'static str,
     pub head_digest_hex: &'static str,
+    /// Trace manifest of each range, in shard order; empty when ranges are not traced.
+    pub range_manifests: &'static [&'static [u8]],
 }
 
 pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
@@ -414,6 +416,12 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
     n_layer: 43,
     head_cid: "QmVEZUvJF9e2FRMf5aW6MxWGENgqmhbo2dr87em2hK4QFp",
     head_digest_hex: "667269bca5045390ff0ed3084a224c3d29666ee5fffa1a19e9e97fd6312ec56f",
+    range_manifests: &[
+        include_bytes!("../assets/trace-manifests/range-v4flash-0.bin"),
+        include_bytes!("../assets/trace-manifests/range-v4flash-1.bin"),
+        include_bytes!("../assets/trace-manifests/range-v4flash-2.bin"),
+        include_bytes!("../assets/trace-manifests/range-v4flash-3.bin"),
+    ],
 };
 
 pub static NETWORK_MODEL_SPLIT9B: NetworkModelSpec = NetworkModelSpec {
@@ -423,6 +431,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelSpec = NetworkModelSpec {
     n_layer: 32,
     head_cid: "QmQSC2sjKaAqZH4E6HGbtkowWqGKBrHx4JvAWmXsTpNdDC",
     head_digest_hex: "1f22b2133c40b16d0ba15dffb4823f889b76eb834fe6c90dedc6a38d504a46cb",
+    range_manifests: &[],
 };
 
 // Devnet bench network model: DeepSeek V4-Flash 0731 cut to 4 layers, in two ranges ─ mirror of
@@ -487,6 +496,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelSpec = NetworkModelSpec {
     n_layer: 4,
     head_cid: "",
     head_digest_hex: "49b0307540329173a2b0add6772bc5466d7a5d4cd10eee63d62b41a84ba231d0",
+    range_manifests: &[include_bytes!("../assets/trace-manifests/range-v4t-0.bin"), include_bytes!("../assets/trace-manifests/range-v4t-1.bin")],
 };
 
 /// The network model of the selected network: split V4-Flash-0731, or the two-range truncated

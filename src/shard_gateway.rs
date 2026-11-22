@@ -78,6 +78,8 @@ const FRAME_OPENED: u8 = 7;
 const FRAME_STEP: u8 = 8;
 const FRAME_RESULT: u8 = 9;
 const FRAME_CLOSE: u8 = 10;
+const FRAME_ROOT: u8 = 11;
+const FRAME_ROOTED: u8 = 12;
 
 const STATUS_OK: u8 = 0;
 const STATUS_NO_SHARD: u8 = 1;
@@ -168,6 +170,94 @@ fn receipt_holds(r: &keryx_inference::AiStepReceipt, link: &[u8; 32], request: &
         && verify_schnorr(link, &r.signature, &domain_hash(RECEIPT_DOMAIN, &[&r.signed_bytes()]))
 }
 
+/// A link's trace of one head's sequence.
+#[derive(Clone, Default)]
+pub struct RangeTrace {
+    pub traced: bool,
+    pub pos_roots: Vec<[u8; 32]>,
+    /// `(pos0, n)` and wire input of every step.
+    pub steps: Vec<(u32, u32, Vec<u8>)>,
+    pub in_leaves: Vec<[u8; 32]>,
+    pub out_leaves: Vec<[u8; 32]>,
+}
+
+/// Roots a link commits for a range: its trace, its input (none for token input) and its output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeRoots {
+    pub trace: [u8; 32],
+    pub input: Option<[u8; 32]>,
+    pub output: [u8; 32],
+}
+
+impl RangeTrace {
+    fn record(&mut self, pos0: u32, n: u32, input: &[u8], from_tokens: bool, output: &[u8], pos_roots: Vec<[u8; 32]>, row_bytes: usize) {
+        if self.steps.is_empty() {
+            self.traced = true;
+        }
+        self.traced &= pos_roots.len() == n as usize && output.len() == n as usize * row_bytes;
+        self.pos_roots.extend(pos_roots);
+        if !from_tokens {
+            self.in_leaves.extend(input.chunks(row_bytes).map(|r| *blake3::hash(r).as_bytes()));
+        }
+        self.out_leaves.extend(output.chunks(row_bytes).map(|r| *blake3::hash(r).as_bytes()));
+        self.steps.push((pos0, n, input.to_vec()));
+    }
+
+    pub fn roots(&self) -> Option<RangeRoots> {
+        if !self.traced || self.pos_roots.is_empty() || self.out_leaves.len() != self.pos_roots.len() {
+            return None;
+        }
+        let root = keryx_verifiable_inference::merkle::b3_root;
+        Some(RangeRoots {
+            trace: root(&self.pos_roots),
+            input: (!self.in_leaves.is_empty()).then(|| root(&self.in_leaves)),
+            output: root(&self.out_leaves),
+        })
+    }
+}
+
+fn range_traces() -> &'static Mutex<HashMap<([u8; 32], [u8; 32]), RangeTrace>> {
+    static T: OnceLock<Mutex<HashMap<([u8; 32], [u8; 32]), RangeTrace>>> = OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+fn store_trace(request: [u8; 32], head: [u8; 32], t: RangeTrace) {
+    if !t.steps.is_empty() {
+        range_traces().lock().unwrap_or_else(|p| p.into_inner()).insert((request, head), t);
+    }
+}
+
+/// This link's trace of `request` for `head`.
+pub fn range_trace(request: &[u8; 32], head: &[u8; 32]) -> Option<RangeTrace> {
+    range_traces().lock().unwrap_or_else(|p| p.into_inner()).get(&(*request, *head)).cloned()
+}
+
+/// The roots of the ranges in a response's extension bytes, `None` when it carries none.
+fn response_ranges(ext: &[u8]) -> Option<keryx_inference::RangeTraces> {
+    let mut o = 0usize;
+    while o + keryx_inference::AI_RESPONSE_EXT_HEADER_LEN <= ext.len() {
+        let kind = ext[o];
+        let len = u32::from_le_bytes(ext[o + 1..o + 5].try_into().ok()?) as usize;
+        let body = ext.get(o + 5..o + 5 + len)?;
+        if kind == keryx_inference::AI_RESPONSE_EXT_RANGES {
+            return keryx_inference::RangeTraces::from_bytes(body);
+        }
+        o += 5 + len;
+    }
+    None
+}
+
+/// Whether `ranges` carries this link's roots for `tier`.
+fn ranges_hold(ranges: &keryx_inference::RangeTraces, tier: u8, r: &RangeRoots) -> bool {
+    let Some(i) = ranges.roots.iter().position(|(t, _)| *t == tier) else { return false };
+    let input_ok = match (i, r.input) {
+        (0, None) => true,
+        (i, Some(input)) if i > 0 => ranges.boundaries.get(i - 1) == Some(&input),
+        _ => false,
+    };
+    ranges.roots[i].1 == r.trace && ranges.boundaries.get(i) == Some(&r.output) && input_ok
+}
+
 /// Sequences kept after their head dropped without closing them, by `(request, head)`.
 fn retained() -> &'static Mutex<HashMap<([u8; 32], [u8; 32]), (OpenRange, std::time::Instant)>> {
     static R: OnceLock<Mutex<HashMap<([u8; 32], [u8; 32]), (OpenRange, std::time::Instant)>>> = OnceLock::new();
@@ -193,6 +283,7 @@ fn evict_oldest_retained() -> bool {
 
 /// Closes every retained sequence whose request is not in `live`.
 pub fn release_retained(live: &std::collections::HashSet<[u8; 32]>) {
+    range_traces().lock().unwrap_or_else(|p| p.into_inner()).retain(|(request, _), _| live.contains(request));
     let mut g = retained().lock().unwrap_or_else(|p| p.into_inner());
     g.retain(|(request, _), (o, _)| {
         let keep = live.contains(request);
@@ -452,6 +543,10 @@ pub trait RangeCompute: Send + Sync {
     fn open(&self) -> Result<u32, String>;
     /// Runs `n` tokens of `seq` from `pos0`: token ids or `n × n_hc` residual floats in, `n × n_hc` floats out.
     fn step(&self, seq: u32, pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<Vec<f32>, String>;
+    /// [`Self::step`] with the trace root of every computed position; none when untraced.
+    fn step_traced(&self, seq: u32, pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<(Vec<f32>, Vec<[u8; 32]>), String> {
+        self.step(seq, pos0, tokens, input).map(|o| (o, Vec::new()))
+    }
     /// Forgets and releases `seq`.
     fn close(&self, seq: u32);
 }
@@ -726,6 +821,7 @@ struct OpenRange {
     dims: RangeDims,
     /// Hash of the last receipt sent for this sequence.
     last_receipt: [u8; 32],
+    trace: RangeTrace,
 }
 
 async fn server_session(
@@ -835,7 +931,7 @@ async fn server_session(
                 reply.extend_from_slice(&(dims.n_hc as u32).to_le_bytes());
                 reply.extend_from_slice(&(dims.n_vocab as u32).to_le_bytes());
                 reply.push(dims.from_tokens as u8);
-                open = Some(OpenRange { request, max_len, len: 0, seq, compute, dims, last_receipt: [0u8; 32] });
+                open = Some(OpenRange { request, max_len, len: 0, seq, compute, dims, last_receipt: [0u8; 32], trace: RangeTrace::default() });
                 if out_tx.send((FRAME_OPENED, reply)).await.is_err() {
                     break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head stopped reading"));
                 }
@@ -858,11 +954,11 @@ async fn server_session(
                 let n = input.len(o.dims.n_hc) as u32;
                 let (compute, seq) = (o.compute.clone(), o.seq);
                 let out = tokio::task::spawn_blocking(move || match &input {
-                    StepInput::Tokens(t) => compute.step(seq, pos0, Some(t), None),
-                    StepInput::Residual(r) => compute.step(seq, pos0, None, Some(r)),
+                    StepInput::Tokens(t) => compute.step_traced(seq, pos0, Some(t), None),
+                    StepInput::Residual(r) => compute.step_traced(seq, pos0, None, Some(r)),
                 })
                 .await;
-                let out = match out {
+                let (out, pos_roots) = match out {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
                         log::warn!("shard gateway: step failed: {}", e);
@@ -877,6 +973,7 @@ async fn server_session(
                 o.len += n;
                 note_computed(&head_pubkey, &o.request);
                 let mut reply = f32s_to_bytes(&out);
+                o.trace.record(pos0, n, &payload[8..], o.dims.from_tokens, &reply, pos_roots, o.dims.n_hc * 4);
                 let receipt = step_receipt(&identity, &o.request, pos0, n, &payload[8..], &reply, o.last_receipt);
                 let receipt = receipt.serialize();
                 o.last_receipt = hash32(&receipt);
@@ -887,6 +984,7 @@ async fn server_session(
             }
             FRAME_CLOSE => {
                 if let Some(o) = open.take() {
+                    store_trace(o.request, head_pubkey, o.trace.clone());
                     o.compute.close(o.seq);
                 }
                 pause = None;
@@ -894,10 +992,32 @@ async fn server_session(
             FRAME_PING => {
                 let _ = out_tx.send((FRAME_PONG, payload)).await;
             }
+            FRAME_ROOT => {
+                let Ok(request) = <[u8; 32]>::try_from(payload.as_slice()) else {
+                    let _ = out_tx.send((FRAME_ERROR, b"root: bad length".to_vec())).await;
+                    continue;
+                };
+                let roots = authorize(&head_pubkey, &identity.pubkey, tier, Some(&request))
+                    .then(|| range_trace(&request, &head_pubkey).and_then(|t| t.roots()))
+                    .flatten();
+                match roots {
+                    Some(r) => {
+                        let mut reply = Vec::with_capacity(97);
+                        reply.extend_from_slice(&r.trace);
+                        reply.push(r.input.is_some() as u8);
+                        reply.extend_from_slice(&r.input.unwrap_or([0u8; 32]));
+                        reply.extend_from_slice(&r.output);
+                        let _ = out_tx.send((FRAME_ROOTED, reply)).await;
+                    }
+                    None => {
+                        let _ = out_tx.send((FRAME_ERROR, b"root: no trace".to_vec())).await;
+                    }
+                }
+            }
             FRAME_SIGN => {
                 // The served tier and the authenticated head are bound here, not taken from the head;
                 // the request must be assigned to both, and the head must have computed it through us.
-                if payload.len() < keryx_inference::AI_RESPONSE_PAYLOAD_LEN || payload.len() > keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN {
+                if payload.len() < keryx_inference::AI_RESPONSE_PAYLOAD_LEN || payload.len() > keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN_H18 {
                     let _ = out_tx.send((FRAME_ERROR, b"sign: bad length".to_vec())).await;
                     continue;
                 }
@@ -907,6 +1027,10 @@ async fn server_session(
                     Some(b"sign: request not assigned")
                 } else if !computed_for(&head_pubkey, &request) {
                     Some(b"sign: request not computed through this link")
+                } else if range_trace(&request, &head_pubkey).and_then(|t| t.roots()).is_some_and(|r| {
+                    !response_ranges(&payload[keryx_inference::AI_RESPONSE_PAYLOAD_LEN..]).is_some_and(|ranges| ranges_hold(&ranges, tier, &r))
+                }) {
+                    Some(b"sign: range roots do not match")
                 } else if !may_sign(request, head_pubkey, digest) {
                     Some(b"sign: another response already signed")
                 } else {
@@ -930,6 +1054,7 @@ async fn server_session(
     };
     reader.abort();
     if let Some(o) = open.take() {
+        store_trace(o.request, head_pubkey, o.trace.clone());
         if o.len > 0 {
             retain_range(head_pubkey, o);
         } else {
@@ -1208,6 +1333,19 @@ impl LinkSession {
         Ok(link)
     }
 
+    /// The link's roots of `request`, served through this head.
+    pub async fn root(&self, request: &[u8; 32]) -> Result<RangeRoots, String> {
+        let (kind, p) = self.call(FRAME_ROOT, request.to_vec(), Duration::from_secs(30)).await?;
+        if kind != FRAME_ROOTED || p.len() != 97 || p[32] > 1 {
+            return Err("bad root frame".into());
+        }
+        Ok(RangeRoots {
+            trace: p[..32].try_into().unwrap(),
+            input: (p[32] == 1).then(|| p[33..65].try_into().unwrap()),
+            output: p[65..97].try_into().unwrap(),
+        })
+    }
+
     /// Round-trip time of the link connection.
     pub async fn ping(&self) -> Result<Duration, String> {
         let (tx, rx) = oneshot::channel();
@@ -1219,6 +1357,45 @@ impl LinkSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_link_signs_only_its_own_range_roots() {
+        let mut first = RangeTrace::default();
+        first.record(0, 2, &[1, 0, 0, 0, 2, 0, 0, 0], true, &[7u8; 16], vec![[1u8; 32], [2u8; 32]], 8);
+        first.record(2, 1, &[3, 0, 0, 0], true, &[8u8; 8], vec![[3u8; 32]], 8);
+        let r0 = first.roots().unwrap();
+        assert!(r0.input.is_none());
+        let mut second = RangeTrace::default();
+        let relayed: Vec<u8> = [[7u8; 16].as_slice(), &[8u8; 8]].concat();
+        second.record(0, 3, &relayed, false, &[9u8; 24], vec![[4u8; 32]; 3], 8);
+        let r1 = second.roots().unwrap();
+        // the second range reads what the first one output
+        assert_eq!(r1.input, Some(r0.output));
+        let ranges = keryx_inference::RangeTraces { roots: vec![(5, r0.trace), (6, r1.trace)], boundaries: vec![r0.output, r1.output] };
+        assert!(ranges_hold(&ranges, 5, &r0) && ranges_hold(&ranges, 6, &r1));
+        assert!(!ranges_hold(&ranges, 7, &r1));
+        let wrong_out = keryx_inference::RangeTraces { boundaries: vec![r0.output, [0u8; 32]], ..ranges.clone() };
+        assert!(!ranges_hold(&wrong_out, 6, &r1));
+        let wrong_in = keryx_inference::RangeTraces { boundaries: vec![[0u8; 32], r1.output], ..ranges.clone() };
+        assert!(!ranges_hold(&wrong_in, 6, &r1));
+        // a step without its trace leaves the range unrooted
+        let mut partial = first.clone();
+        partial.record(3, 1, &[4, 0, 0, 0], true, &[8u8; 8], vec![], 8);
+        assert!(partial.roots().is_none());
+        // the extension is read back from the bytes a link signs
+        let links = vec![
+            keryx_inference::AiResponseLink { tier: 5, escrow_pubkey: [5u8; 32], signature: [0u8; 64] },
+            keryx_inference::AiResponseLink { tier: 6, escrow_pubkey: [6u8; 32], signature: [0u8; 64] },
+        ];
+        let head = keryx_inference::AiResponder { escrow_pubkey: [9u8; 32], signature: [0u8; 64] };
+        let trace = keryx_inference::TraceCommitment { trace_root: [1u8; 32], n_prompt: 2, n_pos: 3, stage: 1, tokens_root: None };
+        let resp = keryx_inference::AiResponsePayload {
+            ranges: Some(ranges.clone()),
+            ..keryx_inference::AiResponsePayload::new_v3([2u8; 32], 9, [0x12u8; 34], 3, head, links).with_private_body(vec![1u8; 10]).with_trace(trace)
+        };
+        let signed = resp.link_signed_bytes(5, &[9u8; 32]);
+        assert_eq!(response_ranges(&signed[33 + keryx_inference::AI_RESPONSE_PAYLOAD_LEN..]), Some(ranges));
+    }
 
     fn identity(seed: u8) -> Arc<GatewayIdentity> {
         Arc::new(GatewayIdentity::from_privkey_hex(&hex::encode([seed; 32])).unwrap())

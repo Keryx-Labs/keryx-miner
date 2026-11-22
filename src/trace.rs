@@ -448,6 +448,19 @@ fn meta_leaf(t: u32, n_ubatch: u32) -> Hash {
     *blake3::hash(&meta).as_bytes()
 }
 
+/// Trace root of every position of a range step: `leaves` as the engine wrote them, `nl` per
+/// position. `None` when a leaf is missing.
+pub fn range_pos_roots(leaves: &[u8], nl: usize) -> Option<Vec<Hash>> {
+    if nl == 0 || !leaves.len().is_multiple_of(nl * 32) {
+        return None;
+    }
+    let all: Vec<Hash> = leaves.chunks_exact(32).map(|c| c.try_into().unwrap()).collect();
+    if all.contains(&[0u8; 32]) {
+        return None;
+    }
+    Some(all.chunks(nl).map(b3_root).collect())
+}
+
 impl TraceRecord {
     /// Leaves as written by the engine, position-major (`n_pos × n_leaves`). The fill-ins of
     /// leaves the engine never writes are applied here; any other leaf left unwritten is an error.

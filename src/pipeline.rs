@@ -468,6 +468,16 @@ impl RangeCompute for LinkRange {
         r.step(seq, pos0, tokens, input).map_err(|rc| format!("range step failed ({})", rc))
     }
 
+    fn step_traced(&self, seq: u32, pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<(Vec<f32>, Vec<[u8; 32]>), String> {
+        let g = self.host.lock().unwrap_or_else(|p| p.into_inner());
+        let r = g.as_ref().ok_or("range unloaded")?;
+        let Some(nl) = r.leaf_count() else {
+            return r.step(seq, pos0, tokens, input).map(|o| (o, Vec::new())).map_err(|rc| format!("range step failed ({})", rc));
+        };
+        let (out, leaves, _) = r.step_traced(seq, pos0, tokens, input).map_err(|rc| format!("range step failed ({})", rc))?;
+        Ok((out, crate::trace::range_pos_roots(&leaves, nl).unwrap_or_default()))
+    }
+
     fn close(&self, seq: u32) {
         if let Some(r) = self.host.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
             r.clear(seq);
@@ -503,6 +513,11 @@ fn link_range(k: usize) -> Result<Arc<dyn RangeCompute>, String> {
     let dims = {
         let g = host.lock().unwrap_or_else(|p| p.into_inner());
         let r = g.as_ref().ok_or("range unloaded")?;
+        if let Some(m) = network_model().range_manifests.get(k) {
+            if let Err(rc) = r.trace_configure(m, range_ctx()) {
+                log::warn!("pipeline: range {} not traced ({})", k, rc);
+            }
+        }
         RangeDims { n_hc: r.n_hc, n_vocab: r.n_vocab, n_ctx: range_ctx(), from_tokens: r.first == 0 }
     };
     let c = Arc::new(LinkRange { host, dims, seqs: Mutex::new(vec![false; LINK_SEQS as usize]) });

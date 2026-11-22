@@ -1067,6 +1067,12 @@ KERYX_EXPORT int keryx_llama_trace_tokens(KeryxLlama* h, const int32_t* tokens, 
 #endif
 }
 
+#ifndef __APPLE__
+// Manifest each GPU's trace was last configured with by a range, empty when none.
+static std::mutex keryx_range_cfg_mu;
+static std::string keryx_range_cfg[16];
+#endif
+
 // Enables the canonical trace on the engine's GPU for the model described by `manifest`
 // (`max_pos` positions per response; the context size when 0). Returns 0 on success.
 KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) {
@@ -1079,6 +1085,10 @@ KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest
     if (max_pos <= 0 && !keryx_has_ctx(h)) return -2;
     const uint32_t mp = max_pos > 0 ? (uint32_t)max_pos : (uint32_t)llama_n_ctx(h->ctx);
     const int rc = ggml_cuda_q8c_configure(h->gpu, manifest, manifest_len, mp);
+    if (h->gpu >= 0 && h->gpu < 16) {
+        std::lock_guard<std::mutex> cl(keryx_range_cfg_mu);
+        keryx_range_cfg[h->gpu].clear();
+    }
     h->traced = rc == 0;
     if (rc != 0) keryx_set_error("trace", "trace configuration failed (" + std::to_string(rc) + ")");
     return rc;
@@ -1725,9 +1735,16 @@ KERYX_EXPORT int keryx_range_trace_configure(KeryxRange* r, const void* manifest
     (void)r; (void)manifest; (void)manifest_len; (void)max_pos;
     return -1;
 #else
-    if (!r || !manifest || max_pos <= 0) return -1;
+    if (!r || !manifest || max_pos <= 0 || r->gpu < 0 || r->gpu >= 16) return -1;
     std::lock_guard<std::mutex> lock(r->mu);
-    const int rc = ggml_cuda_q8c_configure(r->gpu, manifest, manifest_len, (uint32_t) max_pos);
+    std::lock_guard<std::mutex> cl(keryx_range_cfg_mu);
+    std::string* cfg = keryx_range_cfg;
+    const std::string want = std::string((const char*) manifest, manifest_len) + std::to_string(max_pos);
+    int rc = 0;
+    if (cfg[r->gpu] != want) {
+        rc = ggml_cuda_q8c_configure(r->gpu, manifest, manifest_len, (uint32_t) max_pos);
+        cfg[r->gpu] = rc == 0 ? want : std::string();
+    }
     r->traced = rc == 0;
     if (rc != 0) keryx_set_error("range", "trace configuration failed (" + std::to_string(rc) + ")");
     return rc;
