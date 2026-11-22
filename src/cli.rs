@@ -61,6 +61,16 @@ pub struct Opt {
     pub shard_port: u16,
 
     #[clap(
+        long = "zone",
+        value_name = "ZONE",
+        default_value = "eu",
+        help = "Zone this miner declares for network-model pipelines (H18): eu, na, sa, as, oc or af. \
+                Pipelines are formed within a zone first.",
+        help_heading = "Model split"
+    )]
+    pub zone: String,
+
+    #[clap(
         long = "shard-gateway",
         value_name = "HOST:PORT",
         help = "Listen address of the shard gateway (H14): the authenticated, encrypted front of the shard servers. \

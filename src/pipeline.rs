@@ -8,56 +8,54 @@ use std::time::Duration;
 use crate::models::{network_model, NETWORK_MODEL_TIER};
 use crate::shard_gateway::{self, GatewayIdentity, LinkSession, RangeCompute, RangeDims, StepInput};
 
+/// Place of a declared key once the node drew the ranks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Unranked,
+    Pipeline(u32),
+    Surplus,
+}
+
 /// An armed network-model audit as the node publishes it in the block template.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assignment {
     pub request_hash: [u8; 32],
     pub accepted_daa: u64,
     pub window_end_daa: u64,
-    /// `(shard tier, escrow pubkey)` of every availability declaration, chain order. The
-    /// first key of a tier is its chosen one, the following ones its substitutes.
-    pub links: Vec<(u8, [u8; 32])>,
+    pub declare_end_daa: u64,
+    /// `(shard tier, escrow pubkey, slot)` of every availability declaration, chain order.
+    pub links: Vec<(u8, [u8; 32], Slot)>,
 }
 
 impl Assignment {
-    /// The declared keys of `tier`, chain order, each once.
-    pub fn declared_keys(&self, tier: u8) -> Vec<[u8; 32]> {
-        let mut out: Vec<[u8; 32]> = Vec::new();
-        for (t, k) in self.links.iter() {
-            if *t == tier && !out.contains(k) {
-                out.push(*k);
-            }
-        }
-        out
+    /// Whether the node drew the ranks.
+    pub fn ranked(&self) -> bool {
+        self.links.iter().any(|(_, _, s)| *s != Slot::Unranked)
     }
 
-    /// The first declared key of `tier`.
-    pub fn chosen_key(&self, tier: u8) -> Option<[u8; 32]> {
-        self.links.iter().find(|(t, _)| *t == tier).map(|(_, k)| *k)
+    pub fn declared(&self, tier: u8, key: &[u8; 32]) -> bool {
+        self.links.iter().any(|(t, k, _)| *t == tier && k == key)
     }
 
-    /// Every shard tier has at least one declaration.
-    pub fn complete(&self) -> bool {
-        self.pipeline_count() > 0
+    /// Slot of `key` declared for `tier`.
+    pub fn slot(&self, tier: u8, key: &[u8; 32]) -> Option<Slot> {
+        self.links.iter().find(|(t, k, _)| *t == tier && k == key).map(|(_, _, s)| *s)
     }
 
-    /// Pipelines the declarations make up: pipeline `i` is the `i`-th key declared for each tier.
+    /// The key of pipeline `i` for `tier`.
+    pub fn pipeline_key(&self, tier: u8, i: u32) -> Option<[u8; 32]> {
+        self.links.iter().find(|(t, _, s)| *t == tier && *s == Slot::Pipeline(i)).map(|(_, k, _)| *k)
+    }
+
     pub fn pipeline_count(&self) -> usize {
-        let nm = network_model();
-        (0..nm.shards.len()).map(|k| self.declared_keys(NETWORK_MODEL_TIER + 1 + k as u8).len()).min().unwrap_or(0)
+        self.links.iter().filter_map(|(_, _, s)| if let Slot::Pipeline(i) = s { Some(*i as usize + 1) } else { None }).max().unwrap_or(0)
     }
 
-    /// Rank of `key` among the declarations of `tier`.
-    pub fn rank(&self, tier: u8, key: &[u8; 32]) -> Option<usize> {
-        self.declared_keys(tier).iter().position(|k| k == key)
-    }
-
-    /// Keys a head of rank `rank` may use for `tier`, in the order to try them: its own pipeline's,
-    /// then the spares no pipeline holds.
-    pub fn link_candidates(&self, tier: u8, rank: usize) -> Vec<[u8; 32]> {
-        let keys = self.declared_keys(tier);
-        let k = self.pipeline_count();
-        keys.get(rank).copied().into_iter().chain(keys.iter().skip(k.max(rank + 1)).copied()).collect()
+    /// Keys a head of pipeline `i` may use for `tier`, in the order to try them: its own
+    /// pipeline's, then the surplus keys.
+    pub fn link_candidates(&self, tier: u8, i: u32) -> Vec<[u8; 32]> {
+        let spares = self.links.iter().filter(|(t, _, s)| *t == tier && *s == Slot::Surplus).map(|(_, k, _)| *k);
+        self.pipeline_key(tier, i).into_iter().chain(spares).collect()
     }
 }
 
@@ -65,29 +63,54 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
-/// Parses one `hash:accepted:window_end:tier-escrowhex,...` entry.
+/// Parses one `hash:accepted:window_end:declare_end:tier-escrowhex-slot,...` entry.
 pub fn parse_assignment(s: &str) -> Option<Assignment> {
     let mut parts = s.split(':');
     let request_hash = unhex32(parts.next()?)?;
     let accepted_daa: u64 = parts.next()?.parse().ok()?;
     let window_end_daa: u64 = parts.next()?.parse().ok()?;
+    let declare_end_daa: u64 = parts.next()?.parse().ok()?;
     let mut links = Vec::new();
     for item in parts.next()?.split(',').filter(|i| !i.is_empty()) {
-        let (t, k) = item.split_once('-')?;
-        links.push((t.parse().ok()?, unhex32(k)?));
+        let mut f = item.split('-');
+        let t = f.next()?.parse().ok()?;
+        let k = unhex32(f.next()?)?;
+        let slot = match f.next()? {
+            "u" => Slot::Unranked,
+            "s" => Slot::Surplus,
+            i => Slot::Pipeline(i.parse().ok()?),
+        };
+        if f.next().is_some() {
+            return None;
+        }
+        links.push((t, k, slot));
     }
-    Some(Assignment { request_hash, accepted_daa, window_end_daa, links })
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(Assignment { request_hash, accepted_daa, window_end_daa, declare_end_daa, links })
 }
 
-/// Shard tiers with no declaration yet in the published assignment (all of them when none is
-/// published): what a head is still waiting for.
-pub fn missing_shard_tiers(request_hash: &[u8; 32]) -> Vec<u8> {
-    let nm = network_model();
-    let a = assignment_for(request_hash);
-    (0..nm.shards.len())
-        .map(|k| NETWORK_MODEL_TIER + 1 + k as u8)
-        .filter(|t| a.as_ref().map_or(true, |a| a.chosen_key(*t).is_none()))
-        .collect()
+/// Zone codes, in the order of their declared byte.
+const ZONES: [&str; keryx_inference::NETWORK_ZONES as usize] = ["eu", "na", "sa", "as", "oc", "af"];
+
+pub fn parse_zone(s: &str) -> Option<u8> {
+    ZONES.iter().position(|z| z.eq_ignore_ascii_case(s.trim())).map(|i| i as u8)
+}
+
+static ZONE: OnceLock<u8> = OnceLock::new();
+
+pub fn set_zone(zone: u8) {
+    let _ = ZONE.set(zone);
+}
+
+/// The zone this miner declares.
+pub fn zone() -> u8 {
+    ZONE.get().copied().unwrap_or(0)
+}
+
+pub fn zone_name(zone: u8) -> &'static str {
+    ZONES.get(zone as usize).copied().unwrap_or("?")
 }
 
 fn assignments() -> &'static Mutex<HashMap<[u8; 32], Assignment>> {
@@ -102,6 +125,49 @@ pub fn note_assignments(encoded: &str) {
     if let Ok(mut g) = assignments().lock() {
         *g = parsed;
     }
+}
+
+pub fn all_assignments() -> Vec<Assignment> {
+    assignments().lock().map(|g| g.values().cloned().collect()).unwrap_or_default()
+}
+
+/// Failed links of this head's pipelines not reported yet, `request -> (tier, key)`. A report
+/// does not stand against a pipeline that ends up served.
+fn link_failures() -> &'static Mutex<HashMap<[u8; 32], (u8, [u8; 32])>> {
+    static F: OnceLock<Mutex<HashMap<[u8; 32], (u8, [u8; 32])>>> = OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+/// Reported requests: the node takes one report per head.
+fn reported() -> &'static Mutex<HashSet<[u8; 32]>> {
+    static R: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Records that the link `(tier, key)` of this head's pipeline failed `request_hash`.
+pub fn note_link_failure(request_hash: [u8; 32], tier: u8, key: [u8; 32]) {
+    if reported().lock().is_ok_and(|r| r.contains(&request_hash)) {
+        return;
+    }
+    if let Ok(mut g) = link_failures().lock() {
+        g.entry(request_hash).or_insert((tier, key));
+    }
+}
+
+/// Failure reports to publish, each handed out once: the recorded ones of a live assignment.
+pub fn take_failure_reports() -> Vec<([u8; 32], u8, [u8; 32])> {
+    let Ok(mut g) = link_failures().lock() else { return Vec::new() };
+    let Ok(mut done) = reported().lock() else { return Vec::new() };
+    if done.len() >= MAX_RESPONSES_SEEN {
+        done.clear();
+    }
+    let mut out = Vec::new();
+    for (rh, (tier, key)) in g.drain() {
+        if assignment_for(&rh).is_some() && done.insert(rh) {
+            out.push((rh, tier, key));
+        }
+    }
+    out
 }
 
 pub fn assignment_for(request_hash: &[u8; 32]) -> Option<Assignment> {
@@ -130,17 +196,34 @@ pub fn response_seen(request_hash: &[u8; 32], responder: &[u8; 32]) -> bool {
     responses_seen().lock().map(|g| g.contains(&(*request_hash, *responder))).unwrap_or(false)
 }
 
-/// Whether `head` heads a live assignment (`request` when given) in which `own` declared `tier`.
+/// Heads that opened a surplus key, by `(request, tier, key)`: a spare serves one head.
+fn spare_claims() -> &'static Mutex<HashMap<([u8; 32], u8, [u8; 32]), [u8; 32]>> {
+    static C: OnceLock<Mutex<HashMap<([u8; 32], u8, [u8; 32]), [u8; 32]>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Whether `head` heads a pipeline of a live assignment (`request` when given) in which `own`
+/// is that pipeline's key for `tier`, or a surplus key no other head claimed yet.
 pub fn authorizes(head: &[u8; 32], own: &[u8; 32], tier: u8, request: Option<&[u8; 32]>) -> bool {
     let Ok(g) = assignments().lock() else { return false };
     let head_tier = head_tier();
-    g.values()
-        .filter(|a| request.is_none_or(|r| a.request_hash == *r))
-        .any(|a| match (a.rank(head_tier, head), a.rank(tier, own)) {
-            // a link serves its own pipeline's head and the earlier ones, as the chain counts it
-            (Some(h), Some(l)) => h < a.pipeline_count() && l >= h,
-            _ => false,
-        })
+    let Some((rh, pipeline_of_own)) = g.values().filter(|a| request.is_none_or(|r| a.request_hash == *r)).find_map(|a| {
+        let Some(Slot::Pipeline(h)) = a.slot(head_tier, head) else { return None };
+        match a.slot(tier, own)? {
+            Slot::Pipeline(l) if l == h => Some((a.request_hash, true)),
+            Slot::Surplus => Some((a.request_hash, false)),
+            _ => None,
+        }
+    }) else {
+        return false;
+    };
+    if pipeline_of_own {
+        return true;
+    }
+    let Ok(mut claims) = spare_claims().lock() else { return false };
+    let live: HashSet<[u8; 32]> = g.keys().copied().collect();
+    claims.retain(|(r, _, _), _| live.contains(r));
+    *claims.entry((rh, tier, *own)).or_insert(*head) == *head
 }
 
 /// The shard tiers this miner serves right now.
@@ -276,8 +359,7 @@ pub enum HeadDecision {
     Drop(&'static str),
 }
 
-/// Serve as soon as this head's pipeline is complete: every pipeline serves at once, and each
-/// valid one enters the reward draw. Wait meanwhile, mining on.
+/// Serve once the node drew the ranks and this head heads a pipeline; wait meanwhile, mining on.
 pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa: u64) -> HeadDecision {
     let Some(identity) = identity() else { return HeadDecision::Drop("no escrow identity") };
     if response_seen(request_hash, &identity.pubkey) {
@@ -290,13 +372,46 @@ pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa
     if now_daa >= a.window_end_daa {
         return HeadDecision::Drop("service window closed");
     }
-    let head_tier = head_tier();
-    if !a.declared_keys(head_tier).contains(&identity.pubkey) {
-        return if waited > ASSIGNMENT_WAIT { HeadDecision::Drop("own declaration not in the audit") } else { HeadDecision::Wait };
+    match a.slot(head_tier(), &identity.pubkey) {
+        Some(Slot::Pipeline(_)) => HeadDecision::Serve,
+        Some(Slot::Surplus) => HeadDecision::Drop("no pipeline for this head"),
+        Some(Slot::Unranked) => HeadDecision::Wait,
+        None if a.ranked() => HeadDecision::Drop("own declaration not in the audit"),
+        None => HeadDecision::Wait,
     }
-    match a.rank(head_tier, &identity.pubkey) {
-        Some(rank) if rank < a.pipeline_count() => HeadDecision::Serve,
-        _ => HeadDecision::Wait,
+}
+
+/// What a head waits for, for the log: the shard tiers with no declaration yet, or the rank draw.
+pub fn waiting_for(request_hash: &[u8; 32]) -> String {
+    let nm = network_model();
+    let a = assignment_for(request_hash);
+    let missing: Vec<u8> = (0..nm.shards.len())
+        .map(|k| NETWORK_MODEL_TIER + 1 + k as u8)
+        .filter(|t| a.as_ref().is_none_or(|a| !a.links.iter().any(|(lt, _, _)| lt == t)))
+        .collect();
+    match a {
+        Some(a) if missing.is_empty() => format!("the rank draw past DAA {}", a.declare_end_daa),
+        _ => format!("shard tier(s) {:?} to declare", missing),
+    }
+}
+
+/// A pipeline the head could not run, with the link of its own pipeline to report when that
+/// link's range found no reachable key.
+#[derive(Debug)]
+pub struct HeadFailure {
+    pub reason: String,
+    pub failed_link: Option<(u8, [u8; 32])>,
+}
+
+impl From<String> for HeadFailure {
+    fn from(reason: String) -> Self {
+        Self { reason, failed_link: None }
+    }
+}
+
+impl From<&str> for HeadFailure {
+    fn from(reason: &str) -> Self {
+        Self { reason: reason.to_string(), failed_link: None }
     }
 }
 
@@ -418,15 +533,14 @@ static HEADING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Serves `request_hash` as the pipeline head, after [`head_decision`] said so: each link runs its
 /// own layers on what it receives, this miner runs the last range and samples.
-pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize) -> Result<HeadResult, String> {
+pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize) -> Result<HeadResult, HeadFailure> {
     let _heading = HEADING.lock().await;
     let identity = identity().ok_or("no escrow identity")?;
     let head_tier = head_tier();
     let assignment = assignment_for(&request_hash).ok_or("no assignment published for this request")?;
-    let rank = assignment
-        .rank(head_tier, &identity.pubkey)
-        .filter(|r| *r < assignment.pipeline_count())
-        .ok_or("this head has no complete pipeline")?;
+    let Some(Slot::Pipeline(rank)) = assignment.slot(head_tier, &identity.pubkey) else {
+        return Err("this head has no pipeline".into());
+    };
     let nm = network_model();
     let n_links = nm.shards.len() - 1;
     let t0 = std::time::Instant::now();
@@ -441,7 +555,7 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     };
     let ctx = range_ctx() as usize;
     if prompt_ids.len() + 16 > ctx {
-        return Err(format!("{} prompt tokens do not fit the {}-token context", prompt_ids.len(), ctx));
+        return Err(format!("{} prompt tokens do not fit the {}-token context", prompt_ids.len(), ctx).into());
     }
     let max_len = (prompt_ids.len() + max_tokens).min(ctx) as u32;
 
@@ -449,7 +563,16 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     for (k, spec) in nm.shards.iter().enumerate().take(n_links) {
         let tier = NETWORK_MODEL_TIER + 1 + k as u8;
         let mut spare: std::collections::VecDeque<[u8; 32]> = assignment.link_candidates(tier, rank).into();
-        let (session, n_hc) = open_next(&request_hash, max_len, spec.model_id, tier, k, &mut spare, &identity).await?;
+        let opened = open_next(&request_hash, max_len, spec.model_id, tier, k, &mut spare, &identity).await;
+        let (session, n_hc) = match opened {
+            Ok(o) => o,
+            Err(reason) => {
+                for l in &links {
+                    l.session.close().await;
+                }
+                return Err(HeadFailure { reason, failed_link: assignment.pipeline_key(tier, rank).map(|key| (tier, key)) });
+            }
+        };
         links.push(HeadLink { k, tier, model_id: spec.model_id, session, spare, tokens: Vec::new(), residual: Vec::new(), n_hc });
     }
     log::info!(
@@ -465,19 +588,25 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let mut pos = 0u32;
     let mut feed: Vec<i32> = prompt_ids;
     let mut produced = 0usize;
-    let result: Result<(), String> = async {
+    // a link whose range ran out of reachable keys is the one its own pipeline holds there
+    let failed = |reason: String, tier: u8| HeadFailure { reason, failed_link: assignment.pipeline_key(tier, rank).map(|key| (tier, key)) };
+    let result: Result<(), HeadFailure> = async {
         loop {
             let mut next = None;
             for (c, chunk) in feed.chunks(shard_gateway::MAX_STEP_TOKENS).enumerate() {
                 let last = (c + 1) * shard_gateway::MAX_STEP_TOKENS >= feed.len();
-                let mut x = step_link(&mut links[0], &request_hash, max_len, &identity, pos, StepInput::Tokens(chunk.to_vec())).await?;
+                let t0 = links[0].tier;
+                let mut x = step_link(&mut links[0], &request_hash, max_len, &identity, pos, StepInput::Tokens(chunk.to_vec()))
+                    .await
+                    .map_err(|e| failed(e, t0))?;
                 for l in links.iter_mut().skip(1) {
-                    x = step_link(l, &request_hash, max_len, &identity, pos, StepInput::Residual(x)).await?;
+                    let t = l.tier;
+                    x = step_link(l, &request_hash, max_len, &identity, pos, StepInput::Residual(x)).await.map_err(|e| failed(e, t))?;
                 }
                 next = head_step(&host, pos, x, last).await?;
                 pos += chunk.len() as u32;
             }
-            let tok = next.ok_or("no token sampled")?;
+            let tok = next.ok_or(HeadFailure::from("no token sampled"))?;
             let piece = {
                 let g = host.lock().unwrap_or_else(|p| p.into_inner());
                 g.as_ref().ok_or("head range unloaded")?.piece(tok)?
@@ -492,7 +621,7 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
                 return Ok(());
             }
             if std::time::Instant::now() > deadline {
-                return Err(format!("generation deadline exceeded after {} tokens", produced));
+                return Err(format!("generation deadline exceeded after {} tokens", produced).into());
             }
             feed = vec![tok];
         }
@@ -524,17 +653,44 @@ mod tests {
         L.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn slot_code(s: Slot) -> String {
+        match s {
+            Slot::Unranked => "u".into(),
+            Slot::Surplus => "s".into(),
+            Slot::Pipeline(i) => i.to_string(),
+        }
+    }
+
+    fn encode(rh: [u8; 32], links: &[(u8, [u8; 32], Slot)]) -> String {
+        let l: Vec<String> = links.iter().map(|(t, k, s)| format!("{}-{}-{}", t, hex::encode(k), slot_code(*s))).collect();
+        format!("{}:100:6500:400:{}", hex::encode(rh), l.join(","))
+    }
+
+    /// Two pipelines over every shard tier (key `16 * k + i`), a spare on the first range.
+    fn two_pipelines(rh: [u8; 32], head1: [u8; 32]) -> String {
+        let n = network_model().shards.len();
+        let mut links = Vec::new();
+        for k in 0..n {
+            let t = NETWORK_MODEL_TIER + 1 + k as u8;
+            for i in 0..2u8 {
+                let key = if t == head_tier() && i == 1 { head1 } else { [16 * k as u8 + i; 32] };
+                links.push((t, key, Slot::Pipeline(i as u32)));
+            }
+        }
+        links.push((NETWORK_MODEL_TIER + 1, [2u8; 32], Slot::Surplus));
+        encode(rh, &links)
+    }
+
     #[test]
     fn assignments_parse_and_index_by_request() {
         let _serial = assignments_lock();
         let rh = [7u8; 32];
-        let k = [9u8; 32];
-        let enc = format!("{}:100:6500:6-{},11-{}", hex::encode(rh), hex::encode(k), hex::encode([1u8; 32]));
+        let enc = encode(rh, &[(6, [9u8; 32], Slot::Pipeline(0)), (11, [1u8; 32], Slot::Surplus), (6, [3u8; 32], Slot::Unranked)]);
         let a = parse_assignment(&enc).unwrap();
-        assert_eq!(a.request_hash, rh);
-        assert_eq!(a.accepted_daa, 100);
-        assert_eq!(a.window_end_daa, 6500);
-        assert_eq!(a.links, vec![(6, k), (11, [1u8; 32])]);
+        assert_eq!((a.request_hash, a.accepted_daa, a.window_end_daa, a.declare_end_daa), (rh, 100, 6500, 400));
+        assert_eq!(a.links, vec![(6, [9u8; 32], Slot::Pipeline(0)), (11, [1u8; 32], Slot::Surplus), (6, [3u8; 32], Slot::Unranked)]);
+        assert!(parse_assignment(&format!("{}:1:2:", hex::encode(rh))).is_none());
+        assert!(parse_assignment(&format!("{}:1:2:3:6-{}", hex::encode(rh), hex::encode([1u8; 32]))).is_none());
         note_assignments(&format!("{};bad;", enc));
         assert_eq!(assignment_for(&rh), Some(a));
         note_assignments("");
@@ -542,84 +698,97 @@ mod tests {
     }
 
     #[test]
-    fn declarations_are_ordered_and_the_first_is_chosen() {
-        let a = Assignment {
-            request_hash: [7u8; 32],
-            accepted_daa: 1,
-            window_end_daa: 2,
-            links: vec![(6, [1u8; 32]), (11, [9u8; 32]), (6, [2u8; 32]), (6, [1u8; 32]), (11, [8u8; 32])],
-        };
-        assert_eq!(a.declared_keys(6), vec![[1u8; 32], [2u8; 32]]);
-        assert_eq!(a.chosen_key(6), Some([1u8; 32]));
-        assert_eq!(a.chosen_key(11), Some([9u8; 32]));
-        assert_eq!(a.chosen_key(7), None);
-        assert!(!a.complete());
-        assert_eq!(a.pipeline_count(), 0);
-        let full = Assignment {
-            links: (0..network_model().shards.len()).map(|k| (NETWORK_MODEL_TIER + 1 + k as u8, [k as u8; 32])).collect(),
-            ..a.clone()
-        };
-        assert!(full.complete());
-        note_response_seen([5u8; 32], [1u8; 32]);
-        assert!(response_seen(&[5u8; 32], &[1u8; 32]));
-        assert!(!response_seen(&[5u8; 32], &[2u8; 32]));
-    }
-
-    /// `per_tier[k]` keys declared for range `k`, key bytes `16 * k + i`.
-    fn encoded(rh: [u8; 32], per_tier: &[usize], extra_heads: &[[u8; 32]]) -> String {
-        let mut links: Vec<(u8, [u8; 32])> = Vec::new();
-        for (k, n) in per_tier.iter().enumerate() {
-            for i in 0..*n {
-                links.push((NETWORK_MODEL_TIER + 1 + k as u8, [16 * k as u8 + i as u8; 32]));
-            }
-        }
-        links.extend(extra_heads.iter().map(|h| (head_tier(), *h)));
-        format!("{}:1:1000:{}", hex::encode(rh), links.iter().map(|(t, k)| format!("{}-{}", t, hex::encode(k))).collect::<Vec<_>>().join(","))
+    fn zones_parse_by_code() {
+        assert_eq!(parse_zone("eu"), Some(0));
+        assert_eq!(parse_zone(" AS "), Some(3));
+        assert_eq!(parse_zone("af"), Some(keryx_inference::NETWORK_ZONES - 1));
+        assert_eq!(parse_zone("mars"), None);
+        assert_eq!(zone_name(1), "na");
     }
 
     #[test]
-    fn pipelines_follow_declaration_order() {
-        let _serial = assignments_lock();
+    fn heads_take_their_pipeline_then_spares() {
         let rh = [0x43u8; 32];
-        let a = parse_assignment(&encoded(rh, &[3, 2, 2, 2], &[])).unwrap();
+        let a = parse_assignment(&two_pipelines(rh, [0xEEu8; 32])).unwrap();
+        assert!(a.ranked());
         assert_eq!(a.pipeline_count(), 2);
         let t5 = NETWORK_MODEL_TIER + 1;
         assert_eq!(a.link_candidates(t5, 0), vec![[0u8; 32], [2u8; 32]], "own key, then the spare");
         assert_eq!(a.link_candidates(t5, 1), vec![[1u8; 32], [2u8; 32]]);
         assert_eq!(a.link_candidates(NETWORK_MODEL_TIER + 2, 1), vec![[17u8; 32]]);
-        note_assignments(&encoded(rh, &[3, 2, 2, 2], &[]));
+        let unranked = Assignment { links: a.links.iter().map(|(t, k, _)| (*t, *k, Slot::Unranked)).collect(), ..a.clone() };
+        assert!(!unranked.ranked());
+        assert_eq!(unranked.pipeline_count(), 0);
+    }
+
+    #[test]
+    fn links_serve_their_own_head_and_a_spare_serves_one() {
+        let _serial = assignments_lock();
+        let rh = [0x44u8; 32];
+        note_assignments(&two_pipelines(rh, [0xEEu8; 32]));
+        let t5 = NETWORK_MODEL_TIER + 1;
         let ht = head_tier();
-        let head = |i: u8| [48 + i; 32];
-        // a link serves its own pipeline's head and earlier ones, never a later one
-        assert!(authorizes(&head(0), &[1u8; 32], t5, Some(&rh)));
-        assert!(authorizes(&head(1), &[1u8; 32], t5, Some(&rh)));
-        assert!(!authorizes(&head(1), &[0u8; 32], t5, Some(&rh)));
-        assert!(authorizes(&head(1), &[2u8; 32], t5, Some(&rh)));
-        assert!(!authorizes(&head(1), &[1u8; 32], t5, Some(&[0u8; 32])));
+        let n = network_model().shards.len() as u8 - 1;
+        let head0 = [16 * n; 32];
+        let head1 = [0xEEu8; 32];
+        assert!(authorizes(&head0, &[0u8; 32], t5, Some(&rh)));
+        assert!(!authorizes(&head1, &[0u8; 32], t5, Some(&rh)), "another pipeline's link");
+        assert!(authorizes(&head1, &[1u8; 32], t5, Some(&rh)));
+        assert!(!authorizes(&[0u8; 32], &[1u8; 32], t5, Some(&rh)), "not a head");
+        assert!(!authorizes(&head0, &[0u8; 32], t5, Some(&[0u8; 32])));
+        // the spare goes to the first head that opens it
+        assert!(authorizes(&head1, &[2u8; 32], t5, Some(&rh)));
+        assert!(authorizes(&head1, &[2u8; 32], t5, None));
+        assert!(!authorizes(&head0, &[2u8; 32], t5, Some(&rh)));
         assert_eq!(ht, 8);
         note_assignments("");
     }
 
     #[test]
-    fn head_decision_waits_serves_and_drops() {
+    fn head_decision_waits_for_the_rank_draw() {
         let _serial = assignments_lock();
         let rh = [0x42u8; 32];
         let now = std::time::Instant::now();
         set_identity(Arc::new(GatewayIdentity::from_privkey_hex(&"11".repeat(32)).unwrap()));
         let me = identity().unwrap().pubkey;
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Wait);
-        // second head key while the other tiers hold one pipeline: wait
-        note_assignments(&encoded(rh, &[1, 1, 1], &[[0xEEu8; 32], me]));
+        let ranked = two_pipelines(rh, me);
+        let a = parse_assignment(&ranked).unwrap();
+        let unranked: Vec<(u8, [u8; 32], Slot)> = a.links.iter().map(|(t, k, _)| (*t, *k, Slot::Unranked)).collect();
+        note_assignments(&encode(rh, &unranked));
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Wait);
-        // a second pipeline completes: serve at once
-        note_assignments(&encoded(rh, &[2, 2, 2], &[[0xEEu8; 32], me]));
+        assert!(waiting_for(&rh).contains("rank draw"));
+        note_assignments(&ranked);
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Serve);
-        // another pipeline's response does not stand this head down; its own does
+        assert_eq!(head_decision(&rh, now, 6500), HeadDecision::Drop("service window closed"));
+        // a surplus head has nothing to serve
+        let spare: Vec<(u8, [u8; 32], Slot)> =
+            a.links.iter().map(|(t, k, s)| (*t, *k, if *k == me { Slot::Surplus } else { *s })).collect();
+        note_assignments(&encode(rh, &spare));
+        assert_eq!(head_decision(&rh, now, 0), HeadDecision::Drop("no pipeline for this head"));
+        // ranked without this head's declaration
+        let without: Vec<(u8, [u8; 32], Slot)> = a.links.iter().filter(|(_, k, _)| *k != me).copied().collect();
+        note_assignments(&encode(rh, &without));
+        assert_eq!(head_decision(&rh, now, 0), HeadDecision::Drop("own declaration not in the audit"));
+        note_assignments(&ranked);
         note_response_seen(rh, [0xEEu8; 32]);
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Serve);
         note_response_seen(rh, me);
         assert_eq!(head_decision(&rh, now, 0), HeadDecision::Drop("already served"));
-        assert_eq!(head_decision(&[0x41u8; 32], now, 1000), HeadDecision::Wait);
+        note_assignments("");
+    }
+
+    #[test]
+    fn a_failed_link_is_reported_once() {
+        let _serial = assignments_lock();
+        let rh = [0x45u8; 32];
+        note_assignments(&two_pipelines(rh, [0xEEu8; 32]));
+        note_link_failure(rh, 6, [1u8; 32]);
+        note_link_failure(rh, 7, [2u8; 32]);
+        note_link_failure([0x46u8; 32], 6, [1u8; 32]);
+        assert_eq!(take_failure_reports(), vec![(rh, 6, [1u8; 32])]);
+        note_link_failure(rh, 6, [1u8; 32]);
+        assert!(take_failure_reports().is_empty());
         note_assignments("");
     }
 

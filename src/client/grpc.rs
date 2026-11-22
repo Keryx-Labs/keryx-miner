@@ -643,6 +643,8 @@ pub struct KeryxdHandler {
 
     /// Network-model requests this miner already declared itself available for (H14).
     ai_declared: std::collections::HashSet<String>,
+    /// Network-model requests declared on, with the last time a missing declaration was sent again.
+    ai_redeclared: std::collections::HashMap<[u8; 32], std::time::Instant>,
 
     /// Network-model requests this head is not yet serving: waiting for the declarations, or
     /// leaving the chosen head its turn. Mining goes on meanwhile.
@@ -973,6 +975,7 @@ impl KeryxdHandler {
             ai_request_txids: std::collections::HashMap::new(),
             ai_response_inflight: std::collections::HashMap::new(),
             ai_declared: std::collections::HashSet::new(),
+            ai_redeclared: std::collections::HashMap::new(),
             ai_pipeline_waiting: Vec::new(),
             ai_pipeline_since: std::collections::HashMap::new(),
             backfill_cutoff_daa: None,
@@ -1339,36 +1342,84 @@ impl KeryxdHandler {
         if block_daa < keryx_miner::pom::model_split_activation_daa() || self.ai_declared.contains(stable_id) {
             return;
         }
-        let Some(w) = self.escrow_watcher.as_ref() else { return };
         let tiers = keryx_miner::pipeline::served_tiers();
+        if self.escrow_watcher.is_none() {
+            return;
+        }
         if tiers.is_empty() {
             log::debug!("Inference: network-model request id={} — no shard served by this miner, nothing declared", stable_id);
             return;
         }
-        let now = std::time::Instant::now();
-        let due = now.checked_sub(std::time::Duration::from_secs(AI_RESPONSE_RETRY_SECS)).unwrap_or(now);
         for tier in tiers.iter() {
-            let avail = w.sign_avail(request_hash, *tier);
-            let rpc_tx = crate::proto::RpcTransaction {
-                version: 0,
-                inputs: vec![],
-                outputs: vec![],
-                lock_time: 0,
-                subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_AVAIL_HEX.to_string(),
-                gas: 0,
-                payload: hex::encode(avail.serialize()),
-                mass: 0,
-                verbose_data: None,
-            };
-            if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
-                self.ai_response_inflight.insert(txid, (rpc_tx, 0, due));
-            }
+            self.queue_declaration(request_hash, *tier);
         }
-        info!("Inference: declared available for id={} on tier(s) {:?}", stable_id, tiers);
+        info!(
+            "Inference: declared available for id={} on tier(s) {:?}, zone {}",
+            stable_id,
+            tiers,
+            keryx_miner::pipeline::zone_name(keryx_miner::pipeline::zone())
+        );
         if self.ai_declared.len() >= MAX_AI_SEEN_IDS {
             self.ai_declared.clear();
+            self.ai_redeclared.clear();
         }
         self.ai_declared.insert(stable_id.to_string());
+        self.ai_redeclared.insert(request_hash, std::time::Instant::now());
+    }
+
+    /// Queues a transaction of the AiAvail subnetwork for submission on the next tick.
+    fn queue_avail_tx(&mut self, payload: Vec<u8>) {
+        let rpc_tx = crate::proto::RpcTransaction {
+            version: 0,
+            inputs: vec![],
+            outputs: vec![],
+            lock_time: 0,
+            subnetwork_id: keryx_inference::SUBNETWORK_ID_AI_AVAIL_HEX.to_string(),
+            gas: 0,
+            payload: hex::encode(payload),
+            mass: 0,
+            verbose_data: None,
+        };
+        let now = std::time::Instant::now();
+        let due = now.checked_sub(std::time::Duration::from_secs(AI_RESPONSE_RETRY_SECS)).unwrap_or(now);
+        if let Some(txid) = Self::compute_rpc_txid(&rpc_tx) {
+            self.ai_response_inflight.entry(txid).or_insert((rpc_tx, 0, due));
+        }
+    }
+
+    fn queue_declaration(&mut self, request_hash: [u8; 32], tier: u8) {
+        let Some(w) = self.escrow_watcher.as_ref() else { return };
+        let avail = w.sign_avail(request_hash, tier, keryx_miner::pipeline::zone());
+        self.queue_avail_tx(avail.serialize());
+    }
+
+    /// Sends again the declarations of this miner that its armed audits still lack, until their
+    /// deadline; and the failure reports of the pipelines this head could not run.
+    fn maintain_pipeline_transactions(&mut self) {
+        let now_daa = self.last_known_daa;
+        let Some(own) = keryx_miner::pipeline::identity().map(|i| i.pubkey) else { return };
+        let tiers = keryx_miner::pipeline::served_tiers();
+        for a in keryx_miner::pipeline::all_assignments() {
+            let Some(last) = self.ai_redeclared.get(&a.request_hash).copied() else { continue };
+            if a.ranked() || now_daa > a.declare_end_daa || last.elapsed().as_secs() < AI_RESPONSE_RETRY_SECS {
+                continue;
+            }
+            let missing: Vec<u8> = tiers.iter().copied().filter(|t| !a.declared(*t, &own)).collect();
+            if missing.is_empty() {
+                continue;
+            }
+            for tier in missing.iter() {
+                self.queue_declaration(a.request_hash, *tier);
+            }
+            self.ai_redeclared.insert(a.request_hash, std::time::Instant::now());
+            log::info!("Inference: declaration for id={} on tier(s) {:?} not in the audit yet — sent again", hex::encode(&a.request_hash[..8]), missing);
+        }
+        for (request_hash, tier, key) in keryx_miner::pipeline::take_failure_reports() {
+            let Some(w) = self.escrow_watcher.as_ref() else { continue };
+            let fail = w.sign_fail(request_hash, tier, key);
+            self.queue_avail_tx(fail.serialize());
+            info!("Inference: pipeline id={} — reported the link of tier {} ({}) as failed", hex::encode(&request_hash[..8]), tier, hex::encode(&key[..8]));
+        }
     }
 
     /// Moves the waiting network-model requests whose turn has come back to the queue front,
@@ -1847,11 +1898,7 @@ impl KeryxdHandler {
                     }
                     keryx_miner::pipeline::HeadDecision::Wait => {
                         if first_seen {
-                            info!(
-                                "Inference: pipeline request id={} waiting — shard tier(s) {:?} have not declared yet",
-                                stable_id,
-                                keryx_miner::pipeline::missing_shard_tiers(&request_hash)
-                            );
+                            info!("Inference: pipeline request id={} waiting for {}", stable_id, keryx_miner::pipeline::waiting_for(&request_hash));
                         }
                         if let Some(entry) = job.retry {
                             self.ai_pipeline_waiting.push((entry, since));
@@ -1872,8 +1919,11 @@ impl KeryxdHandler {
                         Ok(r) => (Some(keryx_miner::llm::Generated { text: r.text, trace: None, device: 0 }), r.links, false),
                         Err(e) => {
                             // a link not reachable yet may be by the next try; a prompt too long never fits
-                            let transient = !e.contains("do not fit");
-                            log::warn!("Inference: pipeline head failed for id={} — {}{}", stable_id, e, if transient { " (retried)" } else { "; AiResponse skipped" });
+                            let transient = !e.reason.contains("do not fit");
+                            log::warn!("Inference: pipeline head failed for id={} — {}{}", stable_id, e.reason, if transient { " (retried)" } else { "; AiResponse skipped" });
+                            if let Some((tier, key)) = e.failed_link {
+                                keryx_miner::pipeline::note_link_failure(request_hash, tier, key);
+                            }
                             (None, Vec::new(), transient)
                         }
                     };
@@ -3558,6 +3608,7 @@ impl KeryxdHandler {
                     self.scan_txs_for_ai_requests(&block.transactions, block.header.as_ref().map_or(0, |h| h.daa_score));
                 }
                 self.promote_waiting_pipeline_requests();
+                self.maintain_pipeline_transactions();
                 if !self.inference_busy() && self.startable_request().is_some() {
                     self.try_start_inference(miner).await?;
                 }

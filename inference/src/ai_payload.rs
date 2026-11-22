@@ -77,11 +77,20 @@ pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN
     + AI_RESPONSE_TRACE_TOKENS_LEN;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_AVAIL` transactions:
-/// `[request_hash: 32] [tier: 1] [escrow_pubkey: 32] [schnorr_signature: 64]`
-/// Fixed 129 bytes — a shard holder declaring itself available for a network-model request.
-/// The signature covers the 33 `[request_hash] [tier]` bytes.
-pub const AI_AVAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 64;
-pub const AI_AVAIL_SIGNED_LEN: usize = 33;
+/// `[request_hash: 32] [tier: 1] [zone: 1] [escrow_pubkey: 32] [schnorr_signature: 64]`
+/// Fixed 130 bytes — a shard holder declaring itself available for a network-model request.
+/// The signature covers the 34 `[request_hash] [tier] [zone]` bytes.
+pub const AI_AVAIL_PAYLOAD_LEN: usize = 32 + 1 + 1 + 32 + 64;
+pub const AI_AVAIL_SIGNED_LEN: usize = 34;
+
+/// Declared zones: 0 Europe, 1 North America, 2 South America, 3 Asia, 4 Oceania,
+/// 5 Africa and Middle East.
+pub const NETWORK_ZONES: u8 = 6;
+
+/// Failure report on the same subnetwork: `[request_hash: 32] [link_tier: 1] [link_escrow_pubkey: 32]
+/// [head_escrow_pubkey: 32] [schnorr_signature: 64]`, signed by the head over the first 65 bytes.
+pub const AI_FAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 32 + 64;
+pub const AI_FAIL_SIGNED_LEN: usize = 65;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
 /// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
@@ -491,18 +500,19 @@ impl AiResponsePayload {
 pub struct AiAvailPayload {
     pub request_hash: [u8; 32],
     pub tier: u8,
+    pub zone: u8,
     pub escrow_pubkey: [u8; 32],
     pub signature: [u8; 64],
 }
 
 impl AiAvailPayload {
-    pub fn new(request_hash: [u8; 32], tier: u8, escrow_pubkey: [u8; 32], signature: [u8; 64]) -> Self {
-        Self { request_hash, tier, escrow_pubkey, signature }
+    pub fn new(request_hash: [u8; 32], tier: u8, zone: u8, escrow_pubkey: [u8; 32], signature: [u8; 64]) -> Self {
+        Self { request_hash, tier, zone, escrow_pubkey, signature }
     }
 
-    /// The 33 bytes the declaration signature covers.
+    /// The 34 bytes the declaration signature covers.
     pub fn signed_bytes(&self) -> [u8; AI_AVAIL_SIGNED_LEN] {
-        avail_signed_bytes(&self.request_hash, self.tier)
+        avail_signed_bytes(&self.request_hash, self.tier, self.zone)
     }
 
     pub fn serialize(&self) -> Vec<u8> {
@@ -514,14 +524,15 @@ impl AiAvailPayload {
     }
 
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() != AI_AVAIL_PAYLOAD_LEN {
+        if data.len() != AI_AVAIL_PAYLOAD_LEN || data[33] >= NETWORK_ZONES {
             return None;
         }
         Some(Self {
             request_hash: data[0..32].try_into().ok()?,
             tier: data[32],
-            escrow_pubkey: data[33..65].try_into().ok()?,
-            signature: data[65..129].try_into().ok()?,
+            zone: data[33],
+            escrow_pubkey: data[34..66].try_into().ok()?,
+            signature: data[66..130].try_into().ok()?,
         })
     }
 
@@ -531,12 +542,43 @@ impl AiAvailPayload {
     }
 }
 
-/// The bytes an availability declaration signs: `[request_hash] [tier]`.
-pub fn avail_signed_bytes(request_hash: &[u8; 32], tier: u8) -> [u8; AI_AVAIL_SIGNED_LEN] {
+/// The bytes an availability declaration signs: `[request_hash] [tier] [zone]`.
+pub fn avail_signed_bytes(request_hash: &[u8; 32], tier: u8, zone: u8) -> [u8; AI_AVAIL_SIGNED_LEN] {
     let mut out = [0u8; AI_AVAIL_SIGNED_LEN];
     out[..32].copy_from_slice(request_hash);
     out[32] = tier;
+    out[33] = zone;
     out
+}
+
+/// Failure report of a pipeline head on a `SUBNETWORK_ID_AI_AVAIL` transaction: the link of
+/// its pipeline that failed it, signed by the head's escrow key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiFailPayload {
+    pub request_hash: [u8; 32],
+    pub link_tier: u8,
+    pub link_escrow_pubkey: [u8; 32],
+    pub head_escrow_pubkey: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl AiFailPayload {
+    /// The 65 bytes the head signature covers.
+    pub fn signed_bytes_of(request_hash: &[u8; 32], link_tier: u8, link_escrow_pubkey: &[u8; 32]) -> [u8; AI_FAIL_SIGNED_LEN] {
+        let mut out = [0u8; AI_FAIL_SIGNED_LEN];
+        out[..32].copy_from_slice(request_hash);
+        out[32] = link_tier;
+        out[33..65].copy_from_slice(link_escrow_pubkey);
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AI_FAIL_PAYLOAD_LEN);
+        out.extend_from_slice(&Self::signed_bytes_of(&self.request_hash, self.link_tier, &self.link_escrow_pubkey));
+        out.extend_from_slice(&self.head_escrow_pubkey);
+        out.extend_from_slice(&self.signature);
+        out
+    }
 }
 
 /// Payload of a `SUBNETWORK_ID_AI_CHALLENGE` transaction.
@@ -846,7 +888,7 @@ mod tests {
 
     #[test]
     fn ai_avail_roundtrip_is_exact_length() {
-        let avail = AiAvailPayload::new([7u8; 32], 9, [0x33u8; 32], [0x44u8; 64]);
+        let avail = AiAvailPayload::new([7u8; 32], 9, 3, [0x33u8; 32], [0x44u8; 64]);
         let bytes = avail.serialize();
         assert_eq!(bytes.len(), AI_AVAIL_PAYLOAD_LEN);
         assert_eq!(AiAvailPayload::deserialize(&bytes), Some(avail));
@@ -854,9 +896,18 @@ mod tests {
         let mut short = bytes.clone();
         short.pop();
         assert!(AiAvailPayload::deserialize(&short).is_none());
-        let mut long = bytes.clone();
-        long.push(0);
-        assert!(AiAvailPayload::deserialize(&long).is_none());
+        let mut zoned = bytes.clone();
+        zoned[33] = NETWORK_ZONES;
+        assert!(AiAvailPayload::deserialize(&zoned).is_none());
+    }
+
+    #[test]
+    fn ai_fail_is_exact_length() {
+        let fail = AiFailPayload { request_hash: [7u8; 32], link_tier: 6, link_escrow_pubkey: [0x55u8; 32], head_escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let bytes = fail.serialize();
+        assert_eq!(bytes.len(), AI_FAIL_PAYLOAD_LEN);
+        assert_eq!(&bytes[..AI_FAIL_SIGNED_LEN], AiFailPayload::signed_bytes_of(&[7u8; 32], 6, &[0x55u8; 32]).as_slice());
+        assert_eq!(&bytes[65..97], &[0x33u8; 32]);
     }
 
     #[test]

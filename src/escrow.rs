@@ -513,17 +513,29 @@ impl EscrowWatcher {
     }
 
     /// Availability declaration for a network-model request: schnorr signature with the escrow
-    /// key over the domain-hashed `[request_hash] [tier]` bytes — MUST match the node's
+    /// key over the domain-hashed `[request_hash] [tier] [zone]` bytes — MUST match the node's
     /// `verify_avail_signature` (blake2b-256("KeryxServiceAvailV1" || signed_bytes)).
-    pub fn sign_avail(&self, request_hash: [u8; 32], tier: u8) -> keryx_inference::AiAvailPayload {
-        let signed = keryx_inference::avail_signed_bytes(&request_hash, tier);
+    pub fn sign_avail(&self, request_hash: [u8; 32], tier: u8, zone: u8) -> keryx_inference::AiAvailPayload {
+        let signed = keryx_inference::avail_signed_bytes(&request_hash, tier, zone);
+        let sig = self.sign_domain(b"KeryxServiceAvailV1", &signed);
+        keryx_inference::AiAvailPayload::new(request_hash, tier, zone, self.pubkey_bytes, sig)
+    }
+
+    /// Failure report of this head against the link `(link_tier, link_key)` of its pipeline —
+    /// MUST match the node's `verify_fail_signature` (blake2b-256("KeryxPipelineFailV1" || signed_bytes)).
+    pub fn sign_fail(&self, request_hash: [u8; 32], link_tier: u8, link_key: [u8; 32]) -> keryx_inference::AiFailPayload {
+        let signed = keryx_inference::AiFailPayload::signed_bytes_of(&request_hash, link_tier, &link_key);
+        let signature = self.sign_domain(b"KeryxPipelineFailV1", &signed);
+        keryx_inference::AiFailPayload { request_hash, link_tier, link_escrow_pubkey: link_key, head_escrow_pubkey: self.pubkey_bytes, signature }
+    }
+
+    fn sign_domain(&self, domain: &[u8], signed: &[u8]) -> [u8; 64] {
         let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
-        hasher.update(b"KeryxServiceAvailV1");
-        hasher.update(&signed);
+        hasher.update(domain);
+        hasher.update(signed);
         let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
         let keypair = secp256k1::Keypair::from_secret_key(&self.secp, &self.secret_key);
-        let sig = self.secp.sign_schnorr_no_aux_rand(&msg, &keypair);
-        keryx_inference::AiAvailPayload::new(request_hash, tier, self.pubkey_bytes, *sig.as_ref())
+        *self.secp.sign_schnorr_no_aux_rand(&msg, &keypair).as_ref()
     }
 
     /// Signed trace opening payload: `body ‖ escrow_pubkey ‖ schnorr(blake2b-256("KeryxTraceOpeningV1" ‖ body))`.

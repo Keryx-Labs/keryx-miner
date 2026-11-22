@@ -1275,6 +1275,10 @@ async fn run() -> Result<(), Error> {
     // Escrow delegation cert: binds the escrow key to the payout address. From H6 a coinbase
     // without a valid pair is an invalid block, so a bad cert fails here instead of producing
     // rejected blocks.
+    let Some(zone) = keryx_miner::pipeline::parse_zone(&opt.zone) else {
+        return Err(format!("--zone {}: expected one of eu, na, sa, as, oc, af", opt.zone).into());
+    };
+    keryx_miner::pipeline::set_zone(zone);
     // Pipeline identity (H14): the escrow key proves this miner to the links it connects to.
     if let Some(privkey) = escrow_privkey.as_deref() {
         let identity = std::sync::Arc::new(keryx_miner::shard_gateway::GatewayIdentity::from_privkey_hex(privkey)?);
