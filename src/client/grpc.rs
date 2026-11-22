@@ -3245,10 +3245,17 @@ impl KeryxdHandler {
         let resp = match (&self.escrow_watcher, v2) {
             (Some(w), true) if !links.is_empty() => {
                 // Pipeline response (V3): each link signs its tier under this head over the v1 and
-                // body bytes, then the head signs everything, links included. No trace.
-                let with_body = |r: keryx_inference::AiResponsePayload| match &private_body {
-                    Some(body) => r.with_private_body(body.clone()),
-                    None => r,
+                // extension bytes, then the head signs everything, links included.
+                let traced = keryx_miner::pipeline::take_pipeline_trace(&request_hash).filter(|_| private_body.is_some());
+                let with_body = |r: keryx_inference::AiResponsePayload| {
+                    let r = match &private_body {
+                        Some(body) => r.with_private_body(body.clone()),
+                        None => r,
+                    };
+                    match &traced {
+                        Some((c, ranges)) => keryx_inference::AiResponsePayload { ranges: Some(ranges.clone()), ..r.with_trace(*c) },
+                        None => r,
+                    }
                 };
                 let base = with_body(keryx_inference::AiResponsePayload::new(request_hash, challenge_window_end, cid, response_length));
                 let mut message = base.signed_bytes();

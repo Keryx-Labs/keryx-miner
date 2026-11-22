@@ -741,17 +741,87 @@ async fn step_link(l: &mut HeadLink, request: &[u8; 32], max_len: u32, identity:
     }
 }
 
-/// The head's own range: runs `x` at `pos0` and, when `sample`, draws the next token.
-async fn head_step(host: &crate::llama_engine::SharedRange, pos0: u32, x: Vec<f32>, sample: bool) -> Result<Option<i32>, String> {
+/// The head's own range: runs `x` at `pos0` and, when `sample`, draws the next token; with the
+/// trace root of every position when traced.
+async fn head_step(host: &crate::llama_engine::SharedRange, pos0: u32, x: Vec<f32>, sample: bool) -> Result<(Option<i32>, Vec<[u8; 32]>), String> {
     let host = host.clone();
     tokio::task::spawn_blocking(move || {
         let g = host.lock().unwrap_or_else(|p| p.into_inner());
         let r = g.as_ref().ok_or("head range unloaded")?;
-        r.step(0, pos0, None, Some(&x)).map_err(|rc| format!("head range step failed ({})", rc))?;
-        Ok(if sample { Some(r.sample(0).ok_or("no logits to sample")?) } else { None })
+        let roots = match r.leaf_count() {
+            Some(nl) => {
+                let (_, leaves, _) = r.step_traced(0, pos0, None, Some(&x)).map_err(|rc| format!("head range step failed ({})", rc))?;
+                crate::trace::range_pos_roots(&leaves, nl).unwrap_or_default()
+            }
+            None => {
+                r.step(0, pos0, None, Some(&x)).map_err(|rc| format!("head range step failed ({})", rc))?;
+                Vec::new()
+            }
+        };
+        Ok((if sample { Some(r.sample(0).ok_or("no logits to sample")?) } else { None }, roots))
     })
     .await
     .map_err(|e| format!("head task: {}", e))?
+}
+
+/// Trace commitments of the pipeline responses this head served, by request.
+fn pipeline_traces() -> &'static Mutex<HashMap<[u8; 32], (keryx_inference::TraceCommitment, keryx_inference::RangeTraces)>> {
+    static T: OnceLock<Mutex<HashMap<[u8; 32], (keryx_inference::TraceCommitment, keryx_inference::RangeTraces)>>> = OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+/// The head range's commitment and the link range traces of `request`, handed out once.
+pub fn take_pipeline_trace(request: &[u8; 32]) -> Option<(keryx_inference::TraceCommitment, keryx_inference::RangeTraces)> {
+    pipeline_traces().lock().ok()?.remove(request)
+}
+
+fn rows_root(values: &[f32], n_hc: usize) -> [u8; 32] {
+    let leaves: Vec<[u8; 32]> = values
+        .chunks(n_hc.max(1))
+        .map(|row| *blake3::hash(&row.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).as_bytes())
+        .collect();
+    keryx_verifiable_inference::merkle::b3_root(&leaves)
+}
+
+/// Builds and records the trace of a served request: the head range's own, the roots each link
+/// reports and the junctions this head relayed.
+async fn record_pipeline_trace(request: &[u8; 32], links: &[HeadLink], head: &shard_gateway::RangeTrace, head_input: &[f32], n_prompt: u32, n_pos: u32) {
+    if !head.traced || head.pos_roots.len() != n_pos as usize || links.is_empty() || head_input.is_empty() {
+        return;
+    }
+    let n_hc = links[0].n_hc;
+    let mut boundaries = Vec::with_capacity(links.len());
+    for i in 0..links.len() {
+        boundaries.push(if i + 1 < links.len() { rows_root(&links[i + 1].residual, n_hc) } else { rows_root(head_input, n_hc) });
+    }
+    let mut roots = Vec::with_capacity(links.len());
+    for (i, l) in links.iter().enumerate() {
+        match l.session.root(request).await {
+            Ok(r) => {
+                if r.output != boundaries[i] || (i > 0 && r.input != Some(boundaries[i - 1])) {
+                    log::warn!("pipeline: shard {} reports other junction roots than this head relayed", l.k);
+                }
+                roots.push((l.tier, r.trace));
+            }
+            Err(e) => {
+                log::warn!("pipeline: shard {} gave no range root: {}", l.k, e);
+                return;
+            }
+        }
+    }
+    let commitment = keryx_inference::TraceCommitment {
+        trace_root: keryx_verifiable_inference::merkle::b3_root(&head.pos_roots),
+        n_prompt,
+        n_pos,
+        stage: 1,
+        tokens_root: None,
+    };
+    if let Ok(mut g) = pipeline_traces().lock() {
+        if g.len() >= 64 {
+            g.clear();
+        }
+        g.insert(*request, (commitment, keryx_inference::RangeTraces { roots, boundaries }));
+    }
 }
 
 /// One head serves one request at a time.
@@ -771,6 +841,14 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let n_links = nm.shards.len() - 1;
     let t0 = std::time::Instant::now();
     let (_, host) = tokio::task::spawn_blocking(move || bound_range(n_links, 1)).await.map_err(|e| format!("head task: {}", e))??;
+    {
+        let g = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(r), Some(m)) = (g.as_ref(), nm.range_manifests.get(n_links)) {
+            if let Err(rc) = r.trace_configure(m, range_ctx()) {
+                log::warn!("pipeline: head range not traced ({})", rc);
+            }
+        }
+    }
     let templated = crate::llm::format_prompt_for(nm.whole.name, &prompt);
     let prompt_ids = {
         let g = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -844,8 +922,11 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let deadline = t0 + crate::llama_engine::HEAD_GENERATION_DEADLINE;
     let mut answer: Vec<u8> = Vec::new();
     let mut pos = 0u32;
+    let n_prompt = prompt_ids.len() as u32;
     let mut feed: Vec<i32> = prompt_ids;
     let mut produced = 0usize;
+    let mut head_trace = shard_gateway::RangeTrace { traced: true, ..Default::default() };
+    let mut head_input: Vec<f32> = Vec::new();
     let failed = |reason: String, tier: u8| HeadFailure { reason, failed_link: assignment.pipeline_key(tier, rank).map(|key| (tier, key)) };
     let result: Result<(), HeadFailure> = async {
         loop {
@@ -860,7 +941,13 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
                     let t = l.tier;
                     x = step_link(l, &request_hash, max_len, &identity, pos, StepInput::Residual(x)).await.map_err(|e| failed(e, t))?;
                 }
-                next = head_step(&host, pos, x, last).await?;
+                head_input.extend_from_slice(&x);
+                let bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let (sampled, roots) = head_step(&host, pos, x, last).await?;
+                next = sampled;
+                head_trace.traced &= roots.len() == chunk.len();
+                head_trace.pos_roots.extend(roots);
+                head_trace.steps.push((pos, chunk.len() as u32, bytes));
                 pos += chunk.len() as u32;
             }
             let tok = next.ok_or(HeadFailure::from("no token sampled"))?;
@@ -891,6 +978,8 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
         l.session.close().await;
     }
     result?;
+    record_pipeline_trace(&request_hash, &links, &head_trace, &head_input, n_prompt, pos).await;
+    shard_gateway::keep_trace(request_hash, identity.pubkey, head_trace);
     log::info!("pipeline head: {} tokens, {} bytes in {:.1} s", produced, answer.len(), t0.elapsed().as_secs_f64());
     // byte tokens can leave a sequence that is not UTF-8, or one cut by the last token
     let text = String::from_utf8_lossy(&answer).into_owned();

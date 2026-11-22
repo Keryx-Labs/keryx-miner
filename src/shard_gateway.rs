@@ -227,6 +227,11 @@ fn store_trace(request: [u8; 32], head: [u8; 32], t: RangeTrace) {
     }
 }
 
+/// Keeps a trace of `request` under `head` until the request leaves the audits.
+pub fn keep_trace(request: [u8; 32], head: [u8; 32], t: RangeTrace) {
+    store_trace(request, head, t);
+}
+
 /// This link's trace of `request` for `head`.
 pub fn range_trace(request: &[u8; 32], head: &[u8; 32]) -> Option<RangeTrace> {
     range_traces().lock().unwrap_or_else(|p| p.into_inner()).get(&(*request, *head)).cloned()
