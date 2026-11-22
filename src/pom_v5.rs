@@ -24,12 +24,14 @@ pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266
 pub const POM_V5_PAD_TILES_H18: [u64; 9] =
     [780_288, 1_778_688, 4_599_808, 6_266_880, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
 
+/// Context pad tiles of each devnet range. MUST equal the node's `DEVNET_RANGE_PAD_TILES`.
+pub const DEVNET_RANGE_PAD_TILES: u64 = 65_536;
+
 /// Context pad tiles of `tier` at `daa`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
     let table: &[u64] = if daa >= crate::pom::model_split_activation_daa() {
-        // Devnet ranges carry no pad (node `NETWORK_MODEL_V4T.range_pads`).
-        if crate::pom::is_devnet() && tier >= crate::models::NETWORK_MODEL_TIER {
-            return 0;
+        if crate::pom::is_devnet() && tier > crate::models::NETWORK_MODEL_TIER {
+            return DEVNET_RANGE_PAD_TILES;
         }
         &POM_V5_PAD_TILES_H18
     } else if daa >= crate::pom::pad_margin_activation_daa() {
