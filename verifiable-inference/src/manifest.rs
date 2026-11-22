@@ -684,3 +684,36 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod range_manifest_tests {
+    use super::*;
+    use crate::merkle::rt_range_proof;
+
+    /// The range manifests read back to the pinned roots, and every product is one the node
+    /// recomputes.
+    #[test]
+    fn range_manifests_read_back() {
+        let files: [(&[u8], &str, usize, u32); 2] = [
+            (include_bytes!("../testdata/v4t-range-0.manifest"), "a5e6c223a6dbcaae8b458a6126cbe010d17da7b83fe95d1b3e412d0bf1108cac", 46, 45),
+            (include_bytes!("../testdata/v4t-range-1.manifest"), "ea09c706be45bc596e079d6da94dfa7af2499334123d695f8c344af043e4920d", 15, 15),
+        ];
+        let mainnet: [(&[u8], &str, usize, u32); 4] = [
+            (include_bytes!("../testdata/mainnet-range-0.manifest"), "cb1793c52124b1e40571b6fe9f6dff5d47acb89b8a0735dadbd7c7490672e720", 181, 181),
+            (include_bytes!("../testdata/mainnet-range-1.manifest"), "2ae3a3564150ad9cd4a372a787f02a38e2fda340652d82529009694ea9ef6b5f", 185, 185),
+            (include_bytes!("../testdata/mainnet-range-2.manifest"), "055bfa4bc25df49ce25549b48b0ecd2dab3b8acd79afed0184c2397bf32b8066", 189, 189),
+            (include_bytes!("../testdata/mainnet-range-3.manifest"), "79f62b9df5971c116cba3945bdd1bd9950938b8bdcd4fa8d3480fc43203b00c9", 170, 170),
+        ];
+        let files = files.into_iter().chain(mainnet);
+        for (data, root, n, n_products) in files {
+            let (entries, np) = read_file(data).unwrap();
+            assert_eq!((entries.len(), np), (n, n_products));
+            let leaves: Vec<Hash> = entries.iter().map(|(_, b)| Entry::leaf(b)).collect();
+            let m_t = rt_range_proof(&leaves, 0, 1).0;
+            assert_eq!(m_t.iter().map(|b| format!("{b:02x}")).collect::<String>(), root);
+            for (e, _) in entries.iter().take(np as usize) {
+                assert_eq!(crate::quant::row_bytes(e.wtype, e.k as usize), Some(e.row_bytes as usize), "{}", e.name);
+            }
+        }
+    }
+}

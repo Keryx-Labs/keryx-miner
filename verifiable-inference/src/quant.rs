@@ -2,12 +2,15 @@
 
 use crate::f16;
 
+pub const F16: u32 = 1;
 pub const Q4_0: u32 = 2;
 pub const Q5_0: u32 = 6;
 pub const Q8_0: u32 = 8;
+pub const Q2_K: u32 = 10;
 pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
+pub const IQ2_XXS: u32 = 16;
 pub const BF16: u32 = 30;
 
 /// (bytes per block, values per block).
@@ -15,7 +18,10 @@ pub fn block_size(wtype: u32) -> Option<(usize, usize)> {
     match wtype {
         Q4_0 => Some((18, 32)),
         Q5_0 => Some((22, 32)),
+        F16 => Some((2, 1)),
         Q8_0 => Some((34, 32)),
+        Q2_K => Some((84, 256)),
+        IQ2_XXS => Some((66, 256)),
         Q4_K => Some((144, 256)),
         Q5_K => Some((176, 256)),
         Q6_K => Some((210, 256)),
@@ -58,6 +64,33 @@ pub fn dequant_row(wtype: u32, row: &[u8], k: usize) -> Option<Vec<f32>> {
         let blk = &row[b * bb..(b + 1) * bb];
         match wtype {
             BF16 => out[0] = bf16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            F16 => out[0] = f16::read(blk, 0),
+            Q2_K => {
+                let (sc, qs) = (&blk[0..16], &blk[16..80]);
+                let d = f16::read(blk, 80);
+                let dmin = f16::read(blk, 82);
+                for (v, o) in out.iter_mut().enumerate() {
+                    let g = v / 16;
+                    let q = (qs[32 * (v / 128) + v % 32] >> (2 * ((v / 32) % 4))) & 3;
+                    *o = d * (sc[g] & 0xf) as f32 * q as f32 - dmin * (sc[g] >> 4) as f32;
+                }
+            }
+            IQ2_XXS => {
+                let d = f16::read(blk, 0);
+                for ib in 0..8 {
+                    let q = &blk[2 + 8 * ib..2 + 8 * ib + 8];
+                    let signs = u32::from_le_bytes([q[4], q[5], q[6], q[7]]);
+                    let db = d * (0.5 + (signs >> 28) as f32) * 0.25;
+                    for l in 0..4 {
+                        let grid = crate::iq2::IQ2XXS_GRID[q[l] as usize].to_le_bytes();
+                        let sg = crate::iq2::KSIGNS_IQ2XS[((signs >> (7 * l)) & 127) as usize];
+                        for j in 0..8 {
+                            let v = db * grid[j] as f32;
+                            out[32 * ib + 8 * l + j] = if sg & (1 << j) != 0 { -v } else { v };
+                        }
+                    }
+                }
+            }
             Q8_0 => {
                 let d = f16::read(blk, 0);
                 for j in 0..32 {
@@ -179,6 +212,29 @@ pub fn k_tile_form(wtype: u32, row: &[u8], k: usize) -> Option<(Vec<f32>, Vec<f3
         }
     }
     Some((w_eff, b_h))
+}
+
+/// Q2_K row in tiled form.
+pub fn q2k_tile_form(row: &[u8], k: usize) -> Option<(Vec<u8>, Vec<f32>, Vec<f32>)> {
+    if !k.is_multiple_of(256) || row.len() < k / 256 * 84 {
+        return None;
+    }
+    let mut q = vec![0u8; k];
+    let mut a = vec![0f32; k / 16];
+    let mut m = vec![0f32; k / 16];
+    for b in 0..k / 256 {
+        let blk = &row[b * 84..(b + 1) * 84];
+        let d = f16::read(blk, 80);
+        let dmin = f16::read(blk, 82);
+        for g in 0..16 {
+            a[16 * b + g] = f16::round(d * (blk[g] & 0xf) as f32);
+            m[16 * b + g] = f16::round(dmin * (blk[g] >> 4) as f32);
+        }
+        for v in 0..256 {
+            q[256 * b + v] = (blk[16 + 32 * (v / 128) + v % 32] >> (2 * ((v / 32) % 4))) & 3;
+        }
+    }
+    Some((q, a, m))
 }
 
 /// Block scales and offset of a Q4_0/Q5_0 row.

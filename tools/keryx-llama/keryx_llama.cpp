@@ -274,6 +274,9 @@ int  ggml_cuda_q8c_read(int device, uint8_t* leaves, size_t leaves_cap, uint32_t
 int  ggml_cuda_q8c_read_capture(int device, uint8_t* x, size_t x_cap, uint8_t* y, size_t y_cap, uint32_t* x_len, uint32_t* y_len);
 int  ggml_cuda_q8c_arm_captures(int device, const uint32_t* pos, const uint32_t* leaf, uint32_t n, uint32_t slot_bytes);
 int  ggml_cuda_q8c_read_captures(int device, uint8_t* out, size_t out_cap, uint32_t* lens, uint32_t n);
+int  ggml_cuda_q8c_set_pos(int device, uint32_t pos, uint32_t n);
+int  ggml_cuda_q8c_read_range(int device, uint32_t first, uint32_t n, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch,
+                              size_t ubatch_cap);
 // Sequence leaves (ggml-cuda/q8seq.cu, applied by tools/keryx-llama/patches).
 int  ggml_cuda_q8s_configure(int device, const uint32_t* layers, uint32_t n, uint32_t n_attn, uint32_t n_recur,
                              uint32_t seq_heads, uint32_t interval, uint32_t max_tokens);
@@ -544,7 +547,7 @@ static llama_sampler* keryx_make_sampler(const llama_model* model) {
     return smpl;
 }
 
-KERYX_EXPORT int keryx_llama_abi() { return 12; }
+KERYX_EXPORT int keryx_llama_abi() { return 13; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -1507,6 +1510,8 @@ struct KeryxRange {
     std::vector<int32_t> len;    // tokens held per sequence
     llama_sampler* smpl = nullptr; // head range only
     int  sample_seq = -1;        // sequence whose logits the last step left, -1 when none
+    int  gpu    = 0;
+    bool traced = false;
     std::mutex mu;
 };
 
@@ -1601,6 +1606,7 @@ KERYX_EXPORT KeryxRange* keryx_range_load(const char* gguf_path, int gpu, int fi
     r->n_seq = n_seq;
     r->n_ubatch = KERYX_RANGE_MAX_UBATCH;
     r->len.assign((size_t) n_seq, 0);
+    r->gpu = gpu;
     if (head) r->smpl = keryx_make_sampler(model);
     return r;
 #endif
@@ -1626,10 +1632,31 @@ KERYX_EXPORT void keryx_range_clear(KeryxRange* r, int seq) {
 // range takes `tokens`, the others the residual `in` (n × n_hc floats). Writes the residual
 // (n × n_hc floats) or, for the head range, the last token's logits (n_vocab floats) to `out`.
 // 0 on success; a negative code leaves the sequence cleared.
+static int keryx_range_step_locked(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                   float* out, size_t out_floats, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch,
+                                   size_t ubatch_cap);
+
 KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
                                   float* out, size_t out_floats) {
     if (!r) return -1;
     std::lock_guard<std::mutex> lock(r->mu);
+    return keryx_range_step_locked(r, seq, pos0, n, tokens, in, out, out_floats, nullptr, 0, nullptr, 0);
+}
+
+// keryx_range_step on a traced range, also copying the trace leaves (n × leaf count × 32 bytes) and
+// ubatch sizes of the step's positions. -10 when the trace fails.
+KERYX_EXPORT int keryx_range_step_traced(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                         float* out, size_t out_floats, uint8_t* leaves, size_t leaves_cap,
+                                         uint32_t* ubatch, size_t ubatch_cap) {
+    if (!r || !leaves || !ubatch) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    if (!r->traced) return -10;
+    return keryx_range_step_locked(r, seq, pos0, n, tokens, in, out, out_floats, leaves, leaves_cap, ubatch, ubatch_cap);
+}
+
+static int keryx_range_step_locked(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                   float* out, size_t out_floats, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch,
+                                   size_t ubatch_cap) {
     r->sample_seq = -1;
     if (seq < 0 || seq >= r->n_seq || n <= 0 || n > r->n_ubatch) return -2;
     if (pos0 != r->len[(size_t) seq] || pos0 + n > r->n_ctx) return -3;
@@ -1660,6 +1687,12 @@ KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const
     if (!from_tokens) {
         std::memcpy(batch.embd, in, (size_t) n * (size_t) r->n_hc * sizeof(float));
     }
+#ifndef __APPLE__
+    if (r->traced && ggml_cuda_q8c_set_pos(r->gpu, (uint32_t) pos0, (uint32_t) n) != 0) {
+        llama_batch_free(batch);
+        return -10;
+    }
+#endif
     const int rc = llama_decode(r->ctx, batch);
     llama_batch_free(batch);
     if (rc != 0) {
@@ -1674,9 +1707,66 @@ KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const
         return -9;
     }
     std::memcpy(out, res, want * sizeof(float));
+#ifndef __APPLE__
+    if (leaves && ggml_cuda_q8c_read_range(r->gpu, (uint32_t) pos0, (uint32_t) n, leaves, leaves_cap, ubatch, ubatch_cap) != 0) {
+        llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+        r->len[(size_t) seq] = 0;
+        return -10;
+    }
+#endif
     r->len[(size_t) seq] += n;
     if (r->head) r->sample_seq = seq;
     return 0;
+}
+
+// Traces the range on its GPU for `manifest` (`max_pos` positions per sequence). 0 on success.
+KERYX_EXPORT int keryx_range_trace_configure(KeryxRange* r, const void* manifest, size_t manifest_len, int max_pos) {
+#ifdef __APPLE__
+    (void)r; (void)manifest; (void)manifest_len; (void)max_pos;
+    return -1;
+#else
+    if (!r || !manifest || max_pos <= 0) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    const int rc = ggml_cuda_q8c_configure(r->gpu, manifest, manifest_len, (uint32_t) max_pos);
+    r->traced = rc == 0;
+    if (rc != 0) keryx_set_error("range", "trace configuration failed (" + std::to_string(rc) + ")");
+    return rc;
+#endif
+}
+
+// Leaves per traced position of the range, -1 when not traced.
+KERYX_EXPORT int keryx_range_trace_leaf_count(KeryxRange* r) {
+#ifdef __APPLE__
+    (void)r;
+    return -1;
+#else
+    return r && r->traced ? ggml_cuda_q8c_leaf_count(r->gpu) : -1;
+#endif
+}
+
+// Arms the capture of leaf `leaf[k]` at position `pos[k]` for the next traced steps.
+KERYX_EXPORT int keryx_range_arm_captures(KeryxRange* r, const uint32_t* pos, const uint32_t* leaf, uint32_t n,
+                                          uint32_t slot_bytes) {
+#ifdef __APPLE__
+    (void)r; (void)pos; (void)leaf; (void)n; (void)slot_bytes;
+    return -1;
+#else
+    if (!r || !r->traced) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    return ggml_cuda_q8c_arm_captures(r->gpu, pos, leaf, n, slot_bytes);
+#endif
+}
+
+// Copies the armed captures into `out + k * slot_bytes`, their lengths into `lens`.
+KERYX_EXPORT int keryx_range_read_captures(KeryxRange* r, uint8_t* out, size_t out_cap, uint32_t* lens, uint32_t n) {
+#ifdef __APPLE__
+    (void)r; (void)out; (void)out_cap; (void)lens; (void)n;
+    return -1;
+#else
+    if (!r || !r->traced) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    return ggml_cuda_q8c_read_captures(r->gpu, out, out_cap, lens, n);
+#endif
 }
 
 // Tokenizes `text` (`len` bytes) with the model's vocabulary, special tokens parsed. Returns the

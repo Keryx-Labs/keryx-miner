@@ -1021,7 +1021,7 @@ fn feed_row(
         }
         _ => return Err(Fail::Shape),
     };
-    let (y_hat, tol) = (r.y_hat + b, crate::verify::EPS * (r.scale + b.abs()));
+    let (y_hat, tol) = (r.y_hat + b, crate::verify::eps_for(e.wtype) * (r.scale + b.abs()));
     if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
         return Err(Fail::Mismatch);
     }

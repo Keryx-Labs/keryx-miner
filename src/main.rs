@@ -941,6 +941,16 @@ fn main() -> Result<(), Error> {
         let n_gen: usize = val("--range-gen").and_then(|s| s.parse().ok()).unwrap_or(8);
         std::process::exit(keryx_miner::llama_engine::run_range_test(&gguf, gpu, n_layer, split, n_prompt, n_gen));
     }
+    // Hidden traced-range check: --range-trace-test <gguf> --range-first <a> --range-last <b> --range-manifest <file> [--range-gpu <g>]
+    if let Some(i) = argv.iter().position(|a| a == "--range-trace-test") {
+        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
+        let gguf = argv.get(i + 1).cloned().unwrap_or_default();
+        let first: u32 = val("--range-first").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let last: u32 = val("--range-last").and_then(|s| s.parse().ok()).unwrap_or(0);
+        let manifest = val("--range-manifest").unwrap_or_default();
+        let gpu: usize = val("--range-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
+        std::process::exit(keryx_miner::llama_engine::run_range_trace_test(&gguf, gpu, first, last, &manifest));
+    }
     // Hidden model id: --digest <file> prints the IPFS UnixFS v0 digest a model_id is made of.
     if let Some(i) = argv.iter().position(|a| a == "--digest") {
         let Some(path) = argv.get(i + 1) else {

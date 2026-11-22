@@ -60,6 +60,18 @@ pub const MMVQ: u8 = 0;
 pub const MMQ_D4: u8 = 1;
 pub const MMQ_DS4: u8 = 2;
 pub const MMQ_D2S6: u8 = 3;
+/// Unquantized input of a float-weight product, as f32.
+pub const X_F32: u8 = 4;
+/// Unquantized input of a float-weight product, rounded to f16.
+pub const X_F16: u8 = 5;
+
+/// Partial sums of a D2S6 row.
+pub fn d2s6_sums(leaf: &[u8], k: usize) -> Option<Vec<f32>> {
+    if leaf.len() < k.div_ceil(128) * 144 {
+        return None;
+    }
+    Some(leaf.chunks_exact(144).take(k.div_ceil(128)).flat_map(|blk| (0..6).map(move |g| f16::read(blk, 4 + 2 * g))).collect())
+}
 
 /// Values and stored partial sums of a row.
 pub fn decode(leaf: &[u8], layout: u8, k: usize) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
@@ -97,6 +109,18 @@ pub fn decode(leaf: &[u8], layout: u8, k: usize) -> Option<(Vec<f32>, Option<Vec
                     }
                 }
             }
+        }
+        X_F32 => {
+            if leaf.len() < 4 * k {
+                return None;
+            }
+            x.extend(leaf.chunks_exact(4).take(k).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+        }
+        X_F16 => {
+            if leaf.len() < 2 * k {
+                return None;
+            }
+            x.extend((0..k).map(|i| f16::read(leaf, 2 * i)));
         }
         _ => return None,
     }

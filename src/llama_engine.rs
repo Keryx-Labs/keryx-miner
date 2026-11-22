@@ -105,7 +105,7 @@ type SeqReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-pub(crate) const ABI: c_int = 12;
+pub(crate) const ABI: c_int = 13;
 /// Context kept for the block task while the context pad is resident.
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
@@ -1573,6 +1573,12 @@ type RangeClearFn = unsafe extern "C" fn(*mut c_void, c_int);
 type RangeTokenizeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, *mut i32, c_int) -> c_int;
 type RangeResetFn = unsafe extern "C" fn(*mut c_void);
 type RangeSampleFn = unsafe extern "C" fn(*mut c_void, c_int) -> i32;
+type RangeStepTracedFn =
+    unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const i32, *const f32, *mut f32, usize, *mut u8, usize, *mut u32, usize) -> c_int;
+type RangeTraceConfigureFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int;
+type RangeLeafCountFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type RangeArmFn = unsafe extern "C" fn(*mut c_void, *const u32, *const u32, u32, u32) -> c_int;
+type RangeReadCapturesFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, u32) -> c_int;
 type RangePieceFn = unsafe extern "C" fn(*mut c_void, i32, *mut c_char, c_int) -> c_int;
 
 /// The range entry points of `libkeryx-llama.so`.
@@ -1586,6 +1592,11 @@ struct RangeLib {
     sampler_reset: RangeResetFn,
     sample: RangeSampleFn,
     piece: RangePieceFn,
+    step_traced: RangeStepTracedFn,
+    trace_configure: RangeTraceConfigureFn,
+    leaf_count: RangeLeafCountFn,
+    arm_captures: RangeArmFn,
+    read_captures: RangeReadCapturesFn,
     free: FreeFn,
     last_error: ErrorFn,
 }
@@ -1610,6 +1621,11 @@ fn range_lib() -> Result<RangeLib, String> {
                 sampler_reset: sym(lib, "keryx_range_sampler_reset").ok_or("missing keryx_range_sampler_reset")?,
                 sample: sym(lib, "keryx_range_sample").ok_or("missing keryx_range_sample")?,
                 piece: sym(lib, "keryx_range_piece").ok_or("missing keryx_range_piece")?,
+                step_traced: sym(lib, "keryx_range_step_traced").ok_or("missing keryx_range_step_traced")?,
+                trace_configure: sym(lib, "keryx_range_trace_configure").ok_or("missing keryx_range_trace_configure")?,
+                leaf_count: sym(lib, "keryx_range_trace_leaf_count").ok_or("missing keryx_range_trace_leaf_count")?,
+                arm_captures: sym(lib, "keryx_range_arm_captures").ok_or("missing keryx_range_arm_captures")?,
+                read_captures: sym(lib, "keryx_range_read_captures").ok_or("missing keryx_range_read_captures")?,
                 free: sym(lib, "keryx_range_free").ok_or("missing keryx_range_free")?,
                 last_error: sym(lib, "keryx_llama_last_error").ok_or("missing keryx_llama_last_error")?,
             })
@@ -1693,6 +1709,69 @@ impl LayerRange {
         unsafe { (self.lib.clear)(self.ptr, seq as c_int) };
     }
 
+    /// Traces the range for `manifest`, `max_pos` positions per sequence.
+    pub fn trace_configure(&self, manifest: &[u8], max_pos: u32) -> Result<(), i32> {
+        let rc = unsafe { (self.lib.trace_configure)(self.ptr, manifest.as_ptr() as *const c_void, manifest.len(), max_pos as c_int) };
+        if rc == 0 { Ok(()) } else { Err(rc) }
+    }
+
+    /// Leaves per traced position, `None` when the range is not traced.
+    pub fn leaf_count(&self) -> Option<usize> {
+        let n = unsafe { (self.lib.leaf_count)(self.ptr) };
+        (n > 0).then_some(n as usize)
+    }
+
+    /// [`Self::step`] on a traced range: also the step's leaves (n × leaf count × 32 bytes) and
+    /// ubatch sizes.
+    #[allow(clippy::type_complexity)]
+    pub fn step_traced(&self, seq: u32, pos0: u32, tokens: Option<&[i32]>, input: Option<&[f32]>) -> Result<(Vec<f32>, Vec<u8>, Vec<u32>), i32> {
+        let nl = self.leaf_count().ok_or(-10)?;
+        let n = tokens.map(|t| t.len()).or(input.map(|i| i.len() / self.n_hc.max(1))).unwrap_or(0);
+        if input.is_some_and(|i| i.len() != n * self.n_hc) {
+            return Err(-100);
+        }
+        let mut out = vec![0f32; self.out_len(n)];
+        let mut leaves = vec![0u8; n * nl * 32];
+        let mut ubatch = vec![0u32; n];
+        let rc = unsafe {
+            (self.lib.step_traced)(
+                self.ptr,
+                seq as c_int,
+                pos0 as c_int,
+                n as c_int,
+                tokens.map_or(std::ptr::null(), |t| t.as_ptr()),
+                input.map_or(std::ptr::null(), |i| i.as_ptr()),
+                out.as_mut_ptr(),
+                out.len(),
+                leaves.as_mut_ptr(),
+                leaves.len(),
+                ubatch.as_mut_ptr(),
+                ubatch.len(),
+            )
+        };
+        if rc == 0 { Ok((out, leaves, ubatch)) } else { Err(rc) }
+    }
+
+    /// Arms the capture of leaf `leaf[k]` at position `pos[k]`.
+    pub fn arm_captures(&self, pos: &[u32], leaf: &[u32], slot_bytes: u32) -> Result<(), i32> {
+        if pos.len() != leaf.len() {
+            return Err(-1);
+        }
+        let rc = unsafe { (self.lib.arm_captures)(self.ptr, pos.as_ptr(), leaf.as_ptr(), pos.len() as u32, slot_bytes) };
+        if rc == 0 { Ok(()) } else { Err(rc) }
+    }
+
+    /// The armed captures, each cut to its length.
+    pub fn read_captures(&self, n: usize, slot_bytes: usize) -> Result<Vec<Vec<u8>>, i32> {
+        let mut out = vec![0u8; n * slot_bytes];
+        let mut lens = vec![0u32; n];
+        let rc = unsafe { (self.lib.read_captures)(self.ptr, out.as_mut_ptr(), out.len(), lens.as_mut_ptr(), n as u32) };
+        if rc != 0 {
+            return Err(rc);
+        }
+        Ok((0..n).map(|k| out[k * slot_bytes..k * slot_bytes + (lens[k] as usize).min(slot_bytes)].to_vec()).collect())
+    }
+
     /// Token ids of `text`, special tokens parsed.
     pub fn tokenize(&self, text: &str) -> Result<Vec<i32>, String> {
         let len = c_int::try_from(text.len()).map_err(|_| "prompt too long".to_string())?;
@@ -1745,6 +1824,167 @@ impl Drop for LayerRange {
 /// the whole model as one range, then through the ranges [0, split] and [split+1, last], and
 /// compares the logits. Exit code for the hidden `--range-test` mode: 0 equal within tolerance,
 /// 41 load, 42 step, 43 mismatch.
+/// Hidden `--range-trace-test`: a traced range against itself (two interleaved sequences, a
+/// replay) and its captured dense products against the weights. 0 when every check passes.
+pub fn run_range_trace_test(gguf: &str, gpu: usize, first: u32, last: u32, manifest_path: &str) -> i32 {
+    use keryx_verifiable_inference::{dot, manifest, verify};
+    let manifest_bytes = match std::fs::read(manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("manifest: {e}");
+            return 2;
+        }
+    };
+    let Some((entries, n_products)) = manifest::read_file(&manifest_bytes) else {
+        eprintln!("manifest: unreadable");
+        return 2;
+    };
+    let range = match LayerRange::load(gguf, gpu, first, last, None, 1024, 2) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return 42;
+        }
+    };
+    if let Err(rc) = range.trace_configure(&manifest_bytes, 1024) {
+        eprintln!("trace configure: {rc}");
+        return 43;
+    }
+    let nl = range.leaf_count().unwrap_or(0);
+    if nl != 2 * n_products as usize + 1 {
+        eprintln!("leaf count {nl}, manifest wants {}", 2 * n_products + 1);
+        return 44;
+    }
+    let steps: Vec<(u32, u32)> = vec![(0, 40), (40, 1), (41, 1), (42, 1), (43, 1)];
+    let n_pos = 44usize;
+    let tokens: Vec<i32> = (0..n_pos).map(|i| ((100 + 7 * i) % range.n_vocab.max(1)) as i32).collect();
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let residual: Vec<f32> = (0..n_pos * range.n_hc)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            ((rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.2
+        })
+        .collect();
+    let step = |seq: u32, pos0: u32, n: u32| {
+        let (a, b) = (pos0 as usize, (pos0 + n) as usize);
+        if first == 0 {
+            range.step_traced(seq, pos0, Some(&tokens[a..b]), None)
+        } else {
+            range.step_traced(seq, pos0, None, Some(&residual[a * range.n_hc..b * range.n_hc]))
+        }
+    };
+    let mut reference: Vec<u8> = Vec::new();
+    let mut ubatch: Vec<u32> = Vec::new();
+    for &(p, n) in &steps {
+        match step(0, p, n) {
+            Ok((_, l, u)) => {
+                reference.extend_from_slice(&l);
+                ubatch.extend_from_slice(&u);
+            }
+            Err(rc) => {
+                eprintln!("step {p}: {rc}");
+                return 45;
+            }
+        }
+    }
+    range.clear(0);
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for &(p, n) in &steps {
+        for (seq, out) in [(1u32, &mut b), (0u32, &mut a)] {
+            match step(seq, p, n) {
+                Ok((_, l, _)) => out.extend_from_slice(&l),
+                Err(rc) => {
+                    eprintln!("interleaved step {p} seq {seq}: {rc}");
+                    return 45;
+                }
+            }
+        }
+    }
+    let same = |x: &[u8]| x.len() == reference.len() && x == reference.as_slice();
+    println!("leaves: {nl} per position, {n_pos} positions; interleaved sequences equal to the reference: {} / {}", same(&a), same(&b));
+    range.clear(0);
+    range.clear(1);
+    let dense: Vec<u32> = (0..n_products).filter(|&r| entries[r as usize].0.n_exp == 1).collect();
+    let pick: Vec<u32> = {
+        let mut v: Vec<u32> = dense.iter().copied().filter(|&r| entries[r as usize].0.wtype == 1).take(4).collect();
+        v.extend(dense.iter().copied().filter(|&r| entries[r as usize].0.wtype != 1).take(8 - v.len()));
+        v
+    };
+    let mut pos = Vec::new();
+    let mut leaf = Vec::new();
+    for &p in &[5u32, 42] {
+        for &r in &pick {
+            pos.extend([p, p]);
+            leaf.extend([2 * r, 2 * r + 1]);
+        }
+    }
+    let slot = 1u32 << 20;
+    if let Err(rc) = range.arm_captures(&pos, &leaf, slot) {
+        eprintln!("arm: {rc}");
+        return 46;
+    }
+    for &(p, n) in &steps {
+        if let Err(rc) = step(0, p, n) {
+            eprintln!("replay step {p}: {rc}");
+            return 45;
+        }
+    }
+    let caps = match range.read_captures(pos.len(), slot as usize) {
+        Ok(c) => c,
+        Err(rc) => {
+            eprintln!("captures: {rc}");
+            return 46;
+        }
+    };
+    let meta = match std::fs::File::open(gguf).map_err(|e| e.to_string()).and_then(|mut f| crate::gguf::GgufMeta::read(&mut f).map_err(|e| e.to_string())) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("gguf: {e}");
+            return 47;
+        }
+    };
+    let mut file = std::fs::File::open(gguf).unwrap();
+    let mut row_at = |name: &str, row: u64, row_bytes: u64| -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        let t = &meta.tensors[name];
+        let mut buf = vec![0u8; row_bytes as usize];
+        file.seek(SeekFrom::Start(meta.tensor_data_offset + t.offset + row * row_bytes)).unwrap();
+        file.read_exact(&mut buf).unwrap();
+        buf
+    };
+    let (mut ok, mut bad) = (0u32, 0u32);
+    for k in (0..pos.len()).step_by(2) {
+        let (p, r) = (pos[k] as usize, leaf[k] / 2);
+        let (x, y) = (&caps[k], &caps[k + 1]);
+        let at = |l: u32| &reference[(p * nl + l as usize) * 32..(p * nl + l as usize) * 32 + 32];
+        let hashes = blake3::hash(x).as_bytes() == at(2 * r) && blake3::hash(y).as_bytes() == at(2 * r + 1);
+        let e = &entries[r as usize].0;
+        let layout = verify::input_layout(e.role, ubatch[p], e.wtype);
+        let ys: Vec<f32> = y.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let eps = verify::eps_for(e.wtype);
+        let mut honest = ys.len() == e.m as usize;
+        let mut wrong = 0;
+        for i in [0u64, e.m as u64 / 2, e.m as u64 - 1] {
+            let w = row_at(&e.name, i, e.row_bytes as u64);
+            let other = row_at(&e.name, (i + 1) % e.m as u64, e.row_bytes as u64);
+            match (dot::canonical_dot(e.wtype, &w, e.k as usize, x, layout), dot::canonical_dot(e.wtype, &other, e.k as usize, x, layout)) {
+                (Some(h), Some(o)) if honest => {
+                    honest = dot::accept(ys[i as usize], &h, eps);
+                    wrong += dot::accept(ys[i as usize], &o, eps) as u32;
+                }
+                _ => honest = false,
+            }
+        }
+        let pass = hashes && honest && wrong == 0;
+        println!("  pos {p:2} {:40} type {:2} layout {layout} x {:6} B: leaves {} products {} other rows rejected {}", e.name, e.wtype, x.len(), hashes, honest, wrong == 0);
+        if pass { ok += 1 } else { bad += 1 }
+    }
+    println!("{ok} captured products pass, {bad} fail");
+    if same(&a) && same(&b) && bad == 0 { 0 } else { 1 }
+}
+
 pub fn run_range_test(gguf: &str, gpu: usize, n_layer: u32, split: u32, n_prompt: usize, n_gen: usize) -> i32 {
     let last = n_layer - 1;
     let prompt: Vec<i32> = (0..n_prompt).map(|i| 1000 + ((i as i32 * 7919) % 30_000)).collect();

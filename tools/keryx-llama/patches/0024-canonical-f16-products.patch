@@ -1,0 +1,148 @@
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1324,6 +1324,10 @@
+     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+ };
+ 
++// Traced float-weight product in progress, -1 when none.
++static thread_local int q8c_f16_rank  = -1;
++static thread_local int q8c_f16_shift = 0;
++
+ template<ggml_type compute_type>
+ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     using traits = batched_mul_mat_traits<compute_type>;
+@@ -1413,6 +1417,12 @@
+         src1_ptr = src1_alloc.get();
+     }
+ 
++    const bool q8c_f16 = compute_type == GGML_TYPE_F16 && q8c_f16_rank >= 0 && s11 == ne10 && s12 == ne10*ne11 && s13 == s12*ne12;
++    if (q8c_f16) {
++        ggml_cuda_q8c_rows(src1_ptr, Q8C_ROWS, ne11*ne12*ne13, ne10*(int64_t) sizeof(half), 0, 2*q8c_f16_rank, -1, q8c_f16_shift,
++                           main_stream);
++    }
++
+     ggml_cuda_pool_alloc<cuda_t> dst_temp(ctx.pool());
+     char * dst_ptr;
+     size_t nbd2 = dst->nb[2];
+@@ -1428,7 +1438,7 @@
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        prefer_f32_output = q8c_f16_rank >= 0 || cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+@@ -1536,6 +1546,10 @@
+         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
+         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
+     }
++    if (q8c_f16) {
++        ggml_cuda_q8c_out(dst_ddf, ggml_nrows(dst), dst->ne[0]*(int64_t) sizeof(float), 2*q8c_f16_rank + 1, q8c_f16_shift, true,
++                          main_stream);
++    }
+ }
+ 
+ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+@@ -1694,6 +1708,10 @@
+         return false;
+     }
+ 
++    if (src0->type == GGML_TYPE_F16 && ggml_cuda_q8c_enabled() && ggml_cuda_q8c_rank(src0->name) >= 0) {
++        return false;
++    }
++
+     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+         return false;
+     }
+@@ -1739,6 +1757,17 @@
+         return;
+     }
+ 
++    if (ggml_cuda_q8c_enabled() && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++        const int r = ggml_cuda_q8c_rank(src0->name);
++        if (r >= 0 && ggml_cuda_q8c_layout(r) == Q8C_DENSE) {
++            q8c_f16_rank  = r;
++            q8c_f16_shift = ggml_cuda_q8c_row_shift(r, ne11*ne12*ne13);
++            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst);
++            q8c_f16_rank = -1;
++            return;
++        }
++    }
++
+     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
+     // Therefore, in such cases use cuBLAS.
+--- a/ggml/src/ggml-cuda/q8canon.cu
++++ b/ggml/src/ggml-cuda/q8canon.cu
+@@ -977,6 +977,58 @@
+     return 0;
+ }
+ 
++// Moves the trace to position `pos` and clears the leaves of positions [pos, pos + n).
++extern "C" int ggml_cuda_q8c_set_pos(int device, uint32_t pos, uint32_t n) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on) {
++        return -1;
++    }
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    q8c_dev & s = q8c_devs[device];
++    if (pos > s.max_pos || n > s.max_pos - pos) {
++        return -5;
++    }
++    const uint32_t zero = 0;
++    cudaDeviceSynchronize();
++    memset((uint8_t *) s.h_leaves + (size_t) pos*s.nl*32, 0, (size_t) n*s.nl*32);
++    memset((uint32_t *) s.h_ubatch + pos, 0, (size_t) n*4);
++    s.short_of_stage = false;
++    if (cudaMemcpyToSymbol(q8c_pos_base, &pos, 4) != cudaSuccess || cudaMemcpyToSymbol(q8c_overflow, &zero, 4) != cudaSuccess) {
++        return -3;
++    }
++    return 0;
++}
++
++// Leaves and ubatch sizes of positions [first, first + n).
++extern "C" int ggml_cuda_q8c_read_range(int device, uint32_t first, uint32_t n, uint8_t * leaves, size_t leaves_cap,
++                                        uint32_t * ubatch, size_t ubatch_cap) {
++    if (device < 0 || device >= Q8C_MAX_DEVICES || !q8c_devs[device].on || !leaves || !ubatch) {
++        return -1;
++    }
++    q8c_scoped_device sd(device);
++    if (!sd.ok) {
++        return -2;
++    }
++    q8c_dev & s = q8c_devs[device];
++    cudaDeviceSynchronize();
++    uint32_t pos = 0, overflow = 0;
++    if (cudaMemcpyFromSymbol(&pos, q8c_pos_base, 4) != cudaSuccess || cudaMemcpyFromSymbol(&overflow, q8c_overflow, 4) != cudaSuccess) {
++        return -3;
++    }
++    if (overflow || s.short_of_stage || first > pos || n > pos - first) {
++        return -5;
++    }
++    const size_t need = (size_t) n*s.nl*32;
++    if (leaves_cap < need || ubatch_cap < n) {
++        return -6;
++    }
++    memcpy(leaves, (const uint8_t *) s.h_leaves + (size_t) first*s.nl*32, need);
++    memcpy(ubatch, (const uint32_t *) s.h_ubatch + first, (size_t) n*4);
++    return 0;
++}
++
+ // Copies the armed captures into `outs[k]` (capacity `caps[k]`), sets `lens[k]`, then disarms
+ // and frees the capture buffer.
+ static int q8c_take_captures(int device, uint8_t * const * outs, const size_t * caps, uint32_t * lens, uint32_t n) {
+--- a/ggml/src/ggml-cuda/q8canon.cuh
++++ b/ggml/src/ggml-cuda/q8canon.cuh
+@@ -48,6 +48,9 @@
+     void ggml_cuda_q8c_release(int device);
+     int  ggml_cuda_q8c_leaf_count(int device);
+     int  ggml_cuda_q8c_begin_response(int device);
++    int  ggml_cuda_q8c_set_pos(int device, uint32_t pos, uint32_t n);
++    int  ggml_cuda_q8c_read_range(int device, uint32_t first, uint32_t n, uint8_t * leaves, size_t leaves_cap,
++                                  uint32_t * ubatch, size_t ubatch_cap);
+     int  ggml_cuda_q8c_arm_capture(int device, uint32_t pos, uint32_t leaf_x, uint32_t leaf_y);
+     // Up to 32 (position, leaf) captures of at most `slot_bytes` each; read back slot-strided.
+     int  ggml_cuda_q8c_arm_captures(int device, const uint32_t * pos, const uint32_t * leaf, uint32_t n,

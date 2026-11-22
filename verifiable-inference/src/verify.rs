@@ -9,6 +9,12 @@ use crate::{q8, quant};
 
 pub const EPS: f64 = 1e-5;
 pub const EPS_GEGLU: f64 = 3e-5;
+pub const EPS_F16: f64 = 3e-5;
+
+/// Tolerance of a product of weight type `wtype`.
+pub fn eps_for(wtype: u32) -> f64 {
+    if wtype == quant::F16 { EPS_F16 } else { EPS }
+}
 const MMVQ_MAX_BATCH: u32 = 8;
 /// Prompt positions per batch of the traced run.
 pub const UBATCH: u32 = 512;
@@ -148,16 +154,25 @@ pub fn input_layout(role: u8, n_ubatch: u32, wtype: u32) -> u8 {
 }
 
 pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
-    if n_ubatch <= MMVQ_MAX_BATCH {
+    if wtype == quant::F16 {
+        q8::X_F16
+    } else if n_ubatch <= MMVQ_MAX_BATCH {
         q8::MMVQ
     } else if matches!(wtype, 2 | 3 | 7 | quant::Q4_K | quant::Q5_K) {
         q8::MMQ_DS4
+    } else if wtype == quant::Q2_K {
+        q8::MMQ_D2S6
     } else {
         q8::MMQ_D4
     }
 }
 
 pub fn x_len(k: u64, layout: u8) -> u64 {
+    match layout {
+        q8::X_F32 => return 4 * k,
+        q8::X_F16 => return 2 * k,
+        _ => {}
+    }
     let kp = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     if layout == q8::MMVQ { kp / 32 * 36 } else { kp / 128 * 144 }
 }
@@ -332,7 +347,7 @@ pub(crate) fn verify_point_at(
             }
             _ => return Err(Fail::Shape),
         };
-        (r.y_hat + b, EPS * (r.scale + b.abs()))
+        (r.y_hat + b, eps_for(g_entry.wtype) * (r.scale + b.abs()))
     } else {
         if p.rows.len() != 2 || p.bias.is_some() {
             return Err(Fail::Shape);
