@@ -27,6 +27,10 @@ pub const POM_V5_PAD_TILES_H18: [u64; 9] =
 /// Context pad tiles of `tier` at `daa`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
     let table: &[u64] = if daa >= crate::pom::model_split_activation_daa() {
+        // Devnet ranges carry no pad (node `NETWORK_MODEL_V4T.range_pads`).
+        if crate::pom::is_devnet() && tier >= crate::models::NETWORK_MODEL_TIER {
+            return 0;
+        }
         &POM_V5_PAD_TILES_H18
     } else if daa >= crate::pom::pad_margin_activation_daa() {
         &POM_V5_PAD_TILES_H16

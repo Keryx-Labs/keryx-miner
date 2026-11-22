@@ -200,7 +200,7 @@ pub struct Opt {
 
     #[clap(
         long,
-        help = "Use the devnet bench instead of mainnet: default port 22610, the devnet activation gates and the two-range truncated V4-Flash network model from the first block [default: false]"
+        help = "Use the devnet bench instead of mainnet: default port 22610, every gate live from genesis, and H18 with the two-range truncated V4-Flash network model at DAA 5000 [default: false]"
     )]
     devnet: bool,
 

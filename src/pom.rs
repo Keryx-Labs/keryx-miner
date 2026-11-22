@@ -1588,8 +1588,8 @@ pub fn is_testnet() -> bool {
     TESTNET_GATES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Devnet is the local bench: it starts in today's mainnet state, so it shares the testnet's
-/// compact gate values — only H14 is still ahead of it.
+/// Devnet is the local bench: every gate before H18 is live from genesis, H18 at
+/// `DEVNET_H18_ACTIVATION_DAA`.
 static DEVNET_GATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Switches the miner to the devnet bench. Called once at startup when `--devnet` is passed.
@@ -1622,10 +1622,13 @@ fn gate(mainnet: u64, testnet: u64) -> u64 {
     }
 }
 
-/// A gate of H15 or later: never on devnet, whose node runs without them.
+/// Devnet H18 gate. MUST equal the node's `DEVNET_H18_ACTIVATION_DAA`.
+const DEVNET_H18_ACTIVATION_DAA: u64 = 5_000;
+
+/// A gate of H15 to H17: live from genesis on devnet.
 fn gate_h15_on(mainnet: u64, testnet: u64) -> u64 {
     if is_devnet() {
-        u64::MAX
+        1
     } else {
         gate(mainnet, testnet)
     }
@@ -1747,7 +1750,7 @@ pub fn h10_activation_daa() -> u64 {
 /// scheduled.
 pub fn model_split_activation_daa() -> u64 {
     if is_devnet() {
-        1
+        DEVNET_H18_ACTIVATION_DAA
     } else {
         gate(u64::MAX, u64::MAX)
     }
