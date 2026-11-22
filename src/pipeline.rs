@@ -182,6 +182,15 @@ fn push_outgoing(payload: Vec<u8>) {
 
 /// Publishes a forced step: the link `(tier, key)` must answer position `pos` of `input` on chain.
 fn force_step(identity: &GatewayIdentity, request: &[u8; 32], tier: u8, key: [u8; 32], pos: u32, receipt: Option<keryx_inference::AiStepReceipt>, input: Vec<u8>) {
+    static FORCED: OnceLock<Mutex<std::collections::HashSet<([u8; 32], u8, [u8; 32])>>> = OnceLock::new();
+    if let Ok(mut g) = FORCED.get_or_init(Default::default).lock() {
+        if g.len() >= 4096 {
+            g.clear();
+        }
+        if !g.insert((*request, tier, key)) {
+            return;
+        }
+    }
     let receipt = receipt.filter(|r| r.end() == Some(pos));
     let pos = if receipt.is_some() { pos } else { 0 };
     let mut d = keryx_inference::AiDemandPayload {
@@ -295,8 +304,7 @@ pub fn all_assignments() -> Vec<Assignment> {
     assignments().lock().map(|g| g.values().cloned().collect()).unwrap_or_default()
 }
 
-/// Failed links of this head's pipelines whose step was forced, `request -> (tier, key)`, until
-/// the link answers it or the audit closes.
+/// Failed links of this head's pipelines, `request -> (tier, key)`.
 fn link_failures() -> &'static Mutex<HashMap<[u8; 32], (u8, [u8; 32])>> {
     static F: OnceLock<Mutex<HashMap<[u8; 32], (u8, [u8; 32])>>> = OnceLock::new();
     F.get_or_init(Default::default)
@@ -318,8 +326,7 @@ pub fn note_link_failure(request_hash: [u8; 32], tier: u8, key: [u8; 32]) {
     }
 }
 
-/// Failure reports to publish, each handed out once: a recorded failure whose forced step the
-/// link answered on chain. A failure whose step stays unanswered needs no report.
+/// Failure reports to publish, each handed out once.
 pub fn take_failure_reports() -> Vec<([u8; 32], u8, [u8; 32])> {
     let Ok(mut g) = link_failures().lock() else { return Vec::new() };
     let Ok(mut done) = reported().lock() else { return Vec::new() };
@@ -533,7 +540,7 @@ pub enum HeadDecision {
     Drop(&'static str),
 }
 
-/// Serve once the node drew the ranks and this head heads a pipeline; wait meanwhile, mining on.
+/// Whether this head serves now.
 pub fn head_decision(request_hash: &[u8; 32], since: std::time::Instant, now_daa: u64) -> HeadDecision {
     let Some(identity) = identity() else { return HeadDecision::Drop("no escrow identity") };
     if response_seen(request_hash, &identity.pubkey) {
@@ -608,7 +615,7 @@ struct HeadLink {
     receipt: Option<keryx_inference::AiStepReceipt>,
     /// This pipeline's key for the tier, while no step was forced on it yet.
     own: Option<[u8; 32]>,
-    /// The own key failed before any step: its step is forced at position 0 once known.
+    /// The own key failed before any step.
     force_at_zero: bool,
 }
 
@@ -672,8 +679,7 @@ fn first_position(input: &StepInput, n_hc: usize) -> Vec<u8> {
 }
 
 /// Runs `input` at `pos0` through link `l`; a failed link is replaced by the next declared key,
-/// which is first fed everything the failed one had computed. The first failure of this
-/// pipeline's own key forces its step on chain.
+/// which is first fed everything the failed one had computed.
 async fn step_link(l: &mut HeadLink, request: &[u8; 32], max_len: u32, identity: &Arc<GatewayIdentity>, pos0: u32, input: StepInput) -> Result<Vec<f32>, String> {
     loop {
         match l.session.step(pos0, &input).await {
@@ -773,8 +779,6 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
         let (session, n_hc, key) = match opened {
             Ok(o) => o,
             Err(reason) => {
-                // force the own key's first step: its input is the prompt's first token, or what
-                // the links before it make of it
                 if let Some(own) = own {
                     let mut input = StepInput::Tokens(vec![prompt_ids[0]]);
                     let mut known = true;
@@ -827,7 +831,6 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let mut pos = 0u32;
     let mut feed: Vec<i32> = prompt_ids;
     let mut produced = 0usize;
-    // a link whose range ran out of reachable keys is the one its own pipeline holds there
     let failed = |reason: String, tier: u8| HeadFailure { reason, failed_link: assignment.pipeline_key(tier, rank).map(|key| (tier, key)) };
     let result: Result<(), HeadFailure> = async {
         loop {
@@ -1037,7 +1040,6 @@ mod tests {
         note_assignments(&encode(rh, &links));
         note_link_failure(rh, 6, [1u8; 32]);
         note_link_failure([0x46u8; 32], 6, [1u8; 32]);
-        // the step is not answered yet: nothing to report
         assert!(take_failure_reports().is_empty());
         note_assignments(&encode_with(rh, &links, &[(me, 6, [1u8; 32], 0, 900, false)]));
         assert!(take_failure_reports().is_empty());
@@ -1086,8 +1088,8 @@ mod tests {
             signature: [0; 64],
         };
         force_step(&id, &[9u8; 32], 7, [3u8; 32], 4, Some(receipt), f32s_to_bf16(&[0.5; 8]));
-        // a receipt that does not reach the position is dropped and the step forced at 0
         force_step(&id, &[9u8; 32], 7, [4u8; 32], 9, Some(receipt), vec![1, 0, 0, 0]);
+        force_step(&id, &[9u8; 32], 7, [4u8; 32], 0, None, vec![1, 0, 0, 0]);
         let out = take_outgoing();
         assert_eq!(out.len(), 2);
         let d = keryx_inference::AiDemandPayload::deserialize(&out[0]).unwrap();

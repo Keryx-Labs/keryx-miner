@@ -1398,9 +1398,7 @@ impl KeryxdHandler {
         self.queue_avail_tx(avail.serialize());
     }
 
-    /// Sends again the declarations of this miner that its armed audits still lack, until their
-    /// deadline; publishes the forced steps and answers built since the last tick, and the failure
-    /// reports of the pipelines this head gave up after an answered forced step.
+    /// Publishes the pending declarations, forced steps, answers and failure reports.
     fn maintain_pipeline_transactions(&mut self) {
         let now_daa = self.last_known_daa;
         let Some(own) = keryx_miner::pipeline::identity().map(|i| i.pubkey) else { return };

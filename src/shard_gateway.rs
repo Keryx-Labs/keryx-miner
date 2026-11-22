@@ -168,8 +168,7 @@ fn receipt_holds(r: &keryx_inference::AiStepReceipt, link: &[u8; 32], request: &
         && verify_schnorr(link, &r.signature, &domain_hash(RECEIPT_DOMAIN, &[&r.signed_bytes()]))
 }
 
-/// Sequences kept after their head dropped without closing them, by `(request, head)`, so a
-/// step forced on chain can still be answered from the same state.
+/// Sequences kept after their head dropped without closing them, by `(request, head)`.
 fn retained() -> &'static Mutex<HashMap<([u8; 32], [u8; 32]), (OpenRange, std::time::Instant)>> {
     static R: OnceLock<Mutex<HashMap<([u8; 32], [u8; 32]), (OpenRange, std::time::Instant)>>> = OnceLock::new();
     R.get_or_init(Default::default)
@@ -930,7 +929,6 @@ async fn server_session(
         }
     };
     reader.abort();
-    // a sequence the head dropped without closing stays for a step forced on chain
     if let Some(o) = open.take() {
         if o.len > 0 {
             retain_range(head_pubkey, o);
@@ -1380,7 +1378,6 @@ mod tests {
         link.open(&[1u8; 32], 32).await.unwrap();
         assert_eq!(range.held(), 1);
         assert_eq!(crate::pom_gpu::shard_sessions(), before);
-        // the first step does, until the head goes silent; the sequence stays for a forced step
         link.step(0, &StepInput::Tokens(vec![3])).await.unwrap();
         assert_eq!(crate::pom_gpu::shard_sessions(), before + 1);
         tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1425,13 +1422,11 @@ mod tests {
         let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
         link.open(&request, 16).await.unwrap();
         link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
-        // the head vanishes without closing: the sequence stays at position 2
         drop(link);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(range.held(), 1);
         assert!(step_retained(&request, &head.pubkey, 3, &StepInput::Tokens(vec![5])).is_none(), "not at its position");
         assert_eq!(range.held(), 0, "taken once, then closed");
-        // kept again, then answered at its position
         let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
         link.open(&request, 16).await.unwrap();
         link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
@@ -1440,7 +1435,6 @@ mod tests {
         let out = step_retained(&request, &head.pubkey, 2, &StepInput::Tokens(vec![7])).unwrap().unwrap();
         assert_eq!(out, vec![7.5; HC]);
         assert!(step_retained(&request, &head.pubkey, 3, &StepInput::Tokens(vec![7])).is_none());
-        // a request leaving the audits releases what is kept
         let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
         link.open(&request, 16).await.unwrap();
         link.step(0, &StepInput::Tokens(vec![1])).await.unwrap();
