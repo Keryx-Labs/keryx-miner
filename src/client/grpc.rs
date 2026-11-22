@@ -1182,6 +1182,11 @@ impl KeryxdHandler {
     ///   - Subnetwork 0x03 + binary `AiRequestPayload` (future on-chain format)
     ///   - Any non-coinbase TX + `KRX:AI:1:` JSON prefix (web wallet format)
     fn scan_txs_for_ai_requests(&mut self, txs: &[crate::proto::RpcTransaction], block_daa: u64) {
+        for tx in txs.iter().filter(|tx| tx.subnetwork_id == keryx_inference::SUBNETWORK_ID_AI_AVAIL_HEX) {
+            if let Ok(raw) = hex::decode(&tx.payload) {
+                keryx_miner::pipeline::note_demand(&raw);
+            }
+        }
         // Identity of a request follows the same gate as the node: transaction id past it, payload
         // digest before. Decided from the daa of the block the request is observed in, so both
         // sides classify a request the same way across the activation.
@@ -1394,7 +1399,8 @@ impl KeryxdHandler {
     }
 
     /// Sends again the declarations of this miner that its armed audits still lack, until their
-    /// deadline; and the failure reports of the pipelines this head could not run.
+    /// deadline; publishes the forced steps and answers built since the last tick, and the failure
+    /// reports of the pipelines this head gave up after an answered forced step.
     fn maintain_pipeline_transactions(&mut self) {
         let now_daa = self.last_known_daa;
         let Some(own) = keryx_miner::pipeline::identity().map(|i| i.pubkey) else { return };
@@ -1413,6 +1419,10 @@ impl KeryxdHandler {
             }
             self.ai_redeclared.insert(a.request_hash, std::time::Instant::now());
             log::info!("Inference: declaration for id={} on tier(s) {:?} not in the audit yet — sent again", hex::encode(&a.request_hash[..8]), missing);
+        }
+        keryx_miner::pipeline::answer_forced_steps(now_daa);
+        for payload in keryx_miner::pipeline::take_outgoing() {
+            self.queue_avail_tx(payload);
         }
         for (request_hash, tier, key) in keryx_miner::pipeline::take_failure_reports() {
             let Some(w) = self.escrow_watcher.as_ref() else { continue };

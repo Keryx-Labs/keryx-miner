@@ -25,6 +25,8 @@ pub struct Assignment {
     pub declare_end_daa: u64,
     /// `(shard tier, escrow pubkey, slot)` of every availability declaration, chain order.
     pub links: Vec<(u8, [u8; 32], Slot)>,
+    /// Forced steps: `(head key, link tier, link key, position, answer deadline, answered)`.
+    pub disputes: Vec<([u8; 32], u8, [u8; 32], u32, u64, bool)>,
 }
 
 impl Assignment {
@@ -63,7 +65,7 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
-/// Parses one `hash:accepted:window_end:declare_end:tier-escrowhex-slot,...` entry.
+/// Parses one `hash:accepted:window_end:declare_end:tier-escrowhex-slot,...:headhex-tier-linkhex-pos-deadline-answered,...` entry.
 pub fn parse_assignment(s: &str) -> Option<Assignment> {
     let mut parts = s.split(':');
     let request_hash = unhex32(parts.next()?)?;
@@ -85,10 +87,21 @@ pub fn parse_assignment(s: &str) -> Option<Assignment> {
         }
         links.push((t, k, slot));
     }
+    let mut disputes = Vec::new();
+    for item in parts.next()?.split(',').filter(|i| !i.is_empty()) {
+        let f: Vec<&str> = item.split('-').collect();
+        let [h, t, l, pos, end, answered] = f.as_slice() else { return None };
+        let answered = match *answered {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        disputes.push((unhex32(h)?, t.parse().ok()?, unhex32(l)?, pos.parse().ok()?, end.parse().ok()?, answered));
+    }
     if parts.next().is_some() {
         return None;
     }
-    Some(Assignment { request_hash, accepted_daa, window_end_daa, declare_end_daa, links })
+    Some(Assignment { request_hash, accepted_daa, window_end_daa, declare_end_daa, links, disputes })
 }
 
 /// Zone codes, in the order of their declared byte.
@@ -118,21 +131,172 @@ fn assignments() -> &'static Mutex<HashMap<[u8; 32], Assignment>> {
     A.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Replaces the known assignments with the template's `;`-separated list.
+/// Replaces the known assignments with the template's `;`-separated list, and releases the
+/// sequences kept for requests no longer audited.
 pub fn note_assignments(encoded: &str) {
     let parsed: HashMap<[u8; 32], Assignment> =
         encoded.split(';').filter(|s| !s.is_empty()).filter_map(parse_assignment).map(|a| (a.request_hash, a)).collect();
+    let live: HashSet<[u8; 32]> = parsed.keys().copied().collect();
     if let Ok(mut g) = assignments().lock() {
         *g = parsed;
     }
+    shard_gateway::release_retained(&live);
+}
+
+/// bf16 bytes of `v`, rounded to nearest even.
+pub fn f32s_to_bf16(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        let bits = x.to_bits();
+        let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+        out.extend_from_slice(&((rounded >> 16) as u16).to_le_bytes());
+    }
+    out
+}
+
+pub fn bf16_to_f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect()
+}
+
+const DEMAND_DOMAIN: &[u8] = b"KeryxPipelineDemandV1";
+const ANSWER_DOMAIN: &[u8] = b"KeryxPipelineAnswerV1";
+
+/// AiAvail payloads this miner built (forced steps, answers), waiting for submission.
+fn outgoing() -> &'static Mutex<Vec<Vec<u8>>> {
+    static O: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+    O.get_or_init(Default::default)
+}
+
+/// The AiAvail payloads to submit now.
+pub fn take_outgoing() -> Vec<Vec<u8>> {
+    outgoing().lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+}
+
+fn push_outgoing(payload: Vec<u8>) {
+    if let Ok(mut g) = outgoing().lock() {
+        if g.len() < 256 {
+            g.push(payload);
+        }
+    }
+}
+
+/// Publishes a forced step: the link `(tier, key)` must answer position `pos` of `input` on chain.
+fn force_step(identity: &GatewayIdentity, request: &[u8; 32], tier: u8, key: [u8; 32], pos: u32, receipt: Option<keryx_inference::AiStepReceipt>, input: Vec<u8>) {
+    let receipt = receipt.filter(|r| r.end() == Some(pos));
+    let pos = if receipt.is_some() { pos } else { 0 };
+    let mut d = keryx_inference::AiDemandPayload {
+        request_hash: *request,
+        link_tier: tier,
+        link_escrow_pubkey: key,
+        head_escrow_pubkey: identity.pubkey,
+        pos,
+        receipt,
+        input,
+        signature: [0u8; 64],
+    };
+    d.signature = identity.sign_domain(DEMAND_DOMAIN, &d.signed_bytes());
+    log::info!("pipeline: link of tier {} ({}) failed request {} — its position {} is forced on chain", tier, hex::encode(&key[..8]), hex::encode(&request[..8]), pos);
+    push_outgoing(d.serialize());
+}
+
+/// Forced steps on this miner's keys seen in blocks or templates, by `(request, head, tier, pos)`:
+/// their input, and whether an answer was built.
+fn demands() -> &'static Mutex<HashMap<([u8; 32], [u8; 32], u8, u32), (Vec<u8>, bool)>> {
+    static D: OnceLock<Mutex<HashMap<([u8; 32], [u8; 32], u8, u32), (Vec<u8>, bool)>>> = OnceLock::new();
+    D.get_or_init(Default::default)
+}
+
+/// Records an AiAvail payload that forces a step on this miner's key.
+pub fn note_demand(payload: &[u8]) {
+    let Some(d) = keryx_inference::AiDemandPayload::deserialize(payload) else { return };
+    if identity().is_none_or(|i| i.pubkey != d.link_escrow_pubkey) {
+        return;
+    }
+    if let Ok(mut g) = demands().lock() {
+        if g.len() < 256 {
+            g.entry((d.request_hash, d.head_escrow_pubkey, d.link_tier, d.pos)).or_insert((d.input, false));
+        }
+    }
+}
+
+/// Answers the forced steps on this miner's keys the chain now awaits, each once.
+pub fn answer_forced_steps(now_daa: u64) {
+    let Some(identity) = identity() else { return };
+    let due: Vec<(([u8; 32], [u8; 32], u8, u32), Vec<u8>)> = {
+        let Ok(mut g) = demands().lock() else { return };
+        let mut out = Vec::new();
+        g.retain(|(rh, head, tier, pos), (input, started)| {
+            let Some(a) = assignment_for(rh) else { return false };
+            let open = a.disputes.iter().find(|(h, t, l, p, _, _)| h == head && t == tier && *l == identity.pubkey && p == pos);
+            match open {
+                Some((_, _, _, _, deadline, false)) if now_daa <= *deadline => {
+                    if !*started {
+                        *started = true;
+                        out.push(((*rh, *head, *tier, *pos), input.clone()));
+                    }
+                    true
+                }
+                // not folded yet: keep until the audit closes
+                None => true,
+                _ => false,
+            }
+        });
+        out
+    };
+    for ((rh, head, tier, pos), input) in due {
+        let identity = identity.clone();
+        tokio::task::spawn_blocking(move || match forced_output(&rh, &head, tier, pos, &input) {
+            Ok(out) => {
+                let mut a = keryx_inference::AiAnswerPayload {
+                    request_hash: rh,
+                    link_tier: tier,
+                    link_escrow_pubkey: identity.pubkey,
+                    head_escrow_pubkey: head,
+                    pos,
+                    trace_root: [0u8; 32],
+                    output: f32s_to_bf16(&out),
+                    signature: [0u8; 64],
+                };
+                a.signature = identity.sign_domain(ANSWER_DOMAIN, &a.signed_bytes());
+                log::info!("pipeline: answering the step forced on tier {} for request {} at position {}", tier, hex::encode(&rh[..8]), pos);
+                push_outgoing(a.serialize());
+            }
+            Err(e) => log::warn!("pipeline: cannot answer the step forced on tier {} for request {}: {}", tier, hex::encode(&rh[..8]), e),
+        });
+    }
+}
+
+/// This link's output for a forced position: from the sequence kept for that head, or from a
+/// fresh one at position 0.
+fn forced_output(request: &[u8; 32], head: &[u8; 32], tier: u8, pos: u32, input: &[u8]) -> Result<Vec<f32>, String> {
+    let k = (tier - NETWORK_MODEL_TIER - 1) as usize;
+    let input = if k == 0 {
+        StepInput::Tokens(vec![i32::from_le_bytes(input.try_into().map_err(|_| "bad token input")?)])
+    } else {
+        StepInput::Residual(bf16_to_f32s(input))
+    };
+    if let Some(out) = shard_gateway::step_retained(request, head, pos, &input) {
+        return out;
+    }
+    if pos != 0 {
+        return Err(format!("no sequence kept at position {}", pos));
+    }
+    let range = link_range(k)?;
+    let seq = range.open()?;
+    let out = match &input {
+        StepInput::Tokens(t) => range.step(seq, 0, Some(t), None),
+        StepInput::Residual(r) => range.step(seq, 0, None, Some(r)),
+    };
+    range.close(seq);
+    out
 }
 
 pub fn all_assignments() -> Vec<Assignment> {
     assignments().lock().map(|g| g.values().cloned().collect()).unwrap_or_default()
 }
 
-/// Failed links of this head's pipelines not reported yet, `request -> (tier, key)`. A report
-/// does not stand against a pipeline that ends up served.
+/// Failed links of this head's pipelines whose step was forced, `request -> (tier, key)`, until
+/// the link answers it or the audit closes.
 fn link_failures() -> &'static Mutex<HashMap<[u8; 32], (u8, [u8; 32])>> {
     static F: OnceLock<Mutex<HashMap<[u8; 32], (u8, [u8; 32])>>> = OnceLock::new();
     F.get_or_init(Default::default)
@@ -154,19 +318,29 @@ pub fn note_link_failure(request_hash: [u8; 32], tier: u8, key: [u8; 32]) {
     }
 }
 
-/// Failure reports to publish, each handed out once: the recorded ones of a live assignment.
+/// Failure reports to publish, each handed out once: a recorded failure whose forced step the
+/// link answered on chain. A failure whose step stays unanswered needs no report.
 pub fn take_failure_reports() -> Vec<([u8; 32], u8, [u8; 32])> {
     let Ok(mut g) = link_failures().lock() else { return Vec::new() };
     let Ok(mut done) = reported().lock() else { return Vec::new() };
+    let Some(me) = identity().map(|i| i.pubkey) else { return Vec::new() };
     if done.len() >= MAX_RESPONSES_SEEN {
         done.clear();
     }
     let mut out = Vec::new();
-    for (rh, (tier, key)) in g.drain() {
-        if assignment_for(&rh).is_some() && done.insert(rh) {
-            out.push((rh, tier, key));
+    g.retain(|rh, (tier, key)| {
+        let Some(a) = assignment_for(rh) else { return false };
+        if response_seen(rh, &me) {
+            return false;
         }
-    }
+        if a.disputes.iter().any(|(h, t, l, _, _, answered)| *h == me && t == tier && l == key && *answered) {
+            if done.insert(*rh) {
+                out.push((*rh, *tier, *key));
+            }
+            return false;
+        }
+        true
+    });
     out
 }
 
@@ -429,6 +603,13 @@ struct HeadLink {
     tokens: Vec<i32>,
     residual: Vec<f32>,
     n_hc: usize,
+    /// Key of the session, and the last receipt it signed.
+    key: [u8; 32],
+    receipt: Option<keryx_inference::AiStepReceipt>,
+    /// This pipeline's key for the tier, while no step was forced on it yet.
+    own: Option<[u8; 32]>,
+    /// The own key failed before any step: its step is forced at position 0 once known.
+    force_at_zero: bool,
 }
 
 impl HeadLink {
@@ -459,7 +640,7 @@ async fn open_next(
     k: usize,
     spare: &mut std::collections::VecDeque<[u8; 32]>,
     identity: &Arc<GatewayIdentity>,
-) -> Result<(LinkSession, usize), String> {
+) -> Result<(LinkSession, usize, [u8; 32]), String> {
     while let Some(key) = spare.pop_front() {
         let Some(endpoint) = shard_gateway::peer_endpoint(&key) else { continue };
         let t = std::time::Instant::now();
@@ -473,7 +654,7 @@ async fn open_next(
         match session.open(request, max_len).await {
             Ok(d) if d.from_tokens == (k == 0) => {
                 log::info!("pipeline head: link shard {} (tier {}) {} open in {} ms", k, tier, endpoint, t.elapsed().as_millis());
-                return Ok((session, d.n_hc));
+                return Ok((session, d.n_hc, key));
             }
             Ok(_) => log::warn!("pipeline: shard {} at {}: wrong range input", k, endpoint),
             Err(e) => log::warn!("pipeline: shard {} at {}: {}", k, endpoint, e),
@@ -482,23 +663,44 @@ async fn open_next(
     Err(format!("no reachable link for shard {} (tier {})", k, tier))
 }
 
+/// The first position of `input`, as a forced step carries it: a token id, or a bf16 residual.
+fn first_position(input: &StepInput, n_hc: usize) -> Vec<u8> {
+    match input {
+        StepInput::Tokens(t) => t.first().map(|x| x.to_le_bytes().to_vec()).unwrap_or_default(),
+        StepInput::Residual(r) => f32s_to_bf16(&r[..n_hc.min(r.len())]),
+    }
+}
+
 /// Runs `input` at `pos0` through link `l`; a failed link is replaced by the next declared key,
-/// which is first fed everything the failed one had computed.
+/// which is first fed everything the failed one had computed. The first failure of this
+/// pipeline's own key forces its step on chain.
 async fn step_link(l: &mut HeadLink, request: &[u8; 32], max_len: u32, identity: &Arc<GatewayIdentity>, pos0: u32, input: StepInput) -> Result<Vec<f32>, String> {
     loop {
         match l.session.step(pos0, &input).await {
-            Ok(out) => {
+            Ok((out, receipt)) => {
+                if l.force_at_zero && pos0 == 0 {
+                    l.force_at_zero = false;
+                    if let Some(own) = l.own.take() {
+                        force_step(identity, request, l.tier, own, 0, None, first_position(&input, l.n_hc));
+                    }
+                }
                 l.record(&input);
+                l.receipt = Some(receipt);
                 return Ok(out);
             }
             Err(e) => {
                 log::warn!("pipeline: link shard {} failed at position {}: {} — replacing it", l.k, pos0, e);
-                let (session, n_hc) = open_next(request, max_len, l.model_id, l.tier, l.k, &mut l.spare, identity).await?;
+                if l.own == Some(l.key) {
+                    l.own = None;
+                    force_step(identity, request, l.tier, l.key, pos0, l.receipt.take(), first_position(&input, l.n_hc));
+                }
+                let (session, n_hc, key) = open_next(request, max_len, l.model_id, l.tier, l.k, &mut l.spare, identity).await?;
                 if n_hc != l.n_hc {
                     return Err(format!("substitute for shard {} has another residual width", l.k));
                 }
                 let mut pos = 0usize;
                 let total = l.fed();
+                let mut receipt = None;
                 while pos < total {
                     let n = (total - pos).min(shard_gateway::MAX_STEP_TOKENS);
                     let chunk = if l.k == 0 {
@@ -506,10 +708,13 @@ async fn step_link(l: &mut HeadLink, request: &[u8; 32], max_len: u32, identity:
                     } else {
                         StepInput::Residual(l.residual[pos * n_hc..(pos + n) * n_hc].to_vec())
                     };
-                    session.step(pos as u32, &chunk).await.map_err(|e| format!("substitute for shard {} failed its replay: {}", l.k, e))?;
+                    let (_, r) = session.step(pos as u32, &chunk).await.map_err(|e| format!("substitute for shard {} failed its replay: {}", l.k, e))?;
+                    receipt = Some(r);
                     pos += n;
                 }
                 l.session = session;
+                l.key = key;
+                l.receipt = receipt;
             }
         }
     }
@@ -562,18 +767,52 @@ pub async fn run_head(request_hash: [u8; 32], prompt: String, max_tokens: usize)
     let mut links: Vec<HeadLink> = Vec::with_capacity(n_links);
     for (k, spec) in nm.shards.iter().enumerate().take(n_links) {
         let tier = NETWORK_MODEL_TIER + 1 + k as u8;
+        let own = assignment.pipeline_key(tier, rank);
         let mut spare: std::collections::VecDeque<[u8; 32]> = assignment.link_candidates(tier, rank).into();
         let opened = open_next(&request_hash, max_len, spec.model_id, tier, k, &mut spare, &identity).await;
-        let (session, n_hc) = match opened {
+        let (session, n_hc, key) = match opened {
             Ok(o) => o,
             Err(reason) => {
+                // force the own key's first step: its input is the prompt's first token, or what
+                // the links before it make of it
+                if let Some(own) = own {
+                    let mut input = StepInput::Tokens(vec![prompt_ids[0]]);
+                    let mut known = true;
+                    for l in links.iter_mut() {
+                        match l.session.step(0, &input).await {
+                            Ok((x, _)) => input = StepInput::Residual(x),
+                            Err(_) => {
+                                known = false;
+                                break;
+                            }
+                        }
+                    }
+                    if known {
+                        let n_hc = links.last().map_or(0, |l| l.n_hc);
+                        force_step(&identity, &request_hash, tier, own, 0, None, first_position(&input, n_hc));
+                    }
+                }
                 for l in &links {
                     l.session.close().await;
                 }
-                return Err(HeadFailure { reason, failed_link: assignment.pipeline_key(tier, rank).map(|key| (tier, key)) });
+                return Err(HeadFailure { reason, failed_link: own.map(|key| (tier, key)) });
             }
         };
-        links.push(HeadLink { k, tier, model_id: spec.model_id, session, spare, tokens: Vec::new(), residual: Vec::new(), n_hc });
+        let force_at_zero = own.is_some_and(|o| o != key);
+        links.push(HeadLink {
+            k,
+            tier,
+            model_id: spec.model_id,
+            session,
+            spare,
+            tokens: Vec::new(),
+            residual: Vec::new(),
+            n_hc,
+            key,
+            receipt: None,
+            own: own.filter(|o| *o == key || force_at_zero),
+            force_at_zero,
+        });
     }
     log::info!(
         "pipeline: heading request {} as pipeline {} of {}, {} prompt tokens",
@@ -662,8 +901,19 @@ mod tests {
     }
 
     fn encode(rh: [u8; 32], links: &[(u8, [u8; 32], Slot)]) -> String {
+        encode_with(rh, links, &[])
+    }
+
+    fn encode_with(rh: [u8; 32], links: &[(u8, [u8; 32], Slot)], disputes: &[([u8; 32], u8, [u8; 32], u32, u64, bool)]) -> String {
         let l: Vec<String> = links.iter().map(|(t, k, s)| format!("{}-{}-{}", t, hex::encode(k), slot_code(*s))).collect();
-        format!("{}:100:6500:400:{}", hex::encode(rh), l.join(","))
+        let d: Vec<String> =
+            disputes.iter().map(|(h, t, k, p, e, a)| format!("{}-{}-{}-{}-{}-{}", hex::encode(h), t, hex::encode(k), p, e, *a as u8)).collect();
+        format!("{}:100:6500:400:{}:{}", hex::encode(rh), l.join(","), d.join(","))
+    }
+
+    fn me() -> [u8; 32] {
+        set_identity(Arc::new(GatewayIdentity::from_privkey_hex(&"11".repeat(32)).unwrap()));
+        identity().unwrap().pubkey
     }
 
     /// Two pipelines over every shard tier (key `16 * k + i`), a spare on the first range.
@@ -779,17 +1029,103 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_link_is_reported_once() {
+    fn a_failed_link_is_reported_once_its_forced_step_is_answered() {
         let _serial = assignments_lock();
+        let me = me();
         let rh = [0x45u8; 32];
-        note_assignments(&two_pipelines(rh, [0xEEu8; 32]));
+        let links = parse_assignment(&two_pipelines(rh, me)).unwrap().links;
+        note_assignments(&encode(rh, &links));
         note_link_failure(rh, 6, [1u8; 32]);
-        note_link_failure(rh, 7, [2u8; 32]);
         note_link_failure([0x46u8; 32], 6, [1u8; 32]);
+        // the step is not answered yet: nothing to report
+        assert!(take_failure_reports().is_empty());
+        note_assignments(&encode_with(rh, &links, &[(me, 6, [1u8; 32], 0, 900, false)]));
+        assert!(take_failure_reports().is_empty());
+        note_assignments(&encode_with(rh, &links, &[(me, 6, [1u8; 32], 0, 900, true)]));
         assert_eq!(take_failure_reports(), vec![(rh, 6, [1u8; 32])]);
         note_link_failure(rh, 6, [1u8; 32]);
-        assert!(take_failure_reports().is_empty());
+        assert!(take_failure_reports().is_empty(), "once per request");
         note_assignments("");
+    }
+
+    #[test]
+    fn disputes_parse_from_the_assignment() {
+        let rh = [0x47u8; 32];
+        let enc = encode_with(rh, &[(6, [1u8; 32], Slot::Pipeline(0))], &[([2u8; 32], 6, [1u8; 32], 12, 950, true)]);
+        assert_eq!(parse_assignment(&enc).unwrap().disputes, vec![([2u8; 32], 6, [1u8; 32], 12, 950, true)]);
+        assert!(parse_assignment(&format!("{}x-1-2-3-4-5", enc)).is_none());
+        assert!(parse_assignment(&enc.replace("-950-1", "-950-2")).is_none());
+    }
+
+    #[test]
+    fn bf16_rounds_to_nearest_and_back() {
+        let v = [1.0f32, -2.5, 0.0, 3.140625, 1.0e30];
+        let b = f32s_to_bf16(&v);
+        assert_eq!(b.len(), 10);
+        assert_eq!(&b[..2], &[0x80, 0x3F]);
+        assert_eq!(bf16_to_f32s(&b)[..4], [1.0, -2.5, 0.0, 3.140625]);
+        assert!(keryx_inference::bf16_all_finite(&b), "large values keep their scale");
+        // 1 + 2^-8 sits halfway between two bf16 values: ties go to even
+        assert_eq!(bf16_to_f32s(&f32s_to_bf16(&[1.0 + 1.0 / 256.0])), vec![1.0]);
+    }
+
+    #[test]
+    fn a_forced_step_is_signed_by_the_head() {
+        let _serial = assignments_lock();
+        let me = me();
+        let id = identity().unwrap();
+        let _ = take_outgoing();
+        let receipt = keryx_inference::AiStepReceipt {
+            request_hash: [9u8; 32],
+            pos0: 0,
+            n: 4,
+            input_hash: [0; 32],
+            output_hash: [0; 32],
+            trace_root: [0; 32],
+            previous: [0; 32],
+            signature: [0; 64],
+        };
+        force_step(&id, &[9u8; 32], 7, [3u8; 32], 4, Some(receipt), f32s_to_bf16(&[0.5; 8]));
+        // a receipt that does not reach the position is dropped and the step forced at 0
+        force_step(&id, &[9u8; 32], 7, [4u8; 32], 9, Some(receipt), vec![1, 0, 0, 0]);
+        let out = take_outgoing();
+        assert_eq!(out.len(), 2);
+        let d = keryx_inference::AiDemandPayload::deserialize(&out[0]).unwrap();
+        assert_eq!((d.head_escrow_pubkey, d.link_escrow_pubkey, d.link_tier, d.pos, d.receipt), (me, [3u8; 32], 7, 4, Some(receipt)));
+        let digest = {
+            let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+            h.update(DEMAND_DOMAIN);
+            h.update(&d.signed_bytes());
+            h.finalize()
+        };
+        let msg = secp256k1::Message::from_digest_slice(digest.as_bytes()).unwrap();
+        let sig = secp256k1::schnorr::Signature::from_slice(&d.signature).unwrap();
+        let pk = secp256k1::XOnlyPublicKey::from_slice(&me).unwrap();
+        assert!(secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok());
+        let d2 = keryx_inference::AiDemandPayload::deserialize(&out[1]).unwrap();
+        assert_eq!((d2.pos, d2.receipt), (0, None));
+        assert!(take_outgoing().is_empty());
+    }
+
+    #[test]
+    fn only_steps_forced_on_this_miner_are_kept() {
+        let _serial = assignments_lock();
+        let me = me();
+        let d = |link: [u8; 32]| keryx_inference::AiDemandPayload {
+            request_hash: [0x48u8; 32],
+            link_tier: 6,
+            link_escrow_pubkey: link,
+            head_escrow_pubkey: [5u8; 32],
+            pos: 0,
+            receipt: None,
+            input: vec![1, 0, 0, 0],
+            signature: [0; 64],
+        };
+        note_demand(&d([6u8; 32]).serialize());
+        note_demand(&d(me).serialize());
+        note_demand(&d(me).serialize());
+        let g = demands().lock().unwrap();
+        assert_eq!(g.keys().filter(|(rh, ..)| *rh == [0x48u8; 32]).count(), 1);
     }
 
     #[test]

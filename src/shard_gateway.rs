@@ -17,12 +17,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 const MAGIC: &[u8; 4] = b"KRXG";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const CLIENT_DOMAIN: &[u8] = b"KeryxGatewayClientV1";
 const SERVER_DOMAIN: &[u8] = b"KeryxGatewayServerV1";
 const RESPONDER_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
 /// Must equal the node's `LINK_SIG_DOMAIN`.
 const LINK_DOMAIN: &[u8] = b"KeryxPipelineLinkV1";
+const RECEIPT_DOMAIN: &[u8] = b"KeryxPipelineReceiptV1";
 const CHALLENGE_LEN: usize = 4 + 1 + 32;
 const HELLO_LEN: usize = 4 + 1 + 32 + 33 + 32 + 32 + 64;
 const REPLY_LEN: usize = 1 + 33 + 32 + 1 + 64;
@@ -105,6 +106,11 @@ impl GatewayIdentity {
         *self.secp.sign_schnorr_no_aux_rand(&msg, &keypair).as_ref()
     }
 
+    /// Signs `bytes` under `domain` the way the node verifies a domain signature.
+    pub fn sign_domain(&self, domain: &[u8], bytes: &[u8]) -> [u8; 64] {
+        self.sign_digest(&domain_hash(domain, &[bytes]))
+    }
+
 }
 
 /// Digest a link signs: its served `tier`, the head's key, then the response's v1 and extension
@@ -129,6 +135,85 @@ fn verify_schnorr(pubkey: &[u8; 32], sig: &[u8; 64], digest: &[u8; 32]) -> bool 
     let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig) else { return false };
     let Ok(msg) = Message::from_digest_slice(digest) else { return false };
     secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).is_ok()
+}
+
+fn hash32(bytes: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(blake2b_simd::Params::new().hash_length(32).hash(bytes).as_bytes());
+    out
+}
+
+/// The link's signed receipt of the step `[pos0, pos0 + n)` of `request`, chained to `previous`.
+fn step_receipt(identity: &GatewayIdentity, request: &[u8; 32], pos0: u32, n: u32, input: &[u8], output: &[u8], previous: [u8; 32]) -> keryx_inference::AiStepReceipt {
+    let mut r = keryx_inference::AiStepReceipt {
+        request_hash: *request,
+        pos0,
+        n,
+        input_hash: hash32(input),
+        output_hash: hash32(output),
+        trace_root: [0u8; 32],
+        previous,
+        signature: [0u8; 64],
+    };
+    r.signature = identity.sign_domain(RECEIPT_DOMAIN, &r.signed_bytes());
+    r
+}
+
+/// Whether `r` is `link`'s receipt of the step `[pos0, pos0 + n)` of `request` on `output`.
+fn receipt_holds(r: &keryx_inference::AiStepReceipt, link: &[u8; 32], request: &[u8; 32], pos0: u32, n: u32, output: &[u8]) -> bool {
+    r.request_hash == *request
+        && r.pos0 == pos0
+        && r.n == n
+        && r.output_hash == hash32(output)
+        && verify_schnorr(link, &r.signature, &domain_hash(RECEIPT_DOMAIN, &[&r.signed_bytes()]))
+}
+
+/// Sequences kept after their head dropped without closing them, by `(request, head)`, so a
+/// step forced on chain can still be answered from the same state.
+fn retained() -> &'static Mutex<HashMap<([u8; 32], [u8; 32]), (OpenRange, std::time::Instant)>> {
+    static R: OnceLock<Mutex<HashMap<([u8; 32], [u8; 32]), (OpenRange, std::time::Instant)>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+fn retain_range(head: [u8; 32], o: OpenRange) {
+    let mut g = retained().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((old, _)) = g.insert((o.request, head), (o, std::time::Instant::now())) {
+        old.compute.close(old.seq);
+    }
+}
+
+/// Closes the oldest retained sequence; `false` when none is kept.
+fn evict_oldest_retained() -> bool {
+    let mut g = retained().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(key) = g.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) else { return false };
+    if let Some((o, _)) = g.remove(&key) {
+        o.compute.close(o.seq);
+    }
+    true
+}
+
+/// Closes every retained sequence whose request is not in `live`.
+pub fn release_retained(live: &std::collections::HashSet<[u8; 32]>) {
+    let mut g = retained().lock().unwrap_or_else(|p| p.into_inner());
+    g.retain(|(request, _), (o, _)| {
+        let keep = live.contains(request);
+        if !keep {
+            o.compute.close(o.seq);
+        }
+        keep
+    });
+}
+
+/// Runs the forced position `pos` of `(request, head)` on its retained sequence, which it then
+/// closes. `None` when no sequence is kept at that position.
+pub fn step_retained(request: &[u8; 32], head: &[u8; 32], pos: u32, input: &StepInput) -> Option<Result<Vec<f32>, String>> {
+    let (o, _) = retained().lock().unwrap_or_else(|p| p.into_inner()).remove(&(*request, *head))?;
+    let out = (o.len == pos).then(|| match input {
+        StepInput::Tokens(t) => o.compute.step(o.seq, pos, Some(t), None),
+        StepInput::Residual(r) => o.compute.step(o.seq, pos, None, Some(r)),
+    });
+    o.compute.close(o.seq);
+    out
 }
 
 /// Verifies a link signature the way the node does.
@@ -640,6 +725,8 @@ struct OpenRange {
     seq: u32,
     compute: Arc<dyn RangeCompute>,
     dims: RangeDims,
+    /// Hash of the last receipt sent for this sequence.
+    last_receipt: [u8; 32],
 }
 
 async fn server_session(
@@ -734,7 +821,11 @@ async fn server_session(
                     let _ = out_tx.send((FRAME_ERROR, b"open: length".to_vec())).await;
                     break Err(refused("open: length"));
                 }
-                let seq = match compute.open() {
+                let mut opened = compute.open();
+                while opened.is_err() && evict_oldest_retained() {
+                    opened = compute.open();
+                }
+                let seq = match opened {
                     Ok(s) => s,
                     Err(_) => {
                         let _ = out_tx.send((FRAME_ERROR, b"open: busy".to_vec())).await;
@@ -745,7 +836,7 @@ async fn server_session(
                 reply.extend_from_slice(&(dims.n_hc as u32).to_le_bytes());
                 reply.extend_from_slice(&(dims.n_vocab as u32).to_le_bytes());
                 reply.push(dims.from_tokens as u8);
-                open = Some(OpenRange { request, max_len, len: 0, seq, compute, dims });
+                open = Some(OpenRange { request, max_len, len: 0, seq, compute, dims, last_receipt: [0u8; 32] });
                 if out_tx.send((FRAME_OPENED, reply)).await.is_err() {
                     break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head stopped reading"));
                 }
@@ -786,7 +877,12 @@ async fn server_session(
                 };
                 o.len += n;
                 note_computed(&head_pubkey, &o.request);
-                if out_tx.send((FRAME_RESULT, f32s_to_bytes(&out))).await.is_err() {
+                let mut reply = f32s_to_bytes(&out);
+                let receipt = step_receipt(&identity, &o.request, pos0, n, &payload[8..], &reply, o.last_receipt);
+                let receipt = receipt.serialize();
+                o.last_receipt = hash32(&receipt);
+                reply.extend_from_slice(&receipt);
+                if out_tx.send((FRAME_RESULT, reply)).await.is_err() {
                     break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "head stopped reading"));
                 }
             }
@@ -834,8 +930,13 @@ async fn server_session(
         }
     };
     reader.abort();
+    // a sequence the head dropped without closing stays for a step forced on chain
     if let Some(o) = open.take() {
-        o.compute.close(o.seq);
+        if o.len > 0 {
+            retain_range(head_pubkey, o);
+        } else {
+            o.compute.close(o.seq);
+        }
     }
     drop(pause);
     drop(out_tx);
@@ -882,6 +983,8 @@ pub struct LinkSession {
     pub head_pubkey: [u8; 32],
     ctl: mpsc::Sender<Ctl>,
     dims: Mutex<Option<LinkDims>>,
+    /// The request of the open sequence.
+    request: Mutex<Option<[u8; 32]>>,
 }
 
 struct Tunnel {
@@ -960,6 +1063,7 @@ pub async fn connect_link(remote: &str, model_id: [u8; 32], identity: Arc<Gatewa
         head_pubkey: identity.pubkey,
         ctl: ctl_tx,
         dims: Mutex::new(None),
+        request: Mutex::new(None),
     })
 }
 
@@ -1061,18 +1165,26 @@ impl LinkSession {
             return Err("bad open reply".into());
         }
         *self.dims.lock().unwrap_or_else(|p| p.into_inner()) = Some(dims);
+        *self.request.lock().unwrap_or_else(|p| p.into_inner()) = Some(*request);
         Ok(dims)
     }
 
-    /// Runs `input` at `pos0` through the link's layers: its `n × n_hc` residual floats.
-    pub async fn step(&self, pos0: u32, input: &StepInput) -> Result<Vec<f32>, String> {
+    /// Runs `input` at `pos0` through the link's layers: its `n × n_hc` residual floats, with the
+    /// link's signed receipt of the step.
+    pub async fn step(&self, pos0: u32, input: &StepInput) -> Result<(Vec<f32>, keryx_inference::AiStepReceipt), String> {
         let dims = (*self.dims.lock().unwrap_or_else(|p| p.into_inner())).ok_or("link sequence not open")?;
+        let request = (*self.request.lock().unwrap_or_else(|p| p.into_inner())).ok_or("link sequence not open")?;
         let n = input.len(dims.n_hc);
         let (kind, reply) = self.call(FRAME_STEP, input.encode(pos0, dims.n_hc), STEP_TIMEOUT).await?;
-        if kind != FRAME_RESULT || reply.len() != n * dims.n_hc * 4 {
+        let out_len = n * dims.n_hc * 4;
+        if kind != FRAME_RESULT || reply.len() != out_len + keryx_inference::AI_RECEIPT_LEN {
             return Err("bad step reply".into());
         }
-        Ok(bytes_to_f32s(&reply))
+        let receipt = keryx_inference::AiStepReceipt::deserialize(&reply[out_len..]).ok_or("bad step receipt")?;
+        if !receipt_holds(&receipt, &self.peer_pubkey, &request, pos0, n as u32, &reply[..out_len]) {
+            return Err("step receipt does not verify".into());
+        }
+        Ok((bytes_to_f32s(&reply[..out_len]), receipt))
     }
 
     /// Releases the link's sequence; the connection stays up for the signature.
@@ -1263,16 +1375,18 @@ mod tests {
         let range = FakeRange::new(true, 0.0);
         let gw_addr = gateway(shard.clone(), model, range.clone(), allow_all()).await;
         let before = crate::pom_gpu::shard_sessions();
-        let link = connect_link(&gw_addr, model, head, shard.pubkey, 8).await.unwrap();
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
         // opening alone does not pause the GPU
         link.open(&[1u8; 32], 32).await.unwrap();
         assert_eq!(range.held(), 1);
         assert_eq!(crate::pom_gpu::shard_sessions(), before);
-        // the first step does, until the head goes silent
+        // the first step does, until the head goes silent; the sequence stays for a forced step
         link.step(0, &StepInput::Tokens(vec![3])).await.unwrap();
         assert_eq!(crate::pom_gpu::shard_sessions(), before + 1);
         tokio::time::sleep(Duration::from_millis(800)).await;
         assert_eq!(crate::pom_gpu::shard_sessions(), before);
+        assert_eq!(range.held(), 1);
+        assert!(step_retained(&[1u8; 32], &head.pubkey, 1, &StepInput::Tokens(vec![3])).is_some());
         assert_eq!(range.held(), 0);
         SESSION_IDLE_MS.store(120_000, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1292,11 +1406,49 @@ mod tests {
         let mut pos = 0u32;
         for i in 0..20 {
             let x: Vec<f32> = (0..MAX_STEP_TOKENS * HC).map(|j| (i * j) as f32).collect();
-            let out = link.step(pos, &StepInput::Residual(x.clone())).await.unwrap();
+            let (out, _) = link.step(pos, &StepInput::Residual(x.clone())).await.unwrap();
             assert_eq!(out, x.iter().map(|v| v + 1.0).collect::<Vec<_>>());
             pos += MAX_STEP_TOKENS as u32;
         }
         REAUTH_MS.store(30_000, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_sequence_is_kept_for_a_forced_step() {
+        let _serial = session_tests().lock().await;
+        let shard = identity(10);
+        let head = identity(11);
+        let model = [0xE1u8; 32];
+        let request = [0x31u8; 32];
+        let range = FakeRange::new(true, 0.5);
+        let gw_addr = gateway(shard.clone(), model, range.clone(), allow_all()).await;
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
+        link.open(&request, 16).await.unwrap();
+        link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
+        // the head vanishes without closing: the sequence stays at position 2
+        drop(link);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(range.held(), 1);
+        assert!(step_retained(&request, &head.pubkey, 3, &StepInput::Tokens(vec![5])).is_none(), "not at its position");
+        assert_eq!(range.held(), 0, "taken once, then closed");
+        // kept again, then answered at its position
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
+        link.open(&request, 16).await.unwrap();
+        link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
+        drop(link);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let out = step_retained(&request, &head.pubkey, 2, &StepInput::Tokens(vec![7])).unwrap().unwrap();
+        assert_eq!(out, vec![7.5; HC]);
+        assert!(step_retained(&request, &head.pubkey, 3, &StepInput::Tokens(vec![7])).is_none());
+        // a request leaving the audits releases what is kept
+        let link = connect_link(&gw_addr, model, head.clone(), shard.pubkey, 8).await.unwrap();
+        link.open(&request, 16).await.unwrap();
+        link.step(0, &StepInput::Tokens(vec![1])).await.unwrap();
+        drop(link);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(range.held(), 1);
+        release_retained(&std::collections::HashSet::from([[0x77u8; 32]]));
+        assert_eq!(range.held(), 0);
     }
 
     #[tokio::test]
@@ -1365,10 +1517,15 @@ mod tests {
 
         let d = link.open(&assigned, 16).await.unwrap();
         assert_eq!(d, LinkDims { n_hc: HC, n_vocab: 100, from_tokens: true });
-        let out = link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
+        let (out, r0) = link.step(0, &StepInput::Tokens(vec![1, 2])).await.unwrap();
         assert_eq!(out, vec![1.5, 1.5, 1.5, 1.5, 2.5, 2.5, 2.5, 2.5]);
-        let out = link.step(2, &StepInput::Tokens(vec![9])).await.unwrap();
+        let (out, r1) = link.step(2, &StepInput::Tokens(vec![9])).await.unwrap();
         assert_eq!(out, vec![9.5; HC]);
+        // every step comes with the link's chained, signed receipt
+        assert_eq!((r0.pos0, r0.n, r0.previous), (0, 2, [0u8; 32]));
+        assert_eq!((r1.pos0, r1.n, r1.end()), (2, 1, Some(3)));
+        assert_eq!(r1.previous, hash32(&r0.serialize()));
+        assert!(verify_schnorr(&shard.pubkey, &r1.signature, &domain_hash(RECEIPT_DOMAIN, &[&r1.signed_bytes()])));
         link.close().await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(range.held(), 0);

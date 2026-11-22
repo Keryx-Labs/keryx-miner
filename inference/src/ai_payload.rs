@@ -92,6 +92,18 @@ pub const NETWORK_ZONES: u8 = 6;
 pub const AI_FAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 32 + 64;
 pub const AI_FAIL_SIGNED_LEN: usize = 65;
 
+/// Pipeline disputes on the same subnetwork, longer than a failure report:
+/// `[request_hash: 32] [kind: 1] ...`, see [`AiDemandPayload`] and [`AiAnswerPayload`].
+pub const AI_DISPUTE_DEMAND: u8 = 1;
+pub const AI_DISPUTE_ANSWER: u8 = 2;
+/// Largest step input or output a dispute carries.
+pub const MAX_AI_DISPUTE_DATA_LEN: usize = 65_536;
+/// A link's signed receipt of one step: `[request_hash: 32] [pos0: u32] [n: u32] [input hash: 32]
+/// [output hash: 32] [trace root: 32] [previous receipt hash: 32] [schnorr_signature: 64]`.
+pub const AI_RECEIPT_SIGNED_LEN: usize = 32 + 4 + 4 + 32 * 4;
+pub const AI_RECEIPT_LEN: usize = AI_RECEIPT_SIGNED_LEN + 64;
+pub const MAX_AI_DISPUTE_PAYLOAD_LEN: usize = 32 + 1 + 1 + 32 + 32 + 4 + 1 + AI_RECEIPT_LEN + 4 + MAX_AI_DISPUTE_DATA_LEN + 64;
+
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
 /// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
 /// `proof_data` is empty for Phase 3 A2b stubs; 32 bytes (request_hash) for Phase 3 C re-execution.
@@ -665,6 +677,199 @@ fn base58btc_encode(input: &[u8]) -> String {
     for _ in 0..leading_zeros { out.push('1'); }
     for d in digits.iter().rev() { out.push(ALPHABET[*d as usize] as char); }
     out
+}
+
+/// A link's signed receipt of the step `[pos0, pos0 + n)` of a pipeline request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiStepReceipt {
+    pub request_hash: [u8; 32],
+    pub pos0: u32,
+    pub n: u32,
+    pub input_hash: [u8; 32],
+    pub output_hash: [u8; 32],
+    pub trace_root: [u8; 32],
+    pub previous: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl AiStepReceipt {
+    pub fn signed_bytes(&self) -> [u8; AI_RECEIPT_SIGNED_LEN] {
+        let mut out = [0u8; AI_RECEIPT_SIGNED_LEN];
+        out[..32].copy_from_slice(&self.request_hash);
+        out[32..36].copy_from_slice(&self.pos0.to_le_bytes());
+        out[36..40].copy_from_slice(&self.n.to_le_bytes());
+        out[40..72].copy_from_slice(&self.input_hash);
+        out[72..104].copy_from_slice(&self.output_hash);
+        out[104..136].copy_from_slice(&self.trace_root);
+        out[136..168].copy_from_slice(&self.previous);
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = self.signed_bytes().to_vec();
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() != AI_RECEIPT_LEN {
+            return None;
+        }
+        Some(Self {
+            request_hash: data[0..32].try_into().ok()?,
+            pos0: u32::from_le_bytes(data[32..36].try_into().ok()?),
+            n: u32::from_le_bytes(data[36..40].try_into().ok()?),
+            input_hash: data[40..72].try_into().ok()?,
+            output_hash: data[72..104].try_into().ok()?,
+            trace_root: data[104..136].try_into().ok()?,
+            previous: data[136..168].try_into().ok()?,
+            signature: data[168..232].try_into().ok()?,
+        })
+    }
+
+    /// First position the link has not computed yet.
+    pub fn end(&self) -> Option<u32> {
+        self.pos0.checked_add(self.n)
+    }
+}
+
+/// A head's forced step: the link must publish its output for position `pos` of `input`.
+/// `[request_hash: 32] [kind = 1] [link_tier: 1] [link_escrow_pubkey: 32] [head_escrow_pubkey: 32]
+/// [pos: u32] [has_receipt: 1] [receipt: AI_RECEIPT_LEN when present] [input_len: u32] [input]
+/// [schnorr_signature: 64]`, signed by the head over everything before the signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiDemandPayload {
+    pub request_hash: [u8; 32],
+    pub link_tier: u8,
+    pub link_escrow_pubkey: [u8; 32],
+    pub head_escrow_pubkey: [u8; 32],
+    pub pos: u32,
+    pub receipt: Option<AiStepReceipt>,
+    pub input: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+impl AiDemandPayload {
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 2 + 64 + 9 + AI_RECEIPT_LEN + self.input.len());
+        out.extend_from_slice(&self.request_hash);
+        out.push(AI_DISPUTE_DEMAND);
+        out.push(self.link_tier);
+        out.extend_from_slice(&self.link_escrow_pubkey);
+        out.extend_from_slice(&self.head_escrow_pubkey);
+        out.extend_from_slice(&self.pos.to_le_bytes());
+        match &self.receipt {
+            Some(r) => {
+                out.push(1);
+                out.extend_from_slice(&r.serialize());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&(self.input.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.input);
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = self.signed_bytes();
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() <= AI_FAIL_PAYLOAD_LEN || data.len() > MAX_AI_DISPUTE_PAYLOAD_LEN || data[32] != AI_DISPUTE_DEMAND {
+            return None;
+        }
+        let mut at = 33;
+        let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
+            let s = data.get(*at..*at + n)?;
+            *at += n;
+            Some(s)
+        };
+        let link_tier = take(&mut at, 1)?[0];
+        let link_escrow_pubkey: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
+        let head_escrow_pubkey: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
+        let pos = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?);
+        let receipt = match take(&mut at, 1)?[0] {
+            0 => None,
+            1 => Some(AiStepReceipt::deserialize(take(&mut at, AI_RECEIPT_LEN)?)?),
+            _ => return None,
+        };
+        let len = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+        if len > MAX_AI_DISPUTE_DATA_LEN {
+            return None;
+        }
+        let input = take(&mut at, len)?.to_vec();
+        let signature: [u8; 64] = take(&mut at, 64)?.try_into().ok()?;
+        if at != data.len() {
+            return None;
+        }
+        Some(Self { request_hash: data[0..32].try_into().ok()?, link_tier, link_escrow_pubkey, head_escrow_pubkey, pos, receipt, input, signature })
+    }
+}
+
+/// A link's answer to a forced step: its output for position `pos`.
+/// `[request_hash: 32] [kind = 2] [link_tier: 1] [link_escrow_pubkey: 32] [head_escrow_pubkey: 32]
+/// [pos: u32] [trace_root: 32] [output_len: u32] [output] [schnorr_signature: 64]`, signed by the link
+/// over everything before the signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiAnswerPayload {
+    pub request_hash: [u8; 32],
+    pub link_tier: u8,
+    pub link_escrow_pubkey: [u8; 32],
+    pub head_escrow_pubkey: [u8; 32],
+    pub pos: u32,
+    pub trace_root: [u8; 32],
+    pub output: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+impl AiAnswerPayload {
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + 2 + 64 + 40 + self.output.len());
+        out.extend_from_slice(&self.request_hash);
+        out.push(AI_DISPUTE_ANSWER);
+        out.push(self.link_tier);
+        out.extend_from_slice(&self.link_escrow_pubkey);
+        out.extend_from_slice(&self.head_escrow_pubkey);
+        out.extend_from_slice(&self.pos.to_le_bytes());
+        out.extend_from_slice(&self.trace_root);
+        out.extend_from_slice(&(self.output.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.output);
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = self.signed_bytes();
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        const FIXED: usize = 32 + 1 + 1 + 32 + 32 + 4 + 32 + 4 + 64;
+        if data.len() < FIXED || data.len() > FIXED + MAX_AI_DISPUTE_DATA_LEN || data[32] != AI_DISPUTE_ANSWER {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[134..138].try_into().ok()?) as usize;
+        if data.len() != FIXED + len {
+            return None;
+        }
+        Some(Self {
+            request_hash: data[0..32].try_into().ok()?,
+            link_tier: data[33],
+            link_escrow_pubkey: data[34..66].try_into().ok()?,
+            head_escrow_pubkey: data[66..98].try_into().ok()?,
+            pos: u32::from_le_bytes(data[98..102].try_into().ok()?),
+            trace_root: data[102..134].try_into().ok()?,
+            output: data[138..138 + len].to_vec(),
+            signature: data[138 + len..].try_into().ok()?,
+        })
+    }
+}
+
+/// Whether every bf16 value of `data` is finite; `false` for an odd length.
+pub fn bf16_all_finite(data: &[u8]) -> bool {
+    data.len() % 2 == 0 && data.chunks_exact(2).all(|c| u16::from_le_bytes([c[0], c[1]]) & 0x7F80 != 0x7F80)
 }
 
 #[cfg(test)]

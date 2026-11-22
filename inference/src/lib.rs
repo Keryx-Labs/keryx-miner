@@ -13,7 +13,7 @@ pub mod private;
 pub mod task;
 
 pub use ai_payload::{
-    avail_signed_bytes, AiAvailPayload, AiFailPayload, AI_AVAIL_PAYLOAD_LEN, AI_AVAIL_SIGNED_LEN, AI_FAIL_PAYLOAD_LEN, NETWORK_ZONES, SUBNETWORK_ID_AI_AVAIL_HEX,
+    avail_signed_bytes, AiAvailPayload, AiFailPayload, AI_AVAIL_PAYLOAD_LEN, AI_AVAIL_SIGNED_LEN, AI_FAIL_PAYLOAD_LEN, NETWORK_ZONES, SUBNETWORK_ID_AI_AVAIL_HEX, AiStepReceipt, AiDemandPayload, AiAnswerPayload, bf16_all_finite, AI_RECEIPT_LEN, AI_RECEIPT_SIGNED_LEN, MAX_AI_DISPUTE_DATA_LEN,
     AiRequestPayload, AiResponder, AiResponseLink, AiResponsePayload, AiChallengePayload, TraceCommitment,
     AI_REQUEST_HEADER_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN,
     AI_RESPONSE_PAYLOAD_LEN, AI_RESPONSE_PAYLOAD_V2_LEN,
