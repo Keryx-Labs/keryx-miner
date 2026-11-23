@@ -2,7 +2,7 @@ name: release
 
 # Builds the miner for Linux (x86_64, glibc >= 2.34) and Windows (x86_64, MSVC) and attaches the
 # packages to a single draft GitHub Release:
-#   keryx-miner-<tag>-linux-amd64.zip   keryx-miner + libkeryxcuda.so + libkeryx-llama.so
+#   keryx-miner-<tag>-linux-amd64.zip   keryx-miner + libkeryxcuda.so + libkeryx-llama.so + libkeryx-llama-net.so
 #                                       + the CUDA runtime it links (libcudart, libcublas, libcublasLt)
 #   keryx-miner-<tag'>_hiveos.tar.gz    same files + integrations/hiveos scripts, folder keryx-miner/
 #                                       (<tag'> = tag with '-' replaced by '_': HiveOS derives the
@@ -37,6 +37,7 @@ permissions:
 
 env:
   LLAMA_TAG: b10015
+  LLAMA_NET_TAG: b12651
   CUDA_VERSION: "12.9.1"
   PROTOC_VERSION: "23.4"
   KERYX_LLAMA_ARCHS: "70;75;80;86;89;90;100;120"
@@ -105,6 +106,16 @@ jobs:
           restore-keys: |
             llama-linux-${{ env.LLAMA_TAG }}-cuda${{ env.CUDA_VERSION }}-
 
+      - name: Cache the network-model llama.cpp checkout and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            target/llama-src-${{ env.LLAMA_NET_TAG }}
+            target/llama-build-${{ env.LLAMA_NET_TAG }}
+          key: llama-net-linux-${{ env.LLAMA_NET_TAG }}-cuda${{ env.CUDA_VERSION }}-${{ hashFiles('tools/keryx-llama-net/**', 'build.rs') }}
+          restore-keys: |
+            llama-net-linux-${{ env.LLAMA_NET_TAG }}-cuda${{ env.CUDA_VERSION }}-
+
       - name: Build keryx-miner, libkeryxcuda.so and libkeryx-llama.so
         env:
           CUDA_HOME: ${{ env.CUDA_PATH }}
@@ -116,11 +127,14 @@ jobs:
       - name: Check the build products
         run: |
           set -e
-          ls -la target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so
+          ls -la target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so target/release/libkeryx-llama-net.so
           echo "highest glibc symbol version required:"
-          objdump -T target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so | grep -oE 'GLIBC_2\.[0-9]+' | sort -Vu | tail -1
+          objdump -T target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so target/release/libkeryx-llama-net.so | grep -oE 'GLIBC_2\.[0-9]+' | sort -Vu | tail -1
           # Only the CUDA driver/runtime libraries may be unresolved on a GPU-less runner.
-          ldd target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so | grep 'not found' | grep -vE 'libcuda|libcublas|libcudart|libcurand' && exit 1 || true
+          ldd target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so target/release/libkeryx-llama-net.so | grep 'not found' | grep -vE 'libcuda|libcublas|libcudart|libcurand' && exit 1 || true
+          # The two llama.cpp builds share the process: the network one exports its entry points only.
+          extra="$(nm -D --defined-only target/release/libkeryx-llama-net.so | awk '{print $3}' | grep -vE '^(keryx_range_|_init$|_fini$)' || true)"
+          [ -z "$extra" ] || { echo "::error::libkeryx-llama-net.so exports more than keryx_range_*: $(echo $extra | head -c 300)"; exit 1; }
 
       - name: Check the CUDA architectures embedded in libkeryx-llama.so
         run: |
@@ -130,11 +144,15 @@ jobs:
           for want in sm_70 sm_86 sm_90 sm_120; do
             case " $have " in *" $want "*) ;; *) echo "::error::libkeryx-llama.so lacks $want kernels (has: $have)"; exit 1 ;; esac
           done
+          have="$("$CUDA_PATH/bin/cuobjdump" -lelf target/release/libkeryx-llama-net.so | grep -oE 'sm_[0-9]+' | sort -u | tr '\n' ' ')"
+          for want in sm_70 sm_86 sm_90 sm_120; do
+            case " $have " in *" $want "*) ;; *) echo "::error::libkeryx-llama-net.so lacks $want kernels (has: $have)"; exit 1 ;; esac
+          done
 
       - name: Stage the package files
         run: |
           mkdir -p dist/stage
-          cp target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so dist/stage/
+          cp target/release/keryx-miner target/release/libkeryxcuda.so target/release/libkeryx-llama.so target/release/libkeryx-llama-net.so dist/stage/
           libdir="$CUDA_PATH/targets/x86_64-linux/lib"
           cp -L "$libdir/libcudart.so.12" "$libdir/libcublas.so.12" "$libdir/libcublasLt.so.12" dist/stage/
           cp -L "$(gcc -print-file-name=libgomp.so.1)" dist/stage/
