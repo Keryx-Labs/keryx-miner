@@ -415,9 +415,10 @@ pub fn shard_range(gpu: usize, gguf: &str, head_gguf: &str, first: u32, last: u3
     }
     slot.take();
     let t = std::time::Instant::now();
+    let resident = ResidentSet::of(e)?;
     let r = {
         let _native = native();
-        LayerRange::load(head_gguf, gpu, first, last, Some(e.model), n_ctx, n_seq)?
+        LayerRange::load(head_gguf, gpu, first, last, Some(&resident), n_ctx, n_seq)?
     };
     log::info!("shard engine: layers {}-{} bound on GPU {} in {:.1} s", first, last, gpu, t.elapsed().as_secs_f64());
     *slot = Some(r);
@@ -453,6 +454,25 @@ fn so_path() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// `KERYX_LLAMA_NET_SO=<path>` wins; else the network-model range library next to our own binary.
+fn net_so_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("KERYX_LLAMA_NET_SO") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+        log::warn!("range engine: KERYX_LLAMA_NET_SO points at a missing file — ignoring.");
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    #[cfg(target_os = "windows")]
+    let name = "keryx-llama-net.dll";
+    #[cfg(not(target_os = "windows"))]
+    let name = "libkeryx-llama-net.so";
+    let p = dir.join(name);
+    p.exists().then_some(p)
 }
 
 unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
@@ -1566,7 +1586,63 @@ mod tests {
 
 // ── Layer ranges of the network model ─────────────────────────────────────────────────────────
 
-type RangeLoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, *mut c_void, c_int, c_int) -> *mut c_void;
+type RangeLoadFn = unsafe extern "C" fn(
+    *const c_char,
+    c_int,
+    c_int,
+    c_int,
+    *mut c_void,
+    usize,
+    usize,
+    *const *const c_char,
+    *const *mut c_void,
+    *const usize,
+    c_int,
+    c_int,
+) -> *mut c_void;
+
+/// ABI of `libkeryx-llama-net.so`.
+pub(crate) const RANGE_ABI: c_int = 1;
+
+/// Weights a range binds in place: the device tensors of a resident shard.
+pub struct ResidentSet {
+    _names: Vec<CString>,
+    name_ptrs: Vec<*const c_char>,
+    datas: Vec<*mut c_void>,
+    nbytes: Vec<usize>,
+    base: *mut c_void,
+    size: usize,
+}
+
+impl ResidentSet {
+    fn of(e: &ShardEngine) -> Result<Self, String> {
+        let n = unsafe { (e.count)(e.model) };
+        let mut names = Vec::with_capacity(n);
+        let mut datas = Vec::with_capacity(n);
+        let mut nbytes = Vec::with_capacity(n);
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for i in 0..n {
+            let mut name: *const c_char = std::ptr::null();
+            let mut data: *mut c_void = std::ptr::null_mut();
+            let mut nb: usize = 0;
+            let mut is_dev: c_int = 0;
+            let ok = unsafe { (e.info)(e.model, i, &mut name, &mut data, &mut nb, &mut is_dev) };
+            if !ok || name.is_null() || data.is_null() || is_dev == 0 {
+                return Err(format!("resident tensor {} has no device storage", i));
+            }
+            names.push(unsafe { CStr::from_ptr(name) }.to_owned());
+            datas.push(data);
+            nbytes.push(nb);
+            lo = lo.min(data as usize);
+            hi = hi.max(data as usize + nb);
+        }
+        if n == 0 {
+            return Err("empty resident shard".to_string());
+        }
+        let name_ptrs = names.iter().map(|c| c.as_ptr()).collect();
+        Ok(Self { _names: names, name_ptrs, datas, nbytes, base: lo as *mut c_void, size: hi - lo })
+    }
+}
 type RangeDimsFn = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int, *mut c_int);
 type RangeStepFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const i32, *const f32, *mut f32, usize) -> c_int;
 type RangeClearFn = unsafe extern "C" fn(*mut c_void, c_int);
@@ -1581,7 +1657,7 @@ type RangeArmFn = unsafe extern "C" fn(*mut c_void, *const u32, *const u32, u32,
 type RangeReadCapturesFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, u32) -> c_int;
 type RangePieceFn = unsafe extern "C" fn(*mut c_void, i32, *mut c_char, c_int) -> c_int;
 
-/// The range entry points of `libkeryx-llama.so`.
+/// The range entry points of `libkeryx-llama-net.so`.
 #[derive(Clone, Copy)]
 struct RangeLib {
     load: RangeLoadFn,
@@ -1604,13 +1680,13 @@ struct RangeLib {
 fn range_lib() -> Result<RangeLib, String> {
     static LIB: OnceLock<Result<RangeLib, String>> = OnceLock::new();
     LIB.get_or_init(|| {
-        let so = so_path().ok_or("keryx-llama shared library not found")?;
+        let so = net_so_path().ok_or("keryx-llama-net shared library not found")?;
         let lib: &'static libloading::Library =
             Box::leak(Box::new(unsafe { libloading::Library::new(&so) }.map_err(|e| format!("load({}): {}", so.display(), e))?));
         unsafe {
-            let abi = sym::<AbiFn>(lib, "keryx_llama_abi").ok_or("missing keryx_llama_abi")?;
-            if abi() != ABI {
-                return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), ABI));
+            let abi = sym::<AbiFn>(lib, "keryx_range_abi").ok_or("missing keryx_range_abi")?;
+            if abi() != RANGE_ABI {
+                return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), RANGE_ABI));
             }
             Ok(RangeLib {
                 load: sym(lib, "keryx_range_load").ok_or("missing keryx_range_load")?,
@@ -1627,7 +1703,7 @@ fn range_lib() -> Result<RangeLib, String> {
                 arm_captures: sym(lib, "keryx_range_arm_captures").ok_or("missing keryx_range_arm_captures")?,
                 read_captures: sym(lib, "keryx_range_read_captures").ok_or("missing keryx_range_read_captures")?,
                 free: sym(lib, "keryx_range_free").ok_or("missing keryx_range_free")?,
-                last_error: sym(lib, "keryx_llama_last_error").ok_or("missing keryx_llama_last_error")?,
+                last_error: sym(lib, "keryx_range_last_error").ok_or("missing keryx_range_last_error")?,
             })
         }
     })
@@ -1649,13 +1725,42 @@ pub struct LayerRange {
 unsafe impl Send for LayerRange {}
 
 impl LayerRange {
-    /// Loads the range from `gguf`; `resident` is the shard engine of `gpu` whose weights the
-    /// range binds in place (None loads them from the file).
-    pub fn load(gguf: &str, gpu: usize, first: u32, last: u32, resident: Option<*mut c_void>, n_ctx: u32, n_seq: u32) -> Result<Self, String> {
+    /// Loads the range from `gguf`; `resident` holds the weights of `gpu` the range binds in place
+    /// (None loads them from the file).
+    pub fn load(gguf: &str, gpu: usize, first: u32, last: u32, resident: Option<&ResidentSet>, n_ctx: u32, n_seq: u32) -> Result<Self, String> {
         let lib = range_lib()?;
         let path = CString::new(gguf).map_err(|_| "path contains a NUL byte".to_string())?;
         let ptr = unsafe {
-            (lib.load)(path.as_ptr(), gpu as c_int, first as c_int, last as c_int, resident.unwrap_or(std::ptr::null_mut()), n_ctx as c_int, n_seq as c_int)
+            match resident {
+                Some(r) => (lib.load)(
+                    path.as_ptr(),
+                    gpu as c_int,
+                    first as c_int,
+                    last as c_int,
+                    r.base,
+                    r.size,
+                    r.datas.len(),
+                    r.name_ptrs.as_ptr(),
+                    r.datas.as_ptr(),
+                    r.nbytes.as_ptr(),
+                    n_ctx as c_int,
+                    n_seq as c_int,
+                ),
+                None => (lib.load)(
+                    path.as_ptr(),
+                    gpu as c_int,
+                    first as c_int,
+                    last as c_int,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    n_ctx as c_int,
+                    n_seq as c_int,
+                ),
+            }
         };
         if ptr.is_null() {
             let e = unsafe { CStr::from_ptr((lib.last_error)()) }.to_string_lossy().into_owned();
@@ -1906,7 +2011,9 @@ pub fn run_range_trace_test(gguf: &str, gpu: usize, first: u32, last: u32, manif
     println!("leaves: {nl} per position, {n_pos} positions; interleaved sequences equal to the reference: {} / {}", same(&a), same(&b));
     range.clear(0);
     range.clear(1);
-    let dense: Vec<u32> = (0..n_products).filter(|&r| entries[r as usize].0.n_exp == 1).collect();
+    let dense: Vec<u32> = (0..n_products)
+        .filter(|&r| entries[r as usize].0.n_exp == 1 && entries[r as usize].0.glu_form != manifest::FORM_PAIR_UP)
+        .collect();
     let pick: Vec<u32> = {
         let mut v: Vec<u32> = dense.iter().copied().filter(|&r| entries[r as usize].0.wtype == 1).take(4).collect();
         v.extend(dense.iter().copied().filter(|&r| entries[r as usize].0.wtype != 1).take(8 - v.len()));

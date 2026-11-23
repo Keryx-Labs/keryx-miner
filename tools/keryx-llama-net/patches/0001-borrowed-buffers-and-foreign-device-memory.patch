@@ -1,0 +1,75 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index afb86338a..2fc0a2a81 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -56,6 +56,8 @@ extern "C" {
+ 
+     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
+     GGML_API void                           ggml_backend_buffer_free          (ggml_backend_buffer_t buffer);
++    // a second handle on `buffer`'s memory; freeing it leaves the memory to its owner
++    GGML_API ggml_backend_buffer_t          ggml_backend_buffer_borrow        (ggml_backend_buffer_t buffer);
+     GGML_API void *                         ggml_backend_buffer_get_base      (ggml_backend_buffer_t buffer);
+     GGML_API size_t                         ggml_backend_buffer_get_size      (ggml_backend_buffer_t buffer);
+     GGML_API enum ggml_status               ggml_backend_buffer_init_tensor   (ggml_backend_buffer_t buffer, struct ggml_tensor * tensor);
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81eeae..a241915dc 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -26,6 +26,8 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+ 
+ // device buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
++// device memory owned elsewhere; freeing the buffer leaves it allocated
++GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(int device, void * dev_ptr, size_t size);
+ 
+ // conduct allreduce operation between devices
+ GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 8e175649b..f069ffa76 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -264,6 +264,15 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
+     delete buffer;
+ }
+ 
++ggml_backend_buffer_t ggml_backend_buffer_borrow(ggml_backend_buffer_t buffer) {
++    GGML_ASSERT(buffer);
++    struct ggml_backend_buffer_i iface = buffer->iface;
++    iface.free_buffer = NULL;
++    ggml_backend_buffer_t view = ggml_backend_buffer_init(buffer->buft, iface, buffer->context, buffer->size);
++    view->usage = buffer->usage;
++    return view;
++}
++
+ size_t ggml_backend_buffer_get_size(ggml_backend_buffer_t buffer) {
+     GGML_ASSERT(buffer);
+     return buffer->size;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3e1f167e9..d9dcc78fe 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1331,6 +1331,24 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface
+     /* .is_host             = */ NULL,
+ };
+ 
++static void ggml_backend_cuda_buffer_free_foreign(ggml_backend_buffer_t buffer) {
++    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
++    ctx->dev_ptr = nullptr;
++    delete ctx;
++}
++
++ggml_backend_buffer_t ggml_backend_cuda_buffer_from_ptr(int device, void * dev_ptr, size_t size) {
++    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
++    if (buft == nullptr || dev_ptr == nullptr) {
++        return nullptr;
++    }
++    ggml_backend_buffer_i iface = ggml_backend_cuda_buffer_interface;
++    iface.free_buffer = ggml_backend_cuda_buffer_free_foreign;
++    ggml_backend_buffer_t buf = ggml_backend_buffer_init(buft, iface, new ggml_backend_cuda_buffer_context(device, dev_ptr), size);
++    buf->usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
++    return buf;
++}
++
+ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
+     static std::mutex mutex;
+     std::lock_guard<std::mutex> lock(mutex);

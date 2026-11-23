@@ -104,11 +104,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SKIP");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_SRC");
     println!("cargo:rerun-if-env-changed=KERYX_LLAMA_ARCHS");
-    println!("cargo:rerun-if-changed=tools/keryx-llama/patches");
+    println!("cargo:rerun-if-changed=tools/keryx-llama-net/keryx_range.cpp");
+    println!("cargo:rerun-if-changed=tools/keryx-llama-net/patches");
+    println!("cargo:rerun-if-changed=tools/keryx-llama-net/exports.map");
+    println!("cargo:rerun-if-env-changed=KERYX_LLAMA_NET_SRC");
     if env::var("KERYX_LLAMA_SKIP").as_deref() == Ok("1") {
         println!("cargo:warning=KERYX_LLAMA_SKIP=1 — libkeryx-llama.so not built; a prebuilt one must sit next to the miner binary or in-process llama tiers cannot be mined");
     } else if target_arch == "x86_64" && (target_os == "linux" || target_os == "windows") {
         build_keryx_llama(&nvcc)?;
+        if target_os == "linux" {
+            build_keryx_llama_net(&nvcc)?;
+        }
     }
     Ok(())
 }
@@ -141,7 +147,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    apply_llama_patches(&src)?;
+    apply_llama_patches(&src, "tools/keryx-llama/patches")?;
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
     // Reconfigure from scratch when the cache was written at another path (raw or canonical).
@@ -274,6 +280,102 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const LLAMA_NET_TAG: &str = "b12651";
+
+/// Builds `libkeryx-llama-net.so` (layer ranges of the network model) next to the miner binary,
+/// on its own llama.cpp pin. Only the `keryx_range_*` entry points are exported.
+fn build_keryx_llama_net(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = std::path::PathBuf::from(env::var("OUT_DIR")?);
+    let profile_dir = out_dir.ancestors().nth(3).ok_or("cannot locate cargo profile dir from OUT_DIR")?;
+    let target_root = profile_dir.parent().ok_or("cannot locate cargo target dir")?;
+
+    let src = env::var("KERYX_LLAMA_NET_SRC")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| target_root.join(format!("llama-src-{LLAMA_NET_TAG}")));
+    if !src.join("CMakeLists.txt").exists() {
+        eprintln!("cloning llama.cpp {LLAMA_NET_TAG} (first build only; use KERYX_LLAMA_NET_SRC for an offline checkout)");
+        run(
+            "git clone of llama.cpp (network model)",
+            std::process::Command::new("git").args([
+                "clone", "--quiet", "--depth", "1", "--branch", LLAMA_NET_TAG,
+                "https://github.com/ggml-org/llama.cpp",
+            ]).arg(&src),
+        )?;
+    }
+
+    apply_llama_patches(&src, "tools/keryx-llama-net/patches")?;
+
+    let build_dir = target_root.join(format!("llama-build-{LLAMA_NET_TAG}"));
+    let archs = env::var("KERYX_LLAMA_ARCHS")
+        .unwrap_or_else(|_| "70;75;80;86;89;90;100;120".to_string());
+    run(
+        "cmake configure of llama.cpp (network model)",
+        std::process::Command::new("cmake")
+            .arg("-S").arg(&src)
+            .arg("-B").arg(&build_dir)
+            .args([
+                "-DGGML_CUDA=ON",
+                "-DGGML_RPC=OFF",
+                &format!("-DCMAKE_CUDA_ARCHITECTURES={archs}"),
+                "-DBUILD_SHARED_LIBS=OFF",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                "-DLLAMA_CURL=OFF",
+                "-DGGML_NATIVE=OFF",
+                "-DGGML_AVX=OFF",
+                "-DGGML_AVX2=OFF",
+                "-DGGML_FMA=OFF",
+                "-DGGML_F16C=OFF",
+                "-DGGML_BMI2=OFF",
+                "-DGGML_CUDA_NCCL=OFF",
+                "-DGGML_CUDA_FORCE_MMQ=ON",
+                "-DCMAKE_BUILD_TYPE=Release",
+                &format!("-DCMAKE_CUDA_COMPILER={nvcc}"),
+                "-DCMAKE_C_FLAGS=-march=nehalem",
+                "-DCMAKE_CXX_FLAGS=-march=nehalem",
+            ]),
+    )?;
+    let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "8".to_string());
+    run(
+        "cmake build of llama.cpp static libs (network model)",
+        std::process::Command::new("cmake")
+            .arg("--build").arg(&build_dir)
+            .args(["--target", "llama", "--config", "Release", "-j", &jobs]),
+    )?;
+
+    let cuda_home = cuda_home_from_nvcc(nvcc)?;
+    let so = profile_dir.join("libkeryx-llama-net.so");
+    let lib = |p: &str| build_dir.join(p).into_os_string();
+    run(
+        "link of libkeryx-llama-net.so",
+        std::process::Command::new("g++")
+            .args(["-O2", "-std=c++17", "-march=nehalem", "-shared", "-fPIC", "-fopenmp", "-DKERYX_RANGE_TRACE",
+                   "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fno-gnu-unique",
+                   "-Wno-deprecated-declarations", "tools/keryx-llama-net/keryx_range.cpp"])
+            .arg("-I").arg(src.join("include"))
+            .arg("-I").arg(src.join("ggml/include"))
+            .arg("-I").arg(src.join("src"))
+            .arg("-I").arg(cuda_home.join("include"))
+            .arg("-Wl,--start-group")
+            .arg(lib("src/libllama.a"))
+            .arg(lib("ggml/src/ggml-cuda/libggml-cuda.a"))
+            .arg(lib("ggml/src/libggml-cpu.a"))
+            .arg(lib("ggml/src/libggml.a"))
+            .arg(lib("ggml/src/libggml-base.a"))
+            .arg("-Wl,--end-group")
+            .arg(format!("-L{}", cuda_home.join("lib64").display()))
+            .arg(format!("-L{}", cuda_home.join("targets/x86_64-linux/lib").display()))
+            .args(["-lcudart", "-lcublas", "-lcublasLt"])
+            .arg(format!("-L{}", cuda_home.join("lib64/stubs").display()))
+            .arg(format!("-L{}", cuda_home.join("targets/x86_64-linux/lib/stubs").display()))
+            .args(["-lcuda", "-lpthread", "-ldl"])
+            // Two llama.cpp builds share the process: keep this one's symbols to itself.
+            .args(["-Wl,--exclude-libs,ALL", "-Wl,-Bsymbolic", "-Wl,--version-script=tools/keryx-llama-net/exports.map"])
+            .arg("-Wl,-rpath,$ORIGIN")
+            .arg("-o").arg(&so),
+    )?;
+    Ok(())
+}
+
 /// Resolves the CUDA toolkit root for include/lib paths from the nvcc in use.
 fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     let mut p = std::path::PathBuf::from(nvcc);
@@ -304,9 +406,9 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
 
 /// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order, from a
 /// pristine tree whenever the patch set changes.
-fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn apply_llama_patches(src: &std::path::Path, patch_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Absolute without canonicalize: the `\\?\` form it yields on Windows is not a path git can open.
-    let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("tools/keryx-llama/patches");
+    let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join(patch_dir);
     let mut patches: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "patch").unwrap_or(false))
