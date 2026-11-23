@@ -15,6 +15,9 @@ pub const FORM_PAIR_GATE: u8 = 2;
 pub const FORM_PAIR_UP: u8 = 3;
 pub const GLU_SWIGLU: u8 = 1;
 pub const GLU_GEGLU: u8 = 2;
+/// SwiGLU with the gate clamped above and the up clamped on both sides at `SWIGLU_CLAMP_LIMIT`.
+pub const GLU_SWIGLU_CLAMP: u8 = 7;
+pub const SWIGLU_CLAMP_LIMIT: f64 = 10.0;
 pub const NONE: u32 = u32::MAX;
 pub const ROLE_LAYER: u8 = 5;
 /// F32 router weights: `m` rows (experts) of `k` values.

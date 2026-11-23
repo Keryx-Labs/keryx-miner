@@ -11,6 +11,7 @@ pub mod dot;
 pub mod draw;
 pub mod f16;
 mod iq2;
+mod iq3;
 pub mod manifest;
 pub mod merkle;
 pub mod opening;

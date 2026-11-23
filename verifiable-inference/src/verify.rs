@@ -357,10 +357,18 @@ pub(crate) fn verify_point_at(
         } else {
             (dot_row(&g_entry, &p.rows[0], row)?, dot_row(up.as_ref().unwrap(), &p.rows[1], row)?)
         };
-        let (f, df) = glu(g_entry.glu_op, rg.y_hat).ok_or(Fail::Unsupported)?;
-        let h = f * ru.y_hat;
-        let eps_glu = if g_entry.glu_op == manifest::GLU_GEGLU { EPS_GEGLU } else { EPS };
-        (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale) + eps_glu * (rg.y_hat * ru.y_hat).abs())
+        if g_entry.glu_op == manifest::GLU_SWIGLU_CLAMP {
+            let l = manifest::SWIGLU_CLAMP_LIMIT;
+            let (g, u) = (rg.y_hat.min(l), ru.y_hat.clamp(-l, l));
+            let (f, df) = glu(manifest::GLU_SWIGLU, g).ok_or(Fail::Unsupported)?;
+            let h = f * u;
+            (h, EPS * ((df * u).abs() * rg.scale + f.abs() * ru.scale) + EPS * h.abs())
+        } else {
+            let (f, df) = glu(g_entry.glu_op, rg.y_hat).ok_or(Fail::Unsupported)?;
+            let h = f * ru.y_hat;
+            let eps_glu = if g_entry.glu_op == manifest::GLU_GEGLU { EPS_GEGLU } else { EPS };
+            (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale) + eps_glu * (rg.y_hat * ru.y_hat).abs())
+        }
     };
     if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
         return Err(Fail::Mismatch);
