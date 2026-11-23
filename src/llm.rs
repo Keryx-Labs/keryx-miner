@@ -378,6 +378,12 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
             "<｜begin▁of▁sentence｜>{}<｜User｜>{}<｜Assistant｜></think>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
+        // GLM-5.3-Flash — the template has no thinking switch (its generation prompt always opens
+        // <think>): the empty, closed block plays the role of the other models' `thinking = false`.
+        n if n.starts_with("glm53-flash") => format!(
+            "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>{}<|user|>{}<|assistant|><think></think>",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
         // Generic ChatML fallback (unreachable for the registered lineup).
         _ => format!(
             "<|im_start|>system\n{}<|im_end|>\n\

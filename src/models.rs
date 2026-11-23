@@ -27,9 +27,12 @@ pub enum ModelFormat {
     GgufKimiLinear,
     /// GGUF quantized — Gemma 4 architecture (tier 2). llama-served.
     GgufGemma4,
-    /// GGUF quantized — DeepSeek V4 architecture (H14 network model and its shards). Served by
-    /// a pipeline head only.
+    /// GGUF quantized — DeepSeek V4 architecture (devnet bench network model). Served by a
+    /// pipeline head only.
     GgufDeepSeekV4,
+    /// GGUF quantized — GLM5-Next architecture (network model and its ranges). Served by a
+    /// pipeline head only.
+    GgufGlm5Next,
 }
 
 #[derive(Clone)]
@@ -237,107 +240,107 @@ pub fn lineup_of(model_id: &[u8; 32]) -> Lineup {
 
 // ── Network model ───────────────────────────────────────────────────────────────────────────────
 // Active at `crate::pom::model_split_activation_daa()`. From the gate a 32 GB card mines one of the
-// four ranges of DeepSeek-V4-Flash-0731 (Q2), the one the node assigns to its escrow key in the
+// four ranges of GLM-5.3-Flash (UD-IQ2_XXS), the one the node assigns to its escrow key in the
 // template (`assigned_range`). The whole model (tier 4) is the id AiRequests target. model_id bytes MUST equal the node's `POM_TIERS_MODEL_SPLIT`.
 
-/// The whole network model — DeepSeek-V4-Flash-0731 abliterated (huihui-ai, ds4, Q2). Request
-/// target and pipeline-head capability only; never downloaded, walked or mined as such.
-/// `model_id` MUST equal the node's `NETWORK_MODEL_V4_FLASH_MODEL_ID`.
-pub const V4_FLASH: ModelSpec = ModelSpec {
-    name: "v4-flash-0731",
+/// The whole network model — GLM-5.3-Flash abliterated (huihui-ai, UD-IQ2_XXS, MTP layer removed).
+/// Request target and pipeline-head capability only; never downloaded, walked or mined as such.
+/// `model_id` MUST equal the node's `NETWORK_MODEL_GLM53_MODEL_ID`.
+pub const GLM53_FLASH: ModelSpec = ModelSpec {
+    name: "glm53-flash",
     model_id: [
-        0xf9, 0xe0, 0x9f, 0xc3, 0x78, 0x23, 0xa0, 0x3d,
-        0x20, 0x9b, 0x1e, 0xe8, 0x4c, 0x49, 0x67, 0x28,
-        0x54, 0x6c, 0xab, 0x62, 0x41, 0x87, 0x01, 0xa0,
-        0xf0, 0xa3, 0xda, 0xa6, 0xd3, 0x2a, 0xb8, 0xdf,
+        0xd3, 0x39, 0x2d, 0x62, 0x74, 0xcd, 0x5d, 0x70,
+        0xe1, 0x77, 0x2d, 0x7c, 0xd0, 0x3f, 0x7e, 0x85,
+        0xa4, 0xbd, 0xdd, 0xc1, 0xb0, 0x03, 0xac, 0xfb,
+        0x59, 0x93, 0x4f, 0xc5, 0x31, 0x00, 0x4c, 0x51,
     ],
-    format: ModelFormat::GgufDeepSeekV4,
+    format: ModelFormat::GgufGlm5Next,
     tokenizer_cid: "",
-    weight_cids: &["QmfA4tHEStL5poiBvHm1rid4b3cbQbhJ8v83RjE3Uytksg"],
-    dir_name: "V4-Flash-0731",
+    weight_cids: &["QmcZBJSzBnsK2hQ7tk7xkZa6vAvUR6cuuCyBHMguacH6pg"],
+    dir_name: "GLM53-Flash",
     min_vram_mb: 0,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash-0731 range 0: layers 0-10, 32 GB class. `model_id` MUST equal the node's
-/// `V4_FLASH_SHARD_0_MODEL_ID`.
-pub const V4_FLASH_SHARD_0: ModelSpec = ModelSpec {
-    name: "v4-flash-0731-range-0",
+/// GLM-5.3-Flash range 0: layers 0-12, 32 GB class. `model_id` MUST equal the node's
+/// `GLM53_SHARD_0_MODEL_ID`.
+pub const GLM53_FLASH_SHARD_0: ModelSpec = ModelSpec {
+    name: "glm53-flash-range-0",
     model_id: [
-        0x22, 0x7b, 0x7a, 0x33, 0xbf, 0x60, 0x86, 0xfe,
-        0xca, 0xeb, 0xf6, 0xc2, 0x74, 0xf7, 0x42, 0xa9,
-        0x9e, 0x75, 0x21, 0x70, 0x0e, 0x26, 0x25, 0x3a,
-        0xe7, 0xf5, 0x77, 0x82, 0x20, 0x08, 0x54, 0xf8,
+        0x11, 0x35, 0x60, 0xfd, 0xd2, 0xe9, 0x14, 0xce,
+        0x38, 0x34, 0xb4, 0x06, 0x80, 0x48, 0x86, 0x9f,
+        0x47, 0x11, 0xec, 0xa4, 0x3b, 0x2c, 0x30, 0x12,
+        0xfe, 0x01, 0x68, 0x65, 0xfd, 0xf0, 0xf4, 0x1c,
     ],
-    format: ModelFormat::GgufDeepSeekV4,
+    format: ModelFormat::GgufGlm5Next,
     tokenizer_cid: "",
-    weight_cids: &["QmQfFmvDm4SFxuFi2rMXEAWH29dfiTUaajdpFDpYHeLqy1"],
-    dir_name: "V4-Flash-0731-range-0",
+    weight_cids: &["QmPVprC7918W7UqFSFk3AfVoseCCqMbrd4EwLayLAEQ6ou"],
+    dir_name: "GLM53-Flash-range-0",
     min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash-0731 range 1: layers 11-21, 32 GB class. `model_id` MUST equal the node's
-/// `V4_FLASH_SHARD_1_MODEL_ID`.
-pub const V4_FLASH_SHARD_1: ModelSpec = ModelSpec {
-    name: "v4-flash-0731-range-1",
+/// GLM-5.3-Flash range 1: layers 13-23, 32 GB class. `model_id` MUST equal the node's
+/// `GLM53_SHARD_1_MODEL_ID`.
+pub const GLM53_FLASH_SHARD_1: ModelSpec = ModelSpec {
+    name: "glm53-flash-range-1",
     model_id: [
-        0xa6, 0xab, 0x8d, 0x41, 0x50, 0x86, 0x04, 0x40,
-        0xf3, 0xe0, 0x9a, 0x8a, 0x91, 0x70, 0x13, 0xc1,
-        0x6f, 0x55, 0x67, 0x16, 0x11, 0x13, 0xa3, 0x87,
-        0x2a, 0x7f, 0x58, 0x71, 0x02, 0x2d, 0x13, 0xfd,
+        0x3a, 0x93, 0x9a, 0x1c, 0x3b, 0xa5, 0xcc, 0x66,
+        0x98, 0x55, 0x48, 0x17, 0x65, 0x8f, 0x66, 0x99,
+        0xa7, 0xff, 0x3f, 0x20, 0x13, 0x21, 0x92, 0x48,
+        0x19, 0x91, 0x93, 0xfd, 0x8d, 0xe2, 0x08, 0xbc,
     ],
-    format: ModelFormat::GgufDeepSeekV4,
+    format: ModelFormat::GgufGlm5Next,
     tokenizer_cid: "",
-    weight_cids: &["QmZZG7FgKAyobfSnQfLrEiXyewicskH41AoLrSB1oEgPAt"],
-    dir_name: "V4-Flash-0731-range-1",
+    weight_cids: &["QmSHJtvG2AkeRdqFZLGGBjN538PWeduJnhFTPmY7KFxtNP"],
+    dir_name: "GLM53-Flash-range-1",
     min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash-0731 range 2: layers 22-32, 32 GB class. `model_id` MUST equal the node's
-/// `V4_FLASH_SHARD_2_MODEL_ID`.
-pub const V4_FLASH_SHARD_2: ModelSpec = ModelSpec {
-    name: "v4-flash-0731-range-2",
+/// GLM-5.3-Flash range 2: layers 24-34, 32 GB class. `model_id` MUST equal the node's
+/// `GLM53_SHARD_2_MODEL_ID`.
+pub const GLM53_FLASH_SHARD_2: ModelSpec = ModelSpec {
+    name: "glm53-flash-range-2",
     model_id: [
-        0xc0, 0x9b, 0x96, 0xe1, 0xa7, 0xa4, 0x69, 0x15,
-        0x0b, 0xf9, 0x9e, 0xaf, 0x6e, 0xe8, 0xcc, 0x43,
-        0xeb, 0x97, 0xf6, 0x3a, 0xff, 0x57, 0xa8, 0x3b,
-        0x29, 0x9b, 0x6e, 0xe8, 0x82, 0x82, 0x3e, 0xdb,
+        0x7f, 0xfb, 0xd3, 0x14, 0xd6, 0x66, 0xd8, 0x26,
+        0x9e, 0xf2, 0xe4, 0xd4, 0x64, 0xa7, 0x4c, 0xa2,
+        0x86, 0x4c, 0xdc, 0xfb, 0x64, 0xf7, 0xef, 0xa7,
+        0x01, 0x73, 0x7b, 0xea, 0xd9, 0xf1, 0x74, 0x09,
     ],
-    format: ModelFormat::GgufDeepSeekV4,
+    format: ModelFormat::GgufGlm5Next,
     tokenizer_cid: "",
-    weight_cids: &["QmbJWbGDBaS8RuYLkw74qqNaJseEf4hgKeNLk8rqBLMmjQ"],
-    dir_name: "V4-Flash-0731-range-2",
+    weight_cids: &["QmWxFCfx6eJKxuhDw9N6PQLZLKoCpmLW4WGV2jX79ZNieU"],
+    dir_name: "GLM53-Flash-range-2",
     min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// V4-Flash-0731 range 3: layers 33-42, 32 GB class. `model_id` MUST equal the node's
-/// `V4_FLASH_SHARD_3_MODEL_ID`.
-pub const V4_FLASH_SHARD_3: ModelSpec = ModelSpec {
-    name: "v4-flash-0731-range-3",
+/// GLM-5.3-Flash range 3: layers 35-44, 32 GB class. `model_id` MUST equal the node's
+/// `GLM53_SHARD_3_MODEL_ID`.
+pub const GLM53_FLASH_SHARD_3: ModelSpec = ModelSpec {
+    name: "glm53-flash-range-3",
     model_id: [
-        0xa4, 0x9c, 0xdb, 0xb0, 0x81, 0xe0, 0xeb, 0xe8,
-        0x86, 0x63, 0xd8, 0x40, 0x4b, 0xa7, 0x7b, 0xe8,
-        0x61, 0xdb, 0x2b, 0x9e, 0x85, 0x7b, 0xbd, 0xa2,
-        0x3b, 0x5e, 0xba, 0xba, 0xc1, 0x9e, 0x36, 0x17,
+        0xea, 0x0e, 0xd6, 0x10, 0x48, 0x67, 0x56, 0xb9,
+        0x36, 0x3b, 0x41, 0x36, 0xcd, 0xa7, 0x96, 0x49,
+        0xf0, 0xba, 0x65, 0xb1, 0xb3, 0x80, 0xb9, 0xf6,
+        0x7d, 0xb6, 0x75, 0x78, 0x2f, 0x6c, 0x2e, 0x05,
     ],
-    format: ModelFormat::GgufDeepSeekV4,
+    format: ModelFormat::GgufGlm5Next,
     tokenizer_cid: "",
-    weight_cids: &["QmZREJF9HZyZQdvDUGiCdUDuAjABW8wmyYLGpbfcjSLi8v"],
-    dir_name: "V4-Flash-0731-range-3",
+    weight_cids: &["Qme6KEQjyjPF8BUaQKdW25w6fR9pVyAQjVtmr894kBhU4C"],
+    dir_name: "GLM53-Flash-range-3",
     min_vram_mb: 30000,
     ctx_floor: 4_096,
     ctx_cap: 4_096,
 };
 
-/// The four mainnet ranges, layer order (`V4_FLASH_SHARDS[k]` is tier `5 + k`).
-pub const V4_FLASH_SHARDS: [&ModelSpec; 4] = [&V4_FLASH_SHARD_0, &V4_FLASH_SHARD_1, &V4_FLASH_SHARD_2, &V4_FLASH_SHARD_3];
+/// The four mainnet ranges, layer order (`GLM53_FLASH_SHARDS[k]` is tier `5 + k`).
+pub const GLM53_FLASH_SHARDS: [&ModelSpec; 4] = [&GLM53_FLASH_SHARD_0, &GLM53_FLASH_SHARD_1, &GLM53_FLASH_SHARD_2, &GLM53_FLASH_SHARD_3];
 
 // Devnet bench network model: Qwen3.5-9B in two shards ─ mirror of the node's
 // `POM_TIERS_H14_SPLIT9B`: the whole pipeline on one card.
@@ -410,17 +413,17 @@ pub struct NetworkModelSpec {
 }
 
 pub static NETWORK_MODEL_MAINNET: NetworkModelSpec = NetworkModelSpec {
-    whole: &V4_FLASH,
-    shards: &V4_FLASH_SHARDS,
-    layers: &[(0, 10), (11, 21), (22, 32), (33, 42)],
-    n_layer: 43,
-    head_cid: "QmVEZUvJF9e2FRMf5aW6MxWGENgqmhbo2dr87em2hK4QFp",
-    head_digest_hex: "667269bca5045390ff0ed3084a224c3d29666ee5fffa1a19e9e97fd6312ec56f",
+    whole: &GLM53_FLASH,
+    shards: &GLM53_FLASH_SHARDS,
+    layers: &[(0, 12), (13, 23), (24, 34), (35, 44)],
+    n_layer: 45,
+    head_cid: "QmUeqSbDhWA2aqpEyE3ebMbWmjJuFaPNJUe2JdPaQcCNP7",
+    head_digest_hex: "5dceb61d18ced9c3c65e04ca7ae8ad398f7b0c475014258de38e4f372649a27e",
     range_manifests: &[
-        include_bytes!("../assets/trace-manifests/range-v4flash-0.bin"),
-        include_bytes!("../assets/trace-manifests/range-v4flash-1.bin"),
-        include_bytes!("../assets/trace-manifests/range-v4flash-2.bin"),
-        include_bytes!("../assets/trace-manifests/range-v4flash-3.bin"),
+        include_bytes!("../assets/trace-manifests/range-glm53-0.bin"),
+        include_bytes!("../assets/trace-manifests/range-glm53-1.bin"),
+        include_bytes!("../assets/trace-manifests/range-glm53-2.bin"),
+        include_bytes!("../assets/trace-manifests/range-glm53-3.bin"),
     ],
 };
 
@@ -499,7 +502,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelSpec = NetworkModelSpec {
     range_manifests: &[include_bytes!("../assets/trace-manifests/range-v4t-0.bin"), include_bytes!("../assets/trace-manifests/range-v4t-1.bin")],
 };
 
-/// The network model of the selected network: split V4-Flash-0731, or the two-range truncated
+/// The network model of the selected network: split GLM-5.3-Flash, or the two-range truncated
 /// V4 bench on devnet (`--devnet`).
 pub fn network_model() -> &'static NetworkModelSpec {
     if crate::pom::is_devnet() {
@@ -798,11 +801,11 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &KIMI_LINEAR_48B,
     &BOLT_E4B,
     &QWEN3_5_9B_Q8,
-    &V4_FLASH,
-    &V4_FLASH_SHARD_0,
-    &V4_FLASH_SHARD_1,
-    &V4_FLASH_SHARD_2,
-    &V4_FLASH_SHARD_3,
+    &GLM53_FLASH,
+    &GLM53_FLASH_SHARD_0,
+    &GLM53_FLASH_SHARD_1,
+    &GLM53_FLASH_SHARD_2,
+    &GLM53_FLASH_SHARD_3,
     &V4T_WHOLE,
     &V4T_RANGE_0,
     &V4T_RANGE_1,
@@ -892,7 +895,7 @@ mod tests {
                 .or_else(|| pom_tier_index(&spec.model_id, u64::MAX));
             assert!(tier.is_some(), "{} has no tier", spec.name);
         }
-        assert!(!is_pom_model(&V4_FLASH.model_id));
+        assert!(!is_pom_model(&GLM53_FLASH.model_id));
         for spec in network_model().shards {
             assert!(is_pom_model(&spec.model_id));
             assert_eq!(pom_tier_index(&spec.model_id, daa), None);
@@ -922,12 +925,12 @@ mod tests {
     fn model_split_era_mines_the_assigned_range() {
         let daa = u64::MAX;
         assert!(daa >= crate::pom::model_split_activation_daa());
-        for (k, spec) in V4_FLASH_SHARDS.iter().enumerate() {
+        for (k, spec) in GLM53_FLASH_SHARDS.iter().enumerate() {
             assert_eq!(pom_tier_index(&spec.model_id, daa), Some(NETWORK_MODEL_TIER + 1 + k as u8), "{}", spec.name);
             assert_eq!(shard_index(&spec.model_id), Some(k as u8));
-            assert_eq!(spec.dir_name, format!("V4-Flash-0731-range-{}", k));
+            assert_eq!(spec.dir_name, format!("GLM53-Flash-range-{}", k));
         }
-        assert_eq!(pom_tier_index(&V4_FLASH.model_id, daa), None);
+        assert_eq!(pom_tier_index(&GLM53_FLASH.model_id, daa), None);
         assert_eq!(pom_tier_index(&KIMI_LINEAR_48B.model_id, daa), None);
         assert_eq!(pom_tier_index(&BOLT_E4B.model_id, daa), Some(0));
         assert_eq!(pom_tier_index(&QWEN3_5_9B_Q8.model_id, daa), Some(1));
@@ -945,7 +948,7 @@ mod tests {
         // once the gate is scheduled, a 32 GB card keeps every range on disk
         if model_split_staged() {
             let all = pom_models_all_eras(Tier::VeryHigh, Some(daa));
-            for spec in V4_FLASH_SHARDS {
+            for spec in GLM53_FLASH_SHARDS {
                 assert!(all.iter().any(|s| s.model_id == spec.model_id), "{}", spec.name);
             }
         }
