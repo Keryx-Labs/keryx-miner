@@ -907,28 +907,6 @@ fn main() -> Result<(), Error> {
         let gpu = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
         std::process::exit(keryx_miner::llama_engine::run_device_probe_child(gpu));
     }
-    // Hidden pipeline-head check: --split-test <gguf> --split-rpc <host:port,...> --split-ts <f,...>
-    // [--split-manifest <tsv>] [--split-layers <A-B:d,...>] [--split-gpu <n>] [--split-prompt <text>] [--split-tokens <n>]
-    if let Some(i) = argv.iter().position(|a| a == "--split-test") {
-        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
-        let gguf = argv.get(i + 1).cloned().unwrap_or_default();
-        let rpc = val("--split-rpc").unwrap_or_default();
-        let ts = val("--split-ts").unwrap_or_default();
-        let manifest = val("--split-manifest").unwrap_or_default();
-        let layer_map = val("--split-layers").unwrap_or_default();
-        let gpu = val("--split-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let prompt = val("--split-prompt").unwrap_or_else(|| "The capital of France is".to_string());
-        let tokens = val("--split-tokens").and_then(|s| s.parse().ok()).unwrap_or(64);
-        std::process::exit(keryx_miner::llama_engine::run_split_test(&gguf, gpu, &rpc, &ts, &manifest, &layer_map, &prompt, tokens));
-    }
-    // Hidden shard-server check (bench only): --shard-test <shard.gguf> [--shard-gpu <n>] [--shard-endpoint <host:port>]
-    if let Some(i) = argv.iter().position(|a| a == "--shard-test") {
-        let val = |flag: &str| argv.iter().position(|a| a == flag).and_then(|j| argv.get(j + 1)).cloned();
-        let gguf = argv.get(i + 1).cloned().unwrap_or_default();
-        let gpu = val("--shard-gpu").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let endpoint = val("--shard-endpoint").unwrap_or_else(|| "127.0.0.1:50052".to_string());
-        std::process::exit(keryx_miner::llama_engine::run_shard_test(&gguf, gpu, &endpoint));
-    }
     // Hidden layer-range check: --range-test <gguf> --range-layers <n> --range-split <k> [--range-gpu <g>]
     // [--range-prompt <n>] [--range-gen <n>]: the whole model against ranges [0,k] + [k+1,n-1].
     if let Some(i) = argv.iter().position(|a| a == "--range-test") {

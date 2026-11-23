@@ -21,7 +21,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 type AbiFn = unsafe extern "C" fn() -> c_int;
 type ErrorFn = unsafe extern "C" fn() -> *const c_char;
 type LoadFn = unsafe extern "C" fn(*const c_char, c_int, c_int) -> *mut c_void;
-type LoadSplitFn = unsafe extern "C" fn(*const c_char, c_int, c_int, *const c_char, *const c_char, *const c_char) -> *mut c_void;
 type ContextInfoFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type CountFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type InfoFn = unsafe extern "C" fn(*mut c_void, usize, *mut *const c_char, *mut *mut c_void, *mut usize, *mut c_int) -> bool;
@@ -33,8 +32,6 @@ type CanonBlobFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> usize;
 type WantCanonFn = unsafe extern "C" fn(c_int);
 type ProbeDeviceFn = unsafe extern "C" fn(c_int) -> c_int;
 type ShardLoadFn = unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void;
-type ShardServeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
-type TraceFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type GenTracedFn = unsafe extern "C" fn(
     *mut c_void,
     *const c_char,
@@ -105,7 +102,7 @@ type SeqReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-pub(crate) const ABI: c_int = 13;
+pub(crate) const ABI: c_int = 14;
 /// Context kept for the block task while the context pad is resident.
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
@@ -246,16 +243,14 @@ fn slot(gpu: usize) -> Slot {
     g.entry(gpu).or_default().clone()
 }
 
-/// A network-model shard resident on one mining GPU: walked in place and served to pipeline
-/// heads by the in-process rpc server. One per GPU, independent of the llama singleton.
+/// A network-model shard resident on one mining GPU: walked in place and bound by its layer
+/// range. One per GPU, independent of the llama singleton.
 struct ShardEngine {
     model: *mut c_void,
     count: CountFn,
     info: InfoFn,
-    serve: ShardServeFn,
     free: FreeFn,
     gguf: String,
-    endpoint: Option<String>,
     /// The layer range bound to this shard's weights: emptied before the shard is freed.
     range: SharedRange,
 }
@@ -302,12 +297,11 @@ pub fn ensure_shard_loaded(gguf: &str, gpu: usize) -> Result<(), LoadError> {
         Err(e) => return Err(failed("library", format!("load({}) failed: {}", so.display(), e), false)),
     };
     unsafe {
-        let (Some(abi), Some(load), Some(count), Some(info), Some(serve), Some(free)) = (
+        let (Some(abi), Some(load), Some(count), Some(info), Some(free)) = (
             sym::<AbiFn>(lib, "keryx_llama_abi"),
             sym::<ShardLoadFn>(lib, "keryx_shard_load"),
             sym::<CountFn>(lib, "keryx_shard_tensor_count"),
             sym::<InfoFn>(lib, "keryx_shard_tensor_info"),
-            sym::<ShardServeFn>(lib, "keryx_shard_serve"),
             sym::<FreeFn>(lib, "keryx_shard_free"),
         ) else {
             return Err(failed("symbols", format!("{} is missing shard symbols", so.display()), false));
@@ -318,7 +312,7 @@ pub fn ensure_shard_loaded(gguf: &str, gpu: usize) -> Result<(), LoadError> {
         }
         let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
         let cg = CString::new(gguf).map_err(|_| failed("path", "GGUF path contains a NUL byte".to_string(), false))?;
-        log::info!("shard engine: loading {} on GPU {} (resident, served in-process)…", gguf, gpu);
+        log::info!("shard engine: loading {} on GPU {} (resident)…", gguf, gpu);
         let model = load(cg.as_ptr(), gpu as c_int);
         if model.is_null() {
             let detail = last_error.map_or_else(
@@ -327,7 +321,7 @@ pub fn ensure_shard_loaded(gguf: &str, gpu: usize) -> Result<(), LoadError> {
             );
             return Err(failed("native_load", detail, true));
         }
-        g.insert(gpu, ShardEngine { model, count, info, serve, free, gguf: gguf.to_string(), endpoint: None, range: Arc::new(Mutex::new(None)) });
+        g.insert(gpu, ShardEngine { model, count, info, free, gguf: gguf.to_string(), range: Arc::new(Mutex::new(None)) });
         Ok(())
     }
 }
@@ -350,45 +344,6 @@ pub fn shard_tensors(gpu: usize) -> Option<Vec<(String, u64, usize, bool)>> {
         out.push((unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned(), data as u64, nbytes, is_dev != 0));
     }
     Some(out)
-}
-
-/// Starts serving the resident shard of `gpu` on `endpoint` (idempotent).
-pub fn serve_shard(gpu: usize, endpoint: &str) -> Result<(), String> {
-    let mut g = shards().lock().unwrap_or_else(|p| p.into_inner());
-    // The rpc resident set is process-wide: a second server would overwrite the first one's.
-    if let Some((other, _)) = g.iter().find(|(d, e)| **d != gpu && e.endpoint.is_some()) {
-        log::info!("shard engine: GPU {} keeps its copy for PoM only — the shard is served from GPU {}", gpu, other);
-        return Ok(());
-    }
-    let Some(e) = g.get_mut(&gpu) else { return Err(format!("no resident shard on GPU {}", gpu)) };
-    if e.endpoint.is_some() {
-        return Ok(());
-    }
-    let cep = CString::new(endpoint).map_err(|_| "endpoint contains a NUL byte".to_string())?;
-    let rc = unsafe { (e.serve)(e.model, cep.as_ptr(), 4) };
-    if rc < 0 {
-        return Err(format!("shard server failed to start on {}", endpoint));
-    }
-    e.endpoint = Some(endpoint.to_string());
-    log::info!("shard engine: serving GPU {} on {}", gpu, endpoint);
-    Ok(())
-}
-
-/// Loopback endpoint the resident shard of `gpu` is served on, once serving.
-pub fn shard_endpoint(gpu: usize) -> Option<String> {
-    shards().lock().ok()?.get(&gpu)?.endpoint.clone()
-}
-
-/// Loopback endpoint the process serves `gguf` on, whichever GPU holds the served copy.
-pub fn serving_endpoint_for(gguf: &str) -> Option<String> {
-    let g = shards().lock().ok()?;
-    pick_serving(g.values().map(|e| (e.gguf.as_str(), e.endpoint.as_deref())), gguf)
-}
-
-/// Endpoint of the copy of `gguf` that is served: on a multi-GPU rig only one holder serves it,
-/// the others keep theirs for PoM alone, so a holder without an endpoint must not end the search.
-fn pick_serving<'a>(entries: impl Iterator<Item = (&'a str, Option<&'a str>)>, gguf: &str) -> Option<String> {
-    entries.filter(|(g, _)| *g == gguf).find_map(|(_, ep)| ep.map(|e| e.to_string()))
 }
 
 /// Whether a resident shard is active on `gpu` for exactly this GGUF.
@@ -454,25 +409,6 @@ fn so_path() -> Option<std::path::PathBuf> {
         }
     }
     None
-}
-
-/// `KERYX_LLAMA_NET_SO=<path>` wins; else the network-model range library next to our own binary.
-fn net_so_path() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("KERYX_LLAMA_NET_SO") {
-        let pb = std::path::PathBuf::from(p);
-        if pb.exists() {
-            return Some(pb);
-        }
-        log::warn!("range engine: KERYX_LLAMA_NET_SO points at a missing file — ignoring.");
-    }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    #[cfg(target_os = "windows")]
-    let name = "keryx-llama-net.dll";
-    #[cfg(not(target_os = "windows"))]
-    let name = "libkeryx-llama-net.so";
-    let p = dir.join(name);
-    p.exists().then_some(p)
 }
 
 unsafe fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Option<T> {
@@ -870,147 +806,6 @@ pub fn foreign_device_tensor(expected_gpu: usize) -> Option<(String, i32)> {
         }
     }
     None
-}
-
-/// Shard-server check: loads `gguf` resident on `gpu`, serves it on `endpoint` and stays up
-/// until killed. Exit code for the hidden `--shard-test` mode: 41 library, 42 load, 44 serve.
-pub fn run_shard_test(gguf: &str, gpu: usize, endpoint: &str) -> i32 {
-    match ensure_shard_loaded(gguf, gpu) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("shard test: {}", e);
-            return if e.stage == "library" || e.stage == "symbols" || e.stage == "abi" { 41 } else { 42 };
-        }
-    }
-    let ts = shard_tensors(gpu).unwrap_or_default();
-    let bytes: usize = ts.iter().map(|(_, _, n, _)| *n).sum();
-    println!("shard test: {} tensors, {:.2} GiB resident on GPU {}", ts.len(), bytes as f64 / (1u64 << 30) as f64, gpu);
-    if let Err(e) = serve_shard(gpu, endpoint) {
-        eprintln!("shard test: {}", e);
-        return 44;
-    }
-    println!("shard test: serving on {} — Ctrl-C to stop", endpoint);
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
-}
-
-/// Pipeline-head check: loads `gguf` with its layers split across `rpc` shards and local GPU
-/// `gpu` per `tensor_split`, generates once, prints the text and the token rate. Exit code for
-/// the hidden `--split-test` mode: 0 ok, 41 library, 42 load, 43 generation.
-pub fn run_split_test(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, manifest: &str, layer_map: &str, prompt: &str, max_tokens: usize) -> i32 {
-    if !layer_map.is_empty() {
-        std::env::set_var("KERYX_LAYER_MAP", layer_map);
-    }
-    let Some(so) = so_path() else {
-        eprintln!("split test: library not found next to the miner binary");
-        return 41;
-    };
-    let lib = match unsafe { libloading::Library::new(&so) } {
-        Ok(lib) => lib,
-        Err(e) => {
-            eprintln!("split test: {} failed to load: {}", so.display(), e);
-            return 41;
-        }
-    };
-    unsafe {
-        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error), Some(trace)) = (
-            sym::<AbiFn>(&lib, "keryx_llama_abi"),
-            sym::<LoadSplitFn>(&lib, "keryx_llama_load_split"),
-            sym::<GenFn>(&lib, "keryx_llama_generate"),
-            sym::<FreeFn>(&lib, "keryx_llama_free"),
-            sym::<ErrorFn>(&lib, "keryx_llama_last_error"),
-            sym::<TraceFn>(&lib, "keryx_llama_last_trace"),
-        ) else {
-            eprintln!("split test: {} is missing engine symbols", so.display());
-            return 41;
-        };
-        if abi() != ABI {
-            eprintln!("split test: {} has ABI {}, this miner expects {}", so.display(), abi(), ABI);
-            return 41;
-        }
-        let (Ok(cg), Ok(cr), Ok(ct), Ok(cm), Ok(cp)) = (
-            CString::new(gguf), CString::new(rpc), CString::new(tensor_split), CString::new(manifest), CString::new(prompt),
-        ) else {
-            eprintln!("split test: argument contains a NUL byte");
-            return 42;
-        };
-        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let t0 = std::time::Instant::now();
-        let model = load_split(cg.as_ptr(), gpu as c_int, n_ctx, cr.as_ptr(), ct.as_ptr(), cm.as_ptr());
-        if model.is_null() {
-            eprintln!("split test: load failed: {}", CStr::from_ptr(last_error()).to_string_lossy());
-            return 42;
-        }
-        eprintln!("split test: loaded in {:.1} s (shards: {}, split: {})", t0.elapsed().as_secs_f64(), rpc, tensor_split);
-        let mut buf = vec![0u8; 64 * 1024];
-        let t1 = std::time::Instant::now();
-        let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
-        let dt = t1.elapsed().as_secs_f64();
-        eprint!("{}", CStr::from_ptr(trace(model)).to_string_lossy());
-        free(model);
-        if n <= 0 {
-            eprintln!("split test: generation failed");
-            return 43;
-        }
-        buf.truncate(n as usize);
-        println!("{}", String::from_utf8_lossy(&buf));
-        eprintln!("split test: {} bytes in {:.2} s", n, dt);
-    }
-    0
-}
-
-/// Pipeline head generation: loads `gguf` with its shard layers bound to the rpc devices in
-/// `rpc` (per `layer_map`, `KERYX_RPC_RESIDENT`), generates once, frees. Blocking.
-pub fn head_generate(gguf: &str, gpu: usize, rpc: &str, tensor_split: &str, layer_map: &str, prompt: &str, max_tokens: usize) -> Result<String, String> {
-    std::env::set_var("KERYX_LAYER_MAP", layer_map);
-    std::env::set_var("KERYX_RPC_RESIDENT", "1");
-    let so = so_path().ok_or("keryx-llama shared library not found")?;
-    let lib = unsafe { libloading::Library::new(&so) }.map_err(|e| format!("{} failed to load: {}", so.display(), e))?;
-    unsafe {
-        let (Some(abi), Some(load_split), Some(gen), Some(free), Some(last_error), Some(trace)) = (
-            sym::<AbiFn>(&lib, "keryx_llama_abi"),
-            sym::<LoadSplitFn>(&lib, "keryx_llama_load_split"),
-            sym::<GenFn>(&lib, "keryx_llama_generate"),
-            sym::<FreeFn>(&lib, "keryx_llama_free"),
-            sym::<ErrorFn>(&lib, "keryx_llama_last_error"),
-            sym::<TraceFn>(&lib, "keryx_llama_last_trace"),
-        ) else {
-            return Err(format!("{} is missing engine symbols", so.display()));
-        };
-        if abi() != ABI {
-            return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), ABI));
-        }
-        let (Ok(cg), Ok(cr), Ok(ct), Ok(cp)) = (CString::new(gguf), CString::new(rpc), CString::new(tensor_split), CString::new(prompt)) else {
-            return Err("argument contains a NUL byte".into());
-        };
-        let cm = CString::new("").unwrap();
-        let n_ctx: c_int = std::env::var("KERYX_LLAMA_CTX").ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
-        let t0 = std::time::Instant::now();
-        let model = load_split(cg.as_ptr(), gpu as c_int, n_ctx, cr.as_ptr(), ct.as_ptr(), cm.as_ptr());
-        if model.is_null() {
-            return Err(format!("head load failed: {}", CStr::from_ptr(last_error()).to_string_lossy()));
-        }
-        log::info!("pipeline head: model assembled in {:.1} s over {}", t0.elapsed().as_secs_f64(), rpc);
-        let mut buf = vec![0u8; 64 * 1024];
-        let t1 = std::time::Instant::now();
-        std::env::set_var("KERYX_LLAMA_GEN_DEADLINE_MS", HEAD_GENERATION_DEADLINE.as_millis().to_string());
-        let n = gen(model, cp.as_ptr(), max_tokens as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
-        std::env::remove_var("KERYX_LLAMA_GEN_DEADLINE_MS");
-        for line in CStr::from_ptr(trace(model)).to_string_lossy().lines() {
-            log::info!("pipeline head timing: {}", line);
-        }
-        free(model);
-        if n < 0 {
-            return Err(format!("head generation failed: {}", CStr::from_ptr(last_error()).to_string_lossy()));
-        }
-        if n == 0 {
-            return Err("head generation failed: empty output".into());
-        }
-        buf.truncate(n as usize);
-        log::info!("pipeline head: {} bytes in {:.2} s", n, t1.elapsed().as_secs_f64());
-        String::from_utf8(buf).map_err(|e| format!("head output is not UTF-8: {}", e))
-    }
 }
 
 /// Generate inference text with the engine on `gpu`, which must host `gguf`.
@@ -1496,18 +1291,6 @@ pub fn context_tokens(gpu: usize) -> Option<u32> {
 mod tests {
 
     #[test]
-    fn a_multi_gpu_rig_resolves_the_copy_that_serves() {
-        let shard = "/models/V4-Flash-0731-range-0/model.gguf";
-        let rig = [(shard, None), (shard, None), (shard, Some("127.0.0.1:50054")), (shard, None)];
-        assert_eq!(super::pick_serving(rig.iter().copied(), shard), Some("127.0.0.1:50054".to_string()));
-
-        let none_serving = [(shard, None), (shard, None)];
-        assert_eq!(super::pick_serving(none_serving.iter().copied(), shard), None);
-
-        let other_serves = [("/models/other.gguf", Some("127.0.0.1:50052")), (shard, None)];
-        assert_eq!(super::pick_serving(other_serves.iter().copied(), shard), None);
-    }
-    #[test]
     fn generated_text_survives_a_cut_or_invalid_byte() {
         assert_eq!(generated_text("héllo".as_bytes().to_vec()), "héllo");
         let mut cut = "ok é".as_bytes().to_vec();
@@ -1601,9 +1384,6 @@ type RangeLoadFn = unsafe extern "C" fn(
     c_int,
 ) -> *mut c_void;
 
-/// ABI of `libkeryx-llama-net.so`.
-pub(crate) const RANGE_ABI: c_int = 1;
-
 /// Weights a range binds in place: the device tensors of a resident shard.
 pub struct ResidentSet {
     _names: Vec<CString>,
@@ -1657,7 +1437,7 @@ type RangeArmFn = unsafe extern "C" fn(*mut c_void, *const u32, *const u32, u32,
 type RangeReadCapturesFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, u32) -> c_int;
 type RangePieceFn = unsafe extern "C" fn(*mut c_void, i32, *mut c_char, c_int) -> c_int;
 
-/// The range entry points of `libkeryx-llama-net.so`.
+/// The range entry points of `libkeryx-llama.so`.
 #[derive(Clone, Copy)]
 struct RangeLib {
     load: RangeLoadFn,
@@ -1680,13 +1460,13 @@ struct RangeLib {
 fn range_lib() -> Result<RangeLib, String> {
     static LIB: OnceLock<Result<RangeLib, String>> = OnceLock::new();
     LIB.get_or_init(|| {
-        let so = net_so_path().ok_or("keryx-llama-net shared library not found")?;
+        let so = so_path().ok_or("keryx-llama shared library not found")?;
         let lib: &'static libloading::Library =
             Box::leak(Box::new(unsafe { libloading::Library::new(&so) }.map_err(|e| format!("load({}): {}", so.display(), e))?));
         unsafe {
-            let abi = sym::<AbiFn>(lib, "keryx_range_abi").ok_or("missing keryx_range_abi")?;
-            if abi() != RANGE_ABI {
-                return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), RANGE_ABI));
+            let abi = sym::<AbiFn>(lib, "keryx_llama_abi").ok_or("missing keryx_llama_abi")?;
+            if abi() != ABI {
+                return Err(format!("{} has ABI {}, this miner expects {}", so.display(), abi(), ABI));
             }
             Ok(RangeLib {
                 load: sym(lib, "keryx_range_load").ok_or("missing keryx_range_load")?,
@@ -1703,7 +1483,7 @@ fn range_lib() -> Result<RangeLib, String> {
                 arm_captures: sym(lib, "keryx_range_arm_captures").ok_or("missing keryx_range_arm_captures")?,
                 read_captures: sym(lib, "keryx_range_read_captures").ok_or("missing keryx_range_read_captures")?,
                 free: sym(lib, "keryx_range_free").ok_or("missing keryx_range_free")?,
-                last_error: sym(lib, "keryx_range_last_error").ok_or("missing keryx_range_last_error")?,
+                last_error: sym(lib, "keryx_llama_last_error").ok_or("missing keryx_llama_last_error")?,
             })
         }
     })
@@ -2016,7 +1796,15 @@ pub fn run_range_trace_test(gguf: &str, gpu: usize, first: u32, last: u32, manif
         .collect();
     let pick: Vec<u32> = {
         let mut v: Vec<u32> = dense.iter().copied().filter(|&r| entries[r as usize].0.wtype == 1).take(4).collect();
-        v.extend(dense.iter().copied().filter(|&r| entries[r as usize].0.wtype != 1).take(8 - v.len()));
+        v.extend(dense.iter().copied().filter(|&r| entries[r as usize].0.wtype != 1).take(5usize.saturating_sub(v.len())));
+        let mut kinds = Vec::new();
+        for r in 0..n_products {
+            let e = &entries[r as usize].0;
+            if e.n_exp > 1 && e.role != manifest::ROLE_HEADS && e.glu_form != manifest::FORM_PAIR_UP && !kinds.contains(&e.wtype) && v.len() < 8 {
+                kinds.push(e.wtype);
+                v.push(r);
+            }
+        }
         v
     };
     let mut pos = Vec::new();
@@ -2052,16 +1840,23 @@ pub fn run_range_trace_test(gguf: &str, gpu: usize, first: u32, last: u32, manif
             return 47;
         }
     };
-    let mut file = std::fs::File::open(gguf).unwrap();
-    let mut row_at = |name: &str, row: u64, row_bytes: u64| -> Vec<u8> {
+    let read_row = |name: &str, row: u64, row_bytes: u64| -> Vec<u8> {
         use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(gguf).unwrap();
         let t = &meta.tensors[name];
         let mut buf = vec![0u8; row_bytes as usize];
         file.seek(SeekFrom::Start(meta.tensor_data_offset + t.offset + row * row_bytes)).unwrap();
         file.read_exact(&mut buf).unwrap();
         buf
     };
+    let row_at = &read_row;
+    let row_at_up = &read_row;
+    let silu = |g: f64| {
+        let s = 1.0 / (1.0 + (-g).exp());
+        (g * s, s * (1.0 + g * (1.0 - s)))
+    };
     let (mut ok, mut bad) = (0u32, 0u32);
+    let mut worst: Vec<(String, u8, f64)> = Vec::new();
     for k in (0..pos.len()).step_by(2) {
         let (p, r) = (pos[k] as usize, leaf[k] / 2);
         let (x, y) = (&caps[k], &caps[k + 1]);
@@ -2069,24 +1864,60 @@ pub fn run_range_trace_test(gguf: &str, gpu: usize, first: u32, last: u32, manif
         let hashes = blake3::hash(x).as_bytes() == at(2 * r) && blake3::hash(y).as_bytes() == at(2 * r + 1);
         let e = &entries[r as usize].0;
         let layout = verify::input_layout(e.role, ubatch[p], e.wtype);
+        let m = e.m as u64;
         let ys: Vec<f32> = y.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let (slots, ids): (u64, Vec<u64>) = if e.n_exp > 1 {
+            let n = ys.len() as u64 / (m + 1);
+            (n, y[(n * m * 4) as usize..].chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u64).collect())
+        } else {
+            (1, vec![0])
+        };
+        let x_one = x.len() as u64 / if e.n_exp > 1 && x.len() as u64 % slots == 0 && slots > 1 && x.len() as u64 / slots >= verify::x_len(e.k, layout) { slots } else { 1 };
+        let pair = (e.glu_form == manifest::FORM_PAIR_GATE).then(|| &entries[e.partner as usize].0);
         let eps = verify::eps_for(e.wtype);
-        let mut honest = ys.len() == e.m as usize;
+        let mut honest = ys.len() as u64 == slots * m + if e.n_exp > 1 { slots } else { 0 } && ids.len() as u64 == slots;
         let mut wrong = 0;
-        for i in [0u64, e.m as u64 / 2, e.m as u64 - 1] {
-            let w = row_at(&e.name, i, e.row_bytes as u64);
-            let other = row_at(&e.name, (i + 1) % e.m as u64, e.row_bytes as u64);
-            match (dot::canonical_dot(e.wtype, &w, e.k as usize, x, layout), dot::canonical_dot(e.wtype, &other, e.k as usize, x, layout)) {
-                (Some(h), Some(o)) if honest => {
-                    honest = dot::accept(ys[i as usize], &h, eps);
-                    wrong += dot::accept(ys[i as usize], &o, eps) as u32;
+        for (slot, &exp) in ids.iter().enumerate() {
+            let xs = if x_one as usize == x.len() { &x[..] } else { &x[slot * x_one as usize..(slot + 1) * x_one as usize] };
+            for i in [0u64, m / 2, m - 1] {
+                let w = row_at(&e.name, exp * m + i, e.row_bytes as u64);
+                let other = row_at(&e.name, exp * m + (i + 1) % m, e.row_bytes as u64);
+                let yv = ys[(slot as u64 * m + i) as usize];
+                let check = |w: &[u8]| -> Option<(bool, f64)> {
+                    let rg = dot::canonical_dot(e.wtype, w, e.k as usize, xs, layout)?;
+                    let Some(up) = pair else {
+                        return Some((dot::accept(yv, &rg, eps), (yv as f64 - rg.y_hat).abs() / (eps * rg.scale)));
+                    };
+                    let wu = row_at_up(&up.name, exp * m + i, up.row_bytes as u64);
+                    let ru = dot::canonical_dot(up.wtype, &wu, up.k as usize, xs, layout)?;
+                    let l = manifest::SWIGLU_CLAMP_LIMIT;
+                    let (g, u) = (rg.y_hat.min(l), ru.y_hat.clamp(-l, l));
+                    let (f, df) = silu(g);
+                    let h = f * u;
+                    let tol = verify::EPS * ((df * u).abs() * rg.scale + f.abs() * ru.scale) + verify::EPS * h.abs();
+                    Some(((yv as f64 - h).abs() <= tol, (yv as f64 - h).abs() / tol))
+                };
+                match (check(&w), check(&other)) {
+                    (Some((h, ratio)), Some((o, _))) if honest => {
+                        honest = h;
+                        wrong += o as u32;
+                        worst.push((format!("{} type {}{}", e.name, e.wtype, if pair.is_some() { " glu" } else { "" }), layout, ratio));
+                    }
+                    _ => honest = false,
                 }
-                _ => honest = false,
             }
         }
         let pass = hashes && honest && wrong == 0;
         println!("  pos {p:2} {:40} type {:2} layout {layout} x {:6} B: leaves {} products {} other rows rejected {}", e.name, e.wtype, x.len(), hashes, honest, wrong == 0);
         if pass { ok += 1 } else { bad += 1 }
+    }
+    worst.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let mut shown = Vec::new();
+    for (name, layout, ratio) in &worst {
+        if !shown.contains(&(name.clone(), *layout)) {
+            shown.push((name.clone(), *layout));
+            println!("  worst |y - y_hat| / tol {ratio:.3}  {name} layout {layout}");
+        }
     }
     println!("{ok} captured products pass, {bad} fail");
     if same(&a) && same(&b) && bad == 0 { 0 } else { 1 }

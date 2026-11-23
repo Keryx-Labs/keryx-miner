@@ -1,4 +1,0 @@
-{
-  global: keryx_range_*;
-  local: *;
-};

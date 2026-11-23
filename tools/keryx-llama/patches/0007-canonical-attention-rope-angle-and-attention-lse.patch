@@ -1,0 +1,441 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index fc0cc7403..4fe3f7658 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -6,6 +6,28 @@
+ 
+ #include <cstdint>
+ 
++// Device buffer for the log softmax mass of every row of `kqv` when its sequence leaves are
++// traced, else null.
++float * ggml_cuda_q8s_lse_target(const ggml_tensor * kqv, bool stream_k);
++
++// Log softmax mass of each row from the (max, sum) of its `parallel_blocks` parts.
++static __global__ void flash_attn_lse_from_meta(const float2 * meta, const int parallel_blocks, const int64_t nrows, float * lse) {
++    const int64_t r = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (r >= nrows) {
++        return;
++    }
++    const float2 * m = meta + r*parallel_blocks;
++    double kqmax = m[0].x;
++    for (int l = 1; l < parallel_blocks; ++l) {
++        kqmax = fmax(kqmax, (double) m[l].x);
++    }
++    double sum = 0.0;
++    for (int l = 0; l < parallel_blocks; ++l) {
++        sum += (double) m[l].y*exp((double) m[l].x - kqmax);
++    }
++    lse[r] = (float) (kqmax + log(sum));
++}
++
+ #define FATTN_KQ_STRIDE       256
+ #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
+ #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
+@@ -1286,6 +1308,11 @@ void launch_fattn(
+         }
+     }
+ 
++    float * lse_out = ggml_cuda_q8s_lse_target(KQV, stream_k);
++    if (lse_out && parallel_blocks == 1) {
++        dst_tmp_meta.alloc(ggml_nrows(KQV));
++    }
++
+     float scale         = 1.0f;
+     float max_bias      = 0.0f;
+     float logit_softcap = 0.0f;
+@@ -1373,5 +1400,9 @@ void launch_fattn(
+         ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+     }
++    if (lse_out) {
++        const int64_t nrows = ggml_nrows(KQV);
++        flash_attn_lse_from_meta<<<(nrows + 255)/256, 256, 0, main_stream>>>(dst_tmp_meta.ptr, parallel_blocks, nrows, lse_out);
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 177b2f065..ed2506e25 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1,6 +1,10 @@
+ #include "common.cuh"
+ #include "fattn-common.cuh"
+ 
++// f32 accumulators on every GPU.
++#pragma push_macro("FAST_FP16_AVAILABLE")
++#undef FAST_FP16_AVAILABLE
++
+ // nbatch_fa == number of KQ rows to process per iteration
+ // nbatch_K == number of K columns to load in parallel for KQ calculation
+ 
+@@ -319,9 +323,6 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
+         }
+         return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
+     }
+-    if (fast_fp16_available(cc)) {
+-        return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
+-    }
+     return ggml_cuda_fattn_tile_get_config_nvidia_fp32(DKQ, DV, ncols);
+ }
+ 
+@@ -1129,7 +1130,7 @@ static __global__ void flash_attn_tile(
+         }
+ #endif // FAST_FP16_AVAILABLE
+ 
+-        if (gridDim.y != 1 && threadIdx.x == 0) {
++        if (dst_meta && threadIdx.x == 0) {
+             dst_meta[j_dst_unrolled] = make_float2(KQ_max[jc0], KQ_sum[jc0]);
+         }
+     }
+@@ -1356,3 +1357,5 @@ extern DECL_FATTN_TILE_CASE(256, 256);
+ extern DECL_FATTN_TILE_CASE(320, 256);
+ extern DECL_FATTN_TILE_CASE(512, 512);
+ extern DECL_FATTN_TILE_CASE(576, 512);
++
++#pragma pop_macro("FAST_FP16_AVAILABLE")
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 10aa5af15..7b1d0cca5 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -1,4 +1,5 @@
+ #include "common.cuh"
++#include "q8canon.cuh"
+ #include "fattn-common.cuh"
+ #include "fattn-mma-f16.cuh"
+ #include "fattn-tile.cuh"
+@@ -688,6 +689,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+             BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+     }
+ 
++    // the traced run keeps the f32 tile kernel
++    if (ggml_cuda_q8c_enabled()) {
++        return BEST_FATTN_KERNEL_TILE;
++    }
++
+     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
+     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
+index b087a8798..ca4ae29bd 100644
+--- a/ggml/src/ggml-cuda/q8seq.cu
++++ b/ggml/src/ggml-cuda/q8seq.cu
+@@ -15,6 +15,7 @@
+ #define QS_BATCH       64
+ #define QS_MAX_DEVICES 16
+ #define QS_MAX_CAPS    16
++#define QS_LSE_HEADS   256
+ 
+ #define QS_CHUNK_START 1u
+ #define QS_CHUNK_END   2u
+@@ -335,6 +336,11 @@ struct qs_dev {
+     uint32_t    ub_tokens = 0;
+     std::unordered_set<uint32_t> seen;
+     bool        overflow = false;
++    float *     lse = nullptr;
++    size_t      lse_cap = 0;
++    int         lse_layer = -1;
++    uint32_t    lse_heads = 0, lse_tokens = 0;
++    std::vector<uint64_t> lse_pos;  // by layer index
+ };
+ 
+ static qs_dev     qs_devs[QS_MAX_DEVICES];
+@@ -498,9 +504,73 @@ static bool qs_capturing(qs_dev & s, cudaStream_t stream) {
+     return false;
+ }
+ 
++static bool qs_is_attn(const qs_dev & s, int il) {
++    return il >= 0 && il < (int) s.layer.size() && (s.layer[il].kind == Q8S_ATTN || s.layer[il].kind == Q8S_MLA);
++}
++
++// A layer may read another layer's cache: the query names the layer.
++static int qs_attn_layer(const qs_dev & s, const ggml_tensor * kqv) {
++    const int iq = qs_layer_of(kqv->src[0], "Qcur_pos-");
++    return qs_is_attn(s, iq) ? iq : qs_layer_of(kqv->src[1], "cache_k_l");
++}
++
++float * ggml_cuda_q8s_lse_target(const ggml_tensor * kqv, bool stream_k) {
++    qs_dev * s = qs_current();
++    if (!s) {
++        return nullptr;
++    }
++    const int il = qs_attn_layer(*s, kqv);
++    if (!qs_is_attn(*s, il)) {
++        return nullptr;
++    }
++    const uint32_t n_head = (uint32_t) kqv->ne[1], n_tokens = (uint32_t) (kqv->ne[2]*kqv->ne[3]);
++    if (stream_k || s->lse_layer >= 0 || n_head % s->layer[il].heads != 0 || (size_t) n_head*n_tokens > s->lse_cap) {
++        s->overflow = true;
++        return nullptr;
++    }
++    s->lse_layer = il;
++    s->lse_heads = n_head;
++    s->lse_tokens = n_tokens;
++    return s->lse;
++}
++
++// Log masses of `n_head` query heads at every token, grouped per key/value head:
++// out[kv][t][qi] = lse[t][kv*g + qi].
++static __global__ void qs_lse_gather(const float * lse, uint32_t n_head, uint32_t n_tokens, uint32_t g, float * out) {
++    const uint64_t i = (uint64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= (uint64_t) n_head*n_tokens) {
++        return;
++    }
++    const uint32_t t = i / n_head, h = i % n_head, kv = h / g, qi = h % g;
++    out[((uint64_t) kv*n_tokens + t)*g + qi] = lse[i];
++}
++
++static void qs_lse(qs_dev & s, const ggml_tensor * node, cudaStream_t stream) {
++    const int il = qs_attn_layer(s, node);
++    if (s.lse_layer < 0 && !qs_is_attn(s, il)) {
++        return;
++    }
++    if (il != s.lse_layer) {
++        s.overflow = true;
++        s.lse_layer = -1;
++        return;
++    }
++    const qs_layer & L = s.layer[il];
++    const uint32_t g = s.lse_heads / L.heads, n = s.lse_heads*s.lse_tokens;
++    qs_lse_gather<<<(n + 255)/256, 256, 0, stream>>>(s.lse, s.lse_heads, s.lse_tokens, g, (float *) s.scratch);
++    const uint32_t len = s.lse_tokens*g*sizeof(float);
++    qs_append<<<L.heads, 128, 0, stream>>>(s.streams, 2*s.seq_heads*(s.n_attn + s.n_recur) + L.slot*s.seq_heads, 1, s.scratch, len, len, s.d_caps, s.n_caps);
++    s.lse_pos[il] += s.lse_tokens;
++    s.lse_layer = -1;
++}
++
+ void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
+     qs_dev * s = qs_current();
+-    if (!s || ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_GATED_DELTA_NET) && qs_capturing(*s, stream))) {
++    if (!s || ((node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_GATED_DELTA_NET || node->op == GGML_OP_FLASH_ATTN_EXT) && qs_capturing(*s, stream))) {
++        return;
++    }
++    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
++        qs_lse(*s, node, stream);
+         return;
+     }
+     if (node->op == GGML_OP_SET_ROWS) {
+@@ -515,6 +585,7 @@ void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
+ }
+ 
+ static void qs_free(qs_dev & s) {
++    cudaFree(s.lse);
+     cudaFree(s.streams);
+     cudaFree(s.scratch);
+     cudaFree(s.ckpt);
+@@ -559,8 +630,11 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
+     s.seq_heads = seq_heads;
+     s.interval = interval;
+     s.max_tokens = max_tokens;
+-    s.n_leaves = 2*seq_heads*(n_attn + n_recur);
+-    if (cudaMalloc(&s.streams, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess
++    s.n_leaves = 2*seq_heads*(n_attn + n_recur) + seq_heads*n_attn;
++    const size_t lse_cap = (size_t) QS_LSE_HEADS*max_tokens;
++    scratch = std::max(scratch, lse_cap*sizeof(float));
++    if (cudaMalloc(&s.lse, lse_cap*sizeof(float)) != cudaSuccess
++        || cudaMalloc(&s.streams, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess
+         || cudaMalloc(&s.scratch, std::max<size_t>(scratch, 4)) != cudaSuccess
+         || cudaMalloc(&s.ckpt, std::max<size_t>(ckpt, 4)) != cudaSuccess
+         || cudaMalloc(&s.roots, (size_t) s.n_leaves*32) != cudaSuccess
+@@ -570,6 +644,7 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
+     }
+     s.scratch_bytes = scratch;
+     s.ckpt_bytes = ckpt;
++    s.lse_cap = lse_cap;
+     s.on = true;
+     return 0;
+ }
+@@ -596,6 +671,8 @@ extern "C" int ggml_cuda_q8s_begin_response(int device) {
+     s.ub_tokens = 0;
+     s.seen.clear();
+     s.overflow = false;
++    s.lse_layer = -1;
++    s.lse_pos.assign(s.layer.size(), 0);
+     if (cudaMemset(s.streams, 0, (size_t) s.n_leaves*sizeof(qs_stream)) != cudaSuccess) {
+         return -2;
+     }
+@@ -624,6 +701,12 @@ extern "C" int ggml_cuda_q8s_roots(int device, uint8_t * out, size_t out_cap, ui
+     if (s.overflow) {
+         return -4;
+     }
++    for (size_t il = 0; il < s.layer.size(); ++il) {
++        const uint32_t kind = s.layer[il].kind;
++        if ((kind == Q8S_ATTN || kind == Q8S_MLA) && (il >= s.lse_pos.size() || s.lse_pos[il] != s.pos + s.ub_tokens)) {
++            return -4;
++        }
++    }
+     if (out_cap < (size_t) s.n_leaves*32) {
+         return -2;
+     }
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 657b58a4d..a31e2c4eb 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -21,11 +21,11 @@ static __device__ float rope_yarn_ramp(const float low, const float high, const
+ // MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.
+ template<bool forward>
+ static __device__ void rope_yarn(
+-        const float theta_extrap, const float freq_scale, const rope_corr_dims corr_dims, const int64_t i0, const float ext_factor,
++        const double theta_extrap, const float freq_scale, const rope_corr_dims corr_dims, const int64_t i0, const float ext_factor,
+         float mscale, float & cos_theta, float & sin_theta) {
+     // Get n-d rotational scaling corrected for extrapolation
+-    float theta_interp = freq_scale * theta_extrap;
+-    float theta = theta_interp;
++    double theta_interp = freq_scale * theta_extrap;
++    double theta = theta_interp;
+     if (ext_factor != 0.0f) {
+         float ramp_mix = rope_yarn_ramp(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
+         theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+@@ -33,8 +33,8 @@ static __device__ void rope_yarn(
+         // Get n-d magnitude scaling corrected for interpolation
+         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+     }
+-    cos_theta = cosf(theta) * mscale;
+-    sin_theta = sinf(theta) * mscale;
++    cos_theta = (float) cos(theta) * mscale;
++    sin_theta = (float) sin(theta) * mscale;
+     if (!forward) {
+         sin_theta *= -1.0f;
+     }
+@@ -59,7 +59,7 @@ static __global__ void rope_norm(const T *            x,
+                                  const float          ext_factor,
+                                  const float          attn_factor,
+                                  const rope_corr_dims corr_dims,
+-                                 const float          theta_scale,
++                                 const double         theta_scale,
+                                  const float *        freq_factors,
+                                  const int64_t *      row_indices,
+                                  const int            set_rows_stride,
+@@ -107,7 +107,7 @@ static __global__ void rope_norm(const T *            x,
+ 
+     const int iw = i0 - n_offs; // relative idx
+ 
+-    const float theta_base = pos[i2]*powf(theta_scale, iw/2.0f);
++    const double theta_base = pos[i2]*pow(theta_scale, iw/2.0);
+ 
+     const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
+ 
+@@ -141,7 +141,7 @@ static __global__ void rope_neox(const T *            x,
+                                  const float          ext_factor,
+                                  const float          attn_factor,
+                                  const rope_corr_dims corr_dims,
+-                                 const float          theta_scale,
++                                 const double         theta_scale,
+                                  const float *        freq_factors,
+                                  const int64_t *      row_indices,
+                                  const int            set_rows_stride,
+@@ -182,7 +182,7 @@ static __global__ void rope_neox(const T *            x,
+ 
+     const int iw = i0 - n_offs; // relative idx
+ 
+-    const float theta_base = pos[i2]*powf(theta_scale, iw/2.0f);
++    const double theta_base = pos[i2]*pow(theta_scale, iw/2.0);
+ 
+     const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
+ 
+@@ -218,7 +218,7 @@ static __global__ void rope_multi(const T *            x,
+                                   const float          ext_factor,
+                                   const float          attn_factor,
+                                   const rope_corr_dims corr_dims,
+-                                  const float          theta_scale,
++                                  const double         theta_scale,
+                                   const float *        freq_factors,
+                                   const mrope_sections sections,
+                                   const bool           is_imrope,
+@@ -265,26 +265,26 @@ static __global__ void rope_multi(const T *            x,
+     const int sec_w = sections.v[1] + sections.v[0];
+     const int sector = (iw / 2) % sect_dims;
+ 
+-    float theta_base = 0.0;
++    double theta_base = 0.0;
+     if (is_imrope) {
+         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * pow(theta_scale, iw / 2.0);
+         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * pow(theta_scale, iw / 2.0);
+         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2] * pow(theta_scale, iw / 2.0);
+         } else {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * pow(theta_scale, iw / 2.0);
+         }
+     } else {
+         if (sector < sections.v[0]) {
+-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2] * pow(theta_scale, iw / 2.0);
+         } else if (sector >= sections.v[0] && sector < sec_w) {
+-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 1] * pow(theta_scale, iw / 2.0);
+         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 2] * pow(theta_scale, iw / 2.0);
+         } else if (sector >= sec_w + sections.v[2]) {
+-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
++            theta_base = pos[i2 + ne02 * 3] * pow(theta_scale, iw / 2.0);
+         }
+     }
+ 
+@@ -321,7 +321,7 @@ static __global__ void rope_vision(const T *            x,
+                                    const float          ext_factor,
+                                    const float          attn_factor,
+                                    const rope_corr_dims corr_dims,
+-                                   const float          theta_scale,
++                                   const double         theta_scale,
+                                    const float *        freq_factors,
+                                    const mrope_sections sections) {
+     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+@@ -344,13 +344,13 @@ static __global__ void rope_vision(const T *            x,
+     const int sec_w     = sections.v[1] + sections.v[0];
+     const int sector    = (i0 / 2) % sect_dims;
+ 
+-    float theta_base = 0.0;
++    double theta_base = 0.0;
+     if (sector < sections.v[0]) {
+         const int p = sector;
+-        theta_base  = pos[i2] * powf(theta_scale, p);
++        theta_base  = pos[i2] * pow(theta_scale, (double) p);
+     } else if (sector >= sections.v[0] && sector < sec_w) {
+         const int p = sector - sections.v[0];
+-        theta_base  = pos[i2 + ne02] * powf(theta_scale, p);
++        theta_base  = pos[i2 + ne02] * pow(theta_scale, (double) p);
+     }
+ 
+     const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
+@@ -398,7 +398,7 @@ static void rope_norm_cuda(const T *            x,
+     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+     const dim3 block_nums(nr, n_blocks_x, 1);
+ 
+-    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    const double theta_scale = pow((double) freq_base, -2.0 / n_dims);
+ 
+     if (freq_factors == nullptr) {
+         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
+@@ -442,7 +442,7 @@ static void rope_neox_cuda(const T *            x,
+     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+     const dim3 block_nums(nr, n_blocks_x, 1);
+ 
+-    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    const double theta_scale = pow((double) freq_base, -2.0 / n_dims);
+     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+ 
+     if (freq_factors == nullptr) {
+@@ -489,7 +489,7 @@ static void rope_multi_cuda(const T *            x,
+     const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+     const dim3 block_nums(nr, n_blocks_x, 1);
+ 
+-    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    const double theta_scale = pow((double) freq_base, -2.0 / n_dims);
+ 
+     if (freq_factors == nullptr) {
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+@@ -534,7 +534,7 @@ static void rope_vision_cuda(const T *            x,
+     // break down (head_dim, heads, seq) into (CUDA_ROPE_BLOCK_SIZE, x, heads * seq)
+     // where x ~= ceil(head_dim / CUDA_ROPE_BLOCK_SIZE);
+ 
+-    const float theta_scale = powf(freq_base, -2.0f/n_dims);
++    const double theta_scale = pow((double) freq_base, -2.0/n_dims);
+ 
+     if (freq_factors == nullptr) {
+         rope_vision<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
