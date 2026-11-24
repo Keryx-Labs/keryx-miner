@@ -223,7 +223,7 @@ pub const QWEN3_5_9B_Q8: ModelSpec = ModelSpec {
 pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8];
 
 /// Number of tiers of the H18 lineup. MUST equal the node's `H18_TIER_COUNT`.
-pub const H18_TIER_COUNT: usize = 8;
+pub const H18_TIER_COUNT: usize = 7;
 
 /// Whether `model_id` is one of the Proof-of-Model tier models. DAA-independent — used at startup
 /// to pick a mineable PoM model before any block DAA is known (the tier *index* is then computed
