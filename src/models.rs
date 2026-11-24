@@ -25,8 +25,10 @@ pub enum ModelFormat {
     GgufQwen35,
     /// GGUF quantized — Kimi-Linear MoE architecture (tier 4). llama-served.
     GgufKimiLinear,
-    /// GGUF quantized — Gemma 4 architecture (tier 2). llama-served.
+    /// GGUF quantized — Gemma 4 architecture. llama-served.
     GgufGemma4,
+    /// GGUF quantized — Qwen3.5 MoE architecture. llama-served.
+    GgufQwen35Moe,
 }
 
 #[derive(Clone)]
@@ -219,8 +221,46 @@ pub const QWEN3_5_9B_Q8: ModelSpec = ModelSpec {
     ctx_cap: 32_768,
 };
 
+/// H18 tier-2 model — MiniCPM-V-4.7-35B-A3B abliterated IQ3_XXS (mradermacher GGUF).
+/// `model_id` MUST equal the node's `MINICPM_V_4_7_MODEL_ID`.
+pub const MINICPM_V_4_7: ModelSpec = ModelSpec {
+    name: "minicpm-v-4.7-35b",
+    model_id: [
+        0xe1, 0xba, 0x4a, 0xb2, 0xf8, 0xcf, 0xc6, 0xde,
+        0x46, 0x57, 0x33, 0x45, 0x7f, 0xc1, 0x4c, 0x7e,
+        0x3b, 0x9e, 0x58, 0x97, 0x06, 0xc8, 0x8b, 0x58,
+        0x25, 0x1a, 0x8c, 0x2f, 0xbc, 0x90, 0x38, 0x17,
+    ],
+    format: ModelFormat::GgufQwen35Moe,
+    tokenizer_cid: "",
+    weight_cids: &["QmdXoCVVLhTxwo8DoG7uXJKsHA5rghaavLYh5tW3Rgob8S"],
+    dir_name: "MiniCPM-V-4.7-35B",
+    min_vram_mb: 16_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
+/// H18 tier-3 model — Gemma-4-31B ARA heretic Q4_K_M (mradermacher GGUF).
+/// `model_id` MUST equal the node's `GEMMA_4_31B_MODEL_ID`.
+pub const GEMMA_4_31B: ModelSpec = ModelSpec {
+    name: "gemma-4-31b",
+    model_id: [
+        0x8b, 0x83, 0x0f, 0x57, 0x7d, 0x1e, 0xae, 0x28,
+        0x6b, 0xf8, 0x5f, 0x37, 0x5b, 0x8a, 0x69, 0x17,
+        0x23, 0x22, 0x57, 0xf8, 0x7c, 0x64, 0x54, 0xb2,
+        0x8c, 0xfb, 0xf4, 0x4c, 0xdd, 0xd1, 0x69, 0xb6,
+    ],
+    format: ModelFormat::GgufGemma4,
+    tokenizer_cid: "",
+    weight_cids: &["QmXjFHkSXBqcpUQpdgfv9aFRnQ679jaABs3czwDgVTunsF"],
+    dir_name: "Gemma-4-31B",
+    min_vram_mb: 24_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
 /// H18 models by tier. Mirror of the node's `POM_TIERS_H18`.
-pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8];
+pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7, &GEMMA_4_31B];
 
 /// Number of tiers of the H18 lineup. MUST equal the node's `H18_TIER_COUNT`.
 pub const H18_TIER_COUNT: usize = 7;
@@ -385,6 +425,8 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &KIMI_LINEAR_48B,
     &KEV_4B,
     &QWEN3_5_9B_Q8,
+    &MINICPM_V_4_7,
+    &GEMMA_4_31B,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -421,6 +463,8 @@ mod tests {
         }
         assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, KEV_4B.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, QWEN3_5_9B_Q8.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, MINICPM_V_4_7.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, GEMMA_4_31B.model_id);
         for old in [&QWEN3_5_9B_ABLITERATED, &GLM_4_9B_0414, &GEMMA_4_12B_ABLITERATED, &QWEN3_8_27B, &KIMI_LINEAR_48B] {
             assert_eq!(pom_tier_index(&old.model_id, daa), None, "{}", old.name);
         }

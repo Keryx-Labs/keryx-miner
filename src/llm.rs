@@ -339,7 +339,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" => format!(
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "minicpm-v-4.7-35b" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -350,7 +350,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // same role as Qwen's empty think block. Without it the model opens its own and the
         // channel markers leak into the answer. BOS is omitted on purpose: this GGUF sets
         // add_bos_token, so the tokenizer prepends it.
-        "gemma-4-12b-abliterated" => format!(
+        "gemma-4-12b-abliterated" | "gemma-4-31b" => format!(
             "<|turn>system\n{}<turn|>\n\
              <|turn>user\n{}<turn|>\n\
              <|turn>model\n<|channel>thought\n<channel|>",
@@ -380,7 +380,7 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
             "[gMASK]<sop><|user|>\nRequest id:".to_string(),
             format!("\n{}\n\n{}\n<|assistant|>\n", SYSTEM_PROMPT_NEXT, prompt),
         ),
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" => (
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "minicpm-v-4.7-35b" => (
             "<|im_start|>system\nRequest id:".to_string(),
             format!(
                 "\n{}<|im_end|>\n\
@@ -389,7 +389,7 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
                 SYSTEM_PROMPT_NEXT, prompt
             ),
         ),
-        "gemma-4-12b-abliterated" => (
+        "gemma-4-12b-abliterated" | "gemma-4-31b" => (
             "<|turn>system\nRequest id:".to_string(),
             format!(
                 "\n{}<turn|>\n\
