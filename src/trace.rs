@@ -611,11 +611,14 @@ pub fn chained_deadline(own: u64, open_ends: &[u64], seed_daa: u64, work: u64) -
     open_ends.iter().copied().filter(|e| *e >= seed_daa).max().map_or(own, |end| own.max(end + OPEN_AUDIT_WORK_PASSES * work))
 }
 
-/// Serving work of one request under the node's v3 window. MUST equal the node's `service_work_daa`.
-pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32) -> u64 {
+/// Serving work of one request accepted at `accepted_daa` under the node's v3 window. MUST equal
+/// the node's `service_work_daa`.
+pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32, accepted_daa: u64) -> u64 {
     const RATE: [u64; 5] = [90, 180, 85, 70, 35];
+    const RATE_H18: &[u64] = &[90, 208];
     const MAX_TOKENS_CAP: u32 = 4_096;
-    let rate = RATE[(tier as usize).min(RATE.len() - 1)];
+    let rates: &[u64] = if accepted_daa >= crate::pom::h18_activation_daa() { RATE_H18 } else { &RATE };
+    let rate = rates[(tier as usize).min(rates.len() - 1)];
     2 * (n_prompt as u64).div_ceil(100) + (rate * generated.min(MAX_TOKENS_CAP) as u64).div_ceil(100)
 }
 
@@ -1242,7 +1245,7 @@ mod tests {
 
     #[test]
     fn deadlines_chain_behind_the_open_audits_of_the_key() {
-        let work = service_work_daa(0, 0, 4_096);
+        let work = service_work_daa(0, 0, 4_096, 0);
         assert_eq!(chained_deadline(5_000, &[], 100, work), 5_000);
         assert_eq!(chained_deadline(5_000, &[90], 100, work), 5_000, "a closed or missed audit no longer counts");
         assert_eq!(chained_deadline(5_000, &[4_000], 100, work), 4_000 + OPEN_AUDIT_WORK_PASSES * work);

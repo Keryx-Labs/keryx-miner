@@ -177,6 +177,54 @@ pub const GEMMA_4_12B_ABLITERATED: ModelSpec = ModelSpec {
     ctx_cap: 131_072,
 };
 
+// ── H18 lineup ──────────────────────────────────────────────────
+// Active at `crate::pom::h18_activation_daa()`. Tiers are added as they are pinned; model_id bytes
+// MUST equal the node's `POM_TIERS_H18` constants.
+
+/// H18 tier-0 model — Kev-4B Q8_0 (ggml-org GGUF, decision model).
+/// `model_id` MUST equal the node's `KEV_4B_MODEL_ID`.
+pub const KEV_4B: ModelSpec = ModelSpec {
+    name: "kev-4b",
+    model_id: [
+        0xd3, 0x25, 0x75, 0xe6, 0x1a, 0xf4, 0x9d, 0x71,
+        0xfa, 0x6c, 0x31, 0x0f, 0x6d, 0x6b, 0xef, 0xe1,
+        0xfe, 0x4b, 0xa9, 0xe3, 0x84, 0xbc, 0x03, 0xa1,
+        0x61, 0x81, 0x94, 0x0e, 0x5c, 0xeb, 0x52, 0x51,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmcYss4ww73a1FGPWPJUpXyyrvHucX84ebGPV955pVp1uJ"],
+    dir_name: "Kev-4B",
+    min_vram_mb: 8_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
+/// H18 tier-1 model — Qwen3.5-9B-abliterated Q8_0 (huihui-ai abliteration, mradermacher GGUF).
+/// `model_id` MUST equal the node's `QWEN3_5_9B_Q8_MODEL_ID`.
+pub const QWEN3_5_9B_Q8: ModelSpec = ModelSpec {
+    name: "qwen3.5-9b-q8",
+    model_id: [
+        0x25, 0xdd, 0x00, 0x1c, 0xa8, 0x01, 0x70, 0x8f,
+        0xa8, 0x2a, 0x9d, 0x2a, 0x77, 0xe7, 0xba, 0xec,
+        0x4f, 0x27, 0x43, 0xae, 0xbe, 0xe9, 0x9d, 0xc6,
+        0x04, 0xc3, 0xbf, 0xbc, 0xf6, 0x71, 0x64, 0x57,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmQtTFMQYvnoZ1ZxNsuth8zzLWoBVKnCDVoW2ViCn8H6na"],
+    dir_name: "Qwen3.5-9B-Q8_0",
+    min_vram_mb: 12_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
+/// H18 models by tier. Mirror of the node's `POM_TIERS_H18`.
+pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8];
+
+/// Number of tiers of the H18 lineup. MUST equal the node's `H18_TIER_COUNT`.
+pub const H18_TIER_COUNT: usize = 8;
+
 /// Whether `model_id` is one of the Proof-of-Model tier models. DAA-independent — used at startup
 /// to pick a mineable PoM model before any block DAA is known (the tier *index* is then computed
 /// per block via `pom_tier_index`).
@@ -187,14 +235,18 @@ pub fn is_pom_model(model_id: &[u8; 32]) -> bool {
         || *model_id == QWEN3_6_27B.model_id
         || *model_id == QWEN3_8_27B.model_id
         || *model_id == KIMI_LINEAR_48B.model_id
+        || H18_LINEUP.iter().any(|m| m.model_id == *model_id)
 }
 
 /// Mirror of the node's per-block tier table (`POM_TIERS_H6`, `POM_TIERS_H14` from the
-/// private-inference gate), recomputed from the block DAA.
+/// private-inference gate, `POM_TIERS_H18` from the H18 gate), recomputed from the block DAA.
 /// Below the H6 gate this binary refuses to mine (None) — it never produces a pre-H6-era block.
 pub fn pom_tier_index(model_id: &[u8; 32], daa: u64) -> Option<u8> {
     if daa < crate::pom::pom_v3_activation_daa() {
         return None;
+    }
+    if daa >= crate::pom::h18_activation_daa() {
+        return H18_LINEUP.iter().position(|m| m.model_id == *model_id).map(|t| t as u8);
     }
     if *model_id == QWEN3_5_9B_ABLITERATED.model_id {
         Some(0)
@@ -233,10 +285,10 @@ pub fn h6_staged() -> bool {
 /// prefetches every scheduled era (`pom_models_all_eras`), and hot-swaps the resident model at
 /// the crossing (`pom_gpu::advance_mining_tier_if_due`).
 pub fn staging_daa() -> u64 {
-    match crate::pom::private_inference_activation_daa() {
-        u64::MAX => crate::pom::pom_v3_activation_daa(),
-        h14 => h14.max(crate::pom::pom_v3_activation_daa()),
-    }
+    [crate::pom::private_inference_activation_daa(), crate::pom::h18_activation_daa()]
+        .into_iter()
+        .filter(|g| *g != u64::MAX)
+        .fold(crate::pom::pom_v3_activation_daa(), u64::max)
 }
 
 /// The tier of a `pom_tier_index` value.
@@ -261,6 +313,9 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
     if daa < crate::pom::pom_v3_activation_daa() {
         return None;
     }
+    if daa >= crate::pom::h18_activation_daa() {
+        return H18_LINEUP.get(tier as usize).copied();
+    }
     Some(match tier {
         Tier::VeryLight => &QWEN3_5_9B_ABLITERATED,
         Tier::Light => &GLM_4_9B_0414,
@@ -280,8 +335,10 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
 /// (height unknown) keeps every scheduled era.
 pub fn pom_models_all_eras(tier: Tier, chain_daa: Option<u64>) -> Vec<&'static ModelSpec> {
     let mut gates = vec![crate::pom::pom_v3_activation_daa(), staging_daa()];
-    if crate::pom::private_inference_activation_daa() != u64::MAX {
-        gates.push(crate::pom::private_inference_activation_daa());
+    for gate in [crate::pom::private_inference_activation_daa(), crate::pom::h18_activation_daa()] {
+        if gate != u64::MAX {
+            gates.push(gate);
+        }
     }
     let mut out: Vec<&'static ModelSpec> = Vec::new();
     for gate in reachable_gates(gates, chain_daa) {
@@ -326,6 +383,8 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &QWEN3_6_27B,
     &QWEN3_8_27B,
     &KIMI_LINEAR_48B,
+    &KEV_4B,
+    &QWEN3_5_9B_Q8,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -345,6 +404,31 @@ pub fn available_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h18_gate_waits_for_the_full_lineup() {
+        assert!(crate::pom::h18_activation_daa() == u64::MAX || H18_LINEUP.len() == H18_TIER_COUNT);
+    }
+
+    /// From the H18 gate the lineup models replace every H14 model, tier for tier.
+    #[test]
+    fn h18_table_mirrors_node() {
+        let daa = crate::pom::h18_activation_daa();
+        for (t, spec) in H18_LINEUP.iter().enumerate() {
+            assert_eq!(pom_tier_index(&spec.model_id, daa), Some(t as u8));
+            assert_eq!(pom_tier_index(&spec.model_id, daa - 1), None);
+            assert_eq!(crate::pom_v5::pom_v5_pad_tiles(t as u8, daa), crate::pom_v5::POM_V5_PAD_TILES_H18[t]);
+        }
+        assert_eq!(pom_model_for_tier(daa, Tier::VeryLight).unwrap().model_id, KEV_4B.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, QWEN3_5_9B_Q8.model_id);
+        for old in [&QWEN3_5_9B_ABLITERATED, &GLM_4_9B_0414, &GEMMA_4_12B_ABLITERATED, &QWEN3_8_27B, &KIMI_LINEAR_48B] {
+            assert_eq!(pom_tier_index(&old.model_id, daa), None, "{}", old.name);
+        }
+        assert_eq!(crate::pom_v5::POM_V5_PAD_TILES_H18.len(), H18_LINEUP.len());
+        assert!(H18_LINEUP.len() <= H18_TIER_COUNT);
+        assert_eq!(crate::trace::service_work_daa(1, 0, 100, daa), 208);
+        assert_eq!(crate::trace::service_work_daa(1, 0, 100, daa - 1), 180);
+    }
 
     /// Only the eras the chain can still reach are kept. Synthetic gates keep this independent of
     /// the network switch.
@@ -371,12 +455,12 @@ mod tests {
         assert_eq!(reachable_gates(vec![54_766_000, 59_009_037, 59_009_037], Some(66_000_000)), vec![59_009_037]);
     }
 
-    /// The per-block tier table — mirror of the node's `POM_TIERS_H6` order. `u64::MAX` sits
-    /// at/after every gate on any network, so this exercises the table without touching the
-    /// global testnet switch.
+    /// The per-block tier table — mirror of the node's `POM_TIERS_H14` order. `u64::MAX - 1` sits
+    /// at/after every scheduled gate on any network, so this exercises the table without touching
+    /// the global testnet switch.
     #[test]
     fn tier_table_mirrors_node() {
-        let daa = u64::MAX;
+        let daa = u64::MAX - 1;
         assert_eq!(pom_tier_index(&QWEN3_5_9B_ABLITERATED.model_id, daa), Some(0));
         assert_eq!(pom_tier_index(&GLM_4_9B_0414.model_id, daa), Some(1));
         assert_eq!(pom_tier_index(&GEMMA_4_12B_ABLITERATED.model_id, daa), Some(2));
@@ -402,7 +486,9 @@ mod tests {
         // Every registry model is a mineable tier in some era.
         for spec in REGISTRY {
             assert!(is_pom_model(&spec.model_id), "{} is not a PoM model", spec.name);
-            let tier = pom_tier_index(&spec.model_id, daa).or_else(|| pom_tier_index(&spec.model_id, pre_h14));
+            let tier = pom_tier_index(&spec.model_id, daa)
+                .or_else(|| pom_tier_index(&spec.model_id, pre_h14))
+                .or_else(|| pom_tier_index(&spec.model_id, u64::MAX));
             assert!(tier.is_some(), "{} has no tier", spec.name);
         }
 

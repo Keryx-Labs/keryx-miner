@@ -1452,7 +1452,7 @@ impl KeryxdHandler {
         };
         let tier = keryx_miner::models::pom_tier_index(model_id, self.last_known_daa).unwrap_or(u8::MAX);
         let (n_prompt, max_tokens) = (*prompt_len as u32, *max_tokens as u32);
-        let work = keryx_miner::trace::OPEN_AUDIT_WORK_PASSES * keryx_miner::trace::service_work_daa(tier, n_prompt, max_tokens);
+        let work = keryx_miner::trace::OPEN_AUDIT_WORK_PASSES * keryx_miner::trace::service_work_daa(tier, n_prompt, max_tokens, self.last_known_daa);
         let backlog = keryx_miner::trace::OPENING_BACKLOG_CAP_DAA;
         let phase = keryx_miner::trace::TRACE_SEED_DELAY_DAA
             + keryx_miner::trace::attn_phase_window_daa(tier, max_tokens, n_prompt, n_prompt.saturating_add(max_tokens))
@@ -2507,7 +2507,7 @@ impl KeryxdHandler {
         for (txid, d) in drawn.iter_mut().filter(|(_, d)| d.audited) {
             let Some(p) = self.pending_traces.get(txid) else { continue };
             let r = &p.trace.record;
-            let work = keryx_miner::trace::service_work_daa(p.tier, r.n_prompt, r.n_pos.saturating_sub(r.n_prompt));
+            let work = keryx_miner::trace::service_work_daa(p.tier, r.n_prompt, r.n_pos.saturating_sub(r.n_prompt), d.accepted_daa);
             d.deadline_daa = keryx_miner::trace::chained_deadline(d.deadline_daa, &open, d.seed_daa, work);
             open.push(d.deadline_daa);
         }

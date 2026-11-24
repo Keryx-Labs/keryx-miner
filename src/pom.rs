@@ -1705,6 +1705,12 @@ pub fn private_inference_activation_daa() -> u64 {
     gate(121_985_000, 1)
 }
 
+/// H18 lineup gate: the tier models of `models::pom_model_for_tier` and their per-tier rules.
+/// MUST equal the node's `h18_activation`; `u64::MAX` until it is scheduled.
+pub fn h18_activation_daa() -> u64 {
+    gate(u64::MAX, u64::MAX)
+}
+
 /// Verifiable-inference gate. At/after this score an AiResponse carries its trace commitment
 /// and the miner opens the points drawn on it. MUST equal the node's
 /// `verifiable_inference_activation`.

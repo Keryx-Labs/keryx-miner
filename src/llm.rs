@@ -339,7 +339,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" => format!(
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -380,7 +380,7 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
             "[gMASK]<sop><|user|>\nRequest id:".to_string(),
             format!("\n{}\n\n{}\n<|assistant|>\n", SYSTEM_PROMPT_NEXT, prompt),
         ),
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" => (
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" => (
             "<|im_start|>system\nRequest id:".to_string(),
             format!(
                 "\n{}<|im_end|>\n\
@@ -1609,7 +1609,7 @@ mod tests {
     #[test]
     fn context_floors_mirror_the_node() {
         for m in crate::models::REGISTRY {
-            let expected = if m.name.starts_with("qwen3.5-9b") { 8_192 } else { 32_768 };
+            let expected = if m.name == "qwen3.5-9b-abliterated" { 8_192 } else { 32_768 };
             assert_eq!(m.ctx_floor, expected, "{}", m.name);
         }
     }
@@ -1622,7 +1622,8 @@ mod tests {
         // Positive control: an unknown model does fall back, so the tail below really is the
         // fallback's signature and the loop is not asserting a tautology.
         assert!(format_prompt_by_name("not-a-real-model", "hi").ends_with("<|im_start|>assistant\n"));
-        for spec in crate::models::REGISTRY {
+        // Kev is a decision model: no chat turn.
+        for spec in crate::models::REGISTRY.iter().filter(|s| s.model_id != crate::models::KEV_4B.model_id) {
             let templated = format_prompt_by_name(spec.name, "hi");
             assert!(
                 !templated.ends_with("<|im_start|>assistant\n"),

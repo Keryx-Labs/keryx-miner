@@ -20,9 +20,18 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 /// Context pad tiles of each H14 tier from the node `pad_margin_activation`. Mirror of `POM_V5_PAD_TILES_H16`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
+/// Context pad tiles of each H18 tier. Mirror of the node's `POM_V5_PAD_TILES_H18`.
+pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688];
+
 /// Context pad tiles of `tier` at `daa`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
-    let table = if daa >= crate::pom::pad_margin_activation_daa() { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
+    let table: &[u64] = if daa >= crate::pom::h18_activation_daa() {
+        POM_V5_PAD_TILES_H18
+    } else if daa >= crate::pom::pad_margin_activation_daa() {
+        &POM_V5_PAD_TILES_H16
+    } else {
+        &POM_V5_PAD_TILES_H14
+    };
     table.get(tier as usize).copied().unwrap_or(0)
 }
 
