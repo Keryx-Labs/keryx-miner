@@ -339,7 +339,7 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // Qwen3 family — ChatML + a pre-filled empty think block so the visible answer starts
         // immediately (an open think block would eat the whole max_tokens budget). This is the
         // `enable_thinking = false` branch of their embedded template, verbatim.
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "minicpm-v-4.7-35b" => format!(
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "minicpm-v-4.7-35b" | "qwen3.8-27b-turbo" => format!(
             "<|im_start|>system\n{}<|im_end|>\n\
              <|im_start|>user\n{}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -380,7 +380,7 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
             "[gMASK]<sop><|user|>\nRequest id:".to_string(),
             format!("\n{}\n\n{}\n<|assistant|>\n", SYSTEM_PROMPT_NEXT, prompt),
         ),
-        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "minicpm-v-4.7-35b" => (
+        "qwen3.8-27b" | "qwen3.6-27b" | "qwen3.5-9b-abliterated" | "qwen3.5-9b-q8" | "minicpm-v-4.7-35b" | "qwen3.8-27b-turbo" => (
             "<|im_start|>system\nRequest id:".to_string(),
             format!(
                 "\n{}<|im_end|>\n\

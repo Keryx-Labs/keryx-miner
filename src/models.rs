@@ -259,8 +259,27 @@ pub const GEMMA_4_31B: ModelSpec = ModelSpec {
     ctx_cap: 32_768,
 };
 
+/// H18 tier-4 model — Qwen3.8-27B TURBO Q6_K (DavidAU GGUF, no MTP layer).
+/// `model_id` MUST equal the node's `QWEN3_8_27B_TURBO_MODEL_ID`.
+pub const QWEN3_8_27B_TURBO: ModelSpec = ModelSpec {
+    name: "qwen3.8-27b-turbo",
+    model_id: [
+        0x7a, 0xb0, 0x48, 0x41, 0xbb, 0x0b, 0x92, 0xe2,
+        0xbb, 0xec, 0xdd, 0x53, 0xf8, 0xcd, 0xb0, 0x86,
+        0x51, 0xbd, 0x06, 0xe7, 0x06, 0x11, 0x08, 0xa9,
+        0x8d, 0x05, 0x49, 0x62, 0x86, 0xdb, 0x4c, 0xb9,
+    ],
+    format: ModelFormat::GgufQwen35,
+    tokenizer_cid: "",
+    weight_cids: &["QmWbaMThue94PHhRpmmPbCr3Yq18QW46boZRcfcLBkm4At"],
+    dir_name: "Qwen3.8-27B-TURBO",
+    min_vram_mb: 32_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
 /// H18 models by tier. Mirror of the node's `POM_TIERS_H18`.
-pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7, &GEMMA_4_31B];
+pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7, &GEMMA_4_31B, &QWEN3_8_27B_TURBO];
 
 /// Number of tiers of the H18 lineup. MUST equal the node's `H18_TIER_COUNT`.
 pub const H18_TIER_COUNT: usize = 7;
@@ -427,6 +446,7 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &QWEN3_5_9B_Q8,
     &MINICPM_V_4_7,
     &GEMMA_4_31B,
+    &QWEN3_8_27B_TURBO,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -465,6 +485,7 @@ mod tests {
         assert_eq!(pom_model_for_tier(daa, Tier::Light).unwrap().model_id, QWEN3_5_9B_Q8.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Default).unwrap().model_id, MINICPM_V_4_7.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::High).unwrap().model_id, GEMMA_4_31B.model_id);
+        assert_eq!(pom_model_for_tier(daa, Tier::VeryHigh).unwrap().model_id, QWEN3_8_27B_TURBO.model_id);
         for old in [&QWEN3_5_9B_ABLITERATED, &GLM_4_9B_0414, &GEMMA_4_12B_ABLITERATED, &QWEN3_8_27B, &KIMI_LINEAR_48B] {
             assert_eq!(pom_tier_index(&old.model_id, daa), None, "{}", old.name);
         }
