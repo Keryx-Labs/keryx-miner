@@ -458,6 +458,7 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// against the staged lineup's models (`spec_for_tier`).
 fn pom_tier_ladder() -> &'static [(keryx_miner::models::Tier, u64)] {
     &[
+        (keryx_miner::models::Tier::Max, 135_000),
         (keryx_miner::models::Tier::Ultra, 93_000),
         (keryx_miner::models::Tier::VeryHigh, 28_000),
         (keryx_miner::models::Tier::High, 22_000),
@@ -477,6 +478,7 @@ fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
         High => 3,
         VeryHigh => 4,
         Ultra => 5,
+        Max => 6,
     }
 }
 
@@ -490,6 +492,7 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
         "ultra" => Some(Tier::Ultra),
+        "max" => Some(Tier::Max),
         _ => None,
     }
 }
@@ -1281,7 +1284,10 @@ async fn run() -> Result<(), Error> {
         opt.very_high || forced_max_rank.is_some_and(|r| r >= 4),
     );
 
-    let tier = if opt.ultra {
+    let tier = if opt.max {
+        info!("--max mode: 141 GB tier — mines DeepSeek-V4.1-Flash under PoM from H18.");
+        keryx_miner::models::Tier::Max
+    } else if opt.ultra {
         info!("--ultra mode: 96 GB tier — mines GLM-5.3-Flash under PoM from H18.");
         keryx_miner::models::Tier::Ultra
     } else if opt.very_high {

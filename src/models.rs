@@ -31,6 +31,8 @@ pub enum ModelFormat {
     GgufQwen35Moe,
     /// GGUF quantized — GLM-5 next architecture. llama-served.
     GgufGlm5Next,
+    /// GGUF quantized — DeepSeek V4.1 architecture, Engram tables in a separate file. llama-served.
+    GgufDeepseek41,
 }
 
 #[derive(Clone)]
@@ -299,8 +301,30 @@ pub const GLM_5_3_FLASH: ModelSpec = ModelSpec {
     ctx_cap: 32_768,
 };
 
+/// H18 tier-6 model — DeepSeek-V4.1-Flash-1017 Uncensored IQ2_XXS (ISTA-DASLab GSQ-RCO, Abiray
+/// abliteration), body only. `model_id` MUST equal the node's `DEEPSEEK_V4_1_FLASH_MODEL_ID`.
+pub const DEEPSEEK_V4_1_FLASH: ModelSpec = ModelSpec {
+    name: "deepseek-v4.1-flash",
+    model_id: [
+        0x54, 0xa0, 0xf4, 0x78, 0xc0, 0x18, 0x6b, 0x83,
+        0x59, 0xe1, 0xcb, 0xc8, 0x59, 0xb4, 0x20, 0xd3,
+        0x2e, 0x54, 0xea, 0x34, 0xd6, 0x5d, 0x13, 0x32,
+        0x92, 0x9d, 0x60, 0x06, 0x3d, 0xf6, 0x38, 0xf9,
+    ],
+    format: ModelFormat::GgufDeepseek41,
+    tokenizer_cid: "",
+    weight_cids: &["QmU31Jg5y7nemq3wtmxcSBY2fez6Pof2eyR9uwRNR7Dc3S"],
+    dir_name: "DeepSeek-V4.1-Flash",
+    min_vram_mb: 135_000,
+    ctx_floor: 32_768,
+    ctx_cap: 32_768,
+};
+
+/// CID of the Engram tables of `DEEPSEEK_V4_1_FLASH` (IQ4_NL GGUF, read from host memory).
+pub const DEEPSEEK_V4_1_FLASH_ENGRAM_CID: &str = "QmXxL7hkDj98hi66pJz6h4u5wF8MrFeNdmT3XzXasi5GXd";
+
 /// H18 models by tier. Mirror of the node's `POM_TIERS_H18`.
-pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7, &GEMMA_4_31B, &QWEN3_8_27B_TURBO, &GLM_5_3_FLASH];
+pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7, &GEMMA_4_31B, &QWEN3_8_27B_TURBO, &GLM_5_3_FLASH, &DEEPSEEK_V4_1_FLASH];
 
 /// Number of tiers of the H18 lineup. MUST equal the node's `H18_TIER_COUNT`.
 pub const H18_TIER_COUNT: usize = 7;
@@ -354,6 +378,8 @@ pub enum Tier {
     VeryHigh,
     /// 96 GB class, from the H18 gate.
     Ultra,
+    /// 141 GB class, from the H18 gate.
+    Max,
 }
 
 /// True once the H6 hardfork has a scheduled DAA — startup staging (lineup + VRAM ladder) then
@@ -382,6 +408,7 @@ pub fn tier_from_index(index: u8) -> Option<Tier> {
         3 => Tier::High,
         4 => Tier::VeryHigh,
         5 => Tier::Ultra,
+        6 => Tier::Max,
         _ => return None,
     })
 }
@@ -406,7 +433,7 @@ pub fn pom_model_for_tier(daa: u64, tier: Tier) -> Option<&'static ModelSpec> {
         Tier::High if daa >= crate::pom::private_inference_activation_daa() => &QWEN3_8_27B,
         Tier::High => &QWEN3_6_27B,
         Tier::VeryHigh => &KIMI_LINEAR_48B,
-        Tier::Ultra => return None,
+        Tier::Ultra | Tier::Max => return None,
     })
 }
 
@@ -473,6 +500,7 @@ pub const REGISTRY: &[&ModelSpec] = &[
     &GEMMA_4_31B,
     &QWEN3_8_27B_TURBO,
     &GLM_5_3_FLASH,
+    &DEEPSEEK_V4_1_FLASH,
 ];
 
 pub fn find(name: &str) -> Option<&'static ModelSpec> {
@@ -514,6 +542,8 @@ mod tests {
         assert_eq!(pom_model_for_tier(daa, Tier::VeryHigh).unwrap().model_id, QWEN3_8_27B_TURBO.model_id);
         assert_eq!(pom_model_for_tier(daa, Tier::Ultra).unwrap().model_id, GLM_5_3_FLASH.model_id);
         assert!(pom_model_for_tier(daa - 1, Tier::Ultra).is_none());
+        assert_eq!(pom_model_for_tier(daa, Tier::Max).unwrap().model_id, DEEPSEEK_V4_1_FLASH.model_id);
+        assert!(pom_model_for_tier(daa - 1, Tier::Max).is_none());
         for old in [&QWEN3_5_9B_ABLITERATED, &GLM_4_9B_0414, &GEMMA_4_12B_ABLITERATED, &QWEN3_8_27B, &KIMI_LINEAR_48B] {
             assert_eq!(pom_tier_index(&old.model_id, daa), None, "{}", old.name);
         }

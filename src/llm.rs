@@ -355,6 +355,11 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
             "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>{}<|user|>{}<|assistant|><think></think>",
             SYSTEM_PROMPT_NEXT, prompt
         ),
+        // DeepSeek V4.1 chat mode: the template emits BOS itself and closes thinking with `</think>`.
+        "deepseek-v4.1-flash" => format!(
+            "<｜begin▁of▁sentence｜><｜System｜>{}<｜User｜>{}<｜Assistant｜></think>",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
         "gemma-4-12b-abliterated" | "gemma-4-31b" => format!(
             "<|turn>system\n{}<turn|>\n\
              <|turn>user\n{}<turn|>\n\

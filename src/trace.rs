@@ -615,7 +615,7 @@ pub fn chained_deadline(own: u64, open_ends: &[u64], seed_daa: u64, work: u64) -
 /// the node's `service_work_daa`.
 pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32, accepted_daa: u64) -> u64 {
     const RATE: [u64; 5] = [90, 180, 85, 70, 35];
-    const RATE_H18: &[u64] = &[90, 208, 85, 70, 70, 35];
+    const RATE_H18: &[u64] = &[90, 208, 85, 70, 70, 35, 35];
     const MAX_TOKENS_CAP: u32 = 4_096;
     let rates: &[u64] = if accepted_daa >= crate::pom::h18_activation_daa() { RATE_H18 } else { &RATE };
     let rate = rates[(tier as usize).min(rates.len() - 1)];
