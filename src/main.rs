@@ -458,6 +458,7 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
 /// against the staged lineup's models (`spec_for_tier`).
 fn pom_tier_ladder() -> &'static [(keryx_miner::models::Tier, u64)] {
     &[
+        (keryx_miner::models::Tier::Ultra, 93_000),
         (keryx_miner::models::Tier::VeryHigh, 28_000),
         (keryx_miner::models::Tier::High, 22_000),
         (keryx_miner::models::Tier::Default, 15_000),
@@ -475,6 +476,7 @@ fn tier_rank(t: keryx_miner::models::Tier) -> u8 {
         Default => 2,
         High => 3,
         VeryHigh => 4,
+        Ultra => 5,
     }
 }
 
@@ -487,6 +489,7 @@ fn parse_tier_name(s: &str) -> Option<keryx_miner::models::Tier> {
         "default" => Some(Tier::Default),
         "high" => Some(Tier::High),
         "very-high" | "veryhigh" | "very_high" => Some(Tier::VeryHigh),
+        "ultra" => Some(Tier::Ultra),
         _ => None,
     }
 }
@@ -531,7 +534,9 @@ fn assign_pom_tiers(
     let candidates: Vec<(u64, keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> = pom_tier_ladder()
         .iter()
         .filter(|(t, _)| tier_rank(*t) <= ceiling_rank)
-        .map(|(t, floor)| (*floor, *t, keryx_miner::models::spec_for_tier(*t)))
+        .filter_map(|(t, floor)| {
+            keryx_miner::models::pom_model_for_tier(keryx_miner::models::staging_daa(), *t).map(|s| (*floor, *t, s))
+        })
         .collect();
 
     let pick = |vram_mb: u64| -> Option<(keryx_miner::models::Tier, &'static keryx_miner::models::ModelSpec)> {
@@ -1276,7 +1281,10 @@ async fn run() -> Result<(), Error> {
         opt.very_high || forced_max_rank.is_some_and(|r| r >= 4),
     );
 
-    let tier = if opt.very_high {
+    let tier = if opt.ultra {
+        info!("--ultra mode: 96 GB tier — mines GLM-5.3-Flash under PoM from H18.");
+        keryx_miner::models::Tier::Ultra
+    } else if opt.very_high {
         info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
         keryx_miner::models::Tier::VeryHigh
     } else if opt.high {

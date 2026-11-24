@@ -350,6 +350,11 @@ fn format_prompt_by_name(name: &str, prompt: &str) -> String {
         // same role as Qwen's empty think block. Without it the model opens its own and the
         // channel markers leak into the answer. BOS is omitted on purpose: this GGUF sets
         // add_bos_token, so the tokenizer prepends it.
+        // GLM-5.3: no thinking switch in the template — the empty think block closes it.
+        "glm-5.3-flash" => format!(
+            "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>{}<|user|>{}<|assistant|><think></think>",
+            SYSTEM_PROMPT_NEXT, prompt
+        ),
         "gemma-4-12b-abliterated" | "gemma-4-31b" => format!(
             "<|turn>system\n{}<turn|>\n\
              <|turn>user\n{}<turn|>\n\
