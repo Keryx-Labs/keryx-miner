@@ -36,13 +36,20 @@ fn ggml_type_layout(dtype: u32) -> Result<(u64, u64)> {
         13 => (256, 176), // Q5_K
         14 => (256, 210), // Q6_K
         15 => (256, 292), // Q8_K
+        16 => (256, 66),  // IQ2_XXS
+        17 => (256, 74),  // IQ2_XS
+        18 => (256, 98),  // IQ3_XXS
+        19 => (256, 50),  // IQ1_S
         20 => (32, 18),   // IQ4_NL
+        21 => (256, 110), // IQ3_S
+        22 => (256, 82),  // IQ2_S
         23 => (256, 136), // IQ4_XS
         24 => (1, 1),   // I8
         25 => (1, 2),   // I16
         26 => (1, 4),   // I32
         27 => (1, 8),   // I64
         28 => (1, 8),   // F64
+        29 => (256, 56),  // IQ1_M
         30 => (1, 2),   // BF16
         other => bail!(
             "GGUF: unsupported GGML dtype {} — add its (block_size, type_size) to ggml_type_layout",
@@ -123,6 +130,36 @@ fn skip_value(f: &mut File, vt: u32) -> Result<Option<u64>> {
         11 | 12 => { f.seek(SeekFrom::Current(8))?; Ok(None) }       // i64 / f64
         other => bail!("GGUF: unknown metadata value type {}", other),
     }
+}
+
+/// The `i32` array stored under metadata `key`, `None` when the file has no such key.
+pub fn read_i32_array(f: &mut File, key: &str) -> Result<Option<Vec<i32>>> {
+    f.seek(SeekFrom::Start(0))?;
+    if read_u32(f)? != GGUF_MAGIC {
+        bail!("GGUF: bad magic");
+    }
+    let _version = read_u32(f)?;
+    let _tensor_count = read_u64(f)?;
+    let kv_count = read_u64(f)?;
+    for _ in 0..kv_count.min(1_000_000) {
+        let k = read_string(f)?;
+        let vt = read_u32(f)?;
+        if k != key {
+            skip_value(f, vt)?;
+            continue;
+        }
+        if vt != 9 || read_u32(f)? != 5 {
+            bail!("GGUF: {key} is not an i32 array");
+        }
+        let n = read_u64(f)?;
+        if n > 64 * 1024 * 1024 {
+            bail!("GGUF: {key} has {n} values");
+        }
+        let mut b = vec![0u8; 4 * n as usize];
+        f.read_exact(&mut b)?;
+        return Ok(Some(b.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()));
+    }
+    Ok(None)
 }
 
 impl GgufMeta {
@@ -282,5 +319,27 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+#[cfg(test)]
+mod lineup_tests {
+    use super::*;
+
+    /// Headers of the local lineup files (`KERYX_GGUF_FILES`, `:`-separated) parse and size
+    /// their tensors to the file length.
+    #[test]
+    #[ignore]
+    fn lineup_headers_parse() {
+        for path in std::env::var("KERYX_GGUF_FILES").expect("KERYX_GGUF_FILES").split(':') {
+            let mut f = File::open(path).unwrap();
+            let m = GgufMeta::read(&mut f).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let len = f.metadata().unwrap().len();
+            assert!(m.required_file_len() <= len, "{path}: {} > {len}", m.required_file_len());
+            println!("{path}: {} tensors, data from {}, needs {} of {len} B", m.tensors.len(), m.tensor_data_offset, m.required_file_len());
+            if let Some(map) = read_i32_array(&mut f, "deepseek41.engram.token_map").unwrap() {
+                assert_eq!((map.len(), map[2], *map.iter().max().unwrap()), (129_280, 2, 99_091));
+            }
+        }
     }
 }
