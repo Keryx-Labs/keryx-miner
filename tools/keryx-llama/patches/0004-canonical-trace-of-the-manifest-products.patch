@@ -1,16 +1,25 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0878ab9..462d88e 100644
+index d9dcc78fe..51e93c121 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -32,6 +32,7 @@
- #include "ggml-cuda/mmq.cuh"
+@@ -36,6 +36,7 @@
+ #include "ggml-cuda/mmq-few.cuh"
  #include "ggml-cuda/mmvf.cuh"
  #include "ggml-cuda/mmvq.cuh"
 +#include "ggml-cuda/q8canon.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
  #include "ggml-cuda/norm.cuh"
  #include "ggml-cuda/opt-step-adamw.cuh"
- #include "ggml-cuda/opt-step-sgd.cuh"
-@@ -3192,6 +3193,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -179,7 +180,7 @@ static bool ggml_cuda_register_host_enabled() {
+ 
+ static bool ggml_cuda_fusion_disabled() {
+     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
+-    return disabled;
++    return disabled || ggml_cuda_q8c_enabled();
+ }
+ 
+ static bool ggml_cuda_p2p_enabled() {
+@@ -4693,6 +4694,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          std::fill(ops, ops + 8, node->op);
  
          for (; n_fuse <= 6; ++n_fuse) {
@@ -20,7 +29,7 @@ index 0878ab9..462d88e 100644
              if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
                  break;
              }
-@@ -3620,6 +3624,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5133,6 +5137,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              }
  
              const ggml_tensor * bias = with_bias ? get_bias_tensor(out_node, scale_node, bias_op) : nullptr;
@@ -30,7 +39,7 @@ index 0878ab9..462d88e 100644
              if (with_bias && !bias) {
                  continue;
              }
-@@ -3689,6 +3696,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5232,6 +5239,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              continue;
          }
  
@@ -40,7 +49,7 @@ index 0878ab9..462d88e 100644
          if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
              continue;
          }
-@@ -3790,6 +3800,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5370,6 +5380,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          // With the use of CUDA graphs, the execution will be performed by the graph launch.
          if (!use_cuda_graph || cuda_graph_update_required) {
              [[maybe_unused]] int prev_i = 0;
@@ -48,7 +57,7 @@ index 0878ab9..462d88e 100644
  
              if (stream_ctx.concurrent_events.size() > 0) {
                  should_launch_concurrent_events = true;
-@@ -3905,6 +3916,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5494,6 +5505,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                              ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
  #endif
                      i += nodes_to_skip;
@@ -56,7 +65,7 @@ index 0878ab9..462d88e 100644
                      continue;
                  }
  #ifndef NDEBUG
-@@ -3921,6 +3933,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5514,6 +5526,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  #endif  // NDEBUG
  
                  bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
@@ -64,7 +73,7 @@ index 0878ab9..462d88e 100644
                  if (!ok) {
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
-@@ -3967,6 +3980,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5555,6 +5568,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -72,8 +81,28 @@ index 0878ab9..462d88e 100644
  }
  
  #ifdef USE_CUDA_GRAPH
+diff --git a/ggml/src/ggml-cuda/mmq-few.cu b/ggml/src/ggml-cuda/mmq-few.cu
+index bc7cbc6e5..cdd5267e2 100644
+--- a/ggml/src/ggml-cuda/mmq-few.cu
++++ b/ggml/src/ggml-cuda/mmq-few.cu
+@@ -1,4 +1,5 @@
+ #include "mmq-few.cuh"
++#include "q8canon.cuh"
+ #include "cp-async.cuh"
+ #include "mma.cuh"
+ #include "mmvq.cuh"
+@@ -907,6 +908,9 @@ static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const
+ }
+ 
+ bool ggml_cuda_should_use_mmq_few(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const int cc) {
++    if (ggml_cuda_q8c_enabled()) {
++        return false;
++    }
+     const int64_t ncols     = ids ? ids->ne[1] : src1->ne[1];
+     const int     min_ncols = ggml_cuda_mmq_few_min_ncols(src0->type, cc, src0->ne[0], ids != nullptr);
+     if (min_ncols == 0 || ncols < min_ncols || ncols > MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS) {
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index bf9f5d5..725c0be 100644
+index c9bcbc2aa..da135231e 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
 @@ -1,5 +1,6 @@
@@ -83,11 +112,12 @@ index bf9f5d5..725c0be 100644
  #include "quantize.cuh"
  #include "mmid.cuh"
  
-@@ -125,6 +126,16 @@ void ggml_cuda_mul_mat_q(
-     // TODO: tighter pool buffer size vs q8 path
-     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+@@ -241,6 +242,17 @@ void ggml_cuda_mul_mat_q(
+     const ggml_prec prec_src1 = ggml_cuda_mmq_get_prec_src1(src0->type, fusion ? fusion->prec_src1 : ggml_prec_get_src(dst, 1), cc);
  
-+    int q8c_r = ggml_cuda_q8c_enabled() && !use_native_fp4 ? ggml_cuda_q8c_rank(src0->name) : -1;
+     const bool use_native_fp4 = prec_src1 == GGML_PREC_Q4;
++
++    int q8c_r = ggml_cuda_q8c_enabled() && !use_native_fp4 && !fusion ? ggml_cuda_q8c_rank(src0->name) : -1;
 +    const int q8c_lay = ggml_cuda_q8c_layout(q8c_r);
 +    if ((ids != nullptr) != (q8c_lay == Q8C_EXPERTS)) {
 +        q8c_r = -1;
@@ -97,10 +127,10 @@ index bf9f5d5..725c0be 100644
 +    const int q8c_shift = q8c_r >= 0 ? ggml_cuda_q8c_row_shift(q8c_r, q8c_leaves) : 0;
 +    const int64_t q8c_row_bytes = ne10_padded/(4*QK8_1) * sizeof(block_q8_1_mmq);
 +
-     if (!ids) {
-         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-@@ -142,6 +153,12 @@ void ggml_cuda_mul_mat_q(
+     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+ 
+@@ -290,6 +302,12 @@ void ggml_cuda_mul_mat_q(
              } else {
                  quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
@@ -113,10 +143,10 @@ index bf9f5d5..725c0be 100644
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -159,6 +176,12 @@ void ggml_cuda_mul_mat_q(
+@@ -308,6 +326,12 @@ void ggml_cuda_mul_mat_q(
              ne03, ne13, s03, s13, s3,
-             ne1};
-         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+             ntj, J_best, fusion_device};
+         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 +        if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r) && q8c_lay == Q8C_HEADS) {
 +            ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, q8c_leaves, dst->ne[0]*sizeof(float), 0, dst->ne[2],
 +                                      q8c_tok3 ? dst->ne[1]*dst->ne[2] : 1, dst->ne[1], nullptr, 0, 0, 2*q8c_r + 1, -1, q8c_shift, stream);
@@ -126,13 +156,22 @@ index bf9f5d5..725c0be 100644
          return;
      }
  
-@@ -203,6 +226,14 @@ void ggml_cuda_mul_mat_q(
+@@ -327,7 +351,7 @@ void ggml_cuda_mul_mat_q(
+ 
+     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
+     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
+-    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
++    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1 && q8c_r < 0;
+ 
+     {
+         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+@@ -371,6 +395,14 @@ void ggml_cuda_mul_mat_q(
          } else {
              quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
 +            if (q8c_r >= 0) {
 +                ggml_cuda_pool_alloc<char> q8c_canon(ctx.pool(), ne12*ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-+                    ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq));
++                    src1_q8_1_padding);
 +                quantize_mmq_q8_1_cuda(src1_d, nullptr, q8c_canon.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
 +                                       ne11, ne12, ne13, stream);
 +                ggml_cuda_q8c_gather_rows(q8c_canon.get(), Q8C_MMQ, ne12, q8c_row_bytes, ne11, ne11, ne11, 1, nullptr, 0, 0,
@@ -141,10 +180,10 @@ index bf9f5d5..725c0be 100644
          }
          CUDA_CHECK(cudaGetLastError());
      }
-@@ -221,6 +252,10 @@ void ggml_cuda_mul_mat_q(
-         ne12};
+@@ -390,6 +422,10 @@ void ggml_cuda_mul_mat_q(
+         ntj, J_best, fusion_device};
  
-     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 +    if (q8c_r >= 0 && ggml_cuda_q8c_plain(q8c_r)) {
 +        ggml_cuda_q8c_gather_rows(dst_d, Q8C_ROWS, dst->ne[2], dst->ne[0]*sizeof(float), 0, dst->ne[1], dst->ne[1], 1,
 +                                  ids->data, dst->ne[1]*sizeof(int32_t), ids->nb[1], 2*q8c_r + 1, -1, q8c_shift, stream);
@@ -153,7 +192,7 @@ index bf9f5d5..725c0be 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index e18ada5..d136adb 100644
+index 6f10428e6..79b07525d 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -1,4 +1,5 @@
@@ -162,7 +201,7 @@ index e18ada5..d136adb 100644
  #include "quantize.cuh"
  #include "unary.cuh"
  #include "vecdotq.cuh"
-@@ -1220,12 +1221,45 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1621,12 +1622,45 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -195,8 +234,8 @@ index e18ada5..d136adb 100644
          const int64_t s11 = src1->nb[1] / ts_src1;
          const int64_t s12 = src1->nb[2] / ts_src1;
          const int64_t s13 = src1->nb[3] / ts_src1;
--        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, src1_q8_1, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
 +        if (q8c_x >= 0 && q8c_lay == Q8C_EXPERTS) {
 +            ggml_cuda_q8c_gather_rows(src1_q8_1, Q8C_ROWS, ne12, q8c_row_bytes, 0, ne11, ne11, 1, nullptr, 0, 0,
 +                                      q8c_x, q8c_x2, q8c_shift, stream);
@@ -210,7 +249,7 @@ index e18ada5..d136adb 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1251,10 +1285,20 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1652,10 +1686,20 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -234,10 +273,10 @@ index e18ada5..d136adb 100644
  void ggml_cuda_op_mul_mat_vec_q(
 diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
 new file mode 100644
-index 0000000..923ecca
+index 000000000..0f1079149
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cu
-@@ -0,0 +1,1021 @@
+@@ -0,0 +1,1041 @@
 +#include "q8canon.cuh"
 +
 +#include "ggml.h"
@@ -639,6 +678,7 @@ index 0000000..923ecca
 +    uint32_t n_products = 0;
 +    uint32_t n_layers   = 0;
 +    uint32_t n_router   = 0;
++    bool     ple        = false;
 +    uint32_t nl         = 0;
 +    uint32_t max_pos    = 0;
 +    uint8_t * stage     = nullptr;
@@ -693,6 +733,7 @@ index 0000000..923ecca
 +    }
 +    uint32_t n_layers = 0;
 +    bool moe = false;
++    bool ple = false;
 +    size_t o = 16;
 +    for (uint32_t i = 0; i < n_entries; ++i) {
 +        if (o + 2 > len) {
@@ -739,7 +780,8 @@ index 0000000..923ecca
 +    s.n_products = n_products;
 +    s.n_layers   = n_layers;
 +    s.n_router   = moe ? n_layers : 0;
-+    s.nl = 2*n_products + 2*n_layers + s.n_router + 1;
++    s.ple        = ple;
++    s.nl = 2*n_products + (ple ? 3 : 2)*n_layers + s.n_router + (ple ? 2 : 0) + 1;
 +    return true;
 +}
 +
@@ -962,6 +1004,14 @@ index 0000000..923ecca
 +
 +// Residual leaf of a layer-stream node named `<kind>-<layer>`, or -1.
 +static int q8c_resid_leaf(const q8c_dev & s, const char * name) {
++    const uint32_t per = s.ple ? 3 : 2;
++    const int after = (int) (2*s.n_products + per*s.n_layers);
++    if (s.ple && strcmp(name, "ple_proj") == 0) {
++        return after + (int) s.n_router;
++    }
++    if (s.ple && strcmp(name, "inp_per_layer") == 0) {
++        return after + (int) s.n_router + 1;
++    }
 +    const char * dash = strrchr(name, '-');
 +    if (s.n_layers == 0 || !dash || dash[1] < '0' || dash[1] > '9') {
 +        return -1;
@@ -973,15 +1023,18 @@ index 0000000..923ecca
 +    }
 +    const size_t n = (size_t) (dash - name);
 +    auto is = [&](const char * k) { return strlen(k) == n && strncmp(name, k, n) == 0; };
-+    const int base = (int) (2*s.n_products + 2*il);
++    const int base = (int) (2*s.n_products + per*il);
 +    if (is("l_out")) {
++        return base + (int) per - 1;
++    }
++    if (s.ple && is("pe_in")) {
 +        return base + 1;
 +    }
 +    if (is("attn_residual") || is("ffn_inp") || is("attn_out")) {
 +        return base;
 +    }
 +    if (s.n_router > 0 && is("ffn_moe_logits")) {
-+        return (int) (2*s.n_products + 2*s.n_layers + il);
++        return after + (int) il;
 +    }
 +    return -1;
 +}
@@ -1003,9 +1056,15 @@ index 0000000..923ecca
 +    if (!ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
 +        return true;
 +    }
-+    const int64_t nrows = ggml_nrows(node);
++    int64_t nrows = ggml_nrows(node);
++    int64_t row_bytes = node->ne[0]*sizeof(float);
++    const int ple_leaf = (int) (2*s->n_products + 3*s->n_layers + s->n_router);
++    if (s->ple && leaf >= ple_leaf) {
++        nrows = leaf == ple_leaf ? node->ne[1] : node->ne[2];
++        row_bytes = (int64_t) ggml_nbytes(node) / nrows;
++    }
 +    const int shift = s->cur && (int64_t) s->cur->n_tokens > nrows ? (int) (s->cur->n_tokens - nrows) : 0;
-+    ggml_cuda_q8c_out(node->data, nrows, node->ne[0]*sizeof(float), leaf, shift, nrows <= 8, stream);
++    ggml_cuda_q8c_out(node->data, nrows, row_bytes, leaf, shift, nrows <= 8, stream);
 +    return true;
 +}
 +
@@ -1261,7 +1320,7 @@ index 0000000..923ecca
 +}
 diff --git a/ggml/src/ggml-cuda/q8canon.cuh b/ggml/src/ggml-cuda/q8canon.cuh
 new file mode 100644
-index 0000000..d138cba
+index 000000000..d138cbade
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/q8canon.cuh
 @@ -0,0 +1,60 @@

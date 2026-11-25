@@ -26,10 +26,15 @@
 #include <cuda_runtime.h>
 #endif
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <set>
+#include <sstream>
+#include <thread>
 #include <string>
 #include <vector>
 #if defined(_WIN32)
@@ -268,6 +273,9 @@ int  ggml_cuda_q8c_read(int device, uint8_t* leaves, size_t leaves_cap, uint32_t
 int  ggml_cuda_q8c_read_capture(int device, uint8_t* x, size_t x_cap, uint8_t* y, size_t y_cap, uint32_t* x_len, uint32_t* y_len);
 int  ggml_cuda_q8c_arm_captures(int device, const uint32_t* pos, const uint32_t* leaf, uint32_t n, uint32_t slot_bytes);
 int  ggml_cuda_q8c_read_captures(int device, uint8_t* out, size_t out_cap, uint32_t* lens, uint32_t n);
+int  ggml_cuda_q8c_set_pos(int device, uint32_t pos, uint32_t n);
+int  ggml_cuda_q8c_read_range(int device, uint32_t first, uint32_t n, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch,
+                              size_t ubatch_cap);
 // Sequence leaves (ggml-cuda/q8seq.cu, applied by tools/keryx-llama/patches).
 int  ggml_cuda_q8s_configure(int device, const uint32_t* layers, uint32_t n, uint32_t n_attn, uint32_t n_recur,
                              uint32_t seq_heads, uint32_t interval, uint32_t max_tokens);
@@ -374,6 +382,8 @@ struct KeryxLlama {
     std::string ctx_info;           // "n_ctx=… kv=… flash_attn=…" for the miner log
     llama_context_params cparams{}; // parameters the context was created with at load
     std::string kv;
+    bool fast_kv = true;            // single-GPU engine; false for a pipeline head
+    std::string timing;             // timing report of the load and the last generation, one line per step
 };
 
 static std::string keryx_ctx_info(KeryxLlama* h) {
@@ -387,6 +397,10 @@ static bool keryx_has_ctx(KeryxLlama* h) {
     if (h->ctx) return true;
     keryx_set_error("context", "the engine has no context");
     return false;
+}
+
+static double keryx_ms_since(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 // llama.cpp/ggml emit a large INFO-level dump on every model load (full tensor list, per-layer
@@ -428,8 +442,9 @@ static int keryx_feed_prompt(KeryxLlama* h, const llama_token* toks, int n) {
     for (int i = 0; i < n; i += n_batch) {
         llama_batch batch = llama_batch_get_one(const_cast<llama_token*>(toks) + i, std::min(n_batch, n - i));
         keryx_trace_batch(h->trace, toks + i, std::min(n_batch, n - i), i);
-        if (llama_decode(h->ctx, batch) != 0) {
-            keryx_set_error("decode", "llama_decode failed while reading the prompt");
+        const int rc = llama_decode(h->ctx, batch);
+        if (rc != 0) {
+            keryx_set_error("decode", "llama_decode failed while reading the prompt (" + std::to_string(rc) + ")");
             return -3;
         }
     }
@@ -457,20 +472,38 @@ static int keryx_trace_reset(KeryxLlama* h) {
 extern "C" {
 
 // ABI version — the miner refuses to use a mismatched .so.
-KERYX_EXPORT int keryx_llama_abi() { return 9; }
+static llama_sampler* keryx_make_sampler(const llama_model* model) {
+    // User-facing sampling (DRY -> repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
+    // text is not consensus-relevant, but keep the flavor consistent.
+    //
+    // The flat repeat penalty alone does not stop these models: it charges a token once for
+    // having appeared, no matter how many times, so a repeated *sentence* pays almost nothing
+    // per token and the loop survives (observed on-chain with GLM-4-9B at 1.10 / 256). DRY
+    // penalises the continuation of an already-seen sequence, growing with its length, which is
+    // the failure mode we actually have. Standard settings: multiplier 0.8, base 1.75, loops
+    // allowed up to 2 tokens, scanning the whole context (-1). The break tokens keep normal
+    // structure (newlines, list markers, quotes) from counting as repetition.
+    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
+    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
+        llama_model_get_vocab(model),
+        0.8f, 1.75f, 2, -1, dry_breakers, sizeof(dry_breakers) / sizeof(dry_breakers[0])));
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(llama_vocab_n_tokens(llama_model_get_vocab(model)), 256, 1.10f, 0.0f, 0.0f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+    return smpl;
+}
+
+KERYX_EXPORT int keryx_llama_abi() { return 14; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
 
-KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
-    keryx_last_error.clear();
-    keryx_install_log_filter();
-    llama_backend_init();
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 999;
-    mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
-    mp.main_gpu     = gpu;
-    mp.use_mmap     = true;
+
+// `fast_kv`: 8-bit KV cache with flash attention.
+static KeryxLlama* keryx_load_with(const char* gguf_path, int gpu, int n_ctx, llama_model_params mp, bool fast_kv) {
+    const auto t_model = std::chrono::steady_clock::now();
     llama_model_kv_override overrides[2] = {};
     if (keryx_needs_glm4_rope_fix(gguf_path)) {
         overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
@@ -481,7 +514,7 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
     {
         // On by default; KERYX_CANONICAL_WEIGHTS=0 keeps llama's own layout.
         const char* cw = std::getenv("KERYX_CANONICAL_WEIGHTS");
-        keryx_llama_canonical_weights = keryx_want_canonical && !(cw && cw[0] == '0');
+        keryx_llama_canonical_weights = fast_kv && keryx_want_canonical && !(cw && cw[0] == '0');
         keryx_llama_canonical_base = nullptr;
         keryx_llama_canonical_bytes = 0;
     }
@@ -493,22 +526,29 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
         keryx_set_error("model", std::string("llama_model_load_from_file failed for ") + gguf_path);
         return nullptr;
     }
+    const double model_ms = keryx_ms_since(t_model);
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
-    // The logical batch bounds one decode call; the physical one bounds the compute buffers,
-    // which grow with it and not with the context.
-    cp.n_batch = std::min(2048u, cp.n_ctx);
-    cp.n_ubatch = std::min(512u, cp.n_batch);
-    // The cache is cleared before every request, so sliding-window layers only need their window.
-    cp.swa_full = false;
-    // 8-bit KV cache with flash attention: half the per-token VRAM of f16. Falls back to the
-    // default cache for an architecture the fast path cannot serve.
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    cp.type_k = GGML_TYPE_Q8_0;
-    cp.type_v = GGML_TYPE_Q8_0;
-    const char* kv = "q8_0";
-    KeryxTrace* trace = keryx_trace_open(gpu);
+    const char* kv = "f16";
+    if (fast_kv) {
+        // The logical batch bounds one decode call; the physical one bounds the compute buffers,
+        // which grow with it and not with the context.
+        cp.n_batch = std::min(2048u, cp.n_ctx);
+        cp.n_ubatch = std::min(512u, cp.n_batch);
+        // The cache is cleared before every request, so sliding-window layers only need their window.
+        cp.swa_full = false;
+        // 8-bit KV cache with flash attention: half the per-token VRAM of f16. Falls back to the
+        // default cache for an architecture the fast path cannot serve.
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cp.type_k = GGML_TYPE_Q8_0;
+        cp.type_v = GGML_TYPE_Q8_0;
+        kv = "q8_0";
+    } else {
+        cp.n_batch = std::min(cp.n_batch, cp.n_ctx);
+        cp.n_ubatch = std::min(cp.n_ubatch, std::max(1u, cp.n_ctx / 4));
+    }
+    KeryxTrace* trace = fast_kv ? keryx_trace_open(gpu) : nullptr;
     if (trace) {
         cp.cb_eval = keryx_trace_cb;
         cp.cb_eval_user_data = trace;
@@ -517,8 +557,9 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
         ggml_cuda_q8_tap = keryx_q8_tap;
 #endif
     }
+    const auto t_ctx = std::chrono::steady_clock::now();
     llama_context* ctx = llama_init_from_model(model, cp);
-    if (!ctx) {
+    if (!ctx && fast_kv) {
         // An MLA cache holds no V rows, but its value length still has to divide a quantized V type.
         cp.type_v = GGML_TYPE_F16;
         kv = "q8_0/f16";
@@ -538,35 +579,32 @@ KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_
         return nullptr;
     }
 
-    // User-facing sampling (DRY -> repeat penalty -> temperature 0.7 / top_p 0.9) — the OPoI
-    // text is not consensus-relevant, but keep the flavor consistent.
-    //
-    // The flat repeat penalty alone does not stop these models: it charges a token once for
-    // having appeared, no matter how many times, so a repeated *sentence* pays almost nothing
-    // per token and the loop survives (observed on-chain with GLM-4-9B at 1.10 / 256). DRY
-    // penalises the continuation of an already-seen sequence, growing with its length, which is
-    // the failure mode we actually have. Standard settings: multiplier 0.8, base 1.75, loops
-    // allowed up to 2 tokens, scanning the whole context (-1). The break tokens keep normal
-    // structure (newlines, list markers, quotes) from counting as repetition.
-    static const char* dry_breakers[] = { "\n", ":", "\"", "*" };
-    llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_dry(
-        llama_model_get_vocab(model), llama_model_n_ctx_train(model),
-        0.8f, 1.75f, 2, -1, dry_breakers, sizeof(dry_breakers) / sizeof(dry_breakers[0])));
-    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(256, 1.10f, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+    llama_sampler* smpl = keryx_make_sampler(model);
 
     auto* h = new KeryxLlama();
     h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace; h->gpu = gpu;
     h->canon_base = canon_base; h->canon_bytes = canon_bytes;
-    h->cparams = cp; h->kv = kv;
+    h->cparams = cp; h->kv = kv; h->fast_kv = fast_kv;
     h->ctx_info = keryx_ctx_info(h);
     if (trace) keryx_trace_meta(gpu, gguf_path, h->ctx_info, trace);
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
     std::sort(h->names.begin(), h->names.end());
+    char buf[128];
+    snprintf(buf, sizeof(buf), "load model %.0f ms, context %.0f ms\n", model_ms, keryx_ms_since(t_ctx));
+    h->timing += buf;
     return h;
+}
+
+KERYX_EXPORT KeryxLlama* keryx_llama_load(const char* gguf_path, int gpu, int n_ctx) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 999;
+    mp.split_mode   = LLAMA_SPLIT_MODE_NONE; // ONE GPU — never layer-split across mining cards
+    mp.main_gpu     = gpu;
+    mp.load_mode    = LLAMA_LOAD_MODE_MMAP;
+    return keryx_load_with(gguf_path, gpu, n_ctx, mp, true);
 }
 
 KERYX_EXPORT size_t keryx_llama_tensor_count(KeryxLlama* h) { return h ? h->names.size() : 0; }
@@ -585,8 +623,13 @@ KERYX_EXPORT int keryx_llama_context_acquire(KeryxLlama* h, int n_ctx) {
     std::lock_guard<std::mutex> g(h->gen_lock);
     llama_context_params cp = h->cparams;
     if (n_ctx > 0) cp.n_ctx = (uint32_t)n_ctx;
-    cp.n_batch = std::min(2048u, cp.n_ctx);
-    cp.n_ubatch = std::min(512u, cp.n_batch);
+    if (h->fast_kv) {
+        cp.n_batch = std::min(2048u, cp.n_ctx);
+        cp.n_ubatch = std::min(512u, cp.n_batch);
+    } else {
+        cp.n_batch = std::min(cp.n_batch, cp.n_ctx);
+        cp.n_ubatch = std::min(cp.n_ubatch, std::max(1u, cp.n_ctx / 4));
+    }
     if (h->ctx && llama_n_ctx(h->ctx) == cp.n_ctx) return (int)cp.n_ctx;
     if (h->ctx) {
         llama_free(h->ctx);
@@ -679,10 +722,32 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
     // Penalty history must not carry over from earlier requests.
     llama_sampler_reset(h->smpl);
     keryx_trace_reset(h);
-    if (keryx_feed_prompt(h, toks.data(), n) != 0) return -3;
+    // Deadline checked between tokens only.
+    long deadline_ms = 0;
+    if (const char* d = getenv("KERYX_LLAMA_GEN_DEADLINE_MS")) deadline_ms = atol(d);
+
+    // Keep the load lines, drop the previous generation's report.
+    const size_t load_end = h->timing.find("prompt ");
+    if (load_end != std::string::npos) h->timing.erase(load_end);
+    char line[256];
+    snprintf(line, sizeof(line), "prompt %d tokens, max %d\n", n, max_tokens);
+    h->timing += line;
+    std::vector<double> step_ms;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if (keryx_feed_prompt(h, toks.data(), n) != 0) {
+        h->timing += keryx_last_error + "\n";
+        return -3;
+    }
+    const double prefill_ms = keryx_ms_since(t0);
+    snprintf(line, sizeof(line), "prefill %.0f ms\n", prefill_ms);
+    h->timing += line;
+
     int written = 0;
+    int tokens = 0;
     for (int i = 0; i < max_tokens; i++) {
         llama_token tok = llama_sampler_sample(h->smpl, h->ctx, -1);
+        tokens++;
         if (llama_vocab_is_eog(vocab, tok)) break;
         char piece[256];
         int pn = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
@@ -690,13 +755,48 @@ KERYX_EXPORT int keryx_llama_generate(KeryxLlama* h, const char* prompt, int max
         if (written + pn >= cap - 1) break;
         memcpy(out + written, piece, pn);
         written += pn;
+        if (deadline_ms > 0) {
+            const long elapsed = (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            if (elapsed > deadline_ms) {
+                keryx_last_error = "generation deadline exceeded after " + std::to_string(tokens) + " tokens";
+                snprintf(line, sizeof(line), "deadline after %d tokens\n", tokens);
+                h->timing += line;
+                return -1;
+            }
+        }
         llama_batch batch = llama_batch_get_one(&tok, 1);
         keryx_trace_batch(h->trace, &tok, 1, n + i);
-        if (llama_decode(h->ctx, batch) != 0) break;
+        const auto t_step = std::chrono::steady_clock::now();
+        const int rc = llama_decode(h->ctx, batch);
+        const double ms = keryx_ms_since(t_step);
+        step_ms.push_back(ms);
+        snprintf(line, sizeof(line), "tok %d %.0f ms\n", tokens, ms);
+        h->timing += line;
+        if (rc < 0) {
+            keryx_last_error = "llama_decode failed (" + std::to_string(rc) + ")";
+            h->timing += keryx_last_error + "\n";
+            return -1;
+        }
+        if (rc != 0) break; // context full
     }
+    const double total_ms = keryx_ms_since(t0);
+    if (!step_ms.empty()) {
+        std::vector<double> sorted = step_ms;
+        std::sort(sorted.begin(), sorted.end());
+        double sum = 0.0;
+        for (double v : sorted) sum += v;
+        snprintf(line, sizeof(line), "summary %d tokens %d bytes in %.0f ms: prefill %.0f ms, per token mean %.0f median %.0f min %.0f max %.0f ms\n",
+                 tokens, written, total_ms, prefill_ms, sum / sorted.size(), sorted[sorted.size() / 2], sorted.front(), sorted.back());
+    } else {
+        snprintf(line, sizeof(line), "summary %d tokens %d bytes in %.0f ms: prefill %.0f ms\n", tokens, written, total_ms, prefill_ms);
+    }
+    h->timing += line;
     out[written] = 0;
     return written;
 }
+
+// Timing report of the load and the last generation on `h`: one line per step, see the miner log.
+KERYX_EXPORT const char* keryx_llama_last_trace(KeryxLlama* h) { return h ? h->timing.c_str() : ""; }
 
 // Like keryx_llama_generate, and records every token fed to the model (prompt, then each decoded
 // token) in `tokens`: that sequence replays the response. Generation stops when `tokens` is full.
@@ -818,6 +918,12 @@ KERYX_EXPORT int keryx_llama_trace_tokens(KeryxLlama* h, const int32_t* tokens, 
 #endif
 }
 
+#ifndef __APPLE__
+// Manifest each GPU's trace was last configured with by a range, empty when none.
+static std::mutex keryx_range_cfg_mu;
+static std::string keryx_range_cfg[16];
+#endif
+
 // Enables the canonical trace on the engine's GPU for the model described by `manifest`
 // (`max_pos` positions per response; the context size when 0). Returns 0 on success.
 KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest, size_t manifest_len, int max_pos) {
@@ -830,6 +936,10 @@ KERYX_EXPORT int keryx_llama_trace_configure(KeryxLlama* h, const void* manifest
     if (max_pos <= 0 && !keryx_has_ctx(h)) return -2;
     const uint32_t mp = max_pos > 0 ? (uint32_t)max_pos : (uint32_t)llama_n_ctx(h->ctx);
     const int rc = ggml_cuda_q8c_configure(h->gpu, manifest, manifest_len, mp);
+    if (h->gpu >= 0 && h->gpu < 16) {
+        std::lock_guard<std::mutex> cl(keryx_range_cfg_mu);
+        keryx_range_cfg[h->gpu].clear();
+    }
     h->traced = rc == 0;
     if (rc != 0) keryx_set_error("trace", "trace configuration failed (" + std::to_string(rc) + ")");
     return rc;
@@ -1063,5 +1173,474 @@ KERYX_EXPORT void keryx_llama_free(KeryxLlama* h) {
     keryx_trace_close(h->trace);
     delete h;
 }
+
+
+// ── Network-model shard (H14) ─────────────────────────────────────────────────────────────────
+// A shard GGUF holds a layer range of the network model and is not a model llama can run. The
+// miner loads it ONCE on its mining GPU: the PoM walk gathers over these tensors exactly like
+// over llama's (same info/device contract), and the layer range binds the same buffer by name —
+// one VRAM copy for walk and service.
+struct KeryxShard {
+    gguf_context*          gguf = nullptr;
+    ggml_context*          ctx  = nullptr;
+    ggml_backend_buffer_t  buf  = nullptr;
+    int                    gpu  = -1;
+    std::vector<std::string> names;              // canonical (byte-lexicographic) order
+    std::vector<ggml_tensor*> tensors;           // parallel to names
+};
+
+KERYX_EXPORT KeryxShard* keryx_shard_load(const char* gguf_path, int gpu) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+#ifdef __APPLE__
+    (void)gguf_path; (void)gpu;
+    keryx_set_error("shard", "shard serving is CUDA-only");
+    return nullptr;
+#else
+    llama_backend_init();
+    ggml_context* meta = nullptr;
+    gguf_init_params gp = { /*no_alloc=*/ true, /*ctx=*/ &meta };
+    gguf_context* g = gguf_init_from_file(gguf_path, gp);
+    if (!g || !meta) {
+        keryx_set_error("shard", std::string("gguf_init_from_file failed for ") + gguf_path);
+        if (g) gguf_free(g);
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(gpu);
+    if (!buft) {
+        keryx_set_error("shard", "no CUDA buffer type for gpu " + std::to_string(gpu));
+        ggml_free(meta); gguf_free(g);
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(meta, buft);
+    if (!buf) {
+        keryx_set_error("shard", "ggml_backend_alloc_ctx_tensors_from_buft failed (out of memory?)");
+        ggml_free(meta); gguf_free(g);
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    FILE* f = fopen(gguf_path, "rb");
+    if (!f) {
+        keryx_set_error("shard", std::string("cannot open ") + gguf_path);
+        ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+        return nullptr;
+    }
+    const size_t data_off = gguf_get_data_offset(g);
+    std::vector<uint8_t> chunk(64u << 20);
+    const int64_t n = gguf_get_n_tensors(g);
+    for (int64_t i = 0; i < n; i++) {
+        const char* name = gguf_get_tensor_name(g, i);
+        ggml_tensor* t = ggml_get_tensor(meta, name);
+        if (!t || !t->data) {
+            keryx_set_error("shard", std::string("tensor without device storage: ") + name);
+            fclose(f); ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+            return nullptr;
+        }
+        const size_t nbytes = ggml_nbytes(t);
+        if (nbytes != gguf_get_tensor_size(g, i)) {
+            keryx_set_error("shard", std::string("tensor size mismatch: ") + name);
+            fclose(f); ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+            return nullptr;
+        }
+#if defined(_WIN32)
+        _fseeki64(f, (long long)(data_off + gguf_get_tensor_offset(g, i)), SEEK_SET);
+#else
+        fseeko(f, (off_t)(data_off + gguf_get_tensor_offset(g, i)), SEEK_SET);
+#endif
+        size_t done = 0;
+        while (done < nbytes) {
+            const size_t want = std::min(chunk.size(), nbytes - done);
+            if (fread(chunk.data(), 1, want, f) != want) {
+                keryx_set_error("shard", std::string("short read in ") + name);
+                fclose(f); ggml_backend_buffer_free(buf); ggml_free(meta); gguf_free(g);
+                return nullptr;
+            }
+            ggml_backend_tensor_set(t, chunk.data(), done, want);
+            done += want;
+        }
+    }
+    fclose(f);
+    auto* h = new KeryxShard();
+    h->gguf = g; h->ctx = meta; h->buf = buf; h->gpu = gpu;
+    for (int64_t i = 0; i < n; i++) h->names.push_back(gguf_get_tensor_name(g, i));
+    std::sort(h->names.begin(), h->names.end());
+    for (auto& nm : h->names) h->tensors.push_back(ggml_get_tensor(meta, nm.c_str()));
+    return h;
+#endif
+}
+
+KERYX_EXPORT size_t keryx_shard_tensor_count(KeryxShard* h) { return h ? h->names.size() : 0; }
+
+KERYX_EXPORT bool keryx_shard_tensor_info(KeryxShard* h, size_t i, const char** name, void** data,
+                                          size_t* nbytes, int* is_device) {
+    if (!h || i >= h->names.size()) return false;
+    const ggml_tensor* t = h->tensors[i];
+    if (!t || !t->data) return false;
+    *name = h->names[i].c_str();
+    *data = t->data;
+    *nbytes = ggml_nbytes(t);
+    *is_device = 1;
+    return true;
+}
+
+KERYX_EXPORT int keryx_shard_tensor_device(KeryxShard* h, size_t i) {
+    if (!h || i >= h->names.size()) return -1;
+    return h->gpu;
+}
+
+KERYX_EXPORT void keryx_shard_free(KeryxShard* h) {
+    if (!h) return;
+    if (h->buf) ggml_backend_buffer_free(h->buf);
+    if (h->ctx) ggml_free(h->ctx);
+    if (h->gguf) gguf_free(h->gguf);
+    delete h;
+}
+
+// ── Layer range of the network model (protocol-restricted pipeline) ──────────────────────────────
+// A link runs its own layers on a received hyper-connection residual and hands the residual (or,
+// on the last range, the logits) back; nothing but numbers crosses the network.
+
+#ifndef __APPLE__
+extern "C" {
+extern thread_local int32_t keryx_llama_range_start;
+extern thread_local int32_t keryx_llama_range_end;
+extern thread_local ggml_backend_buffer_t keryx_llama_local_resident_buf;
+extern thread_local size_t                keryx_llama_local_resident_n;
+extern thread_local const char * const *  keryx_llama_local_resident_names;
+extern thread_local void * const *        keryx_llama_local_resident_datas;
+extern thread_local const size_t *        keryx_llama_local_resident_nbytes;
+}
+#endif
+
+#ifndef __APPLE__
+struct KeryxRange {
+    llama_model*   model = nullptr;
+    llama_context* ctx   = nullptr;
+    ggml_backend_buffer_t resident = nullptr;
+    int  first = 0, last = 0;
+    bool head  = false;
+    int  n_hc  = 0;
+    int  n_vocab = 0;
+    int  n_ctx = 0;
+    int  n_seq = 0;
+    int  n_ubatch = 0;
+    std::vector<int32_t> len;
+    llama_sampler* smpl = nullptr;
+    int  sample_seq = -1;
+    int  gpu    = 0;
+    bool traced = false;
+    std::mutex mu;
+};
+
+static const int KERYX_RANGE_MAX_UBATCH = 512;
+
+// Loads layers [first, last] of `gguf_path` on `gpu`. The `n_resident` tensors already held in
+// device memory [resident_base, resident_base + resident_size) are bound by name, not loaded.
+KERYX_EXPORT KeryxRange* keryx_range_load(const char* gguf_path, int gpu, int first, int last,
+                                          void* resident_base, size_t resident_size, size_t n_resident,
+                                          const char* const* names, void* const* datas, const size_t* nbytes,
+                                          int n_ctx, int n_seq) {
+    keryx_last_error.clear();
+    keryx_install_log_filter();
+    if (!gguf_path || first < 0 || last < first || n_ctx <= 0 || n_seq <= 0 || n_seq > 16
+        || (n_resident > 0 && (!resident_base || !names || !datas || !nbytes))) {
+        keryx_set_error("range", "bad range parameters");
+        return nullptr;
+    }
+    for (size_t i = 0; i < n_resident; i++) {
+        const char* d = (const char*) datas[i];
+        const char* b = (const char*) resident_base;
+        if (!names[i] || d < b || nbytes[i] > resident_size || (size_t) (d - b) > resident_size - nbytes[i]) {
+            keryx_set_error("range", "resident tensor outside the resident buffer");
+            return nullptr;
+        }
+    }
+    llama_backend_init();
+    ggml_backend_buffer_t resident = nullptr;
+    if (n_resident > 0) {
+        resident = ggml_backend_cuda_buffer_from_ptr(gpu, resident_base, resident_size);
+        if (!resident) {
+            keryx_set_error("range", "cannot wrap the resident buffer");
+            return nullptr;
+        }
+    }
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 999;
+    mp.main_gpu = gpu;
+    mp.split_mode = LLAMA_SPLIT_MODE_NONE;
+    keryx_llama_range_start = first;
+    keryx_llama_range_end = last;
+    keryx_llama_local_resident_buf = resident;
+    keryx_llama_local_resident_n = n_resident;
+    keryx_llama_local_resident_names = names;
+    keryx_llama_local_resident_datas = datas;
+    keryx_llama_local_resident_nbytes = nbytes;
+    llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    keryx_llama_range_start = -1;
+    keryx_llama_range_end = -1;
+    keryx_llama_local_resident_buf = nullptr;
+    keryx_llama_local_resident_n = 0;
+    keryx_llama_local_resident_names = nullptr;
+    keryx_llama_local_resident_datas = nullptr;
+    keryx_llama_local_resident_nbytes = nullptr;
+    if (!model) {
+        if (resident) ggml_backend_buffer_free(resident);
+        keryx_set_error("range", std::string("llama_model_load_from_file failed for ") + gguf_path);
+        return nullptr;
+    }
+    const int n_layer = llama_model_n_layer(model);
+    if (last >= n_layer) {
+        llama_model_free(model);
+        if (resident) ggml_backend_buffer_free(resident);
+        keryx_set_error("range", "range beyond the model's layers");
+        return nullptr;
+    }
+    const bool head = last == n_layer - 1;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_seq_max = (uint32_t) n_seq;
+    cp.n_ctx = (uint32_t) n_ctx * (uint32_t) n_seq;
+    cp.n_batch = KERYX_RANGE_MAX_UBATCH;
+    cp.n_ubatch = KERYX_RANGE_MAX_UBATCH;
+    cp.swa_full = false;
+    cp.kv_unified = false;
+    cp.embeddings = !head;
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context* ctx = llama_init_from_model(model, cp);
+    if (!ctx) {
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        ctx = llama_init_from_model(model, cp);
+    }
+    if (!ctx) {
+        llama_model_free(model);
+        if (resident) ggml_backend_buffer_free(resident);
+        keryx_set_error("range", "llama_init_from_model failed");
+        return nullptr;
+    }
+    auto* r = new KeryxRange();
+    r->model = model;
+    r->ctx = ctx;
+    r->resident = resident;
+    r->first = first;
+    r->last = last;
+    r->head = head;
+    r->n_hc = head ? (int) llama_model_n_embd_inp(model) : (int) llama_model_n_embd_out(model);
+    r->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    r->n_ctx = n_ctx;
+    r->n_seq = n_seq;
+    r->n_ubatch = KERYX_RANGE_MAX_UBATCH;
+    r->len.assign((size_t) n_seq, 0);
+    r->gpu = gpu;
+    if (head) r->smpl = keryx_make_sampler(model);
+    return r;
+}
+
+// Residual floats per token and vocabulary size of a loaded range.
+KERYX_EXPORT void keryx_range_dims(KeryxRange* r, int* n_hc, int* n_vocab, int* head) {
+    if (!r) return;
+    if (n_hc) *n_hc = r->n_hc;
+    if (n_vocab) *n_vocab = r->n_vocab;
+    if (head) *head = r->head ? 1 : 0;
+}
+
+// Forgets sequence `seq`.
+KERYX_EXPORT void keryx_range_clear(KeryxRange* r, int seq) {
+    if (!r || seq < 0 || seq >= r->n_seq) return;
+    std::lock_guard<std::mutex> lock(r->mu);
+    llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+    r->len[(size_t) seq] = 0;
+}
+
+static int keryx_range_step_locked(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                   float* out, size_t out_floats, uint8_t* leaves, size_t leaves_cap, uint32_t* ubatch,
+                                   size_t ubatch_cap) {
+    r->sample_seq = -1;
+    if (seq < 0 || seq >= r->n_seq || n <= 0 || n > r->n_ubatch) return -2;
+    if (pos0 != r->len[(size_t) seq] || pos0 + n > r->n_ctx) return -3;
+    const bool from_tokens = r->first == 0;
+    if (from_tokens ? (tokens == nullptr || in != nullptr) : (in == nullptr || tokens != nullptr)) return -4;
+    if (from_tokens) {
+        for (int i = 0; i < n; i++) {
+            if (tokens[i] < 0 || tokens[i] >= r->n_vocab) return -5;
+        }
+    } else {
+        const size_t m = (size_t) n * (size_t) r->n_hc;
+        for (size_t i = 0; i < m; i++) {
+            if (!std::isfinite(in[i])) return -6;
+        }
+    }
+    const size_t want = r->head ? (size_t) r->n_vocab : (size_t) n * (size_t) r->n_hc;
+    if (!out || out_floats != want) return -7;
+
+    llama_batch batch = llama_batch_init(n, from_tokens ? 0 : r->n_hc, 1);
+    batch.n_tokens = n;
+    for (int i = 0; i < n; i++) {
+        if (from_tokens) batch.token[i] = tokens[i];
+        batch.pos[i] = pos0 + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = seq;
+        batch.logits[i] = r->head ? (i == n - 1) : 1;
+    }
+    if (!from_tokens) {
+        std::memcpy(batch.embd, in, (size_t) n * (size_t) r->n_hc * sizeof(float));
+    }
+#ifndef __APPLE__
+    if (r->traced && ggml_cuda_q8c_set_pos(r->gpu, (uint32_t) pos0, (uint32_t) n) != 0) {
+        llama_batch_free(batch);
+        return -10;
+    }
+#else
+    (void) leaves; (void) leaves_cap; (void) ubatch; (void) ubatch_cap;
+#endif
+    const int rc = llama_decode(r->ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+        r->len[(size_t) seq] = 0;
+        return -8;
+    }
+    const float* res = r->head ? llama_get_logits_ith(r->ctx, n - 1) : llama_get_embeddings(r->ctx);
+    if (!res) {
+        llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+        r->len[(size_t) seq] = 0;
+        return -9;
+    }
+    std::memcpy(out, res, want * sizeof(float));
+#ifndef __APPLE__
+    if (leaves && ggml_cuda_q8c_read_range(r->gpu, (uint32_t) pos0, (uint32_t) n, leaves, leaves_cap, ubatch, ubatch_cap) != 0) {
+        llama_memory_seq_rm(llama_get_memory(r->ctx), seq, -1, -1);
+        r->len[(size_t) seq] = 0;
+        return -10;
+    }
+#endif
+    r->len[(size_t) seq] += n;
+    if (r->head) r->sample_seq = seq;
+    return 0;
+}
+
+// Runs `n` tokens at positions [pos0, pos0+n) of sequence `seq` through the range. The first
+// range takes `tokens`, the others the residual `in` (n × n_hc floats). Writes the residual
+// (n × n_hc floats) or, for the head range, the last token's logits (n_vocab floats) to `out`.
+// 0 on success; a negative code leaves the sequence cleared.
+KERYX_EXPORT int keryx_range_step(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                  float* out, size_t out_floats) {
+    if (!r) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    return keryx_range_step_locked(r, seq, pos0, n, tokens, in, out, out_floats, nullptr, 0, nullptr, 0);
+}
+
+// keryx_range_step on a traced range, also copying the trace leaves (n × leaf count × 32 bytes) and
+// ubatch sizes of the step's positions. -10 when the trace fails.
+KERYX_EXPORT int keryx_range_step_traced(KeryxRange* r, int seq, int pos0, int n, const int32_t* tokens, const float* in,
+                                         float* out, size_t out_floats, uint8_t* leaves, size_t leaves_cap,
+                                         uint32_t* ubatch, size_t ubatch_cap) {
+    if (!r || !leaves || !ubatch) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    if (!r->traced) return -10;
+    return keryx_range_step_locked(r, seq, pos0, n, tokens, in, out, out_floats, leaves, leaves_cap, ubatch, ubatch_cap);
+}
+
+// Traces the range on its GPU for `manifest` (`max_pos` positions per sequence). 0 on success.
+KERYX_EXPORT int keryx_range_trace_configure(KeryxRange* r, const void* manifest, size_t manifest_len, int max_pos) {
+#ifndef __APPLE__
+    if (!r || !manifest || max_pos <= 0 || r->gpu < 0 || r->gpu >= 16) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    std::lock_guard<std::mutex> cl(keryx_range_cfg_mu);
+    std::string* cfg = keryx_range_cfg;
+    const std::string want = std::string((const char*) manifest, manifest_len) + std::to_string(max_pos);
+    int rc = 0;
+    if (cfg[r->gpu] != want) {
+        rc = ggml_cuda_q8c_configure(r->gpu, manifest, manifest_len, (uint32_t) max_pos);
+        cfg[r->gpu] = rc == 0 ? want : std::string();
+    }
+    r->traced = rc == 0;
+    if (rc != 0) keryx_set_error("range", "trace configuration failed (" + std::to_string(rc) + ")");
+    return rc;
+#else
+    (void) r; (void) manifest; (void) manifest_len; (void) max_pos;
+    keryx_set_error("range", "built without range traces");
+    return -1;
+#endif
+}
+
+// Leaves per traced position of the range, -1 when not traced.
+KERYX_EXPORT int keryx_range_trace_leaf_count(KeryxRange* r) {
+#ifndef __APPLE__
+    return r && r->traced ? ggml_cuda_q8c_leaf_count(r->gpu) : -1;
+#else
+    (void) r;
+    return -1;
+#endif
+}
+
+// Arms the capture of leaf `leaf[k]` at position `pos[k]` for the next traced steps.
+KERYX_EXPORT int keryx_range_arm_captures(KeryxRange* r, const uint32_t* pos, const uint32_t* leaf, uint32_t n,
+                                          uint32_t slot_bytes) {
+#ifndef __APPLE__
+    if (!r || !r->traced) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    return ggml_cuda_q8c_arm_captures(r->gpu, pos, leaf, n, slot_bytes);
+#else
+    (void) r; (void) pos; (void) leaf; (void) n; (void) slot_bytes;
+    return -1;
+#endif
+}
+
+// Copies the armed captures into `out + k * slot_bytes`, their lengths into `lens`.
+KERYX_EXPORT int keryx_range_read_captures(KeryxRange* r, uint8_t* out, size_t out_cap, uint32_t* lens, uint32_t n) {
+#ifndef __APPLE__
+    if (!r || !r->traced) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    return ggml_cuda_q8c_read_captures(r->gpu, out, out_cap, lens, n);
+#else
+    (void) r; (void) out; (void) out_cap; (void) lens; (void) n;
+    return -1;
+#endif
+}
+
+// Tokenizes `text` (`len` bytes) with the model's vocabulary, special tokens parsed. Returns the
+// token count, or minus the count needed when `cap` is too small.
+KERYX_EXPORT int keryx_range_tokenize(KeryxRange* r, const char* text, int len, int32_t* out, int cap) {
+    if (!r || !text || len < 0 || cap < 0 || (!out && cap > 0)) return INT32_MIN;
+    const llama_vocab* vocab = llama_model_get_vocab(r->model);
+    return llama_tokenize(vocab, text, len, out, cap, true, true);
+}
+
+// Clears the head range's sampling history (start of a new generation).
+KERYX_EXPORT void keryx_range_sampler_reset(KeryxRange* r) {
+    if (!r || !r->smpl) return;
+    std::lock_guard<std::mutex> lock(r->mu);
+    llama_sampler_reset(r->smpl);
+}
+
+// Samples the next token of `seq` from the logits its last head step left; -1 when there are none.
+KERYX_EXPORT int32_t keryx_range_sample(KeryxRange* r, int seq) {
+    if (!r || !r->smpl) return -1;
+    std::lock_guard<std::mutex> lock(r->mu);
+    if (r->sample_seq != seq || seq < 0) return -1;
+    r->sample_seq = -1;
+    return llama_sampler_sample(r->smpl, r->ctx, -1);
+}
+
+// Text of token `tok` into `buf`: its byte length, -2 for an end-of-generation token, -1 on error.
+KERYX_EXPORT int keryx_range_piece(KeryxRange* r, int32_t tok, char* buf, int cap) {
+    if (!r || !buf || cap <= 0) return -1;
+    const llama_vocab* vocab = llama_model_get_vocab(r->model);
+    if (tok < 0 || tok >= llama_vocab_n_tokens(vocab)) return -1;
+    if (llama_vocab_is_eog(vocab, tok)) return -2;
+    const int n = llama_token_to_piece(vocab, tok, buf, cap, 0, true);
+    return n < 0 ? -1 : n;
+}
+
+KERYX_EXPORT void keryx_range_free(KeryxRange* r) {
+    if (!r) return;
+    if (r->smpl) llama_sampler_free(r->smpl);
+    if (r->ctx) llama_free(r->ctx);
+    if (r->model) llama_model_free(r->model);
+    if (r->resident) ggml_backend_buffer_free(r->resident);
+    delete r;
+}
+
+#endif // __APPLE__
 
 } // extern "C"

@@ -1,0 +1,202 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 36e9bc168..5ce193e9f 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1272,7 +1272,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         // skip unused tensors
+         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+             const size_t nbytes = ggml_nbytes(t_meta);
+-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
++            if (!(flags & TENSOR_SKIP)) {
++                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
++            }
+ 
+             size_data -= nbytes;
+             n_created++;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 2c467a925..89083cfde 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3214,14 +3214,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+             {
+                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
+                 // tThe Nextn block is never attended by the trunk graph
+-                llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
+-                    return il < hparams.n_layer() && !hparams.is_recr(il);
++                // keryx: a layer range keeps the caches of its own layers only
++                const int32_t ka = keryx_il_start, kb = keryx_il_end;
++                auto in_range = [ka, kb](uint32_t il) { return ka < 0 || ((int32_t) il >= ka && (int32_t) il <= kb); };
++                llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&, in_range](uint32_t il) {
++                    return il < hparams.n_layer() && !hparams.is_recr(il) && in_range(il);
+                 };
+-                llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
+-                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
++                llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&, in_range](uint32_t il) {
++                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il) && in_range(il);
+                 };
+-                llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
+-                    return il < hparams.n_layer() && hparams.is_recr(il);
++                llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&, in_range](uint32_t il) {
++                    return il < hparams.n_layer() && hparams.is_recr(il) && in_range(il);
+                 };
+ 
+                 // the draft head is a single DSA layer
+diff --git a/src/llama-model.h b/src/llama-model.h
+index eae5c6848..4803651f4 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -897,6 +897,10 @@ struct llama_model {
+     struct ggml_tensor * hc_head_base  = nullptr;
+     struct ggml_tensor * hc_head_scale = nullptr;
+ 
++    // keryx: layer range this model runs, -1 = all
++    int32_t keryx_il_start = -1;
++    int32_t keryx_il_end   = -1;
++
+     // classifier
+     struct ggml_tensor * cls       = nullptr;
+     struct ggml_tensor * cls_b     = nullptr;
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 51a26df3d..d7a163cb4 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -1,6 +1,13 @@
+ #include "models.h"
+ #include "llama-memory-hybrid-idx.h"
+ 
++#include <stdexcept>
++
++extern "C" {
++extern thread_local int32_t keryx_llama_range_start;
++extern thread_local int32_t keryx_llama_range_end;
++}
++
+ // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
+ // mHC residual streams, DeepSeek-style MoE.
+ 
+@@ -56,6 +63,26 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
+         case 45: type = LLM_TYPE_320B_A18B; break; // GLM-5.3-Flash
+         default: type = LLM_TYPE_UNKNOWN;
+     }
++
++    // keryx: a layer range takes the hyper-connection residual in and/or hands it out
++    if (keryx_llama_range_start >= 0) {
++        const int32_t a = keryx_llama_range_start, b = keryx_llama_range_end;
++        if (a > b || b >= (int32_t) hparams.n_layer()) {
++            throw std::runtime_error("GLM5-Next layer range out of bounds");
++        }
++        if (a > 0 && !hparams.is_recr(a) && !hparams.is_indexer_full(a)) {
++            throw std::runtime_error("GLM5-Next layer range starts on a shared-selection layer");
++        }
++        keryx_il_start = a;
++        keryx_il_end   = b;
++        const uint32_t hc_dim = hparams.dsv4_hc_mult * hparams.n_embd;
++        if (a > 0) {
++            hparams.n_embd_inp_impl = hc_dim;
++        }
++        if (b < (int32_t) hparams.n_layer() - 1) {
++            hparams.n_embd_out_impl = hc_dim;
++        }
++    }
+ }
+ 
+ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
+@@ -68,16 +95,24 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    // keryx: outside the layer range, tensors are skipped
++    const bool ranged    = keryx_il_start >= 0;
++    const int  in_flags  = ranged && keryx_il_start > 0 ? TENSOR_SKIP : 0;
++    const int  out_flags = ranged && keryx_il_end < n_layer - 1 ? TENSOR_SKIP : 0;
+ 
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, in_flags);
++
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, out_flags);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, out_flags);
+ 
+     for (int i = 0; i < n_layer_all; ++i) {
+         auto & layer = layers[i];
+ 
+         const bool is_nextn = i >= n_layer;
+-        const int flags = is_nextn ? mtp_flags : trunk_flags;
++        int flags = is_nextn ? mtp_flags : trunk_flags;
++        if (ranged && (is_nextn || i < keryx_il_start || i > keryx_il_end)) {
++            flags |= TENSOR_SKIP;
++        }
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
+         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
+@@ -658,8 +693,25 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+ 
+     ggml_tensor * cur;
+ 
+-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+-    cb(inp, "inp_embd", -1);
++    const int64_t hc = hparams.dsv4_hc_mult;
++    // keryx: a layer range starts from a received residual and may stop before the output head
++    const int il_first = model.keryx_il_start >= 0 ? model.keryx_il_start : 0;
++    const int il_last  = model.keryx_il_start >= 0 ? model.keryx_il_end   : n_layer - 1;
++
++    ggml_tensor * inpL;
++    if (il_first > 0) {
++        auto inp = std::make_unique<llm_graph_input_embd>(n_embd*hc);
++        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd*hc, n_tokens);
++        cb(inp->embd, "inp_hc", -1);
++        ggml_set_input(inp->embd);
++        inpL = ggml_reshape_3d(ctx0, inp->embd, n_embd, hc, n_tokens);
++        res->add_input(std::move(inp));
++    } else {
++        ggml_tensor * inp = build_inp_embd(model.tok_embd);
++        cb(inp, "inp_embd", -1);
++        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
++        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++    }
+ 
+     // recurrent state + K-only MLA cache through the generic hybrid input, plus the indexer cache
+     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+@@ -669,8 +721,6 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+     auto * inp_attn  = inp_hyb->get_attn();
+     auto * inp_kpool = build_inp_kpool(mctx_hyb);
+ 
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+-
+     const int64_t n_head_kda   = hparams.n_head();
+     const int64_t head_dim     = hparams.n_embd_head_kda;
+     const int64_t d_conv       = hparams.ssm_d_conv;
+@@ -682,14 +732,11 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+     GGML_ASSERT(ubatch.equal_seqs());
+     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+ 
+-    const int64_t hc = hparams.dsv4_hc_mult;
+-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+     cb(inpL, "hc_init", -1);
+ 
+     ggml_tensor * prev_sel = nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = il_first; il <= il_last; ++il) {
+         const auto & layer = model.layers[il];
+ 
+         ggml_tensor * residual = inpL;
+@@ -758,6 +805,16 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+         cb(inpL, "l_out", il);
+     }
+ 
++    if (il_last < n_layer - 1) {
++        ggml_tensor * out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, inpL), n_embd*hc, inpL->ne[2]);
++        cb(out, "hc_out", -1);
++        res->t_embd = out;
++        ggml_build_forward_expand(gf, out);
++        return;
++    }
++
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
+     // narrow to the output tokens, then collapse the streams
+     // Unmasked nextn embeddings need all rows.
+     if (crop_before_nextn(inp_out_ids)) {

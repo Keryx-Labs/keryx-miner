@@ -1,8 +1,8 @@
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index eaf3f35..94e4e10 100644
+index 89083cfde..d1762516f 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -36,6 +36,104 @@
+@@ -55,6 +55,105 @@ thread_local const size_t *        keryx_llama_local_resident_nbytes = nullptr;
  #include <string>
  #include <vector>
  
@@ -104,19 +104,20 @@ index eaf3f35..94e4e10 100644
 +    return buf;
 +}
 +
++
  static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
      switch (arch) {
-         case LLM_ARCH_LLAMA:
-@@ -1570,7 +1668,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
-                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+         case LLM_ARCH_CLIP:
+@@ -2208,7 +2307,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                     }
                  }
-             } else {
--                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
-+                if (keryx_llama_canonical_weights && !ggml_backend_buft_is_host(buft)) {
-+                    buf = keryx_canonical_alloc(ml, ctx, buft); // keryx: canonical walk layout
-+                } else {
-+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
-+                }
+                 if (buf == nullptr) {
+-                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                    if (keryx_llama_canonical_weights && !ggml_backend_buft_is_host(buft)) {
++                        buf = keryx_canonical_alloc(ml, ctx, buft); // keryx: canonical walk layout
++                    } else {
++                        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                    }
+                 }
              }
              if (buf == nullptr) {
-                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

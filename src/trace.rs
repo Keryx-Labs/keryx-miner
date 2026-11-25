@@ -32,7 +32,7 @@ const SLOTS: usize = 6;
 /// Slot of each H18 tier; `None` = not traced. MUST follow the node's `TRACE_TIERS_H18`.
 const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [None, Some(5), None, None, None, None, None];
 
-/// Slot whose prefix, chain and sequence contexts a slot uses.
+/// Slot whose prefix and sequence contexts a slot uses.
 const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0];
 
 /// Trace slot of `model_id` serving `tier`; `None` = the tier is not traced.
@@ -192,12 +192,13 @@ const DEFAULT_INTERVAL: u32 = 48;
 
 /// Stage-2 chain context of each tier, with the prefix embedding and norm entries of its
 /// manifest. MUST equal the node's `TRACE_CHAINS_H15`.
-const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 5] = [
+const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; SLOTS] = [
     Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
     Some((ChainCtx { n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 361, 362)),
     Some((ChainCtx { n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 329, 330)),
     Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 497, 498)),
     Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
+    Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
 ];
 
 /// Entries of the stage-2 manifest of `slot` and its product count.
@@ -208,7 +209,7 @@ pub fn chain_manifest(slot: u8) -> Option<keryx_verifiable_inference::manifest::
 /// Stage-2 chain context of `slot`, and its prefix context on the stage-2 manifest.
 pub fn chain_ctx(slot: u8) -> Option<(ChainCtx, PrefixCtx)> {
     let tier = *CTX_SLOT.get(slot as usize)?;
-    let (ctx, embd, norm) = (*CHAIN_CTX.get(tier)?)?;
+    let (ctx, embd, norm) = (*CHAIN_CTX.get(slot as usize)?)?;
     let prefix = PREFIXES.get(tier)?.clone().map(|p| PrefixCtx { embd_entry: embd, norm_entry: norm, ..p });
     let prefix = match (tier, prefix) {
         (_, Some(p)) => p,
@@ -1350,13 +1351,13 @@ mod tests {
         }
         let hex = |m: &TierManifest| hex::encode(m.m_t);
         let p = TierManifest::for_tier(5).unwrap();
-        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("8047cc475c0273252a4c07b1fa438487ee20aad3c13a5e99f4b385becb2cf52d", 251, 249));
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("e29254c3e05d3d8c787c44a85068abcebf5f8cf6d0b33d502c63533091269416", 251, 249));
         let c = TierManifest::for_chain(5).unwrap();
-        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("07b6944852d310a631d574a3adb39e915b47de8d01896627690be62a9af92137", 347, 249));
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("720302d1f880fcee19769a49e17dadd9e25f79c251eec5f9017e769fea447b8b", 347, 249));
         let a = TierManifest::for_attn(5).unwrap();
-        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("fb02fbaca5d528f6d320430937a960ec752c0723c45e7c273d9800f0876c05e2", 459, 249));
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("8d1ad34370b2754bc1142d6b6082e8434faa6419d8c82969d79eb611984cd4b0", 459, 249));
         let ac = a.chain.unwrap();
-        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.n_attn, ac.n_recur, ac.seq_heads), (32, 315, 249, 8, 24, 32));
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.trim_last, ac.n_attn, ac.n_recur, ac.seq_heads), (32, 315, 249, true, 8, 24, 32));
         let (_, pctx) = chain_ctx(5).unwrap();
         assert_eq!((c.entries[pctx.embd_entry as usize].0.role, c.entries[pctx.norm_entry as usize].0.role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
         assert_eq!(c.entries[c.chain.unwrap().layer_base as usize].0.role, manifest::ROLE_LAYER);

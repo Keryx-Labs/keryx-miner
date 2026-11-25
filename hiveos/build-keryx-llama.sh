@@ -10,12 +10,12 @@
 #   pascal: /tmp/cuda124 (12.4), archs 60;61
 # Output: hiveos/dist-<line>/libkeryx-llama.so  (package-line.sh bundles it when present)
 #
-# llama.cpp PINNED to b10015 — the SAME pin as build-llama-server.sh and the byte-identity
+# llama.cpp PINNED to b12651 — the SAME pin as build-llama-server.sh and the byte-identity
 # proof in tools/llama_zerodup_spike. Bump all together, then re-verify the spike.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINE="$1"; JOBS="${2:-16}"
-TAG=b10015
+TAG=b12651
 case "$LINE" in
   modern) ARCHS="75;80;86;89;90;120"; CUDAMOUNT=(); KCUDA=/usr/local/cuda ;;
   legacy) ARCHS="70;75;80;86;89;90";  CUDAMOUNT=(-v /tmp/cuda124:/opt/cuda:ro); KCUDA=/opt/cuda ;;
@@ -58,7 +58,7 @@ docker run --rm --network host \
       -DLLAMA_CURL=OFF -DGGML_NATIVE=OFF $CPUFLAGS -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FORCE_MMQ=ON -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_CUDA_COMPILER=$KCUDA/bin/nvcc
     /tmp/cmk/bin/cmake --build $B --target llama -j "$JOBS"
-    g++ -O2 -std=c++17 $WRAPFLAGS -shared -fPIC -fopenmp /repo/tools/keryx-llama/keryx_llama.cpp \
+    g++ -O2 -std=c++17 $WRAPFLAGS -shared -fPIC -fopenmp -Wno-deprecated-declarations /repo/tools/keryx-llama/keryx_llama.cpp \
       -I /llama/include -I /llama/ggml/include -I /llama/src -I /llama/common \
       -I $KCUDA/include \
       -Wl,--start-group $B/src/libllama.a $B/ggml/src/ggml-cuda/libggml-cuda.a \

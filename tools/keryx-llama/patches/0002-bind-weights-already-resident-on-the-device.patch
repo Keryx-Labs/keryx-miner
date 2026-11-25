@@ -1,0 +1,107 @@
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 808fb44d8..36e9bc168 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1793,6 +1793,11 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        if (cur->buffer && resident_bufs.count(cur->buffer)) {
++            size_done += n_size;
++            continue;
++        }
++
+         const bool from_mapping = use_mmap || lazy.has(cur);
+ 
+         if (from_mapping) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079a4..2dafc74b0 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -15,6 +15,7 @@
+ #include <set>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ // lists of buffer types used for each layer
+ using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+@@ -77,6 +78,8 @@ struct llama_model_loader {
+     size_t   n_bytes    = 0;
+ 
+     bool use_mmap = false;
++    // keryx: buffers bound to weights already resident on the device, never loaded
++    std::unordered_set<ggml_backend_buffer_t> resident_bufs;
+     bool use_direct_io = false;
+     bool check_tensors;
+     bool no_alloc;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 06eb7c929..2c467a925 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -27,6 +27,21 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <string>
++#include <unordered_map>
++
++extern "C" {
++// keryx: layer range to load and run, -1 = the whole model
++thread_local int32_t keryx_llama_range_start = -1;
++thread_local int32_t keryx_llama_range_end   = -1;
++
++// keryx: weights already resident on the device, bound by name instead of loaded
++thread_local ggml_backend_buffer_t keryx_llama_local_resident_buf    = nullptr;
++thread_local size_t                keryx_llama_local_resident_n      = 0;
++thread_local const char * const *  keryx_llama_local_resident_names  = nullptr;
++thread_local void * const *        keryx_llama_local_resident_datas  = nullptr;
++thread_local const size_t *        keryx_llama_local_resident_nbytes = nullptr;
++}
+ #include <cfloat>
+ #include <cstdint>
+ #include <cstring>
+@@ -2159,7 +2174,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                 }
+             } else {
+-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                buf = nullptr;
++                // keryx: tensors already resident on this device are bound in place, the rest allocated
++                if (keryx_llama_local_resident_buf && ggml_backend_buffer_get_type(keryx_llama_local_resident_buf) == buft) {
++                    std::unordered_map<std::string, std::pair<void *, size_t>> resident;
++                    for (size_t i = 0; i < keryx_llama_local_resident_n; i++) {
++                        resident.emplace(keryx_llama_local_resident_names[i],
++                            std::make_pair(keryx_llama_local_resident_datas[i], keryx_llama_local_resident_nbytes[i]));
++                    }
++                    ggml_backend_buffer_t view = ggml_backend_buffer_borrow(keryx_llama_local_resident_buf);
++                    size_t bound = 0;
++                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++                        auto it = resident.find(ggml_get_name(t));
++                        if (it != resident.end() && it->second.second == ggml_nbytes(t)) {
++                            t->buffer = view;
++                            t->data   = it->second.first;
++                            bound++;
++                        }
++                    }
++                    if (bound == 0) {
++                        ggml_backend_buffer_free(view);
++                    } else {
++                        ml.resident_bufs.insert(view);
++                        ggml_backend_buffer_t rest = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
++                        if (rest == nullptr) {
++                            buf = view;
++                        } else {
++                            ggml_backend_buffer_set_usage(view, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                            bufs.emplace_back(view);
++                            buf = rest;
++                        }
++                        LLAMA_LOG_INFO("%s: keryx: %zu tensors bound to resident weights\n", __func__, bound);
++                    }
++                }
++                if (buf == nullptr) {
++                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                }
+             }
+             if (buf == nullptr) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));

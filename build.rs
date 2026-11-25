@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // In-process llama.cpp engine: build `libkeryx-llama.so` next to the miner binary.
-    // llama.cpp is PINNED to b10015 — the SAME pin as hiveos/build-keryx-llama.sh and the
+    // llama.cpp is PINNED to b12651 — the SAME pin as hiveos/build-keryx-llama.sh and the
     // byte-identity proof in tools/llama_zerodup_spike. Bump all together, then re-verify.
     println!("cargo:rerun-if-changed=tools/keryx-llama/keryx_llama.cpp");
     println!("cargo:rerun-if-changed=tools/keryx-llama/patches");
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const LLAMA_TAG: &str = "b10015";
+const LLAMA_TAG: &str = "b12651";
 const LLAMA_ESCAPE_HINT: &str = "set KERYX_LLAMA_SKIP=1 to build the miner without it (a prebuilt libkeryx-llama.so must then be placed next to the binary)";
 
 /// Builds `libkeryx-llama.so` into the cargo profile dir (next to the miner binary):
@@ -140,7 +140,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
-    apply_llama_patches(&src)?;
+    apply_llama_patches(&src, "tools/keryx-llama/patches")?;
 
     let build_dir = target_root.join(format!("llama-build-{LLAMA_TAG}"));
     // Reconfigure from scratch when the cache was written at another path (raw or canonical).
@@ -229,7 +229,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .arg(lib("ggml/src/Release/ggml-cpu.lib"))
                 .arg(lib("ggml/src/Release/ggml.lib"))
                 .arg(lib("ggml/src/Release/ggml-base.lib"))
-                .args(["-lcublas", "-lcublasLt", "-lcuda"])
+                .args(["-lcublas", "-lcublasLt", "-lcuda", "-lws2_32"])
                 .arg("-o").arg(&dll),
         )?;
         return Ok(());
@@ -243,7 +243,7 @@ fn build_keryx_llama(nvcc: &str) -> Result<(), Box<dyn std::error::Error>> {
         std::process::Command::new("g++")
             // -march=nehalem: same no-AVX/no-BMI baseline as the static libs (WRAPFLAGS in
             // hiveos/build-keryx-llama.sh) so the wrapper itself cannot SIGILL pre-Haswell.
-            .args(["-O2", "-std=c++17", "-march=nehalem", "-shared", "-fPIC", "-fopenmp", "tools/keryx-llama/keryx_llama.cpp"])
+            .args(["-O2", "-std=c++17", "-march=nehalem", "-shared", "-fPIC", "-fopenmp", "-Wno-deprecated-declarations", "tools/keryx-llama/keryx_llama.cpp"])
             .arg("-I").arg(src.join("include"))
             .arg("-I").arg(src.join("ggml/include"))
             .arg("-I").arg(src.join("src"))
@@ -299,9 +299,9 @@ fn cuda_home_from_nvcc(nvcc: &str) -> Result<std::path::PathBuf, Box<dyn std::er
 
 /// Applies `tools/keryx-llama/patches/*.patch` to the llama.cpp checkout, in name order, from a
 /// pristine tree whenever the patch set changes.
-fn apply_llama_patches(src: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn apply_llama_patches(src: &std::path::Path, patch_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Absolute without canonicalize: the `\\?\` form it yields on Windows is not a path git can open.
-    let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join("tools/keryx-llama/patches");
+    let dir = std::path::PathBuf::from(env::var("CARGO_MANIFEST_DIR")?).join(patch_dir);
     let mut patches: Vec<_> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "patch").unwrap_or(false))

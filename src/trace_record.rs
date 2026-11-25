@@ -26,11 +26,14 @@ pub struct RecordHeader {
 pub fn patch_set_hash() -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     for p in [
-        &include_bytes!("../tools/keryx-llama/patches/0001-canonical-trace.patch")[..],
-        &include_bytes!("../tools/keryx-llama/patches/0002-sequence-leaves.patch")[..],
-        &include_bytes!("../tools/keryx-llama/patches/0003-fattn-tile-f32.patch")[..],
-        &include_bytes!("../tools/keryx-llama/patches/0004-rope-f64-angle.patch")[..],
-        &include_bytes!("../tools/keryx-llama/patches/0005-attn-lse-capture.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0001-borrowed-buffers-and-foreign-device-memory.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0002-bind-weights-already-resident-on-the-device.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0003-glm5-next-layer-range.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0004-canonical-trace-of-the-manifest-products.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0005-canonical-float-weight-products.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0006-sequence-leaves.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0007-canonical-attention-rope-angle-and-attention-lse.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0008-canonical-weight-layout.patch")[..],
     ] {
         h.update(&(p.len() as u64).to_le_bytes());
         h.update(p);
