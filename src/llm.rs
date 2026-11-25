@@ -1194,6 +1194,9 @@ fn open_selection(
     use crate::trace_seq::{draw_sel, sel_opening, seq_response_ctx};
     let rec = &trace.record;
     let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    if m.chain.is_some_and(|c| c.n_comp > 0) {
+        return open_comp_sel(gguf, dev_id, m, trace, seed, response_txid, index);
+    }
     let d = draw_sel(m, rec, seed).ok_or("no selection draw")?;
     let mut caps = crate::trace::Captures::new();
     if let Some(t) = d.t {
@@ -1204,6 +1207,40 @@ fn open_selection(
     let op = sel_opening(m, rec, seq, index, &d, seed, &caps, response_txid)?;
     let ctx = m.chain.ok_or("no stage-2 context")?;
     keryx_verifiable_inference::dsa::verify_sel_point(&m.tier_ctx(index), &ctx, &seq_response_ctx(rec, seq), seed, &op)
+        .map_err(|e| format!("selection point {e:?} at layer {}, position {:?}", d.layer, d.t))?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("selection opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
+}
+
+/// The two-level selection opening of the draw of `seed`, checked as the node checks it.
+fn open_comp_sel(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+) -> Result<Vec<u8>, String> {
+    use crate::trace_dsv41::{comp_sel_opening, draw_comp_sel};
+    let rec = &trace.record;
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let d = draw_comp_sel(m, rec, seed).ok_or("no selection draw")?;
+    let caps = replay_captures_all(gguf, dev_id, m, trace, &d.captures())?;
+    let spans = match d.t {
+        Some(t) => {
+            let sel = caps.get(&(t as u32, d.sel_leaf)).ok_or("no selection capture")?;
+            let plans = d.spans(m, rec.n_pos as u64, seed, sel).ok_or("selection out of shape")?;
+            if plans.is_empty() { Vec::new() } else { replay_spans(gguf, dev_id, trace, &plans)? }
+        }
+        None => Vec::new(),
+    };
+    let op = comp_sel_opening(m, rec, seq, &d, seed, &caps, &spans, response_txid)?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    keryx_verifiable_inference::dsv41::verify_comp_sel_point(&m.tier_ctx(index), &ctx, &crate::trace_seq::seq_response_ctx(rec, seq), seed, &op)
         .map_err(|e| format!("selection point {e:?} at layer {}, position {:?}", d.layer, d.t))?;
     let body = op.encode();
     if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
