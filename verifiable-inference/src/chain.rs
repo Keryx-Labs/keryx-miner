@@ -1579,6 +1579,9 @@ fn attn_site(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op
         Chain::Layer(ll) if le.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => (ll, ll.attn.ok_or(Fail::Shape)?),
         _ => return Err(Fail::Manifest),
     };
+    if ll.comp.is_some() {
+        return Err(Fail::Shape);
+    }
     if a.slot as u64 != slot {
         return Err(Fail::Manifest);
     }
@@ -1993,7 +1996,7 @@ fn dequant_head(row: &[u8], hd: usize) -> Result<Vec<f32>, Fail> {
 /// Root of position `p` reached by the first of `chunks` of the f32 leaf `leaf`, checked against
 /// the position tree.
 #[allow(clippy::too_many_arguments)]
-fn anchor_root(pos_root: &Hash, n_pos: u64, p: u64, shape: &PosShape, leaf: u64, chunks: &[LeafChunk], total: u64, path: &[Hash]) -> Result<Hash, Fail> {
+pub(crate) fn anchor_root(pos_root: &Hash, n_pos: u64, p: u64, shape: &PosShape, leaf: u64, chunks: &[LeafChunk], total: u64, path: &[Hash]) -> Result<Hash, Fail> {
     let c = chunks.first().ok_or(Fail::Shape)?;
     let h = chunk_leaf(c, total, c.index as u64)?;
     let root = b3_fold(shape.n_leaves, leaf, &h, &c.leaf_path).ok_or(Fail::Trace)?;
@@ -2001,7 +2004,7 @@ fn anchor_root(pos_root: &Hash, n_pos: u64, p: u64, shape: &PosShape, leaf: u64,
 }
 
 /// Values `[lo, lo + n)` of the f32 leaf `leaf` at the position of `root`, from its opened chunks.
-fn head_from_chunks(root: &Hash, shape: &PosShape, leaf: u64, chunks: &[LeafChunk], total: u64, lo: usize, n: usize) -> Result<Vec<f32>, Fail> {
+pub(crate) fn head_from_chunks(root: &Hash, shape: &PosShape, leaf: u64, chunks: &[LeafChunk], total: u64, lo: usize, n: usize) -> Result<Vec<f32>, Fail> {
     let mut out = vec![0f32; n];
     let mut covered = vec![false; n];
     for c in chunks {

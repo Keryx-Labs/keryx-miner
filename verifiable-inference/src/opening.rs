@@ -25,6 +25,8 @@ pub const VERSION_DECISION: u8 = 9;
 pub const VERSION_SEL: u8 = 10;
 /// Compressed row opening of a response, sent apart from its trace opening.
 pub const VERSION_COMP: u8 = 11;
+/// Attention opening of a compressed attention layer, sent as the attention piece.
+pub const VERSION_ATTN_COMP: u8 = 12;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -934,13 +936,14 @@ pub fn inner_body(body: &[u8]) -> Option<Vec<u8>> {
 
 /// Path of an attention opening body, seeded or not; `None` for another body.
 pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
-    inner_body(body).as_deref().and_then(AttnOpening::decode).map(|o| o.path)
+    let b = inner_body(body)?;
+    AttnOpening::decode(&b).map(|o| o.path).or_else(|| CompAttnOpening::decode(&b).map(|o| o.path))
 }
 
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL | VERSION_COMP) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -1554,5 +1557,126 @@ impl CompOpeningPoint {
         let nm = r.u8()? as usize;
         let members = (0..nm).map(|_| Some(SelMember { pos_path: r.hashes()?, k: r.leaf_bytes()?, g: r.leaf_bytes()? })).collect::<Option<Vec<_>>>()?;
         (r.o == b.len()).then_some(CompOpeningPoint { response_txid, pos_root, seq_root, layer, entries, weights, row, members })
+    }
+}
+
+/// Phase of the attention point of a compressed attention layer: keys are the window of the
+/// layer's own cache, then the compressed rows the selection keeps. Query fields at the root and
+/// leaf phases, output, sink and mass at the root, rows and an anchor of the window at a leaf.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompAttnOpening {
+    pub response_txid: Hash,
+    pub pos_root: Hash,
+    pub seq_root: Hash,
+    pub layer: EntryOpening,
+    pub q_entry: EntryOpening,
+    pub q: Vec<LeafChunk>,
+    pub pos_path: Vec<Hash>,
+    pub o_entry: EntryOpening,
+    pub out: LeafBytes,
+    pub sinks: (EntryOpening, ChunkRange),
+    pub lse: crate::seq::SeqSpan,
+    pub sel: Option<SelOpening>,
+    pub path: Vec<u64>,
+    pub parent: Vec<u8>,
+    pub parent_path: Vec<Hash>,
+    pub partials: Vec<u8>,
+    pub window: crate::seq::SeqSpan,
+    pub comp: Vec<crate::seq::SeqSpan>,
+    pub anchor_pos_path: Vec<Hash>,
+    pub anchor_k: Vec<LeafChunk>,
+    pub norms: Vec<(EntryOpening, ChunkRange)>,
+}
+
+impl CompAttnOpening {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_ATTN_COMP);
+        w.0.extend_from_slice(&self.response_txid);
+        w.0.extend_from_slice(&self.pos_root);
+        w.0.extend_from_slice(&self.seq_root);
+        w.entry(&self.layer);
+        w.entry(&self.q_entry);
+        w.u8(self.q.len() as u8);
+        for c in &self.q {
+            w.leaf_chunk(c);
+        }
+        w.hashes(&self.pos_path);
+        w.entry(&self.o_entry);
+        w.leaf_bytes(&self.out);
+        w.weights(&self.sinks);
+        w.seq_span(&self.lse);
+        match &self.sel {
+            Some(s) => {
+                w.u8(1);
+                w.bytes32(&s.bytes);
+                w.hashes(&s.leaf_path);
+                w.hashes(&s.pos_path);
+            }
+            None => w.u8(0),
+        }
+        w.u8(self.path.len() as u8);
+        for c in &self.path {
+            w.u64(*c);
+        }
+        w.bytes32(&self.parent);
+        w.hashes(&self.parent_path);
+        w.bytes32(&self.partials);
+        w.seq_span(&self.window);
+        w.u16(self.comp.len() as u16);
+        for s in &self.comp {
+            w.seq_span(s);
+        }
+        w.hashes(&self.anchor_pos_path);
+        w.u8(self.anchor_k.len() as u8);
+        for c in &self.anchor_k {
+            w.leaf_chunk(c);
+        }
+        w.u8(self.norms.len() as u8);
+        for n in &self.norms {
+            w.weights(n);
+        }
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<CompAttnOpening> {
+        if b.first() != Some(&VERSION_ATTN_COMP) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let pos_root: Hash = r.take(32)?.try_into().ok()?;
+        let seq_root: Hash = r.take(32)?.try_into().ok()?;
+        let layer = r.entry()?;
+        let q_entry = r.entry()?;
+        let nq = r.u8()? as usize;
+        let q = (0..nq).map(|_| r.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+        let pos_path = r.hashes()?;
+        let o_entry = r.entry()?;
+        let out = r.leaf_bytes()?;
+        let sinks = r.weights()?;
+        let lse = r.seq_span()?;
+        let sel = match r.u8()? {
+            0 => None,
+            1 => Some(SelOpening { bytes: r.bytes32()?, leaf_path: r.hashes()?, pos_path: r.hashes()? }),
+            _ => return None,
+        };
+        let np = r.u8()? as usize;
+        let path = (0..np).map(|_| r.u64()).collect::<Option<Vec<_>>>()?;
+        let parent = r.bytes32()?;
+        let parent_path = r.hashes()?;
+        let partials = r.bytes32()?;
+        let window = r.seq_span()?;
+        let nc = r.u16()? as usize;
+        let comp = (0..nc).map(|_| r.seq_span()).collect::<Option<Vec<_>>>()?;
+        let anchor_pos_path = r.hashes()?;
+        let na = r.u8()? as usize;
+        let anchor_k = (0..na).map(|_| r.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+        let nn = r.u8()? as usize;
+        let norms = (0..nn).map(|_| r.weights()).collect::<Option<Vec<_>>>()?;
+        (r.o == b.len()).then_some(CompAttnOpening {
+            response_txid, pos_root, seq_root, layer, q_entry, q, pos_path, o_entry, out, sinks, lse, sel, path, parent, parent_path, partials,
+            window, comp, anchor_pos_path, anchor_k, norms,
+        })
     }
 }
