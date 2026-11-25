@@ -491,7 +491,7 @@ impl TierManifest {
     /// then the meta leaf.
     pub fn n_leaves(&self) -> usize {
         match &self.chain {
-            Some(c) => chain::n_pos_leaves(self.n_products as u64, c.n_layers as u64, if c.n_used > 0 { c.n_layers as u64 } else { 0 }) as usize,
+            Some(c) => (chain::n_pos_leaves(self.n_products as u64, c.n_layers as u64, if c.n_used > 0 { c.n_layers as u64 } else { 0 }) + c.n_sel as u64 + c.n_engram as u64) as usize,
             None => 2 * self.n_products as usize + 1,
         }
     }
@@ -1523,6 +1523,17 @@ pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A position of the tier-5 attention manifest holds its selection leaves before the meta
+    /// leaf, as many as the engine writes.
+    #[test]
+    fn selection_leaves_count_in_the_position_shape() {
+        let m = TierManifest::for_attn(10).unwrap();
+        let c = m.chain.unwrap();
+        assert_eq!(c.n_sel, 11);
+        assert_eq!(m.n_leaves(), 1683);
+        assert_eq!(m.n_leaves() as u64, chain::n_pos_leaves(m.n_products as u64, c.n_layers as u64, chain::n_router(&c)) + c.n_sel as u64);
+    }
 
     /// The sequence streams of a deepseek41 manifest (`VI_DSV41_MANIFEST`): a key-only window per
     /// layer and one compressed row stream per source layer, as many as the node lays out.
