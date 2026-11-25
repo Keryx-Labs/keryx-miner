@@ -71,7 +71,8 @@ pub fn meta_leaf(n_products: u64, n_layers: u64, n_router: u64) -> u64 {
     2 * n_products + 2 * n_layers + n_router
 }
 
-pub(crate) fn n_router(ctx: &ChainCtx) -> u64 {
+/// Router leaves of a position.
+pub fn n_router(ctx: &ChainCtx) -> u64 {
     if ctx.n_used > 0 { ctx.n_layers as u64 } else { 0 }
 }
 

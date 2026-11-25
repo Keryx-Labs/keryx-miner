@@ -2537,7 +2537,7 @@ impl KeryxdHandler {
             let (Some(txid_bytes), Some(block_bytes)) = (hash32(txid), hash32(block)) else { continue };
             let phase = a.path.len();
             let Some(slot) = keryx_miner::trace::slot(&p.model_id, p.tier) else { continue };
-            let Some(n) = keryx_miner::trace_seq::attn_children(slot, &p.trace.record, &d.seed, &a.path) else { continue };
+            let Some(n) = keryx_miner::trace_seq::attn_children(slot, &p.trace.record, &d.seed, &a.path, a.bodies.last().map(Vec::as_slice)) else { continue };
             let Some(weights) = a.bodies.last().and_then(|b| keryx_miner::trace_seq::attn_child_weights(slot, &p.trace.record, &d.seed, b)).filter(|w| w.len() as u64 == n) else {
                 warn!("Trace: response {} — no draw weights for attention phase {}", txid, phase + 1);
                 continue;

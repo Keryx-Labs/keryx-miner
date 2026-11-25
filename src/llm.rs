@@ -399,6 +399,10 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
                 SYSTEM_PROMPT_NEXT, prompt
             ),
         ),
+        "glm-5.3-flash" => (
+            "[gMASK]<sop><|system|>Reasoning Effort: Low<|system|>Request id:".to_string(),
+            format!("\n{}<|user|>{}<|assistant|><think></think>", SYSTEM_PROMPT_NEXT, prompt),
+        ),
         "gemma-4-12b-abliterated" | "gemma-4-31b" => (
             "<|turn>system\nRequest id:".to_string(),
             format!(
@@ -1060,11 +1064,16 @@ fn open_attention(
     prev: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     use crate::trace_seq::{attn_opening, draw_attn, seq_response_ctx};
-    use keryx_verifiable_inference::attn_blocks::{encode_partials, partials_root, pick_partials};
+    use keryx_verifiable_inference::attn_blocks::{encode_partials, partials_root, pick_partials, pick_pruned_partials, PrunedTree};
     use keryx_verifiable_inference::chain::{attn_query, verify_attn_phase};
     let rec = &trace.record;
     let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
-    let d = draw_attn(m, rec, seed).ok_or("no attention draw")?;
+    let mut d = draw_attn(m, rec, seed).ok_or("no attention draw")?;
+    if let Some((dsa, leaf)) = d.dsa {
+        let sel = replay_captures(gguf, dev_id, m, trace, &[(d.t as u32, leaf)])?;
+        let bytes = sel.get(&(d.t as u32, leaf)).ok_or("no selection capture")?;
+        d.keep = Some(keryx_verifiable_inference::chain::dsa_attended(&dsa, d.t, bytes).ok_or("selection out of shape")?);
+    }
     let caps = replay_captures(gguf, dev_id, m, trace, &d.captures(path).ok_or("no attention captures")?)?;
     let plans = d.spans(m, rec.n_pos as u64, path).ok_or("no attention spans")?;
     let spans = replay_spans(gguf, dev_id, trace, &plans)?;
@@ -1078,9 +1087,13 @@ fn open_attention(
     } else {
         let (q, scale) = attn_query(&tier, &ctx, &resp, seed, &full).map_err(|e| format!("attention query {e:?}"))?;
         let (keys, values) = d.rows(&full, path).ok_or("no cache rows")?;
-        let p0 = d.tree.node(path).ok_or("no node")?.0;
-        let partials = pick_partials(&q, scale, &keys, &values, p0, &d.tree, path, |p| verify(&d.phase_fields(&full, path, encode_partials(p))).is_ok())
-            .ok_or_else(|| format!("no partials verify at layer {}, position {}, path {path:?}", d.layer, d.t))?;
+        let p0 = d.node(path).ok_or("no node")?.0;
+        let check = |p: &[keryx_verifiable_inference::attn::Partial]| verify(&d.phase_fields(&full, path, encode_partials(p))).is_ok();
+        let partials = match &d.keep {
+            Some(k) => pick_pruned_partials(&q, scale, &keys, &values, p0, &PrunedTree { tree: d.tree, keep: k }, path, check),
+            None => pick_partials(&q, scale, &keys, &values, p0, &d.tree, path, check),
+        }
+        .ok_or_else(|| format!("no partials verify at layer {}, position {}, path {path:?}", d.layer, d.t))?;
         d.phase_fields(&full, path, partials)
     };
     verify(&op).map_err(|e| format!("attention phase {e:?} at layer {}, position {}, path {path:?}", d.layer, d.t))?;
@@ -1146,11 +1159,54 @@ fn open_pieces(
             bodies.push(open_recurrent(gguf, dev_id, m, trace, seed, response_txid, index)?);
         }
     }
+    if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_sel > 0) {
+        bodies.push(open_selection(gguf, dev_id, m, trace, seed, response_txid, index)?);
+    }
     if let Some(d) = decision {
         bodies.push(open_decision(gguf, dev_id, m, trace, &d, seed, response_txid)?);
     }
     bodies.push(resid);
     Ok(bodies)
+}
+
+/// Replays `wanted` in as many replays as the capture limit takes.
+fn replay_captures_all(gguf: &str, dev_id: u32, m: &crate::trace::TierManifest, trace: &crate::trace::ResponseTrace, wanted: &[(u32, u32)]) -> Result<crate::trace::Captures, String> {
+    let mut caps = crate::trace::Captures::new();
+    for group in wanted.chunks(crate::llama_engine::REPLAY_MAX_CAPTURES) {
+        caps.extend(replay_captures(gguf, dev_id, m, trace, group)?);
+    }
+    Ok(caps)
+}
+
+/// The selection opening of the draw of `seed`, checked as the node checks it.
+fn open_selection(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+) -> Result<Vec<u8>, String> {
+    use crate::trace_seq::{draw_sel, sel_opening, seq_response_ctx};
+    let rec = &trace.record;
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let d = draw_sel(m, rec, seed).ok_or("no selection draw")?;
+    let mut caps = crate::trace::Captures::new();
+    if let Some(t) = d.t {
+        caps = replay_captures_all(gguf, dev_id, m, trace, &d.head_captures())?;
+        let sel = caps.get(&(t as u32, d.sel_leaf)).ok_or("no selection capture")?.clone();
+        caps.extend(replay_captures_all(gguf, dev_id, m, trace, &d.member_captures(seed, &sel).ok_or("selection out of shape")?)?);
+    }
+    let op = sel_opening(m, rec, seq, index, &d, seed, &caps, response_txid)?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    keryx_verifiable_inference::dsa::verify_sel_point(&m.tier_ctx(index), &ctx, &seq_response_ctx(rec, seq), seed, &op)
+        .map_err(|e| format!("selection point {e:?} at layer {}, position {:?}", d.layer, d.t))?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("selection opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
 }
 
 /// Replays the head outputs of a decision response and builds its decision opening.

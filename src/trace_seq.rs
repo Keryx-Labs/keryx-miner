@@ -3,12 +3,12 @@
 use crate::llama_engine::SeqCapture;
 use crate::pom::WeightIndex;
 use crate::trace::{bytes_range, leaf_bytes, leaf_chunk, Captures, SeqTrace, TierManifest, TraceRecord};
-use keryx_verifiable_inference::attn_blocks::{block_params, partial_len, partial_opening, BlockTree};
+use keryx_verifiable_inference::attn_blocks::{block_params, partial_len, partial_opening, BlockTree, PrunedTree};
 use keryx_verifiable_inference::chain::{self, ATTN_POINT};
 use keryx_verifiable_inference::draw;
-use keryx_verifiable_inference::manifest::{self, AttnLinks, Chain, LayerLinks, RecurLinks};
+use keryx_verifiable_inference::manifest::{self, AttnLinks, Chain, DsaLinks, LayerLinks, RecurLinks};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_range_proof, b3_root, Hash, B3_CHUNK};
-use keryx_verifiable_inference::opening::{AttnOpening, LeafChunk, RecurOpening, RecurTap};
+use keryx_verifiable_inference::opening::{AttnOpening, LeafChunk, RecurOpening, RecurTap, SelOpening};
 use keryx_verifiable_inference::quant::{dequant_row, Q8_0};
 use keryx_verifiable_inference::recur::{RECUR_POINT, RECUR_ROWS};
 use keryx_verifiable_inference::seq::{self, SeqSpan};
@@ -98,7 +98,7 @@ fn find_layer<T>(m: &TierManifest, pick: impl Fn(&LayerLinks) -> Option<T>) -> O
 pub type Rows = Vec<Vec<f32>>;
 
 /// What the attention point of a seed opens.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct AttnDraw {
     pub layer: u64,
     pub slot: u64,
@@ -114,6 +114,10 @@ pub struct AttnDraw {
     anchor_draw: u64,
     pub links: AttnLinks,
     pub proj: u32,
+    /// Sparse attention of the layer, its selection leaf, and the attended positions once the
+    /// selection is known.
+    pub dsa: Option<(DsaLinks, u32)>,
+    pub keep: Option<Vec<bool>>,
 }
 
 /// The attention point of `seed`, drawn as the node draws it.
@@ -140,10 +144,45 @@ pub fn draw_attn(m: &TierManifest, rec: &TraceRecord, seed: &Hash) -> Option<Att
     let (c, b) = block_params(row, partial_len(dv))?;
     let tree = BlockTree::new(start, t + 1, c, b)?;
     let proj = if mla && a.out != manifest::NONE { a.out } else { ll.proj };
-    Some(AttnDraw { layer, slot, t, head, qh, start, tree, dv, anchor_draw: d[3], links: a, proj })
+    let dsa = ll.dsa.map(|x| (x, chain::sel_leaf(m.n_products as u64, ctx.n_layers as u64, chain::n_router(&ctx), x.sel as u64) as u32));
+    Some(AttnDraw { layer, slot, t, head, qh, start, tree, dv, anchor_draw: d[3], links: a, proj, dsa, keep: None })
+}
+
+/// The attention point of `seed` with the selection its layer attends, read from `sel` (the
+/// selection leaf at the drawn position) on a sparse attention layer.
+pub fn draw_attn_sel(m: &TierManifest, rec: &TraceRecord, seed: &Hash, sel: Option<&[u8]>) -> Option<AttnDraw> {
+    let mut d = draw_attn(m, rec, seed)?;
+    if let Some((dsa, _)) = d.dsa {
+        d.keep = Some(chain::dsa_attended(&dsa, d.t, sel?)?);
+    }
+    Some(d)
+}
+
+/// The selection leaf an attention opening body carries.
+pub fn body_sel(body: &[u8]) -> Option<Vec<u8>> {
+    let op = keryx_verifiable_inference::opening::inner_body(body).as_deref().and_then(AttnOpening::decode)?;
+    op.sel.map(|s| s.bytes)
 }
 
 impl AttnDraw {
+    /// Positions of the node of `path`, over the children kept on a sparse attention layer.
+    pub fn node(&self, path: &[u64]) -> Option<(u64, u64)> {
+        match &self.keep {
+            Some(k) => PrunedTree { tree: self.tree, keep: k }.node(path),
+            None if self.dsa.is_none() => self.tree.node(path),
+            None => None,
+        }
+    }
+
+    /// Children of the node of `path`, as [`AttnDraw::node`].
+    pub fn children(&self, path: &[u64]) -> Option<Vec<(u64, u64)>> {
+        match &self.keep {
+            Some(k) => PrunedTree { tree: self.tree, keep: k }.children(path),
+            None if self.dsa.is_none() => self.tree.children(path),
+            None => None,
+        }
+    }
+
     /// Whether the phase of `path` opens a leaf.
     pub fn leaf(&self, path: &[u64]) -> bool {
         path.len() as u32 == self.tree.depth()
@@ -151,7 +190,7 @@ impl AttnDraw {
 
     /// Anchor position of the leaf of `path`.
     pub fn anchor(&self, path: &[u64]) -> Option<u64> {
-        let (p0, p1) = self.tree.node(path)?;
+        let (p0, p1) = self.node(path)?;
         Some(p0 + self.anchor_draw % (p1 - p0))
     }
 
@@ -166,6 +205,9 @@ impl AttnDraw {
         }
         if a.mla_rank > 0 {
             out.push((t, 2 * a.absorb + 1));
+        }
+        if let Some((_, leaf)) = self.dsa {
+            out.push((t, leaf));
         }
         if self.leaf(path) {
             let ps = self.anchor(path)? as u32;
@@ -184,7 +226,7 @@ impl AttnDraw {
         let a = &self.links;
         let bb = (a.head_dim / 32 * 34) as u64;
         let kv = if a.mla_rank > 0 { 0 } else { self.head };
-        let (p0, p1) = self.tree.node(path)?;
+        let (p0, p1) = self.node(path)?;
         let (lo, hi, total) = (p0 * bb, p1 * bb, n_pos * bb);
         let mut out = vec![SpanPlan::new(layout.kcache(self.slot, kv)?, total, lo, hi)?];
         if a.mla_rank == 0 {
@@ -202,7 +244,7 @@ impl AttnDraw {
     pub fn rows(&self, op: &AttnOpening, path: &[u64]) -> Option<(Rows, Rows)> {
         let hd = self.links.head_dim as usize;
         let bb = hd / 32 * 34;
-        let (p0, p1) = self.tree.node(path)?;
+        let (p0, p1) = self.node(path)?;
         let rows = |s: &SeqSpan| -> Option<Rows> {
             let off = (p0 as usize * bb).checked_sub(s.first_chunk as usize * B3_CHUNK)?;
             let b = s.bytes.get(off..off + (p1 - p0) as usize * bb)?;
@@ -227,6 +269,7 @@ impl AttnDraw {
             parent: op.parent.clone(),
             parent_path: op.parent_path.clone(),
             partials,
+            sel: op.sel.clone(),
             ..Default::default()
         };
         if path.is_empty() {
@@ -248,10 +291,12 @@ pub fn attn_child_weights(tier: u8, rec: &TraceRecord, seed: &Hash, body: &[u8])
     child_weights(&decode_partials(&op.partials, dv)?)
 }
 
-/// Children of the node of `path` of the attention point of `seed`.
-pub fn attn_children(tier: u8, rec: &TraceRecord, seed: &Hash, path: &[u64]) -> Option<u64> {
+/// Children of the node of `path` of the attention point of `seed`; `body` is the last phase
+/// opened, which carries the selection of a sparse attention layer.
+pub fn attn_children(tier: u8, rec: &TraceRecord, seed: &Hash, path: &[u64], body: Option<&[u8]>) -> Option<u64> {
     let m = TierManifest::for_attn(tier)?;
-    Some(draw_attn(&m, rec, seed)?.tree.children(path)?.len() as u64)
+    let sel = body.and_then(body_sel);
+    Some(draw_attn_sel(&m, rec, seed, sel.as_deref())?.children(path)?.len() as u64)
 }
 
 /// Every field the phase of `path` of `d` may need: the query fields at every phase, the output
@@ -283,7 +328,8 @@ pub fn attn_opening(
         let qh_w = qe.m / nh;
         let rope = hd - r;
         let nope = qh_w - rope;
-        let q = value_chunks(rec, t, q_leaf, q_bytes, d.head * qh_w + nope, rope).ok_or("query chunks")?;
+        // a query without rotary part still opens one chunk of its leaf, for its position root
+        let q = value_chunks(rec, t, q_leaf, q_bytes, d.head * qh_w + nope.min(qh_w - 1), rope.max(1)).ok_or("query chunks")?;
         let absorb = value_chunks(rec, t, 2 * a.absorb + 1, cap(t, 2 * a.absorb + 1).ok_or("no latent query capture")?, d.head * r, r).ok_or("latent query chunks")?;
         let ak = match ps {
             Some(ps) => value_chunks(rec, ps, 2 * a.k + 1, cap(ps, 2 * a.k + 1).ok_or("no anchor capture")?, 0, hd).ok_or("anchor chunks")?,
@@ -350,7 +396,99 @@ pub fn attn_opening(
         parent_path,
         partials: Vec::new(),
         lse,
-        sel: None,
+        sel: match d.dsa {
+            Some((_, leaf)) => {
+                let lb = leaf_bytes(rec, t, leaf, cap(t, leaf).ok_or("no selection capture")?);
+                Some(SelOpening { bytes: lb.bytes, leaf_path: lb.leaf_path, pos_path: rec.pos_path(t) })
+            }
+            None => None,
+        },
+    })
+}
+
+/// What the selection point of a seed opens: the sparse attention layer, and the position when
+/// the response is long enough for some visible pool to be left out.
+#[derive(Clone, Copy, Debug)]
+pub struct SelDraw {
+    pub layer: u64,
+    pub dsa: DsaLinks,
+    pub t: Option<u64>,
+    pub sel_leaf: u32,
+}
+
+/// The selection point of `seed`, drawn as the node draws it.
+pub fn draw_sel(m: &TierManifest, rec: &TraceRecord, seed: &Hash) -> Option<SelDraw> {
+    use keryx_verifiable_inference::dsa;
+    let ctx = m.chain?;
+    if ctx.n_sel == 0 || ctx.n_attn == 0 {
+        return None;
+    }
+    let d = draw::point(seed, dsa::SEL_POINT);
+    let slot = d[1] % ctx.n_attn as u64;
+    let (layer, ll, _) = find_layer(m, |ll| ll.attn.filter(|a| a.slot as u64 == slot))?;
+    let x = ll.dsa?;
+    let span = dsa::eligible(&ctx, &rec.response_ctx(), layer, &x);
+    let t = (!span.is_empty()).then(|| span.start + d[0] % (span.end - span.start));
+    let sel_leaf = chain::sel_leaf(m.n_products as u64, ctx.n_layers as u64, chain::n_router(&ctx), x.sel as u64) as u32;
+    Some(SelDraw { layer, dsa: x, t, sel_leaf })
+}
+
+impl SelDraw {
+    /// Captures at the drawn position: the selection, the indexer query and head weights.
+    pub fn head_captures(&self) -> Vec<(u32, u32)> {
+        let x = &self.dsa;
+        self.t.map(|t| vec![(t as u32, self.sel_leaf), (t as u32, 2 * x.iq + 1), (t as u32, 2 * x.w + 1)]).unwrap_or_default()
+    }
+
+    /// Members of the pools `seed` draws from the selection `sel`: key and gate captures.
+    pub fn member_captures(&self, seed: &Hash, sel: &[u8]) -> Option<Vec<(u32, u32)>> {
+        let (x, t) = (&self.dsa, self.t?);
+        let (_, pools) = chain::dsa_pools(x, t, sel)?;
+        let kp = x.kpool as u64;
+        let drawn = keryx_verifiable_inference::dsa::drawn_pools(seed, &pools, (t + 1) / kp);
+        Some(drawn.iter().flat_map(|&p| (0..kp).flat_map(move |j| [((p * kp + j) as u32, 2 * x.ik + 1), ((p * kp + j) as u32, 2 * x.ig + 1)])).collect())
+    }
+}
+
+/// The selection opening of `d` from its captures.
+#[allow(clippy::too_many_arguments)]
+pub fn sel_opening(
+    m: &TierManifest,
+    rec: &TraceRecord,
+    seq: &SeqTrace,
+    index: &WeightIndex,
+    d: &SelDraw,
+    seed: &Hash,
+    caps: &Captures,
+    response_txid: Hash,
+) -> Result<keryx_verifiable_inference::opening::SelOpeningPoint, String> {
+    use keryx_verifiable_inference::opening::{SelMember, SelOpeningPoint};
+    let base = m.chain.ok_or("no chain context")?.layer_base as u64;
+    let root = SelOpeningPoint { response_txid, pos_root: rec.trace_root, seq_root: seq.root, layer: m.entry_opening(base + d.layer), ..Default::default() };
+    let Some(t) = d.t else { return Ok(root) };
+    let x = &d.dsa;
+    let cap = |pos: u64, leaf: u32| caps.get(&(pos as u32, leaf)).ok_or_else(|| format!("no capture of leaf {leaf} at {pos}"));
+    let (dk, kp) = (m.entry(x.ik as u64).m, x.kpool as u64);
+    let norm = |e: u32, n: u64| bytes_range(m, index, e as u64, 0, 4 * n).ok_or("indexer weights");
+    let sel = cap(t, d.sel_leaf)?;
+    let members = d
+        .member_captures(seed, sel)
+        .ok_or("selection out of shape")?
+        .chunks_exact(2)
+        .map(|c| {
+            let pos = c[0].0 as u64;
+            Ok(SelMember { pos_path: rec.pos_path(pos), k: leaf_bytes(rec, pos, c[0].1, cap(pos, c[0].1)?), g: leaf_bytes(rec, pos, c[1].1, cap(pos, c[1].1)?) })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(SelOpeningPoint {
+        entries: [x.iq, x.ik, x.ig, x.w].iter().map(|&r| m.entry_opening(r as u64)).collect(),
+        norms: vec![norm(x.k_norm, dk)?, norm(x.k_bias, dk)?, norm(x.ape, kp * dk)?],
+        pos_path: rec.pos_path(t),
+        sel: leaf_bytes(rec, t, d.sel_leaf, sel),
+        iq: leaf_bytes(rec, t, 2 * x.iq + 1, cap(t, 2 * x.iq + 1)?),
+        w: leaf_bytes(rec, t, 2 * x.w + 1, cap(t, 2 * x.w + 1)?),
+        members,
+        ..root
     })
 }
 
