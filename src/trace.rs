@@ -1051,6 +1051,7 @@ fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32
         manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE if layer == 0 => None,
         manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE => Some(chain::resid_leaf(np, layer - 1, Resid::Out) as u32),
         manifest::LINK_HC_FFN_IN | manifest::LINK_HC_FFN_PRE => Some(chain::resid_leaf(np, layer, Resid::Attn) as u32),
+        manifest::LINK_HC_HEAD => Some(chain::resid_leaf(np, ctx.n_layers.checked_sub(1)? as u64, Resid::Out) as u32),
         _ => return None,
     })
 }

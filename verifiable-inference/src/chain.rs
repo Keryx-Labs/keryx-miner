@@ -478,7 +478,7 @@ pub fn verify_chain_point(
     };
     let (k, np, n_layers) = (o.input.k, tier.n_products, ctx.n_layers as u64);
     let layer = pl.layer as u64;
-    if pl.link != manifest::LINK_HEAD && layer >= n_layers {
+    if pl.link != manifest::LINK_HEAD && pl.link != manifest::LINK_HC_HEAD && layer >= n_layers {
         return Err(Fail::Manifest);
     }
     match (pl.link, link) {
@@ -509,6 +509,21 @@ pub fn verify_chain_point(
             let (b0, n) = norm_fragment(link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)?, k);
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
+        }
+        (manifest::LINK_HC_HEAD, LinkOpening::Norm { src, norm }) if n_layers > 0 && o.input.n_exp == 1 => {
+            let n_hc = pl.src as u64;
+            if !(2..=16).contains(&n_hc) {
+                return Err(Fail::Manifest);
+            }
+            let r = whole_leaf(&o.pos_root, &shape, resid_leaf(np, n_layers - 1, Resid::Out), src, 4 * n_hc * k)?;
+            let ku = k as usize;
+            let h: Vec<f32> = (0..ku).map(|j| ((0..n_hc as usize).map(|s| r[s * ku + j] as f64).sum::<f64>() / n_hc as f64) as f32).collect();
+            if !(RESID_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&h)) {
+                return Err(Fail::Mismatch);
+            }
+            let (b0, n) = norm_fragment(link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?, k);
+            let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
+            fragment_link(&p.x, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
         (manifest::LINK_NORMED, LinkOpening::Norm { src, norm }) if o.input.n_exp == 1 && pl.src < tier.n_products as u32 => {
             let h = whole_leaf(&o.pos_root, &shape, 2 * pl.src as u64 + 1, src, 4 * k)?;

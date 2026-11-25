@@ -1399,6 +1399,168 @@ mod normed_link_tests {
 }
 
 #[cfg(test)]
+mod hc_head_tests {
+    use super::*;
+    use crate::chain::{ChainCtx, norm_fragment, verify_chain_point};
+    use crate::opening::{LinkOpening, Point};
+    use crate::verify::{Fail, ResponseCtx};
+
+    const NP: u64 = 1;
+    const NHC: usize = 4;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fault {
+        None,
+        FirstStream,
+        UnitWeights,
+    }
+
+    struct H {
+        offs: Vec<usize>,
+        chunk_leaves: Vec<Hash>,
+        all: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        entry_leaves: Vec<Hash>,
+        tier: TierCtx,
+        ctx: ChainCtx,
+        pos: Position,
+        trace_root: Hash,
+    }
+
+    fn build(fault: Fault, n_hc_link: u32) -> H {
+        let none = manifest::NONE;
+        let norm: Vec<f32> = (0..D).map(|i| 0.7 + 0.03 * (i % 11) as f32).collect();
+        let weights = vec![q8_0_rows(31, D, 0.0004), norm.iter().flat_map(|a| a.to_le_bytes()).collect()];
+        let (mut all, mut offs) = (Vec::new(), Vec::new());
+        for w in &weights {
+            offs.push(all.len());
+            all.extend_from_slice(w);
+        }
+        let chunk_leaves: Vec<Hash> = all.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+        let entry = |name: &str, role: u8, i: usize, chain: Chain| {
+            let product = role == manifest::ROLE_PRODUCT;
+            let e = Entry {
+                name: name.into(),
+                wtype: if product { quant::Q8_0 } else { 0 },
+                k: D as u64,
+                m: if product { D as u64 } else { 1 },
+                n_exp: 1,
+                chunk_base: (offs[i] / 32) as u64,
+                n_bytes: weights[i].len() as u64,
+                row_bytes: if product { (D / 32 * 34) as u32 } else { weights[i].len() as u32 },
+                role,
+                glu_op: 0,
+                glu_form: manifest::FORM_NONE,
+                partner: none,
+                bias: none,
+                chain,
+            };
+            let mut b = serialize(&e);
+            b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+            b
+        };
+        let entries = vec![
+            entry("output.weight", manifest::ROLE_PRODUCT, 0, Chain::Product(ProductLink { layer: 1, link: manifest::LINK_HC_HEAD, norm: 1, src: n_hc_link })),
+            entry("output_norm.weight", manifest::ROLE_NORM, 1, Chain::None),
+        ];
+        let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+        let tier = TierCtx {
+            r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+            n_chunks: chunk_leaves.len() as u64,
+            m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+            n_entries: entries.len() as u64,
+            n_products: NP,
+        };
+        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 2, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let streams: Vec<f32> = (0..NHC * D).map(|i| ((i * 13) % 29) as f32 * 0.07 - 1.0 + (i / D) as f32 * 0.3).collect();
+        let mut h: Vec<f64> = match fault {
+            Fault::FirstStream => streams[..D].iter().map(|&a| a as f64).collect(),
+            _ => (0..D).map(|j| (0..NHC).map(|s| streams[s * D + j] as f64).sum::<f64>() / NHC as f64).collect(),
+        };
+        let w = if fault == Fault::UnitWeights { None } else { Some(&norm[..]) };
+        crate::attn::rms_norm(&mut h, w, EPS);
+        let x = q8_1_row(&h);
+        let rb = D / 32 * 34;
+        let y: Vec<f32> = (0..D).map(|r| dot::canonical_dot(quant::Q8_0, &weights[0][r * rb..(r + 1) * rb], D, &x, q8::MMVQ).unwrap().y_hat as f32).collect();
+        let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
+        let n_leaves = 2 * NP as usize + 2 + 1;
+        let mut leaves = vec![Vec::new(); n_leaves];
+        leaves[0] = x;
+        leaves[1] = f(&y);
+        leaves[3] = f(&streams);
+        leaves[n_leaves - 1] = chain::meta(0, 1, 7).to_vec();
+        let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+        let pos = Position { tok: 7, leaves, hashes };
+        let trace_root = b3_root(&[b3_root(&pos.hashes)]);
+        H { offs, chunk_leaves, all, entries, entry_leaves, tier, ctx, pos, trace_root }
+    }
+
+    impl H {
+        fn eo(&self, i: usize) -> EntryOpening {
+            EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+        }
+
+        fn range(&self, off: u64, len: u64) -> ChunkRange {
+            let (first, last) = (off / 32, (off + len - 1) / 32);
+            ChunkRange { first_chunk: first, chunks: self.all[first as usize * 32..(last as usize + 1) * 32].to_vec(), proof: rt_range_proof(&self.chunk_leaves, first, last - first + 1).1 }
+        }
+
+        fn check(&self, seed: &Hash) -> Result<(), Fail> {
+            let d = draw::point(seed, 0);
+            let row = (d[2] % D as u64) as usize;
+            let rb = (D / 32 * 34) as u64;
+            let yc = leaf_chunk(&self.pos, 1, (row * 4 / B3_CHUNK) as u64);
+            let p = Point {
+                n_ubatch: 1,
+                pos_path: Vec::new(),
+                meta_path: b3_path(&self.pos.hashes, self.pos.hashes.len() - 1),
+                entry: self.eo(0),
+                partner: None,
+                bias: None,
+                rows: vec![self.range(row as u64 * rb, rb)],
+                x: self.pos.leaves[0].clone(),
+                x_path: b3_path(&self.pos.hashes, 0),
+                y_total_len: self.pos.leaves[1].len() as u32,
+                y_chunk_index: yc.index,
+                y_chunk: yc.chunk,
+                y_chunk_path: yc.chunk_path,
+                y_path: b3_path(&self.pos.hashes, 1),
+            };
+            let block = chain::link_block(seed, 0, &p.x, crate::q8::MMVQ, D as u64).expect("link block");
+            let (b0, n) = norm_fragment(block, D as u64);
+            let len = (n * 32).min(D as u64 - b0 * 32);
+            let link = LinkOpening::Norm { src: leaf_bytes(&self.pos, 3), norm: (self.eo(1), self.range(self.offs[1] as u64 + 4 * b0 * 32, 4 * len)) };
+            let resp = ResponseCtx { trace_root: self.trace_root, n_prompt: 1, n_pos: 1 };
+            verify_chain_point(&self.tier, &self.ctx, &resp, seed, 0, &p, 7, &link, None).map(|_| ())
+        }
+    }
+
+    fn seeds() -> impl Iterator<Item = Hash> {
+        (0..32u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+    }
+
+    #[test]
+    fn the_head_reads_the_normed_mean_of_the_streams() {
+        let h = build(Fault::None, NHC as u32);
+        for s in seeds() {
+            h.check(&s).unwrap_or_else(|e| panic!("{e:?}"));
+        }
+        for fault in [Fault::FirstStream, Fault::UnitWeights] {
+            let h = build(fault, NHC as u32);
+            assert!(seeds().all(|s| h.check(&s).is_err()));
+        }
+    }
+
+    #[test]
+    fn a_wrong_stream_count_is_refused() {
+        for n in [1, 2, 8] {
+            let h = build(Fault::None, n);
+            assert!(seeds().all(|s| h.check(&s).is_err()), "{n}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod moe_tests {
     use super::*;
     use crate::chain::{route_weights, verify_resid_point};

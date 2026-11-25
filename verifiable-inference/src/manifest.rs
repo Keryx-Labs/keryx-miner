@@ -43,6 +43,8 @@ pub const LINK_HC_ATTN_PRE: u8 = 18;
 pub const LINK_HC_FFN_PRE: u8 = 19;
 /// Input `rms_norm(y) * norm` with `y` the output of product `src` at the same position.
 pub const LINK_NORMED: u8 = 20;
+/// Head input `rms_norm(mean_s R_s) * norm` over the streams of the last layer; `src` = stream count.
+pub const LINK_HC_HEAD: u8 = 21;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
