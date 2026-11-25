@@ -895,6 +895,22 @@ mod tests {
         }
     }
 
+    /// The n-gram tables of a local DeepSeek-V4.1 directory (`KERYX_DSV41_DIR`) register under
+    /// their pinned root, beside an untouched model tree.
+    #[test]
+    #[ignore]
+    fn local_n_gram_tables_register_under_their_pinned_root() {
+        let dir = std::path::PathBuf::from(std::env::var("KERYX_DSV41_DIR").unwrap());
+        let spec = crate::models::DEEPSEEK_V4_1_FLASH;
+        let c = crate::models::companion(&spec).unwrap();
+        let (body, table) = (dir.join("model.gguf"), dir.join(c.file));
+        let root = register_engram(body.to_str().unwrap(), table.to_str().unwrap(), spec.model_id).unwrap();
+        assert_eq!(root, c.root);
+        assert!(crate::pom::table_index(&c.root).is_some());
+        let map = crate::gguf::read_i32_array(&mut std::fs::File::open(&body).unwrap(), "deepseek41.engram.token_map").unwrap().unwrap();
+        assert!(token_map(&register_token_map(&map)).is_some());
+    }
+
     #[test]
     fn compressed_row_openings_verify() {
         let f = fixture(false);

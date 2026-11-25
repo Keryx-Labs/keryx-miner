@@ -1,0 +1,14 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d1762516f..10367f135 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -77,7 +77,8 @@ static ggml_backend_buffer_t keryx_canonical_alloc(llama_model_loader & ml, ggml
+     std::unordered_map<std::string, std::pair<size_t, size_t>> canon;   // name -> (offset, bytes)
+     size_t total = 0;
+     std::vector<std::pair<std::string, size_t>> names;                   // canonical = bytewise name order
+-    for (const auto & [name, w] : ml.weights_map) names.emplace_back(name, ggml_nbytes(w.tensor));
++    // the model file only: a second weight file (n-gram tables) has a root of its own
++    for (const auto & [name, w] : ml.weights_map) if (w.idx == 0) names.emplace_back(name, ggml_nbytes(w.tensor));
+     std::sort(names.begin(), names.end());                               // char_traits<char>: unsigned bytes
+     std::vector<std::string> stream;                                     // names of the stream, in order
+     for (const auto & [name, nb] : names) {

@@ -323,6 +323,31 @@ pub const DEEPSEEK_V4_1_FLASH: ModelSpec = ModelSpec {
 /// CID of the Engram tables of `DEEPSEEK_V4_1_FLASH` (IQ4_NL GGUF, read from host memory).
 pub const DEEPSEEK_V4_1_FLASH_ENGRAM_CID: &str = "QmXxL7hkDj98hi66pJz6h4u5wF8MrFeNdmT3XzXasi5GXd";
 
+/// A second weight file a model reads next to its `model.gguf`: n-gram tables, committed by the
+/// manifest under their own weight root.
+#[derive(Clone, Copy, Debug)]
+pub struct Companion {
+    pub cid: &'static str,
+    /// File name in the model directory; the engine loads it with the model.
+    pub file: &'static str,
+    pub root: [u8; 32],
+}
+
+/// File name of the n-gram tables next to a model.
+pub const ENGRAM_FILE: &str = "engram.gguf";
+
+/// The second weight file of `spec`, if it has one.
+pub fn companion(spec: &ModelSpec) -> Option<Companion> {
+    (spec.model_id == DEEPSEEK_V4_1_FLASH.model_id).then_some(Companion {
+        cid: DEEPSEEK_V4_1_FLASH_ENGRAM_CID,
+        file: ENGRAM_FILE,
+        root: [
+            0x3b, 0xc5, 0x06, 0xf3, 0xa9, 0x28, 0xe2, 0x3d, 0x11, 0xe5, 0x0c, 0xfd, 0xeb, 0x25, 0x94, 0x20,
+            0xe1, 0x19, 0x1c, 0x18, 0x6e, 0x1b, 0xcd, 0x2c, 0x07, 0xd3, 0x50, 0xcc, 0x21, 0xa0, 0x79, 0x13,
+        ],
+    })
+}
+
 /// H18 models by tier. Mirror of the node's `POM_TIERS_H18`.
 pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7, &GEMMA_4_31B, &QWEN3_8_27B_TURBO, &GLM_5_3_FLASH, &DEEPSEEK_V4_1_FLASH];
 

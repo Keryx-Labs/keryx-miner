@@ -253,6 +253,33 @@ fn ipfs_url(cid: &str) -> String {
 }
 
 fn ensure_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let (tok, gguf) = ensure_body_gguf(spec)?;
+    ensure_companion(spec, &gguf)?;
+    Ok((tok, gguf))
+}
+
+/// Fetches the second weight file of `spec` next to `gguf` when missing, and makes it openable:
+/// a table whose weight root is not the pinned one is refused.
+fn ensure_companion(spec: &ModelSpec, gguf: &Path) -> Result<()> {
+    let Some(c) = crate::models::companion(spec) else { return Ok(()) };
+    let path = gguf.with_file_name(c.file);
+    if !crate::gguf::is_complete_file(&path) {
+        ui_download_info(&format!("[keryx-miner] Downloading the n-gram tables of '{}' via IPFS. This happens once.", spec.name));
+        download_file(&ipfs_url(c.cid), &path)?;
+        if !crate::gguf::is_complete_file(&path) {
+            return Err(anyhow!("n-gram tables of '{}' incomplete at {}", spec.name, path.display()));
+        }
+    }
+    let (body, table) = (gguf.to_str().ok_or_else(|| anyhow!("non-UTF-8 model path"))?, path.to_str().ok_or_else(|| anyhow!("non-UTF-8 table path"))?);
+    let root = crate::trace_dsv41::register_engram(body, table, spec.model_id).map_err(|e| anyhow!("n-gram tables of '{}': {e}", spec.name))?;
+    if root != c.root {
+        return Err(anyhow!("n-gram tables of '{}' at {} do not match their pinned root", spec.name, path.display()));
+    }
+    log::info!("LlmEngine '{}': n-gram tables ready at {}", spec.name, path.display());
+    Ok(())
+}
+
+fn ensure_body_gguf(spec: &ModelSpec) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
     let dir = model_dir(spec);
     let tok = dir.join("tokenizer.json");
     let gguf = dir.join("model.gguf");

@@ -534,6 +534,19 @@ KERYX_EXPORT int keryx_llama_abi() { return 15; }
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
 
 
+// Path of `name` in the directory of `path` when that file exists, else empty.
+static std::string keryx_sibling(const char* path, const char* name) {
+    std::string p(path);
+    const size_t slash = p.find_last_of("/\\");
+    const std::string sib = (slash == std::string::npos ? std::string() : p.substr(0, slash + 1)) + name;
+    FILE* f = std::fopen(sib.c_str(), "rb");
+    if (!f) {
+        return std::string();
+    }
+    std::fclose(f);
+    return sib;
+}
+
 // `fast_kv`: 8-bit KV cache with flash attention.
 static KeryxLlama* keryx_load_with(const char* gguf_path, int gpu, int n_ctx, llama_model_params mp, bool fast_kv) {
     const auto t_model = std::chrono::steady_clock::now();
@@ -551,7 +564,15 @@ static KeryxLlama* keryx_load_with(const char* gguf_path, int gpu, int n_ctx, ll
         keryx_llama_canonical_base = nullptr;
         keryx_llama_canonical_bytes = 0;
     }
-    llama_model* model = llama_model_load_from_file(gguf_path, mp);
+    // n-gram tables kept beside the model load with it, as a per-layer embedding shard
+    const std::string table = keryx_sibling(gguf_path, "engram.gguf");
+    llama_model* model = nullptr;
+    if (!table.empty()) {
+        const char* paths[2] = { gguf_path, table.c_str() };
+        model = llama_model_load_from_splits(paths, 2, mp);
+    } else {
+        model = llama_model_load_from_file(gguf_path, mp);
+    }
     void* const canon_base = keryx_llama_canonical_base;
     const size_t canon_bytes = keryx_llama_canonical_bytes;
     keryx_llama_canonical_weights = false;
