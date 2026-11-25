@@ -1068,6 +1068,9 @@ fn open_attention(
     use keryx_verifiable_inference::chain::{attn_query, verify_attn_phase};
     let rec = &trace.record;
     let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    if crate::trace_dsv41::draw_comp_attn(m, rec, seed).is_some() {
+        return open_comp_attention(gguf, dev_id, m, trace, seed, response_txid, index, path, prev);
+    }
     let mut d = draw_attn(m, rec, seed).ok_or("no attention draw")?;
     if let Some((dsa, leaf)) = d.dsa {
         let sel = replay_captures(gguf, dev_id, m, trace, &[(d.t as u32, leaf)])?;
@@ -1100,6 +1103,43 @@ fn open_attention(
     let body = op.encode();
     if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
         return Err(format!("attention opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
+}
+
+/// The compressed attention opening of the draw of `seed` at the phase of `path`, `prev` the
+/// partials of the previous phase, checked as the node checks it.
+#[allow(clippy::too_many_arguments)]
+fn open_comp_attention(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+    path: &[u64],
+    prev: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    use crate::trace_dsv41::{comp_attn_opening, comp_attn_step, draw_comp_attn};
+    let rec = &trace.record;
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let mut d = draw_comp_attn(m, rec, seed).ok_or("no attention draw")?;
+    if let Some(l) = d.sel_leaf {
+        let sel = replay_captures(gguf, dev_id, m, trace, &[(d.t as u32, l)])?;
+        let bytes = sel.get(&(d.t as u32, l)).ok_or("no selection capture")?;
+        d = d.with_sel(bytes).ok_or("selection out of shape")?;
+    }
+    let caps = replay_captures_all(gguf, dev_id, m, trace, &d.captures(path).ok_or("no attention captures")?)?;
+    let plans = d.spans(m, rec.n_pos as u64, path).ok_or("no attention spans")?;
+    let spans = replay_spans(gguf, dev_id, trace, &plans)?;
+    let full = comp_attn_opening(m, rec, seq, index, &d, &caps, &spans, response_txid, path, prev)?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    let parent_root = prev.and_then(|b| keryx_verifiable_inference::attn_blocks::partials_root(b, d.a.head_dim as usize));
+    let op = comp_attn_step(&m.tier_ctx(index), &ctx, &crate::trace_seq::seq_response_ctx(rec, seq), seed, &d, &full, &caps, path, parent_root.as_ref())?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("compressed attention opening of {} B over the cap", body.len()));
     }
     Ok(body)
 }

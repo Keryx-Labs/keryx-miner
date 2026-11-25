@@ -74,7 +74,7 @@ pub(crate) fn span(plan: &SpanPlan, cap: &SeqCapture, seq: &SeqTrace) -> Result<
 }
 
 /// Chunks of the f32 leaf `leaf` at position `t` covering its values `[lo, lo + n)`.
-fn value_chunks(rec: &TraceRecord, t: u64, leaf: u32, bytes: &[u8], lo: u64, n: u64) -> Option<Vec<LeafChunk>> {
+pub(crate) fn value_chunks(rec: &TraceRecord, t: u64, leaf: u32, bytes: &[u8], lo: u64, n: u64) -> Option<Vec<LeafChunk>> {
     let (c0, c1) = (4 * lo / C, (4 * (lo + n) - 1) / C);
     (c0..=c1).map(|c| leaf_chunk(rec, t, leaf, bytes, c)).collect()
 }
@@ -286,6 +286,10 @@ pub fn attn_child_weights(tier: u8, rec: &TraceRecord, seed: &Hash, body: &[u8])
     use keryx_verifiable_inference::attn_blocks::{child_weights, decode_partials};
     use keryx_verifiable_inference::opening::inner_body;
     let m = TierManifest::for_attn(tier)?;
+    if let Some(d) = crate::trace_dsv41::draw_comp_attn(&m, rec, seed) {
+        let op = inner_body(body).as_deref().and_then(keryx_verifiable_inference::opening::CompAttnOpening::decode)?;
+        return child_weights(&decode_partials(&op.partials, d.a.head_dim as usize)?);
+    }
     let dv = draw_attn(&m, rec, seed)?.dv;
     let op = inner_body(body).as_deref().and_then(AttnOpening::decode)?;
     child_weights(&decode_partials(&op.partials, dv)?)
@@ -295,6 +299,13 @@ pub fn attn_child_weights(tier: u8, rec: &TraceRecord, seed: &Hash, body: &[u8])
 /// opened, which carries the selection of a sparse attention layer.
 pub fn attn_children(tier: u8, rec: &TraceRecord, seed: &Hash, path: &[u64], body: Option<&[u8]>) -> Option<u64> {
     let m = TierManifest::for_attn(tier)?;
+    if let Some(mut d) = crate::trace_dsv41::draw_comp_attn(&m, rec, seed) {
+        if d.sel_leaf.is_some() {
+            let op = keryx_verifiable_inference::opening::inner_body(body?).as_deref().and_then(keryx_verifiable_inference::opening::CompAttnOpening::decode)?;
+            d = d.with_sel(&op.sel?.bytes)?;
+        }
+        return Some(d.tree()?.children(path)?.len() as u64);
+    }
     let sel = body.and_then(body_sel);
     Some(draw_attn_sel(&m, rec, seed, sel.as_deref())?.children(path)?.len() as u64)
 }

@@ -23,21 +23,21 @@ pub fn root_lse_tol(m: f64) -> f64 {
     LSE_ROOT_TOL + m.abs().min(176.0) / 4096.0
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 thread_local! {
     static TEST_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(BLOCK_BUDGET) };
 }
 
 /// Sets the phase budget of the calling test thread.
-#[cfg(test)]
-pub(crate) fn set_test_budget(b: usize) {
+#[cfg(any(test, feature = "testkit"))]
+pub fn set_test_budget(b: usize) {
     TEST_BUDGET.with(|c| c.set(b));
 }
 
 fn budget() -> usize {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     return TEST_BUDGET.with(|c| c.get());
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testkit")))]
     BLOCK_BUDGET
 }
 

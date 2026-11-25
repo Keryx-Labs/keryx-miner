@@ -380,6 +380,260 @@ pub fn engram_opening(
     })
 }
 
+/// What the attention point of a seed opens on a compressed attention layer: the position, the
+/// query head, the window, and the selected compressed rows once the selection is read.
+#[derive(Clone, Debug)]
+pub struct CompAttnDraw {
+    pub layer: u64,
+    pub a: manifest::AttnLinks,
+    pub c: CompLinks,
+    pub t: u64,
+    pub qh: u64,
+    pub w0: u64,
+    pub n_w: u64,
+    /// Selection leaf of the layer (none on a window-only layer) and the rows it keeps.
+    pub sel_leaf: Option<u32>,
+    pub ids: Option<Vec<u64>>,
+    anchor_draw: u64,
+}
+
+/// The attention point of `seed` when it lands on a compressed attention layer, as the node
+/// draws it; the selected rows come with [`CompAttnDraw::with_sel`].
+pub fn draw_comp_attn(m: &TierManifest, rec: &TraceRecord, seed: &Hash) -> Option<CompAttnDraw> {
+    let ctx = m.chain?;
+    if ctx.n_attn == 0 {
+        return None;
+    }
+    let d = draw::point(seed, chain::ATTN_POINT);
+    let slot = d[1] % ctx.n_attn as u64;
+    let (layer, ll, a) = find_layer(m, |ll| ll.attn.filter(|a| a.slot as u64 == slot))?;
+    let c = ll.comp?;
+    let t = chain::resid_position(&ctx, &rec.response_ctx(), layer, d[0]).ok()?;
+    let w0 = (t + 1).saturating_sub(a.swa_window as u64);
+    let sel_leaf = (c.ratio > 0).then(|| chain::sel_leaf(m.n_products as u64, ctx.n_layers as u64, chain::n_router(&ctx), c.sel as u64) as u32);
+    let ids = if c.ratio == 0 { Some(Vec::new()) } else { None };
+    Some(CompAttnDraw { layer, a, c, t, qh: d[2] % a.n_head as u64, w0, n_w: t + 1 - w0, sel_leaf, ids, anchor_draw: d[3] })
+}
+
+impl CompAttnDraw {
+    /// The rows the selection leaf `sel` keeps at the drawn position.
+    pub fn with_sel(mut self, sel: &[u8]) -> Option<Self> {
+        let n_top = self.c.n_top as usize;
+        if n_top == 0 || sel.len() != 4 + 4 * n_top {
+            return None;
+        }
+        let n_vis = (self.t + 1) / self.c.ratio as u64;
+        let slots: Vec<u64> = sel[4..].chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as u64).collect();
+        self.ids = Some(slots[..(n_vis as usize).min(n_top)].to_vec());
+        Some(self)
+    }
+
+    pub fn tree(&self) -> Option<keryx_verifiable_inference::attn_blocks::BlockTree> {
+        use keryx_verifiable_inference::attn_blocks::{block_params, partial_len, BlockTree};
+        let (cl, b) = block_params(keryx_verifiable_inference::dsv41::COMP_ROW_COST, partial_len(self.a.head_dim as usize))?;
+        BlockTree::new(0, self.n_w + self.ids.as_ref()?.len() as u64, cl, b)
+    }
+
+    pub fn leaf(&self, path: &[u64]) -> bool {
+        self.tree().is_some_and(|t| path.len() as u32 == t.depth())
+    }
+
+    /// Window positions `[ws, we)` and selected-row indexes `[cs, ce)` under the node of `path`.
+    fn node(&self, path: &[u64]) -> Option<((u64, u64), (usize, usize))> {
+        let (v0, v1) = self.tree()?.node(path)?;
+        let n_w = self.n_w;
+        Some(((v0.min(n_w), v1.min(n_w)), ((v0.max(n_w) - n_w) as usize, (v1.max(n_w) - n_w) as usize)))
+    }
+
+    fn anchor(&self, path: &[u64]) -> Option<Option<u64>> {
+        let ((ws, we), _) = self.node(path)?;
+        Some((ws < we).then(|| self.w0 + ws + self.anchor_draw % (we - ws)))
+    }
+
+    /// Rotary base and scaling of the layer.
+    pub fn rope(&self) -> (f64, keryx_verifiable_inference::attn::Yarn) {
+        if self.c.ratio > 0 { (f32::from_bits(self.c.rope_base) as f64, self.c.yarn()) } else { (f32::from_bits(self.a.rope_base) as f64, keryx_verifiable_inference::attn::Yarn::NONE) }
+    }
+
+    /// Captures the phase of `path` needs: the query, the output and selection at the first
+    /// phase, the anchor of a leaf.
+    pub fn captures(&self, path: &[u64]) -> Option<Vec<(u32, u32)>> {
+        let (a, t) = (&self.a, self.t as u32);
+        let mut out = vec![(t, 2 * a.q + 1), (t, 2 * a.out)];
+        out.extend(self.sel_leaf.map(|l| (t, l)));
+        if self.leaf(path) {
+            if let Some(ps) = self.anchor(path)? {
+                out.push((ps as u32, 2 * a.k + 1));
+            }
+        }
+        Some(out)
+    }
+
+    /// Spans of the phase of `path`: the window rows and selected rows of its node, then the
+    /// head's mass at the first phase.
+    pub fn spans(&self, m: &TierManifest, n_pos: u64, path: &[u64]) -> Option<Vec<SpanPlan>> {
+        let layout = chain::seq_layout(&m.chain?);
+        let (a, c) = (&self.a, &self.c);
+        let rb = (a.head_dim / 32 * 34) as u64;
+        let ((ws, we), (cs, ce)) = self.node(path)?;
+        let mut out = Vec::new();
+        if ws < we {
+            out.push(SpanPlan::new(layout.kcache(a.slot as u64, 0)?, n_pos * rb, (self.w0 + ws) * rb, (self.w0 + we) * rb)?);
+        }
+        if ce > cs {
+            let crb = c.row_len as u64 / 32 * 34;
+            let total = n_pos / c.ratio as u64 * crb;
+            let leaf = layout.comp(c.slot as u64)?;
+            for &id in &self.ids.as_ref()?[cs..ce] {
+                out.push(SpanPlan::new(leaf, total, id * crb, id * crb + rb)?);
+            }
+        }
+        if path.is_empty() {
+            let nh = a.n_head as u64;
+            let lo = (self.t * nh + self.qh) * 4;
+            out.push(SpanPlan::new(layout.lse(a.slot as u64, 0)?, n_pos * nh * 4, lo, lo + 4)?);
+        }
+        Some(out)
+    }
+
+    /// The rotated query head and the keys of the node of `path` (window rows, then the latent
+    /// of the selected rows), from the opening's spans.
+    pub fn query_and_keys(&self, caps: &Captures, op: &keryx_verifiable_inference::opening::CompAttnOpening, path: &[u64]) -> Option<(Vec<f64>, Vec<Vec<f32>>)> {
+        use keryx_verifiable_inference::merkle::B3_CHUNK;
+        use keryx_verifiable_inference::quant::{dequant_row, Q8_0};
+        let hd = self.a.head_dim as usize;
+        let qb = caps.get(&(self.t as u32, 2 * self.a.q + 1))?;
+        let lo = self.qh as usize * hd * 4;
+        let mut q: Vec<f64> = qb.get(lo..lo + 4 * hd)?.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64).collect();
+        let (base, yarn) = self.rope();
+        keryx_verifiable_inference::dsv41::rope_tail(&mut q, self.t, self.a.n_rot as usize, base, &yarn);
+        let rb = hd / 32 * 34;
+        let ((ws, we), _) = self.node(path)?;
+        let mut keys = Vec::new();
+        if ws < we {
+            let s = &op.window;
+            let off = ((self.w0 + ws) as usize * rb).checked_sub(s.first_chunk as usize * B3_CHUNK)?;
+            for r in s.bytes.get(off..off + (we - ws) as usize * rb)?.chunks_exact(rb) {
+                keys.push(dequant_row(Q8_0, r, hd)?);
+            }
+        }
+        let crb = self.c.row_len as usize / 32 * 34;
+        let ((_, _), (cs, _)) = self.node(path)?;
+        for (j, s) in op.comp.iter().enumerate() {
+            let id = self.ids.as_ref()?[cs + j] as usize;
+            let off = (id * crb).checked_sub(s.first_chunk as usize * B3_CHUNK)?;
+            keys.push(dequant_row(Q8_0, s.bytes.get(off..off + rb)?, hd)?);
+        }
+        Some((q, keys))
+    }
+}
+
+/// Every field the phase of `path` of `d` carries, partials left empty; window and selected rows
+/// are kept on inner phases too, for the partials, and reduced by [`comp_attn_phase`].
+#[allow(clippy::too_many_arguments)]
+pub fn comp_attn_opening(
+    m: &TierManifest,
+    rec: &TraceRecord,
+    seq: &SeqTrace,
+    index: &WeightIndex,
+    d: &CompAttnDraw,
+    caps: &Captures,
+    spans: &[SeqCapture],
+    response_txid: Hash,
+    path: &[u64],
+    prev: Option<&[u8]>,
+) -> Result<keryx_verifiable_inference::opening::CompAttnOpening, String> {
+    use crate::trace_seq::value_chunks as value_chunks_pub;
+    use keryx_verifiable_inference::attn_blocks::partial_opening;
+    use keryx_verifiable_inference::opening::{CompAttnOpening, SelOpening};
+    let (a, c, t) = (&d.a, &d.c, d.t);
+    let hd = a.head_dim as u64;
+    let cap = |pos: u64, leaf: u32| caps.get(&(pos as u32, leaf)).ok_or_else(|| format!("no capture of leaf {leaf} at {pos}"));
+    let plans = d.spans(m, rec.n_pos as u64, path).ok_or("no attention spans")?;
+    if plans.len() != spans.len() {
+        return Err(format!("{} spans captured for {}", spans.len(), plans.len()));
+    }
+    let mut opened = plans.iter().zip(spans).map(|(p, s)| span(p, s, seq)).collect::<Result<Vec<_>, String>>()?;
+    let lse = if path.is_empty() { opened.pop().ok_or("no mass span")? } else { Default::default() };
+    let ((ws, we), _) = d.node(path).ok_or("no node")?;
+    let window = if ws < we { opened.remove(0) } else { Default::default() };
+    let (parent, parent_path) = match (path.last(), prev) {
+        (Some(&i), Some(b)) => partial_opening(b, hd as usize, i as usize).ok_or("no parent partial")?,
+        (None, None) => Default::default(),
+        _ => return Err("the parent partials do not match the path".into()),
+    };
+    let base = m.chain.ok_or("no chain context")?.layer_base as u64;
+    let root = path.is_empty();
+    let last = d.leaf(path);
+    let sel = match d.sel_leaf {
+        Some(l) => {
+            let lb = leaf_bytes(rec, t, l, cap(t, l)?);
+            Some(SelOpening { bytes: lb.bytes, leaf_path: lb.leaf_path, pos_path: rec.pos_path(t) })
+        }
+        None => None,
+    };
+    let mut op = CompAttnOpening { response_txid, pos_root: rec.trace_root, seq_root: seq.root, layer: m.entry_opening(base + d.layer), sel, path: path.to_vec(), parent, parent_path, window, comp: opened, ..Default::default() };
+    if root || last {
+        op.q_entry = m.entry_opening(a.q as u64);
+        op.q = value_chunks_pub(rec, t, 2 * a.q + 1, cap(t, 2 * a.q + 1)?, d.qh * hd, hd).ok_or("query chunks")?;
+        op.pos_path = rec.pos_path(t);
+    }
+    if root {
+        op.o_entry = m.entry_opening(a.out as u64);
+        op.out = leaf_bytes(rec, t, 2 * a.out, cap(t, 2 * a.out)?);
+        op.sinks = bytes_range(m, index, c.sinks as u64, 0, 4 * a.n_head as u64).ok_or("no sink weights")?;
+        op.lse = lse;
+    }
+    if last {
+        if let Some(ps) = d.anchor(path).ok_or("no anchor")? {
+            op.anchor_pos_path = rec.pos_path(ps);
+            op.anchor_k = value_chunks_pub(rec, ps, 2 * a.k + 1, cap(ps, 2 * a.k + 1)?, 0, hd).ok_or("anchor chunks")?;
+            op.norms = vec![bytes_range(m, index, a.k_norm as u64, 0, 4 * hd).ok_or("key norm weights")?];
+        }
+    }
+    Ok(op)
+}
+
+/// `op` reduced to the fields its phase carries, with `partials` on an inner phase.
+pub fn comp_attn_phase(d: &CompAttnDraw, op: &keryx_verifiable_inference::opening::CompAttnOpening, path: &[u64], partials: Vec<u8>) -> keryx_verifiable_inference::opening::CompAttnOpening {
+    if d.leaf(path) {
+        return op.clone();
+    }
+    keryx_verifiable_inference::opening::CompAttnOpening { window: Default::default(), comp: Vec::new(), anchor_pos_path: Vec::new(), anchor_k: Vec::new(), norms: Vec::new(), partials, ..op.clone() }
+}
+
+/// The phase of `path` of `d` from its full opening `full`: the partials of an inner phase picked
+/// so the node's check of the phase passes.
+#[allow(clippy::too_many_arguments)]
+pub fn comp_attn_step(
+    tier: &keryx_verifiable_inference::verify::TierCtx,
+    ctx: &keryx_verifiable_inference::chain::ChainCtx,
+    resp: &keryx_verifiable_inference::verify::ResponseCtx,
+    seed: &Hash,
+    d: &CompAttnDraw,
+    full: &keryx_verifiable_inference::opening::CompAttnOpening,
+    caps: &Captures,
+    path: &[u64],
+    parent_root: Option<&Hash>,
+) -> Result<keryx_verifiable_inference::opening::CompAttnOpening, String> {
+    use keryx_verifiable_inference::attn_blocks::{encode_partials, pick_partials};
+    use keryx_verifiable_inference::dsv41::verify_comp_attn_phase;
+    let verify = |op: &keryx_verifiable_inference::opening::CompAttnOpening| verify_comp_attn_phase(tier, ctx, resp, seed, path, parent_root, op);
+    let op = if d.leaf(path) {
+        full.clone()
+    } else {
+        let tree = d.tree().ok_or("no attention tree")?;
+        let (q, keys) = d.query_and_keys(caps, full, path).ok_or("no query or keys")?;
+        let p0 = tree.node(path).ok_or("no node")?.0;
+        let scale = f32::from_bits(d.a.kq_scale) as f64;
+        let check = |p: &[keryx_verifiable_inference::attn::Partial]| verify(&comp_attn_phase(d, full, path, encode_partials(p))).is_ok();
+        let partials = pick_partials(&q, scale, &keys, &keys, p0, &tree, path, check).ok_or_else(|| format!("no partials verify at layer {}, position {}, path {path:?}", d.layer, d.t))?;
+        comp_attn_phase(d, full, path, partials)
+    };
+    verify(&op).map_err(|e| format!("compressed attention phase {e:?} at layer {}, position {}, path {path:?}", d.layer, d.t))?;
+    Ok(op)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +811,87 @@ mod tests {
                 let r = keryx_verifiable_inference::engram::verify_engram_point(&kit.tier, &kit.ctx, &kit.resp(), &seed, &got);
                 assert_eq!(r, if fault == ResidFault::None { Ok(()) } else { Err(Fail::Mismatch) }, "seed {s}");
             }
+        }
+    }
+
+    /// Every phase of every path of the compressed attention point of `seed`, opened by the miner
+    /// and checked by the node; the deepest path reached, or the first refusal.
+    fn walk_attn(kit: &keryx_verifiable_inference::dsv41kit::AttnKit, seed: &Hash) -> Result<usize, (Vec<u64>, String)> {
+        use keryx_verifiable_inference::chain::AttnStep;
+        use keryx_verifiable_inference::dsv41::verify_comp_attn_phase;
+        use keryx_verifiable_inference::dsv41kit::A_N;
+        use keryx_verifiable_inference::testkit::layout_at;
+        let mut file = b"KXMANIF2".to_vec();
+        file.extend((kit.entries.len() as u32).to_le_bytes());
+        file.extend((kit.tier.n_products as u32).to_le_bytes());
+        for b in &kit.entries {
+            file.extend_from_slice(b);
+        }
+        let mut m = TierManifest::parse(&file).expect("kit manifest");
+        m.chain = Some(kit.ctx);
+        let index = crate::pom::index_from_ram(kit.weights.clone());
+        let ubatch: Vec<u32> = (0..A_N).map(|t| layout_at(t as u64, A_N as u32).0).collect();
+        let leaves: Vec<Hash> = kit.pos.iter().flat_map(|p| p.1.clone()).collect();
+        let rec = TraceRecord::new_chain(&m, A_N as u32, ubatch, leaves, &vec![7; A_N]).expect("kit record");
+        let seq = SeqTrace::new(kit.seq_hashes.clone()).unwrap();
+        let caps: Captures = kit.pos.iter().enumerate().flat_map(|(t, p)| p.0.iter().enumerate().map(move |(l, b)| ((t as u32, l as u32), b.clone()))).collect();
+        let resp = kit.resp();
+        let mut d = draw_comp_attn(&m, &rec, seed).expect("draw");
+        if let Some(l) = d.sel_leaf {
+            let sel = caps[&(d.t as u32, l)].clone();
+            d = d.with_sel(&sel).expect("selection");
+        }
+        let replay = |plans: &[SpanPlan]| -> Vec<SeqCapture> {
+            plans
+                .iter()
+                .map(|p| {
+                    let data = &kit.seq_leaves[p.leaf as usize];
+                    let cvs = data.chunks(keryx_verifiable_inference::merkle::B3_CHUNK).enumerate().map(|(i, c)| b3_chunk_cv(c, i as u64)).collect();
+                    SeqCapture { bytes: data[p.lo as usize..p.hi as usize].to_vec(), cvs }
+                })
+                .collect()
+        };
+        let mut stack: Vec<(Vec<u64>, Option<Vec<u8>>, Option<Hash>)> = vec![(Vec::new(), None, None)];
+        let mut deepest = 0;
+        while let Some((path, prev, root)) = stack.pop() {
+            let fail = |e: String| (path.clone(), e);
+            assert!(d.captures(&path).unwrap().iter().all(|c| caps.contains_key(c)));
+            let spans = replay(&d.spans(&m, rec.n_pos as u64, &path).unwrap());
+            let full = comp_attn_opening(&m, &rec, &seq, &index, &d, &caps, &spans, [1; 32], &path, prev.as_deref()).map_err(fail)?;
+            let op = comp_attn_step(&kit.tier, &kit.ctx, &resp, seed, &d, &full, &caps, &path, root.as_ref()).map_err(fail)?;
+            match verify_comp_attn_phase(&kit.tier, &kit.ctx, &resp, seed, &path, root.as_ref(), &op).map_err(|e| fail(format!("{e:?}")))? {
+                AttnStep::Done => deepest = deepest.max(path.len()),
+                AttnStep::Next { root, n, .. } => stack.extend((0..n).map(|i| ([path.clone(), vec![i]].concat(), Some(op.partials.clone()), Some(root)))),
+            }
+        }
+        Ok(deepest)
+    }
+
+    #[test]
+    fn compressed_attention_openings_verify_at_every_phase() {
+        use keryx_verifiable_inference::attn_blocks::set_test_budget;
+        use keryx_verifiable_inference::dsv41kit::{build_attn, AttnFault, A_BUDGET, A_N, A_NTOP};
+        set_test_budget(A_BUDGET);
+        let seeds: Vec<Hash> = (0..40u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes()).collect();
+        let kit = build_attn(AttnFault::None);
+        let deep = seeds.iter().map(|s| walk_attn(&kit, s).unwrap_or_else(|e| panic!("{e:?}"))).max();
+        assert!(deep >= Some(1), "{deep:?}");
+        let t_of = |s: &Hash| (draw::point(s, chain::ATTN_POINT)[0] % A_N as u64) as usize;
+        for fault in [AttnFault::NoSink, AttnFault::Dense, AttnFault::ForgedWindow] {
+            let kit = build_attn(fault);
+            let mut refused = 0;
+            for s in &seeds {
+                match walk_attn(&kit, s) {
+                    Ok(_) => assert!(fault == AttnFault::Dense && (t_of(s) + 1) / 2 <= A_NTOP || fault == AttnFault::ForgedWindow, "{s:?}"),
+                    Err((path, _)) => {
+                        refused += 1;
+                        if fault != AttnFault::ForgedWindow {
+                            assert!(path.is_empty(), "refused at {path:?}");
+                        }
+                    }
+                }
+            }
+            assert!(refused > 0, "fault never refused");
         }
     }
 
