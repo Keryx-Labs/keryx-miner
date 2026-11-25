@@ -8,6 +8,8 @@ pub mod chain;
 pub mod decision;
 pub mod dsa;
 pub mod dsv41;
+#[cfg(any(test, feature = "testkit"))]
+pub mod dsv41kit;
 pub mod engram;
 #[cfg(any(test, feature = "testkit"))]
 pub mod chainkit;

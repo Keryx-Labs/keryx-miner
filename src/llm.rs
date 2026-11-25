@@ -1162,6 +1162,9 @@ fn open_pieces(
     if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_sel > 0) {
         bodies.push(open_selection(gguf, dev_id, m, trace, seed, response_txid, index)?);
     }
+    if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_comp > 0) {
+        bodies.push(open_comp(gguf, dev_id, m, trace, seed, response_txid, index)?);
+    }
     if let Some(d) = decision {
         bodies.push(open_decision(gguf, dev_id, m, trace, &d, seed, response_txid)?);
     }
@@ -1205,6 +1208,34 @@ fn open_selection(
     let body = op.encode();
     if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
         return Err(format!("selection opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
+}
+
+/// The compressed row opening of the draw of `seed`, checked as the node checks it.
+fn open_comp(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+) -> Result<Vec<u8>, String> {
+    use crate::trace_dsv41::{comp_opening, draw_comp};
+    let rec = &trace.record;
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let d = draw_comp(m, rec, seed).ok_or("no compressed row draw")?;
+    let caps = replay_captures_all(gguf, dev_id, m, trace, &d.captures())?;
+    let plans = d.spans(m).ok_or("no compressed row span")?;
+    let spans = if plans.is_empty() { Vec::new() } else { replay_spans(gguf, dev_id, trace, &plans)? };
+    let op = comp_opening(m, rec, seq, index, &d, &caps, &spans, response_txid)?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    keryx_verifiable_inference::dsv41::verify_comp_point(&m.tier_ctx(index), &ctx, &crate::trace_seq::seq_response_ctx(rec, seq), seed, &op)
+        .map_err(|e| format!("compressed row point {e:?} at layer {}, block {:?}", d.layer, d.k))?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("compressed row opening of {} B over the cap", body.len()));
     }
     Ok(body)
 }

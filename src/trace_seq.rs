@@ -26,7 +26,7 @@ pub struct SpanPlan {
 }
 
 impl SpanPlan {
-    fn new(leaf: u64, total: u64, lo: u64, hi: u64) -> Option<Self> {
+    pub(crate) fn new(leaf: u64, total: u64, lo: u64, hi: u64) -> Option<Self> {
         (lo < hi && hi <= total).then(|| Self { leaf: leaf as u32, total, lo: lo / C * C, hi: total.min(hi.div_ceil(C) * C) })
     }
 
@@ -46,7 +46,7 @@ pub fn max_chunks(plans: &[SpanPlan]) -> u32 {
 }
 
 /// The span of `plan` from its capture, checked against the committed sequence leaf.
-fn span(plan: &SpanPlan, cap: &SeqCapture, seq: &SeqTrace) -> Result<SeqSpan, String> {
+pub(crate) fn span(plan: &SpanPlan, cap: &SeqCapture, seq: &SeqTrace) -> Result<SeqSpan, String> {
     let leaf_hash = *seq.leaves.get(plan.leaf as usize).ok_or("no such sequence leaf")?;
     if cap.bytes.len() as u64 != plan.hi - plan.lo {
         return Err(format!("leaf {}: {} bytes captured for {}..{}", plan.leaf, cap.bytes.len(), plan.lo, plan.hi));
@@ -86,7 +86,7 @@ fn layer_links(m: &TierManifest, layer: u64) -> Option<LayerLinks> {
     }
 }
 
-fn find_layer<T>(m: &TierManifest, pick: impl Fn(&LayerLinks) -> Option<T>) -> Option<(u64, LayerLinks, T)> {
+pub(crate) fn find_layer<T>(m: &TierManifest, pick: impl Fn(&LayerLinks) -> Option<T>) -> Option<(u64, LayerLinks, T)> {
     let ctx = m.chain?;
     (0..ctx.n_layers as u64).find_map(|l| {
         let ll = layer_links(m, l)?;
