@@ -486,16 +486,28 @@ pub const EPS_ROUTE: f64 = 1e-5;
 const ROUTE_SUM_FLOOR: f64 = 6.103515625e-5;
 
 /// Mixing weights of the committed experts `ids` from the committed router scores, or `None` when
-/// `ids` is not the top `ids.len()` of `sigmoid(scores) + bias`.
-pub fn route_weights(scores: &[f32], bias: &[f32], ids: &[u32], w_scale: f64) -> Option<Vec<f64>> {
-    if scores.len() != bias.len() || ids.is_empty() || ids.len() > scores.len() {
+/// `ids` is not the top `ids.len()` of `sigmoid(scores) + bias`, or of `softmax(scores)` without a
+/// bias.
+pub fn route_weights(scores: &[f32], bias: Option<&[f32]>, ids: &[u32], w_scale: f64) -> Option<Vec<f64>> {
+    if bias.is_some_and(|b| b.len() != scores.len()) || ids.is_empty() || ids.len() > scores.len() {
         return None;
     }
-    let p: Vec<f64> = scores.iter().map(|&x| 1.0 / (1.0 + libm::exp(-(x as f64)))).collect();
-    if p.iter().any(|v| !v.is_finite()) || bias.iter().any(|b| !b.is_finite()) {
+    let p: Vec<f64> = match bias {
+        Some(_) => scores.iter().map(|&x| 1.0 / (1.0 + libm::exp(-(x as f64)))).collect(),
+        None => {
+            let top = scores.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
+            let e: Vec<f64> = scores.iter().map(|&x| libm::exp(x as f64 - top)).collect();
+            let z: f64 = e.iter().sum();
+            e.iter().map(|v| v / z).collect()
+        }
+    };
+    if p.iter().any(|v| !v.is_finite()) || bias.is_some_and(|b| b.iter().any(|v| !v.is_finite())) {
         return None;
     }
-    let sel: Vec<f64> = p.iter().zip(bias).map(|(a, &b)| a + b as f64).collect();
+    let sel: Vec<f64> = match bias {
+        Some(b) => p.iter().zip(b).map(|(a, &v)| a + v as f64).collect(),
+        None => p.clone(),
+    };
     let mut chosen = vec![false; p.len()];
     let mut prev = f64::INFINITY;
     for &id in ids {
@@ -544,7 +556,10 @@ impl MoeCheck<'_> {
         }
         let n_exp = re.m;
         let scores = whole_leaf(self.pos_root, self.shape, router_leaf(np, ctx.n_layers as u64, self.layer), &m.scores, 4 * n_exp)?;
-        let bias = f32_weights(tier, &m.bias, moe.probs_bias, n_exp, 0, n_exp)?;
+        let bias = match moe.probs_bias {
+            manifest::NONE => None,
+            b => Some(f32_weights(tier, &m.bias, b, n_exp, 0, n_exp)?),
+        };
 
         let body = n_used * self.dim * 4;
         let per_slot = self.dim * 4 / B3_CHUNK as u64;
@@ -558,11 +573,32 @@ impl MoeCheck<'_> {
             return Err(Fail::Trace);
         }
         let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-        let w = route_weights(&scores, &bias, &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
+        let w = route_weights(&scores, bias.as_deref(), &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
 
         let h = whole_leaf(self.pos_root, self.shape, resid_leaf(np, self.layer, Resid::Attn), &m.resid, 4 * self.dim)?;
         let w_norm = f32_weights(tier, &m.norm, moe.ffn_norm, self.dim, 0, self.dim)?;
         let v = rms_norm(&h, &w_norm, ctx.eps);
+        let gate = match (moe.shexp_gate, &m.shexp_gate) {
+            (manifest::NONE, None) => None,
+            (gi, Some((ge, gr))) if gi != manifest::NONE => {
+                let e = open_entry(tier, ge, gi as u64)?;
+                if e.role != manifest::ROLE_ROUTER || e.wtype != 0 || e.k != self.dim || e.m != 1 {
+                    return Err(Fail::Manifest);
+                }
+                let wg = f32s(&open_bytes(tier, &e, gr, 0, 4 * self.dim)?);
+                let (mut dot, mut mag) = (0f64, 0f64);
+                for (&wj, &vj) in wg.iter().zip(&v) {
+                    dot += wj as f64 * vj;
+                    mag += (wj as f64 * vj).abs();
+                }
+                let g = 1.0 / (1.0 + libm::exp(-dot));
+                if !g.is_finite() || !mag.is_finite() {
+                    return Err(Fail::Mismatch);
+                }
+                Some((g, g * (1.0 - g) * EPS_ROUTER * mag))
+            }
+            _ => return Err(Fail::Shape),
+        };
         let row = draw::point(self.seed, RESID_POINT)[3] % n_exp;
         let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * self.dim, 4 * self.dim)?);
         let (mut dot, mut mag) = (0f64, 0f64);
@@ -581,13 +617,16 @@ impl MoeCheck<'_> {
         if ys.iter().any(|y| y.len() != n) || sh.len() != n || dst.len() != n || src.len() != n || off + n > self.dim as usize {
             return Err(Fail::Shape);
         }
+        let (g, g_tol) = gate.unwrap_or((1.0, 0.0));
         for j in 0..n {
-            let (mut sum, mut mag) = (sh[j] as f64 + src[j] as f64, (sh[j] as f64).abs() + (src[j] as f64).abs());
+            let shared = sh[j] as f64 * g;
+            let (mut sum, mut mag) = (shared + src[j] as f64, shared.abs() + (src[j] as f64).abs());
             for (ws, y) in w.iter().zip(&ys) {
                 sum += ws * y[j] as f64;
                 mag += (ws * y[j] as f64).abs();
             }
-            if !mag.is_finite() || !(dst[j] as f64 - sum).abs().partial_cmp(&(EPS_MOE * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
+            let tol = EPS_MOE * mag + (sh[j] as f64).abs() * g_tol + f32::MIN_POSITIVE as f64;
+            if !mag.is_finite() || !(dst[j] as f64 - sum).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
                 return Err(Fail::Mismatch);
             }
         }
@@ -982,15 +1021,29 @@ mod tests {
         let mut order: Vec<u32> = (0..16).collect();
         order.sort_by(|&a, &b| scores[b as usize].total_cmp(&scores[a as usize]));
         let top = &order[..4];
-        let w = route_weights(&scores, &bias, top, 2.0).unwrap();
+        let w = route_weights(&scores, Some(&bias), top, 2.0).unwrap();
         assert!((w.iter().sum::<f64>() - 2.0).abs() < 1e-12);
-        assert!(route_weights(&scores, &bias, &order[1..5], 2.0).is_none());
-        assert!(route_weights(&scores, &bias, &[top[1], top[0], top[2], top[3]], 2.0).is_none());
-        assert!(route_weights(&scores, &bias, &[top[0], top[0], top[2], top[3]], 2.0).is_none());
+        assert!(route_weights(&scores, Some(&bias), &order[1..5], 2.0).is_none());
+        assert!(route_weights(&scores, Some(&bias), &[top[1], top[0], top[2], top[3]], 2.0).is_none());
+        assert!(route_weights(&scores, Some(&bias), &[top[0], top[0], top[2], top[3]], 2.0).is_none());
         let mut biased = bias.clone();
         biased[order[10] as usize] = 5.0;
-        let w2 = route_weights(&scores, &biased, &[order[10], top[0], top[1], top[2]], 2.0).unwrap();
+        let w2 = route_weights(&scores, Some(&biased), &[order[10], top[0], top[1], top[2]], 2.0).unwrap();
         assert!((w2.iter().sum::<f64>() - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn softmax_routing_takes_the_top_scores() {
+        let scores = [0.5f32, 3.0, -1.0, 2.0, 2.5, 0.0];
+        let w = route_weights(&scores, None, &[1, 4, 3], 1.0).unwrap();
+        let e: Vec<f64> = [3.0f64, 2.5, 2.0].iter().map(|s| s.exp()).collect();
+        let z: f64 = e.iter().sum();
+        for (a, b) in w.iter().zip(&e) {
+            assert!((a - b / z).abs() < 1e-12);
+        }
+        assert!(route_weights(&scores, None, &[1, 4, 0], 1.0).is_none());
+        assert!(route_weights(&scores, None, &[4, 1, 3], 1.0).is_none());
+        assert!(route_weights(&scores, Some(&[0.0; 5]), &[1], 1.0).is_none());
     }
 
     #[test]

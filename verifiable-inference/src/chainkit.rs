@@ -1288,7 +1288,7 @@ mod moe_tests {
 
         let none = manifest::NONE;
         let last = if batch > 1 { manifest::ROLE_OUTPUT } else { manifest::ROLE_PRODUCT };
-        let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3 };
+        let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3, shexp_gate: manifest::NONE };
         let entries = vec![
             entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_down_exps.weight", last, D, D, E as u32, exps_off, E * D * RB, RB, Chain::None),
@@ -1321,7 +1321,7 @@ mod moe_tests {
         let mut ids: Vec<u32> = (0..E as u32).collect();
         ids.sort_by(|&a, &b| sel[b as usize].total_cmp(&sel[a as usize]));
         ids.truncate(U);
-        let w = route_weights(&scores, &bias, &ids, SCALE as f64).unwrap();
+        let w = route_weights(&scores, Some(&bias), &ids, SCALE as f64).unwrap();
         let row_dot = |off: usize, x: &[u8]| crate::dot::canonical_dot(quant::Q8_0, &weights[off..off + RB], D, x, q8::MMVQ).unwrap().y_hat as f32;
         let q = |v: Vec<f32>| q8_1_row(&v.iter().map(|&a| a as f64).collect::<Vec<_>>());
         let xs: Vec<Vec<u8>> = (0..U).map(|s| q(vecf(50 + s as u64, D, 1.0))).collect();
@@ -1409,6 +1409,7 @@ mod moe_tests {
                     router_row: (self.eo(4), self.range(row as usize * 4 * D, 4 * D)),
                     resid: leaf_bytes(&self.pos, chain::resid_leaf(np, 0, Resid::Attn)),
                     norm: (self.eo(6), self.range(4 * E * D + 4 * E, 4 * D)),
+                    shexp_gate: None,
                 })),
             })
         }

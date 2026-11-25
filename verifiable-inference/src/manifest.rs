@@ -15,6 +15,9 @@ pub const FORM_PAIR_GATE: u8 = 2;
 pub const FORM_PAIR_UP: u8 = 3;
 pub const GLU_SWIGLU: u8 = 1;
 pub const GLU_GEGLU: u8 = 2;
+/// SwiGLU with the gate clamped above and the up clamped on both sides at `SWIGLU_CLAMP_LIMIT`.
+pub const GLU_SWIGLU_CLAMP: u8 = 7;
+pub const SWIGLU_CLAMP_LIMIT: f64 = 10.0;
 pub const NONE: u32 = u32::MAX;
 pub const ROLE_LAYER: u8 = 5;
 /// F32 router weights: `m` rows (experts) of `k` values.
@@ -39,6 +42,9 @@ const TAG_ATTN_LAYER: u8 = 4;
 const TAG_ATTN_MOE_LAYER: u8 = 5;
 const TAG_RECUR_LAYER: u8 = 6;
 const TAG_RECUR_MOE_LAYER: u8 = 7;
+const TAG_MOEG_LAYER: u8 = 10;
+const TAG_ATTN_MOEG_LAYER: u8 = 11;
+const TAG_RECUR_MOEG_LAYER: u8 = 12;
 
 /// Source of a product's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +80,8 @@ pub struct MoeLinks {
     pub ffn_norm: u32,
     /// Rank of the gate product of the routed experts, whose input is the router input.
     pub gate_exps: u32,
+    /// F32 gate of the shared expert, whose output is scaled by its sigmoid; `NONE` = ungated.
+    pub shexp_gate: u32,
 }
 
 /// Attention of a layer.
@@ -221,14 +229,26 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
             let link = *b.get(5)?;
             Some((Chain::Product(ProductLink { layer: u32a(1)?, link, norm: u32a(6)?, src: u32a(10)? }), 14))
         }
-        Some(&tag @ (TAG_LAYER | TAG_MOE_LAYER | TAG_ATTN_LAYER | TAG_ATTN_MOE_LAYER | TAG_RECUR_LAYER | TAG_RECUR_MOE_LAYER)) => {
-            let moe = if matches!(tag, TAG_MOE_LAYER | TAG_ATTN_MOE_LAYER | TAG_RECUR_MOE_LAYER) {
-                Some(MoeLinks { down_exps: u32a(25)?, router: u32a(29)?, probs_bias: u32a(33)?, w_scale: u32a(37)?, ffn_norm: u32a(41)?, gate_exps: u32a(45)? })
+        Some(
+            &tag @ (TAG_LAYER | TAG_MOE_LAYER | TAG_ATTN_LAYER | TAG_ATTN_MOE_LAYER | TAG_RECUR_LAYER | TAG_RECUR_MOE_LAYER
+            | TAG_MOEG_LAYER | TAG_ATTN_MOEG_LAYER | TAG_RECUR_MOEG_LAYER),
+        ) => {
+            let gated = matches!(tag, TAG_MOEG_LAYER | TAG_ATTN_MOEG_LAYER | TAG_RECUR_MOEG_LAYER);
+            let moe = if gated || matches!(tag, TAG_MOE_LAYER | TAG_ATTN_MOE_LAYER | TAG_RECUR_MOE_LAYER) {
+                let shexp_gate = if gated { u32a(49)? } else { NONE };
+                if gated && shexp_gate == NONE {
+                    return None;
+                }
+                Some(MoeLinks { down_exps: u32a(25)?, router: u32a(29)?, probs_bias: u32a(33)?, w_scale: u32a(37)?, ffn_norm: u32a(41)?, gate_exps: u32a(45)?, shexp_gate })
             } else {
                 None
             };
-            let base = if moe.is_some() { 49 } else { 25 };
-            let attn = if matches!(tag, TAG_ATTN_LAYER | TAG_ATTN_MOE_LAYER) {
+            let base = match (moe.is_some(), gated) {
+                (_, true) => 53,
+                (true, false) => 49,
+                (false, false) => 25,
+            };
+            let attn = if matches!(tag, TAG_ATTN_LAYER | TAG_ATTN_MOE_LAYER | TAG_ATTN_MOEG_LAYER) {
                 let mut f = [0u32; ATTN_FIELDS];
                 for (i, v) in f.iter_mut().enumerate() {
                     *v = u32a(base + 4 * i)?;
@@ -237,7 +257,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
             } else {
                 None
             };
-            let recur = if matches!(tag, TAG_RECUR_LAYER | TAG_RECUR_MOE_LAYER) {
+            let recur = if matches!(tag, TAG_RECUR_LAYER | TAG_RECUR_MOE_LAYER | TAG_RECUR_MOEG_LAYER) {
                 let mut f = [0u32; RECUR_FIELDS];
                 for (i, v) in f.iter_mut().enumerate() {
                     *v = u32a(base + 4 * i)?;
@@ -278,13 +298,17 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             b.extend_from_slice(&p.src.to_le_bytes());
         }
         Chain::Layer(l) => {
-            b.push(match (l.moe.is_some(), l.attn.is_some(), l.recur.is_some()) {
-                (false, false, false) => TAG_LAYER,
-                (true, false, false) => TAG_MOE_LAYER,
-                (false, true, _) => TAG_ATTN_LAYER,
-                (true, true, _) => TAG_ATTN_MOE_LAYER,
-                (false, false, true) => TAG_RECUR_LAYER,
-                (true, false, true) => TAG_RECUR_MOE_LAYER,
+            let gated = l.moe.is_some_and(|m| m.shexp_gate != NONE);
+            b.push(match (l.moe.is_some(), gated, l.attn.is_some(), l.recur.is_some()) {
+                (false, _, false, false) => TAG_LAYER,
+                (true, false, false, false) => TAG_MOE_LAYER,
+                (true, true, false, false) => TAG_MOEG_LAYER,
+                (false, _, true, _) => TAG_ATTN_LAYER,
+                (true, false, true, _) => TAG_ATTN_MOE_LAYER,
+                (true, true, true, _) => TAG_ATTN_MOEG_LAYER,
+                (false, _, false, true) => TAG_RECUR_LAYER,
+                (true, false, false, true) => TAG_RECUR_MOE_LAYER,
+                (true, true, false, true) => TAG_RECUR_MOEG_LAYER,
             });
             for v in [l.layer, l.proj, l.down, l.post_attn, l.post_ffn, l.scale] {
                 b.extend_from_slice(&v.to_le_bytes());
@@ -292,6 +316,9 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             if let Some(m) = l.moe {
                 for v in [m.down_exps, m.router, m.probs_bias, m.w_scale, m.ffn_norm, m.gate_exps] {
                     b.extend_from_slice(&v.to_le_bytes());
+                }
+                if m.shexp_gate != NONE {
+                    b.extend_from_slice(&m.shexp_gate.to_le_bytes());
                 }
             }
             if let Some(a) = l.attn {
@@ -449,7 +476,7 @@ mod tests {
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
         let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None });
-        let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13 };
+        let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13, shexp_gate: NONE };
         let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None });
         let attn = AttnLinks {
             q: 1, k: 2, v: 3, q_norm: NONE, k_norm: NONE, n_head: 32, n_head_kv: 2, head_dim: 128, rope_kind: 0, n_rot: 128,
@@ -469,15 +496,28 @@ mod tests {
         let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur) });
         assert_eq!(chain_bytes(&lr).len(), 25 + 76);
         assert_eq!(chain_bytes(&lmr).len(), 49 + 76);
-        for c in [Chain::None, p, l, lm, la, lma, lr, lmr] {
+        let gated = MoeLinks { probs_bias: NONE, w_scale: 1f32.to_bits(), shexp_gate: 44, ..moe };
+        let lg = Chain::Layer(LayerLinks { moe: Some(gated), ..match lm { Chain::Layer(x) => x, _ => unreachable!() } });
+        let lga = Chain::Layer(LayerLinks { moe: Some(gated), ..match lma { Chain::Layer(x) => x, _ => unreachable!() } });
+        let lgr = Chain::Layer(LayerLinks { moe: Some(gated), ..match lmr { Chain::Layer(x) => x, _ => unreachable!() } });
+        assert_eq!(chain_bytes(&lg).len(), 53);
+        assert_eq!(chain_bytes(&lga).len(), 53 + 84);
+        assert_eq!(chain_bytes(&lgr).len(), 53 + 76);
+        assert_eq!(chain_bytes(&lm).len(), 49);
+        for c in [Chain::None, p, l, lm, la, lma, lr, lmr, lg, lga, lgr] {
             let mut b = base_bytes("x", ROLE_PRODUCT);
             b.extend_from_slice(&chain_bytes(&c));
             let (e, len) = Entry::parse(&b).unwrap();
             assert_eq!((len, e.chain), (b.len(), c));
         }
         let mut bad = base_bytes("x", ROLE_PRODUCT);
-        bad.push(9);
+        bad.push(13);
         assert!(Entry::parse(&bad).is_none());
+        let mut ungated = base_bytes("x", ROLE_PRODUCT);
+        let mut g = chain_bytes(&lg);
+        g[49..53].copy_from_slice(&NONE.to_le_bytes());
+        ungated.extend_from_slice(&g);
+        assert!(Entry::parse(&ungated).is_none());
     }
 
     #[test]

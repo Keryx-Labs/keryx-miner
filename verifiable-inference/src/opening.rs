@@ -149,6 +149,8 @@ pub struct MoeAdd {
     pub resid: LeafBytes,
     /// The whole FFN norm weight of the layer.
     pub norm: (EntryOpening, ChunkRange),
+    /// The whole gate row of a gated shared expert.
+    pub shexp_gate: Option<(EntryOpening, ChunkRange)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -396,7 +398,7 @@ impl W {
                 self.weights(norm);
             }
             ResidAdd::Moe(m) => {
-                self.u8(2);
+                self.u8(if m.shexp_gate.is_some() { 3 } else { 2 });
                 self.leaf_bytes(&m.scores);
                 self.weights(&m.bias);
                 self.bytes32(&m.ids.chunk);
@@ -409,6 +411,9 @@ impl W {
                 self.weights(&m.router_row);
                 self.leaf_bytes(&m.resid);
                 self.weights(&m.norm);
+                if let Some(g) = &m.shexp_gate {
+                    self.weights(g);
+                }
             }
         }
     }
@@ -508,7 +513,7 @@ impl R<'_> {
         let add = match self.u8()? {
             0 => ResidAdd::Chunk(self.leaf_chunk()?),
             1 => ResidAdd::Normed { y: self.leaf_bytes()?, norm: self.weights()? },
-            2 => {
+            tag @ (2 | 3) => {
                 let scores = self.leaf_bytes()?;
                 let bias = self.weights()?;
                 let ids = ExpertIds { chunk: self.bytes32()?, chunk_path: self.hashes()? };
@@ -523,6 +528,7 @@ impl R<'_> {
                     router_row: self.weights()?,
                     resid: self.leaf_bytes()?,
                     norm: self.weights()?,
+                    shexp_gate: if tag == 3 { Some(self.weights()?) } else { None },
                 }))
             }
             _ => return None,
@@ -1089,6 +1095,23 @@ mod resid_opening_tests {
             c.push(0);
             assert!(ResidOpening::decode(&c).is_none() && !is_audit_body(&b[..b.len() - 1]));
             assert!(Opening::decode(&b).is_none() && AttnOpening::decode(&b).is_none() && RecurOpening::decode(&b).is_none());
+        }
+        let w = |s: u8| (EntryOpening { index: s as u32, bytes: vec![s; 40], path: vec![[s; 32]; 4] }, range(s));
+        for gate in [None, Some(w(12))] {
+            let mut p = point();
+            p.add = ResidAdd::Moe(Box::new(MoeAdd {
+                scores: LeafBytes { bytes: vec![1; 1024], leaf_path: vec![[1; 32]; 9] },
+                bias: w(2),
+                ids: ExpertIds { chunk: vec![3; 32], chunk_path: vec![[3; 32]; 2] },
+                slots: vec![chunk(4, 1024), chunk(5, 1024)],
+                shexp: chunk(6, 1024),
+                router_row: w(7),
+                resid: LeafBytes { bytes: vec![8; 4096], leaf_path: vec![[8; 32]; 9] },
+                norm: w(9),
+                shexp_gate: gate,
+            }));
+            let o = ResidOpening { response_txid: [1; 32], roots: None, resid: p, feed: feed.clone(), expert: None };
+            assert_eq!(ResidOpening::decode(&o.encode()), Some(o));
         }
     }
 

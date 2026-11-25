@@ -27,13 +27,13 @@ pub const STAGE_1A: u8 = 1;
 pub const POINTS: u32 = draw::POINTS;
 
 /// Trace slots: the H14 tiers in tier order, then the traced H18 tiers.
-const SLOTS: usize = 7;
+const SLOTS: usize = 10;
 
 /// Slot of each H18 tier; `None` = not traced. MUST follow the node's `TRACE_TIERS_H18`.
-const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [Some(6), Some(5), None, None, None, None, None];
+const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [Some(6), Some(5), Some(8), Some(7), Some(9), None, None];
 
-/// Slot whose prefix and sequence contexts a slot uses.
-const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0, 0];
+/// Slot whose prefix context a slot uses.
+const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0, 0, 2, 0, 0];
 
 /// Trace slot of `model_id` serving `tier`; `None` = the tier is not traced.
 pub fn slot(model_id: &[u8; 32], tier: u8) -> Option<u8> {
@@ -52,6 +52,9 @@ const MANIFESTS: [Option<&[u8]>; SLOTS] = [
     None,
     Some(include_bytes!("../assets/trace-manifests/h18-tier1.bin")),
     Some(include_bytes!("../assets/trace-manifests/h18-tier0.bin")),
+    Some(include_bytes!("../assets/trace-manifests/h18-tier3.bin")),
+    Some(include_bytes!("../assets/trace-manifests/h18-tier2.bin")),
+    Some(include_bytes!("../assets/trace-manifests/h18-tier4.bin")),
 ];
 
 /// Prefix contexts of the audited tiers, in tier order. MUST equal the node's `TRACE_PREFIXES`.
@@ -172,6 +175,9 @@ const CHAIN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/chain-tier4.bin"),
     include_bytes!("../assets/trace-manifests/chain-h18-tier1.bin"),
     include_bytes!("../assets/trace-manifests/chain-h18-tier0.bin"),
+    include_bytes!("../assets/trace-manifests/chain-h18-tier3.bin"),
+    include_bytes!("../assets/trace-manifests/chain-h18-tier2.bin"),
+    include_bytes!("../assets/trace-manifests/chain-h18-tier4.bin"),
 ];
 
 /// Serialized manifests under the attention rule (attention and recurrent descriptors), in tier
@@ -184,11 +190,14 @@ const ATTN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/attn-tier4.bin"),
     include_bytes!("../assets/trace-manifests/attn-h18-tier1.bin"),
     include_bytes!("../assets/trace-manifests/attn-h18-tier0.bin"),
+    include_bytes!("../assets/trace-manifests/attn-h18-tier3.bin"),
+    include_bytes!("../assets/trace-manifests/attn-h18-tier2.bin"),
+    include_bytes!("../assets/trace-manifests/attn-h18-tier4.bin"),
 ];
 
 /// Attention layers, recurrent layers and sequence heads of each manifest under the attention
 /// rule. MUST equal the node's `TRACE_ATTN_H_NEXT`.
-const ATTN_SEQ: [(u32, u32, u32); 5] = [(8, 24, 32), (40, 0, 2), (48, 0, 8), (16, 48, 48), (7, 20, 32)];
+const ATTN_SEQ: [(u32, u32, u32); SLOTS] = [(8, 24, 32), (40, 0, 2), (48, 0, 8), (16, 48, 48), (7, 20, 32), (8, 24, 32), (8, 24, 32), (60, 0, 16), (10, 30, 32), (16, 48, 48)];
 
 /// Positions between recurrent state checkpoints when a manifest has no recurrent layer.
 const DEFAULT_INTERVAL: u32 = 48;
@@ -203,6 +212,9 @@ const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; SLOTS] = [
     Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
     Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
     Some((ChainCtx { n_layers: 32, layer_base: 316, embd_entry: 250, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 250, 251)),
+    Some((ChainCtx { n_layers: 60, layer_base: 653, embd_entry: 411, eps: 9.999999974752427e-07, embd_scale: 73.32121276855469, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 411, 412)),
+    Some((ChainCtx { n_layers: 40, layer_base: 593, embd_entry: 431, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 431, 432)),
+    Some((ChainCtx { n_layers: 64, layer_base: 626, embd_entry: 496, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 496, 497)),
 ];
 
 /// Positions whose head output a decision opening reads: every marker, then the pointer.
@@ -275,6 +287,24 @@ static KEV_PREFIX: PrefixCtx = match PREFIXES {
     _ => panic!(),
 };
 
+/// Prefix context of the H18 tier 3. MUST equal the node's `GEMMA4_31B_PREFIX`.
+static GEMMA4_31B_PREFIX: PrefixCtx = match PREFIXES {
+    [_, _, Some(p), ..] => PrefixCtx { embd_entry: 411, norm_entry: 412, embd_scale: 73.32121276855469, ..p },
+    _ => panic!(),
+};
+
+/// Prefix context of the H18 tier 2. MUST equal the node's `MINICPM_V_4_7_PREFIX`.
+static MINICPM_V_4_7_PREFIX: PrefixCtx = match PREFIXES {
+    [Some(p), ..] => PrefixCtx { embd_entry: 431, norm_entry: 432, ..p },
+    _ => panic!(),
+};
+
+/// Prefix context of the H18 tier 4. MUST equal the node's `QWEN3_8_TURBO_PREFIX`.
+static QWEN3_8_TURBO_PREFIX: PrefixCtx = match PREFIXES {
+    [Some(p), ..] => PrefixCtx { embd_entry: 496, norm_entry: 497, ..p },
+    _ => panic!(),
+};
+
 /// Slot of the decision tier.
 const DECISION_SLOT: u8 = 6;
 
@@ -310,8 +340,12 @@ pub const KIMI_PREFIX_OFFSET: u32 = 6;
 
 /// The prefix context of `slot`; `None` = no manifest.
 pub fn prefix_ctx(slot: u8) -> Option<&'static PrefixCtx> {
-    if slot == DECISION_SLOT {
-        return Some(&KEV_PREFIX);
+    match slot {
+        DECISION_SLOT => return Some(&KEV_PREFIX),
+        7 => return Some(&GEMMA4_31B_PREFIX),
+        8 => return Some(&MINICPM_V_4_7_PREFIX),
+        9 => return Some(&QWEN3_8_TURBO_PREFIX),
+        _ => {}
     }
     PREFIXES.get(*CTX_SLOT.get(slot as usize)?).and_then(|p| p.as_ref())
 }
@@ -377,7 +411,7 @@ impl TierManifest {
     /// The manifest of `slot` under the attention rule, with its chain context.
     pub fn for_attn(slot: u8) -> Option<Self> {
         let (mut ctx, _) = chain_ctx(slot)?;
-        (ctx.n_attn, ctx.n_recur, ctx.seq_heads) = *ATTN_SEQ.get(*CTX_SLOT.get(slot as usize)?)?;
+        (ctx.n_attn, ctx.n_recur, ctx.seq_heads) = *ATTN_SEQ.get(slot as usize)?;
         let m = Self::parse(Self::raw_attn(slot)?)?;
         Some(Self { chain: Some(ctx), ..m })
     }
@@ -1245,13 +1279,20 @@ pub fn chain_opening(
         let attn_leaf = chain::resid_leaf(np, r.layer, Resid::Attn) as u32;
         ResidAdd::Moe(Box::new(MoeAdd {
             scores: leaf_bytes(rec, r.t, router_leaf, cap(r.t, router_leaf)?),
-            bias: bytes_range(m, index, moe.probs_bias as u64, 0, 4 * n_exp)?,
+            bias: match moe.probs_bias {
+                manifest::NONE => Default::default(),
+                b => bytes_range(m, index, b as u64, 0, 4 * n_exp)?,
+            },
             ids: expert_ids(down_y, n_used)?,
             slots,
             shexp: leaf_chunk(rec, r.t, y_leaf, y, r.c)?,
             router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
             resid: leaf_bytes(rec, r.t, attn_leaf, cap(r.t, attn_leaf)?),
             norm: bytes_range(m, index, moe.ffn_norm as u64, 0, 4 * dim)?,
+            shexp_gate: match moe.shexp_gate {
+                manifest::NONE => None,
+                g => Some(bytes_range(m, index, g as u64, 0, 4 * dim)?),
+            },
         }))
     } else if post == manifest::NONE {
         ResidAdd::Chunk(leaf_chunk(rec, r.t, y_leaf, y, r.c)?)
@@ -1435,7 +1476,7 @@ mod tests {
         assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 0), Some(0));
         assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 5), None);
         for (t, m) in H18_LINEUP.iter().enumerate() {
-            assert_eq!(slot(&m.model_id, t as u8).is_some(), t <= 1, "tier {t}");
+            assert_eq!(slot(&m.model_id, t as u8).is_some(), t <= 4, "tier {t}");
         }
         let hex = |m: &TierManifest| hex::encode(m.m_t);
         let p = TierManifest::for_tier(5).unwrap();
@@ -1453,6 +1494,64 @@ mod tests {
         assert_eq!((p.entry(pre.embd_entry as u64).role, p.entry(pre.norm_entry as u64).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
         assert_eq!((pre.offset, pre.eps, pre.table), (6, 9.999999974752427e-07, prefix_ctx(0).unwrap().table));
         assert!(decision_ctx(5).is_none());
+    }
+
+    #[test]
+    fn h18_tier_4_matches_the_node() {
+        use crate::models::QWEN3_8_27B_TURBO;
+        assert_eq!(slot(&QWEN3_8_27B_TURBO.model_id, 4), Some(9));
+        let hex = |m: &TierManifest| hex::encode(m.m_t);
+        let p = TierManifest::for_tier(9).unwrap();
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("347712e797a5983349dc44bde2c81c2da8fd4e7f64f48cd0a6ae19e05c800646", 498, 496));
+        let c = TierManifest::for_chain(9).unwrap();
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("fe59f580d00fdd9a192bb94e17758ffa2b885754f85cc5dc195aca9c29c2efd7", 690, 496));
+        let a = TierManifest::for_attn(9).unwrap();
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("aab3aef4e7c377400f2635346b32aeeb7b8619172d03739702d44b0837741ec4", 914, 496));
+        let ac = a.chain.unwrap();
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.trim_last, ac.n_attn, ac.n_recur, ac.seq_heads), (64, 626, 496, true, 16, 48, 48));
+        let pre = prefix_ctx(9).unwrap();
+        assert_eq!((pre.offset, pre.embd_entry, pre.norm_entry, pre.table), (6, 496, 497, prefix_ctx(0).unwrap().table));
+        assert_eq!((p.entry(496).role, p.entry(497).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+    }
+
+    #[test]
+    fn h18_tier_2_matches_the_node() {
+        use crate::models::MINICPM_V_4_7;
+        assert_eq!(slot(&MINICPM_V_4_7.model_id, 2), Some(8));
+        let hex = |m: &TierManifest| hex::encode(m.m_t);
+        let p = TierManifest::for_tier(8).unwrap();
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("2c85883160fc25d2ad4e4e395062d35b59da50950a3fa139c6530da21fe86d69", 433, 431));
+        let c = TierManifest::for_chain(8).unwrap();
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("b3f5b984a13153d671c74b018434bafb99dd15aeab59ed96246ba0017ae651c9", 633, 431));
+        let a = TierManifest::for_attn(8).unwrap();
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("626f96bde1b84901bfffacd59a84b09a95a65b3101dff656afe31164b9a20ad9", 773, 431));
+        let ac = a.chain.unwrap();
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.trim_last, ac.n_used, ac.n_attn, ac.n_recur, ac.seq_heads), (40, 593, 431, true, 8, 10, 30, 32));
+        let pre = prefix_ctx(8).unwrap();
+        assert_eq!((pre.offset, pre.embd_entry, pre.norm_entry, pre.table), (6, 431, 432, prefix_ctx(0).unwrap().table));
+        assert_eq!((p.entry(431).role, p.entry(432).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+        let gated = a.entries.iter().filter(|(e, _)| matches!(e.chain, Chain::Layer(ll) if ll.moe.is_some_and(|m| m.shexp_gate != manifest::NONE && m.probs_bias == manifest::NONE))).count();
+        assert_eq!(gated, 40);
+    }
+
+    #[test]
+    fn h18_tier_3_matches_the_node() {
+        use crate::models::GEMMA_4_31B;
+        assert_eq!(slot(&GEMMA_4_31B.model_id, 3), Some(7));
+        let hex = |m: &TierManifest| hex::encode(m.m_t);
+        let p = TierManifest::for_tier(7).unwrap();
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("6318370827685d26d26a38acd7b99ba8df7af09569c145e356484aa80bb96b98", 413, 411));
+        let c = TierManifest::for_chain(7).unwrap();
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("d73e86cdac75517c4f25178fa1cf23a2a23e8aebc9431db7dd29f8d3f5ef4c14", 713, 411));
+        let a = TierManifest::for_attn(7).unwrap();
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("42a76d7ce49724a65142dbd71486b2e40dc5e8ac894f560891813b73b3f69622", 834, 411));
+        let ac = a.chain.unwrap();
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.trim_last, ac.n_attn, ac.n_recur, ac.seq_heads), (60, 653, 411, true, 60, 0, 16));
+        let pre = prefix_ctx(7).unwrap();
+        assert_eq!((pre.offset, pre.embd_entry, pre.norm_entry, pre.embd_scale, pre.table), (7, 411, 412, 73.32121276855469, prefix_ctx(2).unwrap().table));
+        assert_eq!((p.entry(411).role, p.entry(412).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+        assert_eq!(a.seq_layers().len(), 60);
+        assert!(decision_ctx(7).is_none());
     }
 
     #[test]
@@ -1544,7 +1643,7 @@ mod tests {
             assert!(legacy.entries.iter().all(|(e, _)| e.role != manifest::ROLE_EMBD && e.role != manifest::ROLE_NORM));
         }
         assert!(TierManifest::for_tier(4).is_none());
-        assert!(TierManifest::for_tier(9).is_none());
+        assert!(TierManifest::for_tier(SLOTS as u8).is_none());
         assert!(prefix_ctx(4).is_none());
     }
 
