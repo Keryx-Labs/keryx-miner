@@ -1651,7 +1651,7 @@ mod moe_tests {
 
         let none = manifest::NONE;
         let last = if batch > 1 { manifest::ROLE_OUTPUT } else { manifest::ROLE_PRODUCT };
-        let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3, shexp_gate: manifest::NONE };
+        let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3, shexp_gate: manifest::NONE, gating: 0 };
         let entries = vec![
             entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_down_exps.weight", last, D, D, E as u32, exps_off, E * D * RB, RB, Chain::None),

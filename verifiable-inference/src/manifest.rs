@@ -81,6 +81,9 @@ const HC_FIELDS: usize = 13;
 /// of the layer for the FFN half).
 const TAG_HC1: u8 = 18;
 const HC1_FIELDS: usize = HC_FIELDS + 6;
+/// A layer whose routed experts are gated by another function than the bias implies.
+const TAG_GATING: u8 = 19;
+pub const GATING_SQRT_SOFTPLUS: u32 = 4;
 
 /// Source of a product's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +389,9 @@ pub struct MoeLinks {
     pub gate_exps: u32,
     /// F32 gate of the shared expert, whose output is scaled by its sigmoid; `NONE` = ungated.
     pub shexp_gate: u32,
+    /// Expert gating function: 0 as the bias implies (sigmoid with a selection bias, softmax
+    /// without), `GATING_SQRT_SOFTPLUS` otherwise.
+    pub gating: u32,
 }
 
 /// Attention of a layer.
@@ -576,6 +582,15 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                 _ => None,
             }
         }
+        Some(&TAG_GATING) => {
+            let g = u32a(1)?;
+            match parse_chain(b.get(5..)?)? {
+                (Chain::Layer(l), len) if g == GATING_SQRT_SOFTPLUS && l.moe.is_some_and(|m| m.gating == 0) => {
+                    Some((Chain::Layer(LayerLinks { moe: l.moe.map(|m| MoeLinks { gating: g, ..m }), ..l }), 5 + len))
+                }
+                _ => None,
+            }
+        }
         Some(&TAG_HC1) => {
             let mut f = [0u32; HC1_FIELDS];
             for (i, v) in f.iter_mut().enumerate() {
@@ -613,7 +628,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                 if gated && shexp_gate == NONE {
                     return None;
                 }
-                Some(MoeLinks { down_exps: u32a(25)?, router: u32a(29)?, probs_bias: u32a(33)?, w_scale: u32a(37)?, ffn_norm: u32a(41)?, gate_exps: u32a(45)?, shexp_gate })
+                Some(MoeLinks { down_exps: u32a(25)?, router: u32a(29)?, probs_bias: u32a(33)?, w_scale: u32a(37)?, ffn_norm: u32a(41)?, gate_exps: u32a(45)?, shexp_gate, gating: 0 })
             } else {
                 None
             };
@@ -672,6 +687,11 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             b.push(p.link);
             b.extend_from_slice(&p.norm.to_le_bytes());
             b.extend_from_slice(&p.src.to_le_bytes());
+        }
+        Chain::Layer(l) if l.moe.is_some_and(|m| m.gating != 0) => {
+            b.push(TAG_GATING);
+            b.extend_from_slice(&l.moe.unwrap().gating.to_le_bytes());
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { moe: l.moe.map(|m| MoeLinks { gating: 0, ..m }), ..*l })));
         }
         Chain::Layer(l) if l.engram.is_some() => {
             b.push(TAG_ENGRAM);
@@ -842,6 +862,21 @@ pub fn read_file(data: &[u8]) -> Option<Manifest> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_gated_moe_layer_round_trips_and_ungated_layers_keep_their_bytes() {
+        let moe = MoeLinks { down_exps: 1, router: 2, probs_bias: 3, w_scale: 1.5f32.to_bits(), ffn_norm: 4, gate_exps: 5, shexp_gate: NONE, gating: 0 };
+        let l = LayerLinks { layer: 0, proj: 0, down: 1, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None, comp: None, engram: None };
+        let plain = chain_bytes(&Chain::Layer(l));
+        let gated = Chain::Layer(LayerLinks { moe: Some(MoeLinks { gating: GATING_SQRT_SOFTPLUS, ..moe }), ..l });
+        let b = chain_bytes(&gated);
+        assert_eq!(b[0], TAG_GATING);
+        assert_eq!(&b[5..], &plain[..]);
+        assert_eq!(parse_chain(&b), Some((gated, b.len())));
+        let mut bad = b.clone();
+        bad[1] = 7;
+        assert_eq!(parse_chain(&bad), None);
+    }
+
     use super::*;
 
     /// A built manifest with attention descriptors, at `KERYX_ATTN_MANIFEST` (skipped when unset):
@@ -885,7 +920,7 @@ mod tests {
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
         let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, hc: None, dsa: None, comp: None, engram: None });
-        let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13, shexp_gate: NONE };
+        let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13, shexp_gate: NONE, gating: 0 };
         let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None, comp: None, engram: None });
         let attn = AttnLinks {
             q: 1, k: 2, v: 3, q_norm: NONE, k_norm: NONE, n_head: 32, n_head_kv: 2, head_dim: 128, rope_kind: 0, n_rot: 128,
@@ -967,6 +1002,107 @@ mod tests {
         for ((e, bytes), (wb, c)) in entries.iter().zip(&want) {
             assert_eq!((bytes, e.chain), (wb, *c));
         }
+    }
+
+    /// Cross-references of a deepseek41 manifest (`VI_DSV41_MANIFEST`): each descriptor field names
+    /// an entry of the role and size the checks read.
+    #[test]
+    #[ignore]
+    fn dsv41_manifest_from_env() {
+        let path = std::env::var("VI_DSV41_MANIFEST").expect("VI_DSV41_MANIFEST");
+        let (entries, n_products) = read_file(&std::fs::read(path).unwrap()).unwrap();
+        let e = |i: u32| &entries[i as usize].0;
+        let named = |i: u32, role: u8, suffix: &str| {
+            assert_ne!(i, NONE, "{suffix}");
+            let x = e(i);
+            assert!(x.role == role && x.name.ends_with(suffix), "{} (role {}) is not {suffix}", x.name, x.role);
+            x
+        };
+        let layers: Vec<LayerLinks> = entries.iter().filter_map(|(x, _)| if let Chain::Layer(l) = x.chain { Some(l) } else { None }).collect();
+        let n_layers = layers.len() as u64;
+        let n_sel = layers.iter().filter_map(|l| l.comp).flat_map(|c| [c.sel, c.cand]).filter(|&v| v != NONE).max().unwrap() as u64 + 1;
+        let (mut n_comp, mut n_engram) = (0, 0);
+        for (li, l) in layers.iter().enumerate() {
+            let pre = |x: &str| format!("blk.{li}.{x}");
+            assert_eq!(l.layer as usize, li);
+            let moe = l.moe.unwrap();
+            assert_eq!(moe.gating, GATING_SQRT_SOFTPLUS);
+            assert!(matches!(e(moe.router).wtype, crate::quant::BF16) && e(moe.router).role == ROLE_ROUTER);
+            named(l.proj, ROLE_PRODUCT, &pre("attn_output_b.weight"));
+            let hc = l.hc.unwrap();
+            assert_eq!(hc.lag, 1);
+            named(hc.attn_fn, ROLE_PRODUCT, &pre("hc_attn_fn.weight"));
+            named(hc.ffn_fn, ROLE_PRODUCT, &pre("hc_ffn_fn.weight"));
+            if li == 0 {
+                assert_eq!(hc.prev_fn, NONE);
+            } else {
+                assert_eq!(hc.prev_fn, layers[li - 1].hc.unwrap().ffn_fn);
+                assert_eq!(hc.prev_base, layers[li - 1].hc.unwrap().ffn_base);
+                assert_eq!(hc.prev_scale, layers[li - 1].hc.unwrap().ffn_scale);
+            }
+            let a = l.attn.unwrap();
+            named(a.q, ROLE_PRODUCT, &pre("attn_q_b.weight"));
+            named(a.k, ROLE_PRODUCT, &pre("attn_kv.weight"));
+            named(a.k_norm, ROLE_NORM, &pre("attn_kv_a_norm.weight"));
+            let out = named(a.out, ROLE_HEADS, &pre("attn_output_a.weight"));
+            assert_eq!(out.k * out.n_exp as u64, a.n_head as u64 * a.head_dim as u64);
+            assert_eq!(a.slot as usize, li);
+            let c = l.comp.unwrap();
+            assert_eq!(named(c.sinks, ROLE_NORM, &pre("attn_sinks.weight")).k, a.n_head as u64);
+            if c.ratio == 0 {
+                assert!(c.src == NONE && c.sel == NONE && c.n_top == 0);
+            } else {
+                let src = &layers[c.src as usize];
+                let sc = src.comp.unwrap();
+                assert!(c.src as usize <= li && sc.src == c.src && sc.slot == c.slot && sc.ratio == c.ratio);
+                if c.src as usize == li {
+                    n_comp += 1;
+                    named(c.kv, ROLE_PRODUCT, &pre("attn_compressor_kv.weight"));
+                    if c.ratio > 1 {
+                        named(c.gate, ROLE_PRODUCT, &pre("attn_compressor_gate.weight"));
+                    } else {
+                        assert_eq!(c.gate, NONE);
+                    }
+                    named(c.norm, ROLE_NORM, &pre("attn_compressor_norm.weight"));
+                    let ik = named(c.ik, ROLE_MATRIX, &pre("indexer.attn_k.weight"));
+                    assert_eq!(ik.wtype, crate::quant::Q8_0);
+                    assert_eq!(ik.k + named(c.k_norm, ROLE_NORM, &pre("indexer.k_norm.weight")).k, c.row_len as u64);
+                } else {
+                    assert!(c.kv == NONE && c.ik == NONE);
+                }
+                let t = &layers[c.topk_src as usize].comp.unwrap();
+                assert!(c.topk_src as usize <= li && t.topk_src == c.topk_src && t.sel == c.sel && c.n_top > 0);
+                if c.topk_src as usize == li {
+                    named(c.iq, ROLE_PRODUCT, &pre("indexer.attn_q_b.weight"));
+                    named(c.iw, ROLE_PRODUCT, &pre("indexer.proj.weight"));
+                } else {
+                    assert!(c.iq == NONE && c.iw == NONE && c.cand == NONE);
+                }
+                if c.cand != NONE {
+                    assert!(c.cand_n > 0 && c.cand_bs > 0 && (c.pick == 1) == (li as u32 == layers.iter().position(|x| x.comp.is_some_and(|y| y.pick == 1)).unwrap() as u32));
+                }
+            }
+            if let Some(g) = l.engram {
+                assert_eq!(g.module, n_engram);
+                named(g.kv, ROLE_PRODUCT, &pre("engram_kv.weight"));
+                assert_eq!(named(g.gate, ROLE_NORM, &pre("engram_gate.weight")).k % hc.n_hc as u64, 0);
+                assert_eq!(g.out_leaf as u64, crate::chain::engram_leaf(n_products as u64, n_layers, n_layers, n_sel, g.module as u64));
+                assert!(g.primes[..g.n_cols()].iter().all(|&p| p > 1) && g.map_len > g.pad);
+                n_engram += 1;
+            }
+        }
+        for (x, _) in &entries {
+            if let Chain::Product(p) = x.chain {
+                if p.link == LINK_HC_ATTN_PRE {
+                    let want = if p.layer == 0 { NONE } else { layers[p.layer as usize - 1].hc.unwrap().ffn_fn };
+                    assert_eq!(p.src, want, "{}", x.name);
+                }
+                if p.link == LINK_HC_FFN_PRE {
+                    assert_eq!(p.src, layers[p.layer as usize].hc.unwrap().attn_fn, "{}", x.name);
+                }
+            }
+        }
+        println!("{n_layers} layers, {n_products} products, {n_comp} compressed row sources, {n_sel} selection leaves, {n_engram} n-gram modules");
     }
 
     #[test]

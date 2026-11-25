@@ -681,7 +681,7 @@ mod tests {
 #[cfg(test)]
 mod moe_tests {
     use super::*;
-    use crate::chain::{route_weights, verify_resid_opening, verify_resid_point};
+    use crate::chain::{route_weights_gated, verify_resid_opening, verify_resid_point};
     use crate::opening::{ExpertIds, ExpertRow, HcMoe};
     use crate::verify::Fail;
 
@@ -708,6 +708,10 @@ mod moe_tests {
         unscaled: bool,
         /// The router weights are stored in BF16 (not a fault).
         bf16_router: bool,
+        /// The manifest gates the experts by sqrt-softplus (not a fault).
+        sqrt_softplus: bool,
+        /// The experts are combined with sigmoid weights whatever the manifest says.
+        sigmoid_weights: bool,
     }
 
     struct Kit {
@@ -776,7 +780,7 @@ mod moe_tests {
 
         let none = manifest::NONE;
         let scale = [0.5f32, 0.4, 0.6];
-        let moe = manifest::MoeLinks { down_exps: 1, router: 5, probs_bias: 6, w_scale: W_SCALE.to_bits(), ffn_norm: 7, gate_exps: 3, shexp_gate: none };
+        let moe = manifest::MoeLinks { down_exps: 1, router: 5, probs_bias: 6, w_scale: W_SCALE.to_bits(), ffn_norm: 7, gate_exps: 3, shexp_gate: none, gating: if f.sqrt_softplus { manifest::GATING_SQRT_SOFTPLUS } else { 0 } };
         let hc = manifest::HcLinks {
             attn_fn: 4,
             ffn_fn: 4,
@@ -830,7 +834,8 @@ mod moe_tests {
         let mut ids: Vec<u32> = (0..E as u32).collect();
         ids.sort_by(|&a, &b| sel[b as usize].total_cmp(&sel[a as usize]));
         ids.truncate(U);
-        let w = route_weights(&scores, Some(&bias), &ids, if f.unscaled { 1.0 } else { W_SCALE as f64 }).unwrap();
+        let gating = if f.sqrt_softplus && !f.sigmoid_weights { manifest::GATING_SQRT_SOFTPLUS } else { 0 };
+        let w = route_weights_gated(&scores, Some(&bias), &ids, if f.unscaled { 1.0 } else { W_SCALE as f64 }, gating).unwrap();
         let row_dot = |off: usize, x: &[u8]| crate::dot::canonical_dot(q, &weights[off..off + RB], D, x, q8::MMVQ).unwrap().y_hat as f32;
         let qx = |v: Vec<f32>| q8_1_row(&v.iter().map(|&a| a as f64).collect::<Vec<_>>());
         let xs: Vec<Vec<u8>> = (0..U).map(|s| qx(vecf(50 + s as u64, D, 1.0))).collect();
@@ -994,6 +999,21 @@ mod moe_tests {
         let v = build(Fault { bf16_router: true, scores_off_input: true, ..Default::default() }).verdicts();
         let refused = v.iter().filter(|r| **r == Err(Fail::Mismatch)).count();
         assert!(refused * 4 >= v.len() * 3, "{refused} of {}", v.len());
+    }
+
+    #[test]
+    fn sqrt_softplus_gated_experts_pass_and_sigmoid_weights_are_refused() {
+        let k = build(Fault { sqrt_softplus: true, ..Default::default() });
+        let mut n = 0;
+        for s in 0..256u32 {
+            let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            let Some(p) = k.open(&seed) else { continue };
+            verify_resid_point(&k.tier, &k.ctx, &k.resp(), &seed, &p).unwrap_or_else(|e| panic!("seed {s}: {e:?}"));
+            n += 1;
+        }
+        assert!(n > 20, "{n}");
+        let v = build(Fault { sqrt_softplus: true, sigmoid_weights: true, ..Default::default() }).verdicts();
+        assert!(!v.is_empty() && v.iter().all(|r| *r == Err(Fail::Mismatch)), "{v:?}");
     }
 
     #[test]

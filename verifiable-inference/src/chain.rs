@@ -728,17 +728,30 @@ const ROUTE_SUM_FLOOR: f64 = 6.103515625e-5;
 /// `ids` is not the top `ids.len()` of `sigmoid(scores) + bias`, or of `softmax(scores)` without a
 /// bias.
 pub fn route_weights(scores: &[f32], bias: Option<&[f32]>, ids: &[u32], w_scale: f64) -> Option<Vec<f64>> {
+    route_weights_gated(scores, bias, ids, w_scale, 0)
+}
+
+/// `route_weights` under the expert gating function `gating` (`MoeLinks::gating`).
+pub fn route_weights_gated(scores: &[f32], bias: Option<&[f32]>, ids: &[u32], w_scale: f64, gating: u32) -> Option<Vec<f64>> {
     if bias.is_some_and(|b| b.len() != scores.len()) || ids.is_empty() || ids.len() > scores.len() {
         return None;
     }
-    let p: Vec<f64> = match bias {
-        Some(_) => scores.iter().map(|&x| 1.0 / (1.0 + libm::exp(-(x as f64)))).collect(),
-        None => {
+    let p: Vec<f64> = match (gating, bias) {
+        (manifest::GATING_SQRT_SOFTPLUS, _) => scores
+            .iter()
+            .map(|&x| {
+                let x = x as f64;
+                libm::sqrt(if x > 20.0 { x } else { libm::log1p(libm::exp(x)) })
+            })
+            .collect(),
+        (0, Some(_)) => scores.iter().map(|&x| 1.0 / (1.0 + libm::exp(-(x as f64)))).collect(),
+        (0, None) => {
             let top = scores.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
             let e: Vec<f64> = scores.iter().map(|&x| libm::exp(x as f64 - top)).collect();
             let z: f64 = e.iter().sum();
             e.iter().map(|v| v / z).collect()
         }
+        _ => return None,
     };
     if p.iter().any(|v| !v.is_finite()) || bias.is_some_and(|b| b.iter().any(|v| !v.is_finite())) {
         return None;
@@ -828,7 +841,7 @@ impl MoeCheck<'_> {
             return Err(Fail::Trace);
         }
         let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-        let w = route_weights(&scores, bias.as_deref(), &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
+        let w = route_weights_gated(&scores, bias.as_deref(), &ids, f32::from_bits(moe.w_scale) as f64, moe.gating).ok_or(Fail::Mismatch)?;
 
         let h = whole_leaf(self.pos_root, self.shape, resid_leaf(np, self.layer, Resid::Attn), &m.resid, 4 * self.dim)?;
         let w_norm = f32_weights(tier, &m.norm, moe.ffn_norm, self.dim, 0, self.dim)?;
@@ -1047,7 +1060,7 @@ fn hc_moe_out(
         return Err(Fail::Trace);
     }
     let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let w = route_weights(&scores, bias.as_deref(), &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
+    let w = route_weights_gated(&scores, bias.as_deref(), &ids, f32::from_bits(moe.w_scale) as f64, moe.gating).ok_or(Fail::Mismatch)?;
 
     let ge = open_entry(tier, &m.gate, moe.gate_exps as u64)?;
     if ge.k != dim || ge.n_exp < 2 {
@@ -1524,6 +1537,11 @@ mod tests {
         assert!(route_weights(&scores, None, &[1, 4, 0], 1.0).is_none());
         assert!(route_weights(&scores, None, &[4, 1, 3], 1.0).is_none());
         assert!(route_weights(&scores, Some(&[0.0; 5]), &[1], 1.0).is_none());
+        let sp = |x: f32| libm::sqrt(libm::log1p(libm::exp(x as f64)));
+        let w = route_weights_gated(&scores, None, &[1, 4, 3], 1.5, manifest::GATING_SQRT_SOFTPLUS).unwrap();
+        let z = sp(scores[1]) + sp(scores[4]) + sp(scores[3]);
+        assert!((w[0] - 1.5 * sp(scores[1]) / z).abs() < 1e-12);
+        assert!(route_weights_gated(&scores, None, &[1, 4, 3], 1.0, 7).is_none());
     }
 
     #[test]
