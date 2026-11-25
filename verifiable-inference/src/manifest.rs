@@ -57,7 +57,7 @@ const TAG_RECUR_MOEG_LAYER: u8 = 12;
 const TAG_HC: u8 = 14;
 /// An attention layer restricted to the cells an indexer selects, wrapping its links.
 const TAG_DSA: u8 = 15;
-const DSA_FIELDS: usize = 4;
+const DSA_FIELDS: usize = 12;
 const HC_FIELDS: usize = 13;
 
 /// Source of a product's input.
@@ -94,15 +94,26 @@ pub struct DsaLinks {
     pub kpool: u32,
     pub n_top: u32,
     pub tail: u32,
+    /// Products of the indexer query, key, pool gate and head weights.
+    pub iq: u32,
+    pub ik: u32,
+    pub ig: u32,
+    pub w: u32,
+    /// Entries of the key norm weight and bias and of the pool position bias.
+    pub k_norm: u32,
+    pub k_bias: u32,
+    pub ape: u32,
+    /// Key norm epsilon (f32 bits).
+    pub k_eps: u32,
 }
 
 impl DsaLinks {
     fn fields(&self) -> [u32; DSA_FIELDS] {
-        [self.sel, self.kpool, self.n_top, self.tail]
+        [self.sel, self.kpool, self.n_top, self.tail, self.iq, self.ik, self.ig, self.w, self.k_norm, self.k_bias, self.ape, self.k_eps]
     }
 
     fn from_fields(f: [u32; DSA_FIELDS]) -> Self {
-        Self { sel: f[0], kpool: f[1], n_top: f[2], tail: f[3] }
+        Self { sel: f[0], kpool: f[1], n_top: f[2], tail: f[3], iq: f[4], ik: f[5], ig: f[6], w: f[7], k_norm: f[8], k_bias: f[9], ape: f[10], k_eps: f[11] }
     }
 }
 

@@ -21,6 +21,8 @@ pub const VERSION_ROOTS: u8 = 7;
 pub const VERSION_RESID: u8 = 8;
 /// Decision opening of a response, sent apart from its trace opening.
 pub const VERSION_DECISION: u8 = 9;
+/// Selection opening of a response, sent apart from its trace opening.
+pub const VERSION_SEL: u8 = 10;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -936,7 +938,7 @@ pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -1412,5 +1414,82 @@ impl DecisionOpening {
         let marker = r.decision_leaf()?;
         let pointer = r.decision_leaf()?;
         (r.o == b.len()).then_some(DecisionOpening { response_txid, roots, head, answer, marker, pointer })
+    }
+}
+
+/// One member position of a drawn pool: its indexer key and pool gate outputs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SelMember {
+    pub pos_path: Vec<Hash>,
+    pub k: LeafBytes,
+    pub g: LeafBytes,
+}
+
+/// Selection point of a response: the selection leaf of the drawn position and layer, the
+/// indexer query and head weights there, and the members of each drawn pool in draw order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SelOpeningPoint {
+    pub response_txid: Hash,
+    pub pos_root: Hash,
+    pub seq_root: Hash,
+    pub layer: EntryOpening,
+    /// Indexer query, key, gate and head weight products, in that order.
+    pub entries: Vec<EntryOpening>,
+    /// Key norm weight, key norm bias and pool position bias, in that order.
+    pub norms: Vec<(EntryOpening, ChunkRange)>,
+    pub pos_path: Vec<Hash>,
+    pub sel: LeafBytes,
+    pub iq: LeafBytes,
+    pub w: LeafBytes,
+    pub members: Vec<SelMember>,
+}
+
+impl SelOpeningPoint {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_SEL);
+        w.0.extend_from_slice(&self.response_txid);
+        w.0.extend_from_slice(&self.pos_root);
+        w.0.extend_from_slice(&self.seq_root);
+        w.entry(&self.layer);
+        w.u8(self.entries.len() as u8);
+        for e in &self.entries {
+            w.entry(e);
+        }
+        w.u8(self.norms.len() as u8);
+        for n in &self.norms {
+            w.weights(n);
+        }
+        w.hashes(&self.pos_path);
+        for l in [&self.sel, &self.iq, &self.w] {
+            w.leaf_bytes(l);
+        }
+        w.u8(self.members.len() as u8);
+        for m in &self.members {
+            w.hashes(&m.pos_path);
+            w.leaf_bytes(&m.k);
+            w.leaf_bytes(&m.g);
+        }
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<SelOpeningPoint> {
+        if b.first() != Some(&VERSION_SEL) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let pos_root: Hash = r.take(32)?.try_into().ok()?;
+        let seq_root: Hash = r.take(32)?.try_into().ok()?;
+        let layer = r.entry()?;
+        let ne = r.u8()? as usize;
+        let entries = (0..ne).map(|_| r.entry()).collect::<Option<Vec<_>>>()?;
+        let nn = r.u8()? as usize;
+        let norms = (0..nn).map(|_| r.weights()).collect::<Option<Vec<_>>>()?;
+        let pos_path = r.hashes()?;
+        let (sel, iq, w) = (r.leaf_bytes()?, r.leaf_bytes()?, r.leaf_bytes()?);
+        let nm = r.u8()? as usize;
+        let members = (0..nm).map(|_| Some(SelMember { pos_path: r.hashes()?, k: r.leaf_bytes()?, g: r.leaf_bytes()? })).collect::<Option<Vec<_>>>()?;
+        (r.o == b.len()).then_some(SelOpeningPoint { response_txid, pos_root, seq_root, layer, entries, norms, pos_path, sel, iq, w, members })
     }
 }

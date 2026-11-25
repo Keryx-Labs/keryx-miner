@@ -6,6 +6,7 @@ pub mod attn_blocks;
 pub mod block_task;
 pub mod chain;
 pub mod decision;
+pub mod dsa;
 #[cfg(any(test, feature = "testkit"))]
 pub mod chainkit;
 #[cfg(test)]

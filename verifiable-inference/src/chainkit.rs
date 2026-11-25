@@ -2789,7 +2789,7 @@ mod attn_tests {
         const VD: usize = 32;
         const NP: u64 = 5;
         const KQ: f32 = 0.0625;
-        const DSA: DsaLinks = DsaLinks { sel: 0, kpool: 3, n_top: 1, tail: 1 };
+        const DSA: DsaLinks = DsaLinks { sel: 0, kpool: 3, n_top: 1, tail: 1, iq: 0, ik: 0, ig: 0, w: 0, k_norm: 0, k_bias: 0, ape: 0, k_eps: 0 };
         const SEL: usize = sel_leaf(NP, 1, 0, 0) as usize;
         const SMALL_BUDGET: usize = 2 * partial_len(R);
 
@@ -2819,7 +2819,11 @@ mod attn_tests {
         /// Pools chosen at `t`: the last complete one.
         fn selection(t: usize) -> Vec<u8> {
             let n_pool = (t + 1) / DSA.kpool as usize;
-            (n_pool > 0).then(|| (n_pool as u32 - 1).to_le_bytes().to_vec()).unwrap_or_default()
+            let mut b = 0f32.to_le_bytes().to_vec();
+            if n_pool > 0 {
+                b.extend((n_pool as u32 - 1).to_le_bytes());
+            }
+            b
         }
 
         fn attended(t: usize) -> Vec<bool> {
@@ -2992,7 +2996,7 @@ mod attn_tests {
 
         #[test]
         fn the_selection_is_the_chosen_pools_and_the_tail() {
-            let at = |t: u64, sel: &[u32]| dsa_attended(&DSA, t, &sel.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
+            let at = |t: u64, sel: &[u32]| dsa_attended(&DSA, t, &[0u32].iter().chain(sel).flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
             assert_eq!(at(1, &[]), Some(vec![true; 2]));
             assert_eq!(at(4, &[0]), Some(vec![true; 5]));
             assert_eq!(at(7, &[1]), Some(vec![false, false, false, true, true, true, true, true]));
@@ -3000,7 +3004,8 @@ mod attn_tests {
             for bad in [&[][..], &[0, 1], &[2], &[1, 0]] {
                 assert_eq!(at(5, bad), None, "{bad:?}");
             }
-            assert_eq!(dsa_attended(&DsaLinks { tail: 0, ..DSA }, 1, &[]), None);
+            assert_eq!(dsa_attended(&DsaLinks { tail: 0, ..DSA }, 1, &[0; 4]), None);
+            assert_eq!(dsa_attended(&DSA, 1, &[]), None);
         }
 
         #[test]
@@ -3034,7 +3039,7 @@ mod attn_tests {
             let a = build(Fault::None);
             let s = seeds().find(|s| sparse(draw_t(s))).unwrap();
             let mut op = a.open_phase(&s, &[], None);
-            op.sel.as_mut().unwrap().bytes = 0u32.to_le_bytes().to_vec();
+            op.sel.as_mut().unwrap().bytes = [0u32, 0].iter().flat_map(|p| p.to_le_bytes()).collect();
             assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[], None, &op), Err(Fail::Trace));
             op.sel = None;
             assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[], None, &op), Err(Fail::Shape));
@@ -3049,6 +3054,267 @@ mod attn_tests {
             ctx.n_sel = 0;
             let op = a.open_phase(&s, &[], None);
             assert_eq!(verify_attn_phase(&a.tier, &ctx, &a.resp(), &s, &[], None, &op), Err(Fail::Manifest));
+        }
+    }
+
+    mod sel {
+        use super::*;
+        use crate::chain::{dsa_attended, sel_leaf};
+        use crate::dsa::{SEL_DRAWS, SEL_POINT, drawn_pools, pooled_key, score, verify_sel_point};
+        use crate::manifest::DsaLinks;
+        use crate::opening::{SelMember, SelOpeningPoint};
+
+        const KP: usize = 4;
+        const NTOP: usize = 2;
+        const DK: usize = 32;
+        const NHI: usize = 2;
+        const NP: u64 = 4;
+        const NPOS: usize = 20;
+        const KEPS: f32 = 1e-6;
+        const DSA: DsaLinks = DsaLinks { sel: 0, kpool: KP as u32, n_top: NTOP as u32, tail: 0, iq: 0, ik: 1, ig: 2, w: 3, k_norm: 5, k_bias: 6, ape: 7, k_eps: KEPS.to_bits() };
+        const SEL: usize = sel_leaf(NP, 1, 0, 0) as usize;
+
+        /// How the committed selection departs from the top-k.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fault {
+            None,
+            /// The lowest pools, under the best threshold for them.
+            Lowest,
+            /// The top-k, under a threshold above every score.
+            HighThreshold,
+        }
+
+        struct Sel {
+            weights: Vec<u8>,
+            chunk_leaves: Vec<Hash>,
+            entries: Vec<Vec<u8>>,
+            entry_leaves: Vec<Hash>,
+            tier: TierCtx,
+            ctx: ChainCtx,
+            positions: Vec<Position>,
+            pos_roots: Vec<Hash>,
+            pos_root: Hash,
+            seq_root: Hash,
+        }
+
+        fn scores(t: usize, k_norm: &[f32], k_bias: &[f32], ape: &[f32], ik: &[Vec<f32>], ig: &[Vec<f32>], iq: &[Vec<f32>], w: &[Vec<f32>]) -> Vec<f64> {
+            let scale = 1.0 / ((DK * NHI) as f64).sqrt();
+            let wt: Vec<f64> = w[t].iter().map(|&x| x as f64 * scale).collect();
+            (0..(t + 1) / KP)
+                .map(|p| {
+                    let keys: Vec<&[f32]> = (0..KP).map(|j| &ik[p * KP + j][..]).collect();
+                    let gates: Vec<&[f32]> = (0..KP).map(|j| &ig[p * KP + j][..]).collect();
+                    let (key, dev) = pooled_key(&keys, &gates, k_norm, k_bias, ape, KEPS as f64).unwrap();
+                    score(&iq[t], &wt, &key, &dev).unwrap().0
+                })
+                .collect()
+        }
+
+        fn selection(fault: Fault, s: &[f64]) -> Vec<u8> {
+            let mut order: Vec<usize> = (0..s.len()).collect();
+            order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));
+            let k = NTOP.min(s.len());
+            let (mut pools, thr) = match fault {
+                Fault::Lowest if s.len() > k => {
+                    let low = order[s.len() - k..].to_vec();
+                    (low, s[order[s.len() - k]])
+                }
+                Fault::HighThreshold if s.len() > k => (order[..k].to_vec(), s[order[0]] + 10.0),
+                _ => (order[..k].to_vec(), if s.len() > k { (s[order[k - 1]] + s[order[k]]) / 2.0 } else { 0.0 }),
+            };
+            pools.sort();
+            let mut b = (thr as f32).to_le_bytes().to_vec();
+            b.extend(pools.iter().flat_map(|&p| (p as u32).to_le_bytes()));
+            b
+        }
+
+        fn build(fault: Fault) -> Sel {
+            let none = manifest::NONE;
+            let k_norm: Vec<f32> = (0..DK).map(|i| 0.9 + 0.02 * (i % 7) as f32).collect();
+            let k_bias: Vec<f32> = (0..DK).map(|i| 0.05 * (i % 5) as f32 - 0.1).collect();
+            let ape: Vec<f32> = (0..KP * DK).map(|i| 0.1 * (i % 9) as f32 - 0.4).collect();
+            let weights: Vec<u8> = k_norm.iter().chain(&k_bias).chain(&ape).flat_map(|a| a.to_le_bytes()).collect();
+            let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+            let attn = AttnLinks {
+                q: 0, k: 1, v: none, q_norm: none, k_norm: none, n_head: 1, n_head_kv: 1, head_dim: 512, rope_kind: 0,
+                n_rot: 0, rope_base: 0, kq_scale: 1f32.to_bits(), swa_window: 0, softcap: 0, rope_freqs: none, v_norm: 0, gated: 0,
+                slot: 0, mla_rank: 512, absorb: 2, out: 3,
+            };
+            let entries = vec![
+                entry("blk.0.indexer.attn_q_b.weight", manifest::ROLE_PRODUCT, 64, NHI * DK, 0, 0, Chain::None),
+                entry("blk.0.indexer.attn_k.weight", manifest::ROLE_PRODUCT, 64, DK, 0, 0, Chain::None),
+                entry("blk.0.indexer_compressor_gate.weight", manifest::ROLE_PRODUCT, 64, DK, 0, 0, Chain::None),
+                entry("blk.0.indexer.proj.weight", manifest::ROLE_PRODUCT, 64, NHI, 0, 0, Chain::None),
+                entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
+                    layer: 0, proj: 3, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
+                    hc: None, dsa: Some(DSA) })),
+                entry("blk.0.indexer.k_norm.weight", manifest::ROLE_NORM, DK, 1, 0, 4 * DK, Chain::None),
+                entry("blk.0.indexer.k_norm.bias", manifest::ROLE_NORM, DK, 1, 4 * DK, 4 * DK, Chain::None),
+                entry("blk.0.indexer_compressor_ape.weight", manifest::ROLE_NORM, KP * DK, 1, 8 * DK, 4 * KP * DK, Chain::None),
+            ];
+            let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+            let tier = TierCtx {
+                r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+                n_chunks: chunk_leaves.len() as u64,
+                m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+                n_entries: entries.len() as u64,
+                n_products: NP,
+            };
+            let ctx = ChainCtx { n_sel: 1, n_layers: 1, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let iq: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(400 + t as u64, NHI * DK)).collect();
+            let ik: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(500 + t as u64, DK).iter().map(|x| 3.0 * x).collect()).collect();
+            let ig: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(600 + t as u64, DK)).collect();
+            let w: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(700 + t as u64, NHI).iter().map(|x| 4.0 * x.abs() + 0.5).collect()).collect();
+            let n_leaves = n_pos_leaves(NP, 1, 0) as usize + 1;
+            let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
+            let positions: Vec<Position> = (0..NPOS)
+                .map(|t| {
+                    let mut leaves = vec![Vec::new(); n_leaves];
+                    leaves[1] = f(&iq[t]);
+                    leaves[3] = f(&ik[t]);
+                    leaves[5] = f(&ig[t]);
+                    leaves[7] = f(&w[t]);
+                    leaves[SEL] = selection(fault, &scores(t, &k_norm, &k_bias, &ape, &ik, &ig, &iq, &w));
+                    leaves[n_leaves - 1] = chain::meta(t as u32, NPOS as u32, 7).to_vec();
+                    let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+                    Position { tok: 7, leaves, hashes }
+                })
+                .collect();
+            let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
+            let pos_root = b3_root(&pos_roots);
+            Sel { weights, chunk_leaves, entries, entry_leaves, tier, ctx, positions, pos_roots, pos_root, seq_root: [5; 32] }
+        }
+
+        impl Sel {
+            fn eo(&self, i: usize) -> EntryOpening {
+                EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+            }
+
+            fn resp(&self) -> ResponseCtx {
+                ResponseCtx { trace_root: seq::trace_root(&self.pos_root, &self.seq_root), n_prompt: NPOS as u32, n_pos: NPOS as u32 }
+            }
+
+            fn t(seed: &Hash) -> usize {
+                let first = (NTOP + 1) * KP - 1;
+                first + (draw::point(seed, SEL_POINT)[0] % (NPOS - first) as u64) as usize
+            }
+
+            fn open(&self, seed: &Hash) -> SelOpeningPoint {
+                let t = Self::t(seed);
+                let pos = &self.positions[t];
+                let range = |off: usize, n: usize| ChunkRange {
+                    first_chunk: (off / 32) as u64,
+                    chunks: self.weights[off..off + n].to_vec(),
+                    proof: rt_range_proof(&self.chunk_leaves, (off / 32) as u64, (n / 32) as u64).1,
+                };
+                let ranges = [range(0, 4 * DK), range(4 * DK, 4 * DK), range(8 * DK, 4 * KP * DK)];
+                let pools: Vec<u64> = pos.leaves[SEL][4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect();
+                let members = drawn_pools(seed, &pools, ((t + 1) / KP) as u64)
+                    .into_iter()
+                    .flat_map(|p| (0..KP as u64).map(move |j| p * KP as u64 + j))
+                    .map(|m| {
+                        let mp = &self.positions[m as usize];
+                        SelMember { pos_path: b3_path(&self.pos_roots, m as usize), k: leaf_bytes(mp, 3), g: leaf_bytes(mp, 5) }
+                    })
+                    .collect();
+                SelOpeningPoint {
+                    response_txid: [1; 32],
+                    pos_root: self.pos_root,
+                    seq_root: self.seq_root,
+                    layer: self.eo(4),
+                    entries: (0..4).map(|i| self.eo(i)).collect(),
+                    norms: (5..8).zip(ranges).map(|(i, r)| (self.eo(i), r)).collect(),
+                    pos_path: b3_path(&self.pos_roots, t),
+                    sel: leaf_bytes(pos, SEL as u64),
+                    iq: leaf_bytes(pos, 1),
+                    w: leaf_bytes(pos, 7),
+                    members,
+                }
+            }
+
+            fn verify(&self, seed: &Hash, op: &SelOpeningPoint) -> Result<(), Fail> {
+                verify_sel_point(&self.tier, &self.ctx, &self.resp(), seed, op)
+            }
+        }
+
+        #[test]
+        fn an_honest_selection_passes_and_round_trips() {
+            let a = build(Fault::None);
+            for s in seeds() {
+                let op = a.open(&s);
+                assert_eq!(SelOpeningPoint::decode(&op.encode()), Some(op.clone()));
+                assert!(op.encode().len() < crate::opening::MAX_BODY_LEN);
+                a.verify(&s, &op).unwrap_or_else(|e| panic!("{e:?}"));
+            }
+        }
+
+        #[test]
+        fn the_selection_leaf_still_bounds_the_attended_cells() {
+            let a = build(Fault::None);
+            let t = NPOS - 1;
+            let keep = dsa_attended(&DSA, t as u64, &a.positions[t].leaves[SEL]).unwrap();
+            assert_eq!(keep.iter().filter(|&&k| k).count(), NTOP * KP);
+        }
+
+        #[test]
+        fn the_lowest_pools_are_caught() {
+            let a = build(Fault::Lowest);
+            let fails: Vec<Fail> = seeds().filter_map(|s| a.verify(&s, &a.open(&s)).err()).collect();
+            assert!(fails.len() > seeds().count() / 2, "{}", fails.len());
+            assert!(fails.iter().all(|&e| e == Fail::Mismatch));
+        }
+
+        #[test]
+        fn a_threshold_above_every_score_is_caught() {
+            let a = build(Fault::HighThreshold);
+            for s in seeds() {
+                assert_eq!(a.verify(&s, &a.open(&s)), Err(Fail::Mismatch));
+            }
+        }
+
+        #[test]
+        fn forged_openings_are_refused() {
+            let a = build(Fault::None);
+            let s = seeds().next().unwrap();
+            let op = a.open(&s);
+            let mut m = op.clone();
+            m.members[1].k.bytes[0] ^= 1;
+            assert_eq!(a.verify(&s, &m), Err(Fail::Trace));
+            let mut m = op.clone();
+            m.members.swap(0, SEL_DRAWS * KP);
+            assert_eq!(a.verify(&s, &m), Err(Fail::Trace));
+            let mut m = op.clone();
+            m.members.pop();
+            assert_eq!(a.verify(&s, &m), Err(Fail::Shape));
+            let mut m = op.clone();
+            m.iq = leaf_bytes(&a.positions[SelTest::t(&s)], 3);
+            assert_eq!(a.verify(&s, &m), Err(Fail::Trace));
+            let mut m = op;
+            m.entries.swap(1, 2);
+            assert!(a.verify(&s, &m).is_err());
+        }
+
+        type SelTest = Sel;
+
+        #[test]
+        fn drawn_pools_split_around_the_selection() {
+            let s = seeds().next().unwrap();
+            let pools = [1u64, 4, 5];
+            let d = drawn_pools(&s, &pools, 8);
+            assert_eq!(d.len(), 2 * SEL_DRAWS);
+            assert!(d[..SEL_DRAWS].iter().all(|p| pools.contains(p)));
+            assert!(d[SEL_DRAWS..].iter().all(|p| !pools.contains(p) && *p < 8));
+        }
+
+        #[test]
+        fn short_responses_have_nothing_to_check() {
+            let a = build(Fault::None);
+            let s = seeds().next().unwrap();
+            let resp = ResponseCtx { n_pos: ((NTOP + 1) * KP - 1) as u32, ..a.resp() };
+            let mut op = a.open(&s);
+            op.members.clear();
+            assert_eq!(verify_sel_point(&a.tier, &a.ctx, &resp, &s, &op), Ok(()));
+            assert_eq!(verify_sel_point(&a.tier, &ChainCtx { n_sel: 0, ..a.ctx }, &resp, &s, &op), Err(Fail::Unsupported));
         }
     }
 }
