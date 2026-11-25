@@ -27,13 +27,13 @@ pub const STAGE_1A: u8 = 1;
 pub const POINTS: u32 = draw::POINTS;
 
 /// Trace slots: the H14 tiers in tier order, then the traced H18 tiers.
-const SLOTS: usize = 10;
+const SLOTS: usize = 11;
 
 /// Slot of each H18 tier; `None` = not traced. MUST follow the node's `TRACE_TIERS_H18`.
-const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [Some(6), Some(5), Some(8), Some(7), Some(9), None, None];
+const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [Some(6), Some(5), Some(8), Some(7), Some(9), Some(10), None];
 
 /// Slot whose prefix context a slot uses.
-const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0, 0, 2, 0, 0];
+const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0, 0, 2, 0, 0, 0];
 
 /// Trace slot of `model_id` serving `tier`; `None` = the tier is not traced.
 pub fn slot(model_id: &[u8; 32], tier: u8) -> Option<u8> {
@@ -55,6 +55,7 @@ const MANIFESTS: [Option<&[u8]>; SLOTS] = [
     Some(include_bytes!("../assets/trace-manifests/h18-tier3.bin")),
     Some(include_bytes!("../assets/trace-manifests/h18-tier2.bin")),
     Some(include_bytes!("../assets/trace-manifests/h18-tier4.bin")),
+    Some(include_bytes!("../assets/trace-manifests/h18-tier5.bin")),
 ];
 
 /// Prefix contexts of the audited tiers, in tier order. MUST equal the node's `TRACE_PREFIXES`.
@@ -178,6 +179,7 @@ const CHAIN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/chain-h18-tier3.bin"),
     include_bytes!("../assets/trace-manifests/chain-h18-tier2.bin"),
     include_bytes!("../assets/trace-manifests/chain-h18-tier4.bin"),
+    include_bytes!("../assets/trace-manifests/chain-h18-tier5.bin"),
 ];
 
 /// Serialized manifests under the attention rule (attention and recurrent descriptors), in tier
@@ -193,11 +195,13 @@ const ATTN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/attn-h18-tier3.bin"),
     include_bytes!("../assets/trace-manifests/attn-h18-tier2.bin"),
     include_bytes!("../assets/trace-manifests/attn-h18-tier4.bin"),
+    include_bytes!("../assets/trace-manifests/attn-h18-tier5.bin"),
 ];
 
 /// Attention layers, recurrent layers and sequence heads of each manifest under the attention
 /// rule. MUST equal the node's `TRACE_ATTN_H_NEXT`.
-const ATTN_SEQ: [(u32, u32, u32); SLOTS] = [(8, 24, 32), (40, 0, 2), (48, 0, 8), (16, 48, 48), (7, 20, 32), (8, 24, 32), (8, 24, 32), (60, 0, 16), (10, 30, 32), (16, 48, 48)];
+const ATTN_SEQ: [(u32, u32, u32, u32); SLOTS] =
+    [(8, 24, 32, 0), (40, 0, 2, 0), (48, 0, 8, 0), (16, 48, 48, 0), (7, 20, 32, 0), (8, 24, 32, 0), (8, 24, 32, 0), (60, 0, 16, 0), (10, 30, 32, 0), (16, 48, 48, 0), (11, 34, 64, 11)];
 
 /// Positions between recurrent state checkpoints when a manifest has no recurrent layer.
 const DEFAULT_INTERVAL: u32 = 48;
@@ -215,6 +219,7 @@ const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; SLOTS] = [
     Some((ChainCtx { n_sel: 0, n_layers: 60, layer_base: 653, embd_entry: 411, eps: 9.999999974752427e-07, embd_scale: 73.32121276855469, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 411, 412)),
     Some((ChainCtx { n_sel: 0, n_layers: 40, layer_base: 593, embd_entry: 431, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 431, 432)),
     Some((ChainCtx { n_sel: 0, n_layers: 64, layer_base: 626, embd_entry: 496, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 496, 497)),
+    Some((ChainCtx { n_sel: 0, n_layers: 45, layer_base: 1079, embd_entry: 802, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: false, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 802, manifest::NONE)),
 ];
 
 /// Positions whose head output a decision opening reads: every marker, then the pointer.
@@ -305,6 +310,12 @@ static QWEN3_8_TURBO_PREFIX: PrefixCtx = match PREFIXES {
     _ => panic!(),
 };
 
+/// Prefix context of the H18 tier 5. MUST equal the node's `GLM5_3_FLASH_PREFIX`.
+static GLM5_3_FLASH_PREFIX: PrefixCtx = match PREFIXES {
+    [Some(p), ..] => PrefixCtx { offset: 13, embd_entry: 802, norm_entry: manifest::NONE, eps: 9.999999747378752e-06, embd_scale: 1.0, ..p },
+    _ => panic!(),
+};
+
 /// Slot of the decision tier.
 const DECISION_SLOT: u8 = 6;
 
@@ -345,6 +356,7 @@ pub fn prefix_ctx(slot: u8) -> Option<&'static PrefixCtx> {
         7 => return Some(&GEMMA4_31B_PREFIX),
         8 => return Some(&MINICPM_V_4_7_PREFIX),
         9 => return Some(&QWEN3_8_TURBO_PREFIX),
+        10 => return Some(&GLM5_3_FLASH_PREFIX),
         _ => {}
     }
     PREFIXES.get(*CTX_SLOT.get(slot as usize)?).and_then(|p| p.as_ref())
@@ -411,7 +423,7 @@ impl TierManifest {
     /// The manifest of `slot` under the attention rule, with its chain context.
     pub fn for_attn(slot: u8) -> Option<Self> {
         let (mut ctx, _) = chain_ctx(slot)?;
-        (ctx.n_attn, ctx.n_recur, ctx.seq_heads) = *ATTN_SEQ.get(slot as usize)?;
+        (ctx.n_attn, ctx.n_recur, ctx.seq_heads, ctx.n_sel) = *ATTN_SEQ.get(slot as usize)?;
         let m = Self::parse(Self::raw_attn(slot)?)?;
         Some(Self { chain: Some(ctx), ..m })
     }
@@ -1663,7 +1675,7 @@ mod tests {
         assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 0), Some(0));
         assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 5), None);
         for (t, m) in H18_LINEUP.iter().enumerate() {
-            assert_eq!(slot(&m.model_id, t as u8).is_some(), t <= 4, "tier {t}");
+            assert_eq!(slot(&m.model_id, t as u8).is_some(), t <= 5, "tier {t}");
         }
         let hex = |m: &TierManifest| hex::encode(m.m_t);
         let p = TierManifest::for_tier(5).unwrap();
@@ -1699,6 +1711,26 @@ mod tests {
         let pre = prefix_ctx(9).unwrap();
         assert_eq!((pre.offset, pre.embd_entry, pre.norm_entry, pre.table), (6, 496, 497, prefix_ctx(0).unwrap().table));
         assert_eq!((p.entry(496).role, p.entry(497).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+    }
+
+    #[test]
+    fn h18_tier_5_matches_the_node() {
+        use crate::models::GLM_5_3_FLASH;
+        assert_eq!(slot(&GLM_5_3_FLASH.model_id, 5), Some(10));
+        let hex = |m: &TierManifest| hex::encode(m.m_t);
+        let p = TierManifest::for_tier(10).unwrap();
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("c85f9f00c1ad0bb3ce6520a505edef75bb2494f3cf3f3ced43a3827bdba177c2", 804, 768));
+        let c = TierManifest::for_chain(10).unwrap();
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("e28698361ce88e4c42734df8aba442bd1c26ca1dfe26091701cf16697c7417f7", 1124, 768));
+        let a = TierManifest::for_attn(10).unwrap();
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("01499c420b14d3ea976030258c42d0e3354a8937b47c27853a8f555d7eab480d", 1372, 768));
+        let ac = a.chain.unwrap();
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.n_attn, ac.n_recur, ac.seq_heads, ac.n_sel), (45, 1079, 802, 11, 34, 64, 11));
+        assert_eq!(c.chain.unwrap().n_sel, 0);
+        let pre = prefix_ctx(10).unwrap();
+        assert_eq!((pre.offset, pre.embd_entry, pre.norm_entry, pre.table), (13, 802, manifest::NONE, prefix_ctx(0).unwrap().table));
+        assert_eq!(c.entry(802).role, manifest::ROLE_EMBD);
+        assert!(decision_ctx(10).is_none());
     }
 
     #[test]
