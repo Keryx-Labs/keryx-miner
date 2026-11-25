@@ -1166,6 +1166,11 @@ pub fn leaf_cap(m: &TierManifest, leaf: u32) -> usize {
     m.entries.iter().take(np).map(|(e, _)| 4 * e.m.max(e.k) as usize).max().unwrap_or(0)
 }
 
+/// Bytes per weight of a router matrix (f32 or BF16).
+fn router_width(m: &TierManifest, router: u32) -> u64 {
+    if m.entry(router as u64).wtype == keryx_verifiable_inference::quant::BF16 { 2 } else { 4 }
+}
+
 pub(crate) fn bytes_range(m: &TierManifest, index: &WeightIndex, entry: u64, offset: u64, len: u64) -> Option<(EntryOpening, ChunkRange)> {
     let e = m.entry(entry);
     if len == 0 {
@@ -1373,7 +1378,7 @@ pub fn chain_opening(
                     },
                     ids: expert_ids(down_y, n_used)?,
                     slots: (0..n_used).map(|sl| leaf_chunk(rec, r.t, down_leaf, down_y, sl * per_slot + r.c)).collect::<Option<Vec<_>>>()?,
-                    router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
+                    router_row: bytes_range(m, index, moe.router as u64, row * router_width(m, moe.router) * dim, router_width(m, moe.router) * dim)?,
                     gate: m.entry_opening(moe.gate_exps as u64),
                     x: leaf_bytes(rec, r.t, 2 * moe.gate_exps, cap(r.t, 2 * moe.gate_exps)?),
                 }))
@@ -1407,7 +1412,7 @@ pub fn chain_opening(
             ids: expert_ids(down_y, n_used)?,
             slots,
             shexp: leaf_chunk(rec, r.t, y_leaf, y, r.c)?,
-            router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
+            router_row: bytes_range(m, index, moe.router as u64, row * router_width(m, moe.router) * dim, router_width(m, moe.router) * dim)?,
             resid: leaf_bytes(rec, r.t, attn_leaf, cap(r.t, attn_leaf)?),
             norm: bytes_range(m, index, moe.ffn_norm as u64, 0, 4 * dim)?,
             shexp_gate: match moe.shexp_gate {

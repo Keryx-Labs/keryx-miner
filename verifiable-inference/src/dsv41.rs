@@ -980,6 +980,12 @@ mod tests {
         }
 
         fn build(fault: Fault) -> Kit {
+            build_grouped(fault, 1, false)
+        }
+
+        /// The kit with the output product reading `groups` groups of heads, the groups' inputs
+        /// in reverse order when `swap`.
+        fn build_grouped(fault: Fault, groups: usize, swap: bool) -> Kit {
             let norm: Vec<f32> = (0..HD).map(|i| 0.6 + 0.01 * (i % 29) as f32).collect();
             let mut weights: Vec<u8> = norm.iter().flat_map(|a| a.to_le_bytes()).collect();
             let sinks_off = weights.len();
@@ -1001,7 +1007,7 @@ mod tests {
             let entries = vec![
                 entry("blk.0.attn_q_b.weight", manifest::ROLE_PRODUCT, 64, NH * HD, 1, 0, 0, none_link),
                 entry("blk.0.attn_kv.weight", manifest::ROLE_PRODUCT, 64, HD, 1, 0, 0, none_link),
-                entry("blk.0.attn_output_a.weight", manifest::ROLE_HEADS, NH * HD, 16, 1, 0, 0, none_link),
+                entry("blk.0.attn_output_a.weight", manifest::ROLE_HEADS, NH / groups * HD, 16, groups as u32, 0, 0, none_link),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, 0, Chain::Layer(layer)),
                 entry("blk.0.attn_kv_a_norm.weight", manifest::ROLE_NORM, HD, 1, 1, 0, 4 * HD, Chain::None),
                 entry("blk.0.attn_sinks.weight", manifest::ROLE_NORM, NH, 1, 1, sinks_off, 32, Chain::None),
@@ -1031,7 +1037,7 @@ mod tests {
                     let ids = selection(t);
                     let comp_ids: Vec<u64> = if fault == Fault::Dense { (0..(t as u64 + 1) / 2).collect() } else { ids.clone() };
                     let keys: Vec<Vec<f32>> = window(t).map(|p| win_keys[p].clone()).chain(comp_ids.iter().map(|&k| comp_keys[k as usize].clone())).collect();
-                    let mut x = Vec::new();
+                    let mut x: Vec<f64> = Vec::new();
                     for h in 0..NH {
                         let mut qh: Vec<f64> = q[t][h * HD..(h + 1) * HD].iter().map(|&v| v as f64).collect();
                         rope_tail(&mut qh, t as u64, 64, 160_000.0, &y);
@@ -1045,7 +1051,12 @@ mod tests {
                     let mut leaves = vec![Vec::new(); n_leaves];
                     leaves[1] = f(&q[t]);
                     leaves[3] = f(&kv_y[t]);
-                    leaves[4] = in_layout(&q8_1_row(&x), layout_at(t as u64, N as u32).1);
+                    let gk = NH / groups * HD;
+                    let mut order: Vec<usize> = (0..groups).collect();
+                    if swap {
+                        order.reverse();
+                    }
+                    leaves[4] = order.iter().flat_map(|&g| in_layout(&q8_1_row(&x[g * gk..(g + 1) * gk]), layout_at(t as u64, N as u32).1)).collect();
                     leaves[5] = f(&vals(600 + t as u64, 16, 1.0));
                     let mut sel = 0f32.to_le_bytes().to_vec();
                     sel.extend(ids.iter().map(|&k| k as u32).chain(std::iter::repeat(u32::MAX)).take(NTOP).flat_map(|v| v.to_le_bytes()));
@@ -1235,6 +1246,19 @@ mod tests {
             let kit = build(Fault::ForgedWindow);
             let fails = seeds().filter(|s| matches!(kit.walk(s), Err((p, Fail::Mismatch)) if !p.is_empty())).count();
             assert!(fails > 0);
+        }
+
+        #[test]
+        fn grouped_head_outputs_pass_in_their_group_and_fail_in_another() {
+            set_test_budget(BUDGET);
+            let kit = build_grouped(Fault::None, NH, false);
+            for s in seeds() {
+                kit.walk(&s).unwrap_or_else(|e| panic!("{e:?}"));
+            }
+            let swapped = build_grouped(Fault::None, NH, true);
+            for s in seeds() {
+                assert_eq!(swapped.walk(&s), Err((Vec::new(), Fail::Mismatch)));
+            }
         }
 
         #[test]

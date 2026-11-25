@@ -782,6 +782,22 @@ struct MoeCheck<'a> {
     seed: &'a Hash,
 }
 
+/// Relative rounding of a router input a half-precision (BF16) weight matrix may be multiplied with.
+const BF16_INPUT_ROUND: f64 = 1.0 / 256.0;
+
+/// Row `row` of `dim` weights of a router (f32, or BF16 widened exactly), and the relative
+/// rounding of the input its product may carry.
+fn router_row(tier: &TierCtx, re: &manifest::Entry, range: &ChunkRange, row: u64, dim: u64) -> Result<(Vec<f32>, f64), Fail> {
+    match re.wtype {
+        0 => Ok((f32s(&open_bytes(tier, re, range, row * 4 * dim, 4 * dim)?), 0.0)),
+        quant::BF16 => {
+            let b = open_bytes(tier, re, range, row * 2 * dim, 2 * dim)?;
+            Ok((quant::dequant_row(quant::BF16, &b, dim as usize).ok_or(Fail::Shape)?, BF16_INPUT_ROUND))
+        }
+        _ => Err(Fail::Manifest),
+    }
+}
+
 impl MoeCheck<'_> {
     fn verify(&self, moe: &manifest::MoeLinks, m: &crate::opening::MoeAdd, dst: &[f32], src: &[f32], off: usize, n: usize) -> Result<(), Fail> {
         let (tier, ctx, np) = (self.tier, self.ctx, self.tier.n_products);
@@ -790,7 +806,7 @@ impl MoeCheck<'_> {
             return Err(Fail::Shape);
         }
         let re = open_entry(tier, &m.router_row.0, moe.router as u64)?;
-        if re.role != manifest::ROLE_ROUTER || re.wtype != 0 || re.k != self.dim {
+        if re.role != manifest::ROLE_ROUTER || re.k != self.dim {
             return Err(Fail::Manifest);
         }
         let n_exp = re.m;
@@ -839,13 +855,13 @@ impl MoeCheck<'_> {
             _ => return Err(Fail::Shape),
         };
         let row = draw::point(self.seed, RESID_POINT)[3] % n_exp;
-        let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * self.dim, 4 * self.dim)?);
+        let (wr, in_round) = router_row(tier, &re, &m.router_row.1, row, self.dim)?;
         let (mut dot, mut mag) = (0f64, 0f64);
         for (&wj, &vj) in wr.iter().zip(&v) {
             dot += wj as f64 * vj;
             mag += (wj as f64 * vj).abs();
         }
-        if !(scores[row as usize] as f64 - dot).abs().partial_cmp(&(EPS_ROUTER * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
+        if !(scores[row as usize] as f64 - dot).abs().partial_cmp(&((EPS_ROUTER + in_round) * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
             return Err(Fail::Mismatch);
         }
 
@@ -1010,7 +1026,7 @@ fn hc_moe_out(
         return Err(Fail::Shape);
     }
     let re = open_entry(tier, &m.router_row.0, moe.router as u64)?;
-    if re.role != manifest::ROLE_ROUTER || re.wtype != 0 || re.k != dim {
+    if re.role != manifest::ROLE_ROUTER || re.k != dim {
         return Err(Fail::Manifest);
     }
     let n_exp = re.m;
@@ -1044,7 +1060,7 @@ fn hc_moe_out(
     }
     let blocks = q8::blocks(m.x.bytes.get(..x_one).ok_or(Fail::Shape)?, layout, dim as usize).ok_or(Fail::Shape)?;
     let row = draw::point(seed, RESID_POINT)[3] % n_exp;
-    let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * dim, 4 * dim)?);
+    let (wr, in_round) = router_row(tier, &re, &m.router_row.1, row, dim)?;
     let (mut dot, mut mag, mut round) = (0f64, 0f64, 0f64);
     for (j, &wj) in wr.iter().enumerate() {
         let (d, q) = &blocks[j / 32];
@@ -1053,7 +1069,7 @@ fn hc_moe_out(
         mag += (wj as f64 * v).abs();
         round += (wj as f64).abs() * (*d as f64).abs() * Q8_ROUND;
     }
-    let tol = EPS_ROUTER * mag + round + f32::MIN_POSITIVE as f64;
+    let tol = (EPS_ROUTER + in_round) * mag + round + f32::MIN_POSITIVE as f64;
     if !(scores[row as usize] as f64 - dot).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
         return Err(Fail::Mismatch);
     }

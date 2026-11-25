@@ -706,6 +706,8 @@ mod moe_tests {
         expert_bump: bool,
         /// The routed experts are combined without the weight scale.
         unscaled: bool,
+        /// The router weights are stored in BF16 (not a fault).
+        bf16_router: bool,
     }
 
     struct Kit {
@@ -719,6 +721,8 @@ mod moe_tests {
         trace_root: Hash,
         offs: [usize; 5],
         ids: Vec<u32>,
+        /// Bytes per router weight.
+        rw: usize,
     }
 
     fn entry(name: &str, role: u8, wtype: u32, k: usize, m: usize, n_exp: u32, off: usize, n: usize, rb: usize, chain: Chain) -> Vec<u8> {
@@ -753,11 +757,16 @@ mod moe_tests {
             }
             off
         };
-        let router = vecf(1, E * D, 0.05);
+        let router: Vec<f32> = vecf(1, E * D, 0.05)
+            .into_iter()
+            .map(|w| if f.bf16_router { quant::dequant_row(quant::BF16, &((w.to_bits() + 0x8000) >> 16).to_le_bytes()[..2], 1).unwrap()[0] } else { w })
+            .collect();
         let bias = vecf(2, E, 0.01);
         let norm_w: Vec<f32> = (0..D).map(|i| 1.0 + 0.001 * (i % 7) as f32).collect();
         let base: Vec<f32> = (0..N_MIX).map(|j| 0.3 * ((j * 7) % 5) as f32 - 0.6).collect();
-        let router_off = push(bytes(&router));
+        let router_bytes: Vec<u8> = if f.bf16_router { router.iter().flat_map(|w| ((w.to_bits() >> 16) as u16).to_le_bytes()).collect() } else { bytes(&router) };
+        let rw = if f.bf16_router { 2 } else { 4 };
+        let router_off = push(router_bytes);
         let bias_off = push(bytes(&bias));
         let norm_off = push(bytes(&norm_w));
         let base_off = push(bytes(&base));
@@ -790,7 +799,7 @@ mod moe_tests {
             entry("blk.0.ffn_down_shexp.weight", manifest::ROLE_PRODUCT, q, D, D, 1, shexp_off, D * RB, RB, Chain::None),
             entry("blk.0.ffn_gate_exps.weight", manifest::ROLE_PRODUCT, q, D, D, E as u32, 0, 0, 0, Chain::None),
             entry("blk.0.hc_ffn_fn.weight", manifest::ROLE_PRODUCT, q, K_HC, N_MIX, 1, 0, 0, 0, Chain::None),
-            entry("blk.0.ffn_gate_inp.weight", manifest::ROLE_ROUTER, 0, D, E, 1, router_off, 4 * E * D, 4 * D, Chain::None),
+            entry("blk.0.ffn_gate_inp.weight", manifest::ROLE_ROUTER, if f.bf16_router { quant::BF16 } else { 0 }, D, E, 1, router_off, rw * E * D, rw * D, Chain::None),
             entry("blk.0.exp_probs_b.bias", manifest::ROLE_NORM, 0, E, 1, 1, bias_off, 4 * E, 4 * E, Chain::None),
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, 0, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
             entry("blk.0.hc_ffn_base.weight", manifest::ROLE_NORM, 0, N_MIX, 1, 1, base_off, 4 * N_MIX, 4 * N_MIX, Chain::None),
@@ -870,6 +879,7 @@ mod moe_tests {
             pos: Position { tok: 7, leaves, hashes },
             trace_root,
             offs: [router_off, bias_off, base_off, exps_off, shexp_off],
+            rw,
             ids,
         }
     }
@@ -925,7 +935,7 @@ mod moe_tests {
                         bias: (self.eo(6), self.range(bias_off, 4 * E)),
                         ids: ExpertIds { chunk: ids_chunk.chunk, chunk_path: ids_chunk.chunk_path },
                         slots: (0..U as u64).map(|sl| leaf_chunk(&self.pos, 3, sl * per + jc)).collect(),
-                        router_row: (self.eo(5), self.range(router_off + row as usize * 4 * D, 4 * D)),
+                        router_row: (self.eo(5), self.range(router_off + row as usize * self.rw * D, self.rw * D)),
                         gate: self.eo(3),
                         x: leaf_bytes(&self.pos, 6),
                     })),
@@ -968,6 +978,22 @@ mod moe_tests {
             n += 1;
         }
         assert!(n > 20, "{n}");
+    }
+
+    #[test]
+    fn a_bf16_router_passes_and_still_catches_forged_scores() {
+        let k = build(Fault { bf16_router: true, ..Default::default() });
+        let mut n = 0;
+        for s in 0..256u32 {
+            let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            let Some(p) = k.open(&seed) else { continue };
+            verify_resid_point(&k.tier, &k.ctx, &k.resp(), &seed, &p).unwrap_or_else(|e| panic!("seed {s}: {e:?}"));
+            n += 1;
+        }
+        assert!(n > 20, "{n}");
+        let v = build(Fault { bf16_router: true, scores_off_input: true, ..Default::default() }).verdicts();
+        let refused = v.iter().filter(|r| **r == Err(Fail::Mismatch)).count();
+        assert!(refused * 4 >= v.len() * 3, "{refused} of {}", v.len());
     }
 
     #[test]
