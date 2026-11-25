@@ -1199,6 +1199,206 @@ mod head_link_tests {
 }
 
 #[cfg(test)]
+mod normed_link_tests {
+    use super::*;
+    use crate::chain::{ChainCtx, norm_fragment, verify_chain_point};
+    use crate::opening::{LinkOpening, Point};
+    use crate::verify::{Fail, ResponseCtx};
+
+    const NP: u64 = 2;
+
+    /// How the input of the second product departs from `rms_norm(y0) * w`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fault {
+        None,
+        Unnormed,
+        UnitWeights,
+    }
+
+    struct N {
+        offs: Vec<usize>,
+        chunk_leaves: Vec<Hash>,
+        all: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        entry_leaves: Vec<Hash>,
+        tier: TierCtx,
+        ctx: ChainCtx,
+        pos: Position,
+        trace_root: Hash,
+    }
+
+    fn dot_rows(w: &[u8], rows: usize, x: &[u8]) -> Vec<f32> {
+        let rb = D / 32 * 34;
+        (0..rows).map(|r| dot::canonical_dot(quant::Q8_0, &w[r * rb..(r + 1) * rb], D, x, q8::MMVQ).unwrap().y_hat as f32).collect()
+    }
+
+    fn build(fault: Fault) -> N {
+        let none = manifest::NONE;
+        let norm: Vec<f32> = (0..D).map(|i| 0.6 + 0.05 * (i % 13) as f32).collect();
+        let weights = vec![q8_0_rows(21, D, 0.0004), q8_0_rows(22, D, 0.0004), norm.iter().flat_map(|a| a.to_le_bytes()).collect()];
+        let (mut all, mut offs) = (Vec::new(), Vec::new());
+        for w in &weights {
+            offs.push(all.len());
+            all.extend_from_slice(w);
+        }
+        let chunk_leaves: Vec<Hash> = all.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+        let entry = |name: &str, role: u8, i: usize, chain: Chain| {
+            let product = role == manifest::ROLE_PRODUCT;
+            let e = Entry {
+                name: name.into(),
+                wtype: if product { quant::Q8_0 } else { 0 },
+                k: D as u64,
+                m: if product { D as u64 } else { 1 },
+                n_exp: 1,
+                chunk_base: (offs[i] / 32) as u64,
+                n_bytes: weights[i].len() as u64,
+                row_bytes: if product { (D / 32 * 34) as u32 } else { weights[i].len() as u32 },
+                role,
+                glu_op: 0,
+                glu_form: manifest::FORM_NONE,
+                partner: none,
+                bias: none,
+                chain,
+            };
+            let mut b = serialize(&e);
+            b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+            b
+        };
+        let entries = vec![
+            entry("blk.0.attn_q_a.weight", manifest::ROLE_PRODUCT, 0, Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: none, src: none })),
+            entry("blk.0.attn_q_b.weight", manifest::ROLE_PRODUCT, 1, Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NORMED, norm: 2, src: 0 })),
+            entry("blk.0.attn_q_a_norm.weight", manifest::ROLE_NORM, 2, Chain::None),
+        ];
+        let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+        let tier = TierCtx {
+            r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+            n_chunks: chunk_leaves.len() as u64,
+            m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+            n_entries: entries.len() as u64,
+            n_products: NP,
+        };
+        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let x0 = q8_1_row(&(0..D).map(|i| ((i * 7) % 23) as f64 * 0.01 - 0.1).collect::<Vec<_>>());
+        let y0 = dot_rows(&weights[0], D, &x0);
+        let mut h: Vec<f64> = y0.iter().map(|&a| a as f64).collect();
+        if fault != Fault::Unnormed {
+            let w = if fault == Fault::UnitWeights { None } else { Some(&norm[..]) };
+            crate::attn::rms_norm(&mut h, w, EPS);
+        }
+        let x1 = q8_1_row(&h);
+        let y1 = dot_rows(&weights[1], D, &x1);
+        let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
+        let n_leaves = 2 * NP as usize + 2 + 1;
+        let mut leaves = vec![Vec::new(); n_leaves];
+        leaves[0] = x0;
+        leaves[1] = f(&y0);
+        leaves[2] = x1;
+        leaves[3] = f(&y1);
+        leaves[n_leaves - 1] = chain::meta(0, 1, 7).to_vec();
+        let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+        let pos = Position { tok: 7, leaves, hashes };
+        let trace_root = b3_root(&[b3_root(&pos.hashes)]);
+        N { offs, chunk_leaves, all, entries, entry_leaves, tier, ctx, pos, trace_root }
+    }
+
+    impl N {
+        fn eo(&self, i: usize) -> EntryOpening {
+            EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+        }
+
+        fn range(&self, off: u64, len: u64) -> ChunkRange {
+            let (first, last) = (off / 32, (off + len - 1) / 32);
+            ChunkRange { first_chunk: first, chunks: self.all[first as usize * 32..(last as usize + 1) * 32].to_vec(), proof: rt_range_proof(&self.chunk_leaves, first, last - first + 1).1 }
+        }
+
+        fn open(&self, seed: &Hash) -> (usize, Point, LinkOpening) {
+            let d = draw::point(seed, 0);
+            let rank = (d[1] % NP) as usize;
+            let row = (d[2] % D as u64) as usize;
+            let rb = (D / 32 * 34) as u64;
+            let off = self.offs[rank] as u64 + row as u64 * rb;
+            let yc = leaf_chunk(&self.pos, 2 * rank as u64 + 1, (row * 4 / B3_CHUNK) as u64);
+            let p = Point {
+                n_ubatch: 1,
+                pos_path: Vec::new(),
+                meta_path: b3_path(&self.pos.hashes, self.pos.hashes.len() - 1),
+                entry: self.eo(rank),
+                partner: None,
+                bias: None,
+                rows: vec![self.range(off, rb)],
+                x: self.pos.leaves[2 * rank].clone(),
+                x_path: b3_path(&self.pos.hashes, 2 * rank),
+                y_total_len: self.pos.leaves[2 * rank + 1].len() as u32,
+                y_chunk_index: yc.index,
+                y_chunk: yc.chunk,
+                y_chunk_path: yc.chunk_path,
+                y_path: b3_path(&self.pos.hashes, 2 * rank + 1),
+            };
+            let link = if rank == 0 {
+                LinkOpening::None
+            } else {
+                let block = chain::link_block(seed, 0, &p.x, crate::q8::MMVQ, D as u64).expect("link block");
+                let (b0, n) = norm_fragment(block, D as u64);
+                let len = (n * 32).min(D as u64 - b0 * 32);
+                LinkOpening::Norm { src: leaf_bytes(&self.pos, 1), norm: (self.eo(2), self.range(self.offs[2] as u64 + 4 * b0 * 32, 4 * len)) }
+            };
+            (rank, p, link)
+        }
+
+        fn check_with(&self, seed: &Hash, edit: impl Fn(&mut LinkOpening)) -> (usize, Result<(), Fail>) {
+            let (rank, p, mut link) = self.open(seed);
+            edit(&mut link);
+            let resp = ResponseCtx { trace_root: self.trace_root, n_prompt: 1, n_pos: 1 };
+            (rank, verify_chain_point(&self.tier, &self.ctx, &resp, seed, 0, &p, 7, &link, None).map(|_| ()))
+        }
+
+        fn check(&self, seed: &Hash) -> (usize, Result<(), Fail>) {
+            self.check_with(seed, |_| {})
+        }
+    }
+
+    fn seeds() -> impl Iterator<Item = Hash> {
+        (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+    }
+
+    #[test]
+    fn an_honest_normed_input_passes() {
+        let n = build(Fault::None);
+        let mut seen = [false; 2];
+        for s in seeds() {
+            let (rank, r) = n.check(&s);
+            seen[rank] = true;
+            r.unwrap_or_else(|e| panic!("rank {rank}: {e:?}"));
+        }
+        assert!(seen.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn an_unnormed_or_unweighted_input_is_refused() {
+        for fault in [Fault::Unnormed, Fault::UnitWeights] {
+            let n = build(fault);
+            for s in seeds() {
+                let (rank, r) = n.check(&s);
+                assert_eq!(r.is_err(), rank == 1);
+            }
+        }
+    }
+
+    #[test]
+    fn another_source_leaf_is_refused() {
+        let n = build(Fault::None);
+        for s in seeds() {
+            let (rank, r) = n.check_with(&s, |l| {
+                if let LinkOpening::Norm { src, .. } = l {
+                    *src = leaf_bytes(&n.pos, 3);
+                }
+            });
+            assert_eq!(r.is_err(), rank == 1);
+        }
+    }
+}
+
+#[cfg(test)]
 mod moe_tests {
     use super::*;
     use crate::chain::{route_weights, verify_resid_point};

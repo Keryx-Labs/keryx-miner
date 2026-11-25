@@ -41,6 +41,8 @@ pub const LINK_HC_FFN_IN: u8 = 17;
 pub const LINK_HC_ATTN_PRE: u8 = 18;
 /// First input of the FFN half, as [`LINK_HC_ATTN_PRE`].
 pub const LINK_HC_FFN_PRE: u8 = 19;
+/// Input `rms_norm(y) * norm` with `y` the output of product `src` at the same position.
+pub const LINK_NORMED: u8 = 20;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
@@ -645,7 +647,18 @@ mod tests {
         assert_eq!(chain_bytes(&lga).len(), 53 + 84);
         assert_eq!(chain_bytes(&lgr).len(), 53 + 76);
         assert_eq!(chain_bytes(&lm).len(), 49);
-        for c in [Chain::None, p, l, lm, la, lma, lr, lmr, lg, lga, lgr] {
+        let hc = HcLinks { attn_fn: 1, ffn_fn: 2, attn_scale: [3, 4, 5], ffn_scale: [6, 7, 8], attn_base: 9, ffn_base: 10, n_hc: 4, sinkhorn_iters: 20, eps: 1e-6f32.to_bits() };
+        let dsa = DsaLinks { sel: 3, kpool: 4, n_top: 512, tail: 0, iq: 50, ik: 51, ig: 52, w: 53, k_norm: 60, k_bias: 61, ape: 62, k_eps: 1e-6f32.to_bits() };
+        let inner = match lga { Chain::Layer(x) => x, _ => unreachable!() };
+        let ld = Chain::Layer(LayerLinks { dsa: Some(dsa), ..inner });
+        let lhd = Chain::Layer(LayerLinks { hc: Some(hc), dsa: Some(dsa), ..inner });
+        assert_eq!(chain_bytes(&ld).len(), 1 + 4 * DSA_FIELDS + 53 + 84);
+        assert_eq!(chain_bytes(&lhd).len(), 1 + 4 * HC_FIELDS + 1 + 4 * DSA_FIELDS + 53 + 84);
+        let mut no_attn = vec![TAG_DSA];
+        no_attn.extend((0..DSA_FIELDS).flat_map(|_| 0u32.to_le_bytes()));
+        no_attn.extend_from_slice(&chain_bytes(&l));
+        assert!(parse_chain(&no_attn).is_none());
+        for c in [Chain::None, p, l, lm, la, lma, lr, lmr, lg, lga, lgr, ld, lhd] {
             let mut b = base_bytes("x", ROLE_PRODUCT);
             b.extend_from_slice(&chain_bytes(&c));
             let (e, len) = Entry::parse(&b).unwrap();

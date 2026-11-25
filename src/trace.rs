@@ -1026,7 +1026,7 @@ fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32
         manifest::LINK_ATTN_IN => Some(chain::resid_leaf(np, layer - 1, Resid::Out) as u32),
         manifest::LINK_FFN_IN => Some(chain::resid_leaf(np, layer, Resid::Attn) as u32),
         manifest::LINK_HEAD => Some(chain::resid_leaf(np, ctx.n_layers.checked_sub(1)? as u64, Resid::Out) as u32),
-        manifest::LINK_GLU | manifest::LINK_DIRECT | manifest::LINK_HEAD_SLICE => Some(2 * pl.src + 1),
+        manifest::LINK_GLU | manifest::LINK_DIRECT | manifest::LINK_HEAD_SLICE | manifest::LINK_NORMED => Some(2 * pl.src + 1),
         _ => return None,
     })
 }

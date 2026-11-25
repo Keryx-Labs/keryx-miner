@@ -509,6 +509,12 @@ pub fn verify_chain_point(
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
+        (manifest::LINK_NORMED, LinkOpening::Norm { src, norm }) if o.input.n_exp == 1 && pl.src < tier.n_products as u32 => {
+            let h = whole_leaf(&o.pos_root, &shape, 2 * pl.src as u64 + 1, src, 4 * k)?;
+            let (b0, n) = norm_fragment(link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?, k);
+            let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
+            fragment_link(&p.x, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
+        }
         (manifest::LINK_GLU, LinkOpening::Source { src, y, ids: Some(ids) }) if o.input.n_exp > 1 => {
             let se = open_entry(tier, src, pl.src as u64)?;
             if se.glu_form != manifest::FORM_PAIR_GATE || se.n_exp != o.input.n_exp || se.m != k {
