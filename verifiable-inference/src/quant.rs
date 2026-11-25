@@ -12,11 +12,13 @@ pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
 pub const IQ2_XXS: u32 = 16;
+pub const IQ2_XS: u32 = 17;
 pub const IQ3_XXS: u32 = 18;
 pub const IQ3_S: u32 = 21;
 pub const IQ2_S: u32 = 22;
 pub const IQ4_XS: u32 = 23;
 pub const IQ4_NL: u32 = 20;
+pub const IQ1_M: u32 = 29;
 pub const BF16: u32 = 30;
 
 /// (bytes per block, values per block).
@@ -28,6 +30,8 @@ pub fn block_size(wtype: u32) -> Option<(usize, usize)> {
         Q8_0 => Some((34, 32)),
         Q2_K => Some((84, 256)),
         IQ2_XXS => Some((66, 256)),
+        IQ2_XS => Some((74, 256)),
+        IQ1_M => Some((56, 256)),
         Q3_K => Some((110, 256)),
         IQ3_XXS => Some((98, 256)),
         IQ3_S => Some((110, 256)),
@@ -184,6 +188,50 @@ pub fn dequant_row(wtype: u32, row: &[u8], k: usize) -> Option<Vec<f32>> {
                         for j in 0..8 {
                             let v = db[l / 2] * grid[j] as f32;
                             out[32 * ib + 8 * l + j] = if sg & (1 << j) != 0 { -v } else { v };
+                        }
+                    }
+                }
+            }
+            IQ2_XS => {
+                let d = f16::read(blk, 0);
+                let (qs, sc) = (&blk[2..66], &blk[66..74]);
+                for ib in 0..8 {
+                    let db = [d * (0.5 + (sc[ib] & 0xf) as f32) * 0.25, d * (0.5 + (sc[ib] >> 4) as f32) * 0.25];
+                    for l in 0..4 {
+                        let q = u16::from_le_bytes([qs[2 * (4 * ib + l)], qs[2 * (4 * ib + l) + 1]]) as usize;
+                        let grid = crate::iq1::IQ2XS_GRID[q & 511].to_le_bytes();
+                        let sg = crate::iq2::KSIGNS_IQ2XS[q >> 9];
+                        for j in 0..8 {
+                            let v = db[l / 2] * grid[j] as f32;
+                            out[32 * ib + 8 * l + j] = if sg & (1 << j) != 0 { -v } else { v };
+                        }
+                    }
+                }
+            }
+            IQ1_M => {
+                const DELTA: f32 = 0.125;
+                let (qs, qh, sc_b) = (&blk[0..32], &blk[32..48], &blk[48..56]);
+                let sc: [u16; 4] = std::array::from_fn(|i| u16::from_le_bytes([sc_b[2 * i], sc_b[2 * i + 1]]));
+                let bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+                let d = f16::to_f32(bits);
+                for ib in 0..8 {
+                    let dl = [
+                        d * (2 * ((sc[ib / 2] >> (6 * (ib % 2))) & 0x7) + 1) as f32,
+                        d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1) as f32,
+                    ];
+                    let (q, h) = (&qs[4 * ib..4 * ib + 4], &qh[2 * ib..2 * ib + 2]);
+                    let idx = [
+                        q[0] as usize | ((h[0] as usize) << 8 & 0x700),
+                        q[1] as usize | ((h[0] as usize) << 4 & 0x700),
+                        q[2] as usize | ((h[1] as usize) << 8 & 0x700),
+                        q[3] as usize | ((h[1] as usize) << 4 & 0x700),
+                    ];
+                    let shift = [h[0] & 0x08, h[0] & 0x80, h[1] & 0x08, h[1] & 0x80];
+                    for l in 0..4 {
+                        let grid = crate::iq1::IQ1S_GRID[idx[l]].to_le_bytes();
+                        let delta = if shift[l] != 0 { -DELTA } else { DELTA };
+                        for j in 0..8 {
+                            out[32 * ib + 8 * l + j] = dl[l / 2] * (grid[j] as i8 as f32 + delta);
                         }
                     }
                 }
@@ -404,6 +452,30 @@ mod tests {
         }
         seen.dedup();
         assert_eq!(seen, vec![IQ3_XXS, IQ4_XS, IQ2_S, Q3_K]);
+    }
+
+    /// Expert rows of DeepSeek-V4.1 (first, second, middle, last of one IQ1_M and one IQ2_XS
+    /// tensor) and ggml's dequantization of them.
+    #[test]
+    fn iq1_m_and_iq2_xs_rows_match_ggml() {
+        let b: &[u8] = include_bytes!("../testdata/dsv41-iq1m-iq2xs.bin");
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        let (mut o, mut seen) = (0usize, Vec::new());
+        while o < b.len() {
+            let (wtype, k, n) = (u32_at(o) as u32, u32_at(o + 4), u32_at(o + 8));
+            o += 12;
+            let row = &b[o..o + n];
+            o += n;
+            assert_eq!(row_bytes(wtype, k), Some(n), "wtype {wtype}");
+            let got = dequant_row(wtype, row, k).unwrap();
+            for (i, (g, w)) in got.iter().zip(b[o..o + 4 * k].chunks_exact(4)).enumerate() {
+                assert_eq!(g.to_bits(), f32::from_le_bytes(w.try_into().unwrap()).to_bits(), "wtype {wtype} value {i}");
+            }
+            o += 4 * k;
+            seen.push(wtype);
+        }
+        seen.dedup();
+        assert_eq!(seen, vec![IQ1_M, IQ2_XS]);
     }
 
     #[test]

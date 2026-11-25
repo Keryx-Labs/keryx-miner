@@ -16,6 +16,7 @@ pub mod hckit;
 pub mod dot;
 pub mod draw;
 pub mod f16;
+mod iq1;
 mod iq2;
 mod iq3;
 pub mod manifest;
