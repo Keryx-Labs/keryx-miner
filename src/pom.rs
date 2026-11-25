@@ -907,7 +907,10 @@ struct CacheMetadata {
 }
 
 fn cache_metadata_path(tree_path: &Path) -> PathBuf {
-    tree_path.with_file_name(CACHE_METADATA_FILE)
+    match tree_path.file_name().and_then(|n| n.to_str()) {
+        Some("pom-tree.bin") | None => tree_path.with_file_name(CACHE_METADATA_FILE),
+        Some(name) => tree_path.with_file_name(format!("{}.json", name.trim_end_matches(".bin"))),
+    }
 }
 
 fn validate_cache_metadata(
@@ -1128,6 +1131,22 @@ pub fn available_ram_bytes() -> Option<u64> {
     None
 }
 
+/// Indexes of the second weight files a manifest commits by root (n-gram tables).
+static TABLE_INDEXES: Mutex<Vec<Arc<WeightIndex>>> = Mutex::new(Vec::new());
+
+/// Makes `index` available to the openings that name its root.
+pub fn register_table_index(index: Arc<WeightIndex>) {
+    let mut t = TABLE_INDEXES.lock().unwrap_or_else(|e| e.into_inner());
+    if !t.iter().any(|i| i.r_t == index.r_t) {
+        t.push(index);
+    }
+}
+
+/// The registered index of root `r_t`.
+pub fn table_index(r_t: &[u8; 32]) -> Option<Arc<WeightIndex>> {
+    TABLE_INDEXES.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|i| &i.r_t == r_t).cloned()
+}
+
 impl WeightIndex {
     /// Build from a GGUF on disk (pread of each tensor's raw bytes). The bytes are the GGUF's
     /// exact on-disk quantized bytes — the same the miner serves in VRAM and the builder pinned
@@ -1135,11 +1154,21 @@ impl WeightIndex {
     /// GGUF: only every K-th level is stored (~N/(2^K-1) nodes vs ~2N for a full tree). On
     /// subsequent restarts the existing tree is reused (GGUF is immutable), avoiding a rebuild.
     pub fn build_from_gguf(path: &str, model_id: [u8; 32]) -> Result<Self> {
+        Self::build_from_gguf_named(path, model_id, "pom-tree.bin")
+    }
+
+    /// `build_from_gguf` with the checkpoint tree kept as `tree_name` next to the GGUF, for a
+    /// second weight file in the model's directory.
+    pub fn build_from_gguf_named(path: &str, model_id: [u8; 32], tree_name: &str) -> Result<Self> {
         let dir = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
-        let tree_path = dir.join("pom-tree.bin");
+        let tree_path = dir.join(tree_name);
+        let primary = tree_name == "pom-tree.bin";
+        if !primary && (tree_name.starts_with("pom-tree") || !tree_name.ends_with(".bin")) {
+            return Err(anyhow!("PoM: tree name {tree_name} would clash with the primary tree"));
+        }
 
         // Clean up old PID-named files left by previous versions.
-        if let Ok(entries) = std::fs::read_dir(dir) {
+        if let Ok(entries) = std::fs::read_dir(dir).map(|e| e.filter(|_| primary)) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
@@ -1151,7 +1180,7 @@ impl WeightIndex {
         }
 
         // One process builds a model's tree at a time; the others wait and reuse it.
-        let _lock = TreeLock::acquire(&dir.join("pom-tree.bin.lock"))?;
+        let _lock = TreeLock::acquire(&dir.join(format!("{tree_name}.lock")))?;
 
         // Reuse existing checkpoint tree if valid.
         if tree_path.exists() {
@@ -1179,7 +1208,7 @@ impl WeightIndex {
         let batch_size = 1u64 << k; // 64 for K=6
 
         // Built aside and renamed once complete, so an interrupted build leaves no partial tree.
-        let building_path = dir.join("pom-tree.bin.building");
+        let building_path = dir.join(format!("{tree_name}.building"));
         let mut writer = BufWriter::new(
             OpenOptions::new()
                 .read(true)
@@ -2026,6 +2055,48 @@ mod tests {
         let idx = synth_index(n);
         let leaves: Vec<[u8; 32]> = (0..n).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
         assert_eq!(idx.r_t, merkle_root(&leaves));
+    }
+
+    /// A GGUF v3 file holding one F32 tensor `name` of `values`.
+    fn tiny_gguf(path: &Path, name: &str, values: &[f32]) {
+        let mut b = Vec::new();
+        b.extend(0x4655_4747u32.to_le_bytes());
+        b.extend(3u32.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((name.len() as u64).to_le_bytes());
+        b.extend(name.as_bytes());
+        b.extend(1u32.to_le_bytes());
+        b.extend((values.len() as u64).to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        while b.len() % 32 != 0 {
+            b.push(0);
+        }
+        b.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn a_named_tree_leaves_the_primary_tree_of_its_directory_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (body, table) = (dir.path().join("model.gguf"), dir.path().join("table.gguf"));
+        let vals = |seed: f32| (0..1024).map(|i| seed + i as f32).collect::<Vec<f32>>();
+        tiny_gguf(&body, "blk.0.w", &vals(1.0));
+        tiny_gguf(&table, "per_layer_token_embd.weight", &vals(7.0));
+        let root_of = |v: &[f32]| merkle_root(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>().chunks(32).map(blake).collect::<Vec<_>>());
+        let a = WeightIndex::build_from_gguf(body.to_str().unwrap(), [1; 32]).unwrap();
+        assert_eq!(a.r_t, root_of(&vals(1.0)));
+        let primary = std::fs::read(dir.path().join("pom-tree.bin")).unwrap();
+        let primary_meta = std::fs::read(dir.path().join("pom-tree.json")).unwrap();
+        let b = WeightIndex::build_from_gguf_named(table.to_str().unwrap(), [2; 32], "engram-tree.bin").unwrap();
+        assert_eq!(b.r_t, root_of(&vals(7.0)));
+        assert!(dir.path().join("engram-tree.bin").exists() && dir.path().join("engram-tree.json").exists());
+        assert_eq!(std::fs::read(dir.path().join("pom-tree.bin")).unwrap(), primary);
+        assert_eq!(std::fs::read(dir.path().join("pom-tree.json")).unwrap(), primary_meta);
+        assert_eq!(WeightIndex::build_from_gguf(body.to_str().unwrap(), [1; 32]).unwrap().r_t, a.r_t);
+        assert_eq!(WeightIndex::build_from_gguf_named(table.to_str().unwrap(), [2; 32], "engram-tree.bin").unwrap().r_t, b.r_t);
+        assert!(WeightIndex::build_from_gguf_named(table.to_str().unwrap(), [2; 32], "pom-tree-x.bin").is_err());
     }
 
     #[test]
