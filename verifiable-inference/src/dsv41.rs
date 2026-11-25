@@ -5,7 +5,7 @@ use crate::attn::{Yarn, rms_norm, rope_norm_yarn};
 use crate::chain::{ChainCtx, f32_weights, f32s, seq_layout};
 use crate::manifest::{self, Chain};
 use crate::merkle::{Hash, b3_fold, b3_verify};
-use crate::opening::{CompAttnOpening, CompOpeningPoint, LeafBytes};
+use crate::opening::{CompAttnOpening, CompOpeningPoint, CompSelOpening, LeafBytes};
 use crate::verify::{Fail, ResponseCtx, TierCtx, open_bytes, open_entry};
 
 /// Draw index of the compressed row point.
@@ -349,6 +349,154 @@ pub fn verify_comp_attn_phase(
     })
 }
 
+/// Threshold and kept ids of a selection leaf of `n_slots` slots over `n_vis` candidates: the
+/// first `min(n_vis, n_slots)` slots strictly increasing below `n_vis`, the rest `u32::MAX`.
+pub fn parse_kept(b: &[u8], n_slots: usize, n_vis: u64) -> Option<(f64, Vec<u64>)> {
+    if n_slots == 0 || b.len() != 4 + 4 * n_slots {
+        return None;
+    }
+    let thr = f32::from_le_bytes(b[..4].try_into().unwrap()) as f64;
+    let slots: Vec<u32> = b[4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let m = (n_vis as usize).min(n_slots);
+    let ids: Vec<u64> = slots[..m].iter().map(|&x| x as u64).collect();
+    let ok = thr.is_finite() && slots[m..].iter().all(|&x| x == u32::MAX) && ids.windows(2).all(|w| w[0] < w[1]) && ids.last().is_none_or(|&x| x < n_vis);
+    ok.then_some((thr, ids))
+}
+
+/// Indexer score of a compressed row's key `k` for the rotated query heads `q` (`w.len()` heads
+/// end to end) and prescaled head weights `w`, and its magnitude.
+pub fn index_score(q: &[f64], w: &[f64], k: &[f32]) -> (f64, f64) {
+    let d = k.len();
+    let (mut s, mut mag) = (0f64, 0f64);
+    for (h, &wh) in w.iter().enumerate() {
+        let dot: f64 = q[h * d..(h + 1) * d].iter().zip(k).map(|(&a, &b)| a * b as f64).sum();
+        s += wh * dot.max(0.0);
+        mag += wh.abs() * q[h * d..(h + 1) * d].iter().zip(k).map(|(&a, &b)| (a * b as f64).abs()).sum::<f64>();
+    }
+    (s, mag)
+}
+
+/// Verify the selection point of a compressed attention tier under `seed`: a layer's kept rows
+/// are a top-k of its indexer scores (within its candidate blocks), or a layer's candidate blocks
+/// are a top-k of their best row score with the newest block pinned; checked on drawn rows or
+/// blocks on both sides of the committed threshold.
+pub fn verify_comp_sel_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &CompSelOpening) -> Result<(), Fail> {
+    use crate::dsa::{SEL_DRAWS, SEL_POINT, drawn_pools};
+    let (nl, n_pos) = (ctx.n_layers as u64, resp.n_pos as u64);
+    if ctx.n_sel == 0 || ctx.n_comp == 0 || nl == 0 || n_pos == 0 {
+        return Err(Fail::Unsupported);
+    }
+    if crate::seq::trace_root(&op.pos_root, &op.seq_root) != resp.trace_root {
+        return Err(Fail::Trace);
+    }
+    let d = crate::draw::point(seed, SEL_POINT);
+    let s = d[1] % ctx.n_sel as u64;
+    let layer = (op.layer.index as u64).checked_sub(ctx.layer_base as u64).filter(|&l| l < nl).ok_or(Fail::Manifest)?;
+    let c = match open_entry(tier, &op.layer, ctx.layer_base as u64 + layer)?.chain {
+        Chain::Layer(ll) if ll.layer as u64 == layer => ll.comp.ok_or(Fail::Manifest)?,
+        _ => return Err(Fail::Manifest),
+    };
+    let ratio = c.ratio as u64;
+    let picks = c.pick == 1 && c.cand as u64 == s;
+    let keeps = c.sel as u64 == s && c.topk_src as u64 == layer;
+    if ratio == 0 || c.iq == manifest::NONE || picks == keeps {
+        return Err(Fail::Manifest);
+    }
+    let (bs, cand_n, n_top) = (c.cand_bs as u64, c.cand_n as u64, c.n_top as u64);
+    if picks && (bs == 0 || cand_n == 0) {
+        return Err(Fail::Manifest);
+    }
+    let first = if picks { (cand_n * bs + 1) * ratio - 1 } else { (n_top + 1) * ratio - 1 };
+    if first >= n_pos {
+        return Ok(());
+    }
+    let t = first + d[0] % (n_pos - first);
+    let n_vis = (t + 1) / ratio;
+    let [eq, ew] = <[_; 2]>::try_from(op.entries.clone()).map_err(|_| Fail::Shape)?;
+    let (iqe, iwe) = (open_entry(tier, &eq, c.iq as u64)?, open_entry(tier, &ew, c.iw as u64)?);
+    let n_ih = iwe.m;
+    let dk = iqe.m.checked_div(n_ih).filter(|&x| x > 0 && x * n_ih == iqe.m).ok_or(Fail::Manifest)?;
+    let lat = (c.row_len as u64).checked_sub(dk).filter(|&l| l.is_multiple_of(32) && dk.is_multiple_of(32) && c.n_rot as u64 <= dk).ok_or(Fail::Manifest)?;
+    if iqe.role != manifest::ROLE_PRODUCT || iwe.role != manifest::ROLE_PRODUCT {
+        return Err(Fail::Manifest);
+    }
+    let shape = crate::chain::shape_any(tier, ctx);
+    let sel_leaf = |i: u32| crate::chain::sel_leaf(tier.n_products, nl, crate::chain::n_router(ctx), i as u64);
+    let root_t = leaf_root(shape.n_leaves, sel_leaf(s as u32), &op.sel)?;
+    if leaf_root(shape.n_leaves, 2 * c.iq as u64 + 1, &op.iq)? != root_t || leaf_root(shape.n_leaves, 2 * c.iw as u64 + 1, &op.iw)? != root_t || !b3_verify(&op.pos_root, n_pos, t, &root_t, &op.pos_path) {
+        return Err(Fail::Trace);
+    }
+    if op.iq.bytes.len() as u64 != 4 * iqe.m || op.iw.bytes.len() as u64 != 4 * n_ih {
+        return Err(Fail::Shape);
+    }
+    let (base, yarn) = (f32::from_bits(c.rope_base) as f64, c.yarn());
+    let mut q: Vec<f64> = f32s(&op.iq.bytes).iter().map(|&x| x as f64).collect();
+    for h in q.chunks_mut(dk as usize) {
+        rope_tail(h, t, c.n_rot as usize, base, &yarn);
+    }
+    let scale = 1.0 / ((dk * n_ih) as f64).sqrt();
+    let w: Vec<f64> = f32s(&op.iw.bytes).iter().map(|&x| x as f64 * scale).collect();
+    let tol = |mag: f64| (1e-5 + 4e-8 * t as f64) * mag + 1e-30;
+    let crb = c.row_len as u64 / 32 * 34;
+    let layout = seq_layout(ctx);
+    let comp_leaf = layout.comp(c.slot as u64).ok_or(Fail::Shape)?;
+    let n_rows = n_pos / ratio;
+    // scores of the rows [j0, j1) from one opened span
+    let scores = |span: &crate::seq::SeqSpan, j0: u64, j1: u64| -> Result<Vec<(f64, f64)>, Fail> {
+        let b = crate::seq::open_span(&op.seq_root, &layout, comp_leaf, n_rows * crb, j0 * crb, j1 * crb, span).ok_or(Fail::Trace)?;
+        b.chunks_exact(crb as usize)
+            .map(|r| crate::quant::dequant_row(crate::quant::Q8_0, r, c.row_len as usize).map(|v| index_score(&q, &w, &v[lat as usize..])).ok_or(Fail::Shape))
+            .collect()
+    };
+    if picks {
+        let nbv = n_vis.div_ceil(bs);
+        let (thr, blocks) = parse_kept(&op.sel.bytes, cand_n as usize, nbv).ok_or(Fail::Mismatch)?;
+        let pinned = (n_vis - 1) / bs;
+        if !blocks.contains(&pinned) || !op.cand.bytes.is_empty() {
+            return Err(if op.cand.bytes.is_empty() { Fail::Mismatch } else { Fail::Shape });
+        }
+        let drawn = drawn_pools(seed, &blocks, nbv);
+        if op.rows.len() != drawn.len() {
+            return Err(Fail::Shape);
+        }
+        for (i, (&b, span)) in drawn.iter().zip(&op.rows).enumerate() {
+            let sc = scores(span, b * bs, ((b + 1) * bs).min(n_vis))?;
+            let (best, mag) = sc.iter().fold((f64::NEG_INFINITY, 0f64), |(m, g), &(x, y)| (m.max(x), g.max(y)));
+            let ok = if i < SEL_DRAWS { b == pinned || best + tol(mag) >= thr } else { best - tol(mag) <= thr };
+            if !ok {
+                return Err(Fail::Mismatch);
+            }
+        }
+        return Ok(());
+    }
+    let (thr, ids) = parse_kept(&op.sel.bytes, n_top as usize, n_vis).ok_or(Fail::Mismatch)?;
+    // the layer picking the candidate blocks keeps its rows over all its scores
+    let eligible: Box<dyn Fn(u64) -> bool> = if c.cand == manifest::NONE || c.pick == 1 {
+        if !op.cand.bytes.is_empty() {
+            return Err(Fail::Shape);
+        }
+        Box::new(|_| true)
+    } else {
+        if leaf_root(shape.n_leaves, sel_leaf(c.cand), &op.cand)? != root_t {
+            return Err(Fail::Trace);
+        }
+        let (_, blocks) = parse_kept(&op.cand.bytes, cand_n as usize, n_vis.div_ceil(bs)).ok_or(Fail::Mismatch)?;
+        Box::new(move |j: u64| blocks.binary_search(&(j / bs)).is_ok())
+    };
+    let drawn = drawn_pools(seed, &ids, n_vis);
+    if op.rows.len() != drawn.len() {
+        return Err(Fail::Shape);
+    }
+    for (i, (&j, span)) in drawn.iter().zip(&op.rows).enumerate() {
+        let (sc, mag) = scores(span, j, j + 1)?[0];
+        let ok = if i < SEL_DRAWS { eligible(j) && sc + tol(mag) >= thr } else { !eligible(j) || sc - tol(mag) <= thr };
+        if !ok {
+            return Err(Fail::Mismatch);
+        }
+    }
+    Ok(())
+}
+
 fn leaf_root(n_leaves: u64, index: u64, leaf: &LeafBytes) -> Result<Hash, Fail> {
     b3_fold(n_leaves, index, blake3::hash(&leaf.bytes).as_bytes(), &leaf.leaf_path).ok_or(Fail::Trace)
 }
@@ -601,7 +749,7 @@ mod tests {
                 src: 0, slot: 0, ratio: 2, kv: 0, gate: 1, norm: 3, ik: 4, k_norm: 5, n_rot: 64, rope_base: 160_000f32.to_bits(),
                 freq_scale: (y.freq_scale as f32).to_bits(), ext_factor: 1f32.to_bits(), attn_factor: (y.attn_factor as f32).to_bits(),
                 beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(),
-                sinks: NONE, sel: NONE, n_top: 0, row_len: 640,
+                sinks: NONE, sel: NONE, n_top: 0, row_len: 640, iq: NONE, iw: NONE, topk_src: NONE, cand: NONE, cand_n: 0, cand_bs: 0, pick: 0,
             };
             let none_link = Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: NONE, src: NONE });
             let layer = LayerLinks { layer: 0, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: Some(comp) };
@@ -846,7 +994,7 @@ mod tests {
             let comp = CompLinks {
                 src: 0, slot: 0, ratio: 2, kv: NONE, gate: NONE, norm: NONE, ik: NONE, k_norm: NONE, n_rot: 64, rope_base: 160_000f32.to_bits(),
                 freq_scale: (y.freq_scale as f32).to_bits(), ext_factor: 1f32.to_bits(), attn_factor: (y.attn_factor as f32).to_bits(),
-                beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(), sinks: 5, sel: 0, n_top: NTOP as u32, row_len: 640,
+                beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(), sinks: 5, sel: 0, n_top: NTOP as u32, row_len: 640, iq: NONE, iw: NONE, topk_src: 0, cand: NONE, cand_n: 0, cand_bs: 0, pick: 0,
             };
             let none_link = Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: NONE, src: NONE });
             let layer = LayerLinks { layer: 0, proj: 2, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: Some(comp) };
@@ -1099,6 +1247,289 @@ mod tests {
             assert_eq!(verify_comp_attn_phase(&kit.tier, &kit.ctx, &kit.resp(), &s, &[], None, &op).err(), Some(Fail::Trace));
             op.sel = None;
             assert_eq!(verify_comp_attn_phase(&kit.tier, &kit.ctx, &kit.resp(), &s, &[], None, &op).err(), Some(Fail::Shape));
+        }
+    }
+
+    mod comp_sel {
+        use super::*;
+        use crate::dsa::{SEL_POINT, drawn_pools};
+        use crate::manifest::{AttnLinks, CompLinks, Entry, LayerLinks, ProductLink};
+        use crate::merkle::{B3_CHUNK, b3_chunks_proof, b3_path, b3_root, rt_range_proof};
+        use crate::opening::EntryOpening;
+        use crate::seq::{SeqLayout, SeqSpan};
+
+        const N: usize = 12;
+        const NIH: usize = 2;
+        const DK: usize = 128;
+        const LAT: usize = 32;
+        const NTOP: usize = 2;
+        const CN: usize = 2;
+        const BS: usize = 2;
+        const NONE: u32 = manifest::NONE;
+        const LAYOUT: SeqLayout = SeqLayout { n_attn: 2, n_recur: 0, heads: 1, n_comp: 1 };
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fault {
+            None,
+            /// Layer 0 keeps its two lowest rows.
+            LowRows,
+            /// Layer 0 picks its lowest blocks besides the pinned one.
+            LowBlocks,
+            /// Layer 1 keeps a row outside the candidate blocks.
+            OutsideCandidates,
+        }
+
+        struct Kit {
+            entries: Vec<Vec<u8>>,
+            entry_leaves: Vec<Hash>,
+            tier: TierCtx,
+            ctx: ChainCtx,
+            pos: Vec<(Vec<Vec<u8>>, Vec<Hash>)>,
+            pos_roots: Vec<Hash>,
+            pos_root: Hash,
+            seq_leaves: Vec<Vec<u8>>,
+            seq_hashes: Vec<Hash>,
+            seq_root: Hash,
+        }
+
+        fn entry(name: &str, role: u8, k: usize, m: usize, chain: Chain) -> Vec<u8> {
+            let e = Entry {
+                name: name.into(), wtype: crate::quant::Q8_0, k: k as u64, m: m as u64, n_exp: 1, chunk_base: 0, n_bytes: 0, row_bytes: 0, role, glu_op: 0,
+                glu_form: manifest::FORM_NONE, partner: NONE, bias: NONE, chain,
+            };
+            let mut b = crate::testkit::serialize(&e);
+            b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+            b
+        }
+
+        fn links(layer: u32, iq: u32, sel: u32, pick: u32) -> CompLinks {
+            let y = block().yarn;
+            CompLinks {
+                src: 0, slot: 0, ratio: 1, kv: NONE, gate: NONE, norm: NONE, ik: NONE, k_norm: NONE, n_rot: 64, rope_base: 160_000f32.to_bits(),
+                freq_scale: (y.freq_scale as f32).to_bits(), ext_factor: 1f32.to_bits(), attn_factor: (y.attn_factor as f32).to_bits(), beta_fast: 32f32.to_bits(),
+                beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(), sinks: NONE, sel, n_top: NTOP as u32, row_len: (LAT + DK) as u32,
+                iq, iw: iq + 1, topk_src: layer, cand: 1, cand_n: CN as u32, cand_bs: BS as u32, pick,
+            }
+        }
+
+        fn top(scores: &[f64], keep: impl Fn(usize) -> bool, n: usize, pinned: Option<usize>) -> (f64, Vec<usize>) {
+            let mut order: Vec<usize> = (0..scores.len()).filter(|&j| keep(j) && Some(j) != pinned).collect();
+            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+            let room = n - pinned.is_some() as usize;
+            let mut kept: Vec<usize> = order.iter().take(room).copied().chain(pinned).collect();
+            kept.sort();
+            let thr = match (order.get(room.saturating_sub(1)), order.get(room)) {
+                (Some(&a), Some(&b)) if room > 0 => (scores[a] + scores[b]) / 2.0,
+                (Some(&a), None) => scores[a],
+                _ => 0.0,
+            };
+            (thr, kept)
+        }
+
+        fn leaf(thr: f64, kept: &[usize], slots: usize) -> Vec<u8> {
+            let mut b = (thr as f32).to_le_bytes().to_vec();
+            b.extend(kept.iter().map(|&k| k as u32).chain(std::iter::repeat(u32::MAX)).take(slots).flat_map(|v| v.to_le_bytes()));
+            b
+        }
+
+        fn build(fault: Fault) -> Kit {
+            let a_links = |slot: u32| AttnLinks {
+                q: 0, k: 0, v: NONE, q_norm: NONE, k_norm: NONE, n_head: 1, n_head_kv: 1, head_dim: 512, rope_kind: 0, n_rot: 64, rope_base: 0,
+                kq_scale: 1f32.to_bits(), swa_window: 4, softcap: 0, rope_freqs: NONE, v_norm: 0, gated: 0, slot, mla_rank: 0, absorb: NONE, out: NONE,
+            };
+            let none_link = Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: NONE, src: NONE });
+            let layer = |l: u32, c: CompLinks| {
+                Chain::Layer(LayerLinks { layer: l, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(a_links(l)), recur: None, hc: None, dsa: None, comp: Some(c) })
+            };
+            let entries = vec![
+                entry("blk.0.indexer.attn_q_b.weight", manifest::ROLE_PRODUCT, 64, NIH * DK, none_link),
+                entry("blk.0.indexer.proj.weight", manifest::ROLE_PRODUCT, 64, NIH, none_link),
+                entry("blk.1.indexer.attn_q_b.weight", manifest::ROLE_PRODUCT, 64, NIH * DK, none_link),
+                entry("blk.1.indexer.proj.weight", manifest::ROLE_PRODUCT, 64, NIH, none_link),
+                entry("blk.0", manifest::ROLE_LAYER, 0, 0, layer(0, links(0, 0, 0, 1))),
+                entry("blk.1", manifest::ROLE_LAYER, 0, 0, layer(1, links(1, 2, 2, 0))),
+            ];
+            let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+            let tier = TierCtx { r_t: [0; 32], n_chunks: 1, m_t: rt_range_proof(&entry_leaves, 0, 1).0, n_entries: entries.len() as u64, n_products: 4 };
+            let ctx = ChainCtx { n_sel: 3, n_comp: 1, n_layers: 2, layer_base: 4, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 2, n_recur: 0, seq_heads: 1 };
+            let y = block().yarn;
+            let rows: Vec<Vec<u8>> = (0..N).map(|j| q8_0(&vals(700 + j as u64, LAT + DK, 1.0).iter().map(|&x| x as f64).collect::<Vec<_>>())).collect();
+            let keys: Vec<Vec<f32>> = rows.iter().map(|r| crate::quant::dequant_row(crate::quant::Q8_0, r, LAT + DK).unwrap()[LAT..].to_vec()).collect();
+            let iq: Vec<[Vec<f32>; 2]> = (0..N).map(|t| [vals(800 + t as u64, NIH * DK, 1.0), vals(820 + t as u64, NIH * DK, 1.0)]).collect();
+            let iw: Vec<[Vec<f32>; 2]> = (0..N).map(|t| [vals(840 + t as u64, NIH, 1.0).iter().map(|x| x.abs() + 0.2).collect(), vals(860 + t as u64, NIH, 1.0).iter().map(|x| x.abs() + 0.2).collect()]).collect();
+            let score = |t: usize, l: usize, j: usize| {
+                let mut q: Vec<f64> = iq[t][l].iter().map(|&x| x as f64).collect();
+                for h in q.chunks_mut(DK) {
+                    rope_tail(h, t as u64, 64, 160_000.0, &y);
+                }
+                let w: Vec<f64> = iw[t][l].iter().map(|&x| x as f64 / ((DK * NIH) as f64).sqrt()).collect();
+                index_score(&q, &w, &keys[j]).0
+            };
+            let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
+            let n_leaves = crate::chain::n_pos_leaves(4, 2, 0) as usize + 3;
+            let pos: Vec<(Vec<Vec<u8>>, Vec<Hash>)> = (0..N)
+                .map(|t| {
+                    let n_vis = t + 1;
+                    let s0: Vec<f64> = (0..n_vis).map(|j| score(t, 0, j)).collect();
+                    let s1: Vec<f64> = (0..n_vis).map(|j| score(t, 1, j)).collect();
+                    let bmax: Vec<f64> = (0..n_vis.div_ceil(BS)).map(|b| (b * BS..((b + 1) * BS).min(n_vis)).map(|j| s0[j]).fold(f64::NEG_INFINITY, f64::max)).collect();
+                    let pinned = (n_vis - 1) / BS;
+                    let (bthr, blocks) = if fault == Fault::LowBlocks && bmax.len() > CN {
+                        let neg: Vec<f64> = bmax.iter().map(|x| -x).collect();
+                        let (th, k) = top(&neg, |_| true, CN, Some(pinned));
+                        (-th, k)
+                    } else {
+                        top(&bmax, |_| true, CN, Some(pinned))
+                    };
+                    let (thr0, kept0) = if fault == Fault::LowRows && n_vis > NTOP {
+                        let neg: Vec<f64> = s0.iter().map(|x| -x).collect();
+                        let (th, k) = top(&neg, |_| true, NTOP, None);
+                        (-th, k)
+                    } else {
+                        top(&s0, |_| true, NTOP, None)
+                    };
+                    let in_cand = |j: usize| blocks.contains(&(j / BS));
+                    let (thr1, mut kept1) = top(&s1, in_cand, NTOP, None);
+                    if fault == Fault::OutsideCandidates && n_vis > CN * BS {
+                        if let Some(out) = (0..n_vis).find(|&j| !in_cand(j)) {
+                            kept1[0] = out;
+                            kept1.sort();
+                        }
+                    }
+                    let mut leaves = vec![Vec::new(); n_leaves];
+                    leaves[1] = f(&iq[t][0]);
+                    leaves[3] = f(&iw[t][0]);
+                    leaves[5] = f(&iq[t][1]);
+                    leaves[7] = f(&iw[t][1]);
+                    let base = crate::chain::sel_leaf(4, 2, 0, 0) as usize;
+                    leaves[base] = leaf(thr0, &kept0, NTOP);
+                    leaves[base + 1] = leaf(bthr, &blocks, CN);
+                    leaves[base + 2] = leaf(thr1, &kept1, NTOP);
+                    leaves[n_leaves - 1] = crate::chain::meta(t as u32, 1, 7).to_vec();
+                    let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+                    (leaves, hashes)
+                })
+                .collect();
+            let pos_roots: Vec<Hash> = pos.iter().map(|(_, h)| b3_root(h)).collect();
+            let pos_root = b3_root(&pos_roots);
+            let mut seq_leaves = vec![Vec::new(); LAYOUT.n_leaves() as usize];
+            seq_leaves[LAYOUT.comp(0).unwrap() as usize] = rows.concat();
+            let seq_hashes: Vec<Hash> = seq_leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+            let seq_root = b3_root(&seq_hashes);
+            Kit { entries, entry_leaves, tier, ctx, pos, pos_roots, pos_root, seq_leaves, seq_hashes, seq_root }
+        }
+
+        impl Kit {
+            fn eo(&self, i: usize) -> EntryOpening {
+                EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+            }
+
+            fn resp(&self) -> ResponseCtx {
+                ResponseCtx { trace_root: crate::seq::trace_root(&self.pos_root, &self.seq_root), n_prompt: N as u32, n_pos: N as u32 }
+            }
+
+            fn lb(&self, t: usize, i: usize) -> LeafBytes {
+                LeafBytes { bytes: self.pos[t].0[i].clone(), leaf_path: b3_path(&self.pos[t].1, i) }
+            }
+
+            fn span(&self, lo: usize, hi: usize) -> SeqSpan {
+                let leaf = LAYOUT.comp(0).unwrap() as usize;
+                let data = &self.seq_leaves[leaf];
+                let (c0, c1) = (lo / B3_CHUNK, (hi - 1) / B3_CHUNK);
+                SeqSpan {
+                    first_chunk: c0 as u32,
+                    bytes: data[c0 * B3_CHUNK..((c1 + 1) * B3_CHUNK).min(data.len())].to_vec(),
+                    chunk_proof: b3_chunks_proof(data, c0 as u64, (c1 - c0 + 1) as u64),
+                    leaf_path: b3_path(&self.seq_hashes, leaf),
+                }
+            }
+
+            /// The opening of `seed`, `None` when it draws nothing to check.
+            fn open(&self, seed: &Hash) -> Option<CompSelOpening> {
+                let d = crate::draw::point(seed, SEL_POINT);
+                let s = (d[1] % 3) as usize;
+                let (layer, l) = [(4usize, 0usize), (4, 0), (5, 1)][s];
+                let picks = s == 1;
+                let first = if picks { CN * BS } else { NTOP };
+                let t = first + (d[0] % (N - first) as u64) as usize;
+                let n_vis = t + 1;
+                let base = crate::chain::sel_leaf(4, 2, 0, 0) as usize;
+                let rb = (LAT + DK) / 32 * 34;
+                let kept = |b: &[u8]| b[4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).filter(|&x| x != u32::MAX).map(|x| x as u64).collect::<Vec<_>>();
+                let sel = &self.pos[t].0[base + s];
+                let rows = if picks {
+                    drawn_pools(seed, &kept(sel), n_vis.div_ceil(BS) as u64)
+                        .iter()
+                        .map(|&b| self.span(b as usize * BS * rb, ((b as usize + 1) * BS).min(n_vis) * rb))
+                        .collect()
+                } else {
+                    drawn_pools(seed, &kept(sel), n_vis as u64).iter().map(|&j| self.span(j as usize * rb, (j as usize + 1) * rb)).collect()
+                };
+                Some(CompSelOpening {
+                    response_txid: [1; 32],
+                    pos_root: self.pos_root,
+                    seq_root: self.seq_root,
+                    layer: self.eo(layer),
+                    entries: vec![self.eo(2 * l), self.eo(2 * l + 1)],
+                    pos_path: b3_path(&self.pos_roots, t),
+                    sel: self.lb(t, base + s),
+                    iq: self.lb(t, 4 * l + 1),
+                    iw: self.lb(t, 4 * l + 3),
+                    cand: if s == 2 { self.lb(t, base + 1) } else { LeafBytes::default() },
+                    rows,
+                })
+            }
+
+            fn verify(&self, seed: &Hash) -> Result<(), Fail> {
+                verify_comp_sel_point(&self.tier, &self.ctx, &self.resp(), seed, &self.open(seed).unwrap())
+            }
+        }
+
+        fn seeds() -> impl Iterator<Item = Hash> {
+            (0..96u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+        }
+
+        fn drawn_leaf(s: &Hash) -> u64 {
+            crate::draw::point(s, SEL_POINT)[1] % 3
+        }
+
+        #[test]
+        fn honest_selections_and_candidates_pass_and_round_trip() {
+            let kit = build(Fault::None);
+            let mut seen = [0; 3];
+            for s in seeds() {
+                let op = kit.open(&s).unwrap();
+                assert_eq!(CompSelOpening::decode(&op.encode()), Some(op.clone()));
+                kit.verify(&s).unwrap_or_else(|e| panic!("leaf {}: {e:?}", drawn_leaf(&s)));
+                seen[drawn_leaf(&s) as usize] += 1;
+            }
+            assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+        }
+
+        #[test]
+        fn forged_selections_are_caught() {
+            for (fault, leaf) in [(Fault::LowRows, 0), (Fault::LowBlocks, 1), (Fault::OutsideCandidates, 2)] {
+                let kit = build(fault);
+                let draws: Vec<Result<(), Fail>> = seeds().filter(|s| drawn_leaf(s) == leaf).map(|s| kit.verify(&s)).collect();
+                let caught = draws.iter().filter(|r| **r == Err(Fail::Mismatch)).count();
+                assert!(caught * 3 > draws.len(), "leaf {leaf}: {caught} of {}", draws.len());
+                assert!(draws.iter().all(|r| r.is_ok() || *r == Err(Fail::Mismatch)));
+            }
+        }
+
+        #[test]
+        fn a_tampered_row_or_query_is_refused() {
+            let kit = build(Fault::None);
+            let s = seeds().next().unwrap();
+            let mut op = kit.open(&s).unwrap();
+            op.rows[0].bytes[3] ^= 1;
+            assert_eq!(verify_comp_sel_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &op), Err(Fail::Trace));
+            let mut op = kit.open(&s).unwrap();
+            op.iq.bytes[0] ^= 1;
+            assert_eq!(verify_comp_sel_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &op), Err(Fail::Trace));
+            let mut op = kit.open(&s).unwrap();
+            op.rows.pop();
+            assert_eq!(verify_comp_sel_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &op), Err(Fail::Shape));
         }
     }
 

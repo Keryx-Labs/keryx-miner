@@ -66,7 +66,7 @@ const TAG_DSA: u8 = 15;
 const DSA_FIELDS: usize = 12;
 /// An attention layer reading compressed rows of blocks of tokens, wrapping its links.
 const TAG_COMP: u8 = 16;
-const COMP_FIELDS: usize = 21;
+const COMP_FIELDS: usize = 28;
 const HC_FIELDS: usize = 13;
 
 /// Source of a product's input.
@@ -127,6 +127,17 @@ pub struct CompLinks {
     pub n_top: u32,
     /// Values per compressed row (latent and indexer key).
     pub row_len: u32,
+    /// Indexer query and head weight products of the layer computing the selection (`NONE` on a
+    /// layer reading another layer's selection), and that layer.
+    pub iq: u32,
+    pub iw: u32,
+    pub topk_src: u32,
+    /// Candidate block leaf the selection is restricted to (`NONE` without one), the blocks it
+    /// keeps, rows per block, and whether this layer picks them.
+    pub cand: u32,
+    pub cand_n: u32,
+    pub cand_bs: u32,
+    pub pick: u32,
 }
 
 impl CompLinks {
@@ -134,6 +145,7 @@ impl CompLinks {
         [
             self.src, self.slot, self.ratio, self.kv, self.gate, self.norm, self.ik, self.k_norm, self.n_rot, self.rope_base, self.freq_scale,
             self.ext_factor, self.attn_factor, self.beta_fast, self.beta_slow, self.n_ctx_orig, self.eps, self.sinks, self.sel, self.n_top, self.row_len,
+            self.iq, self.iw, self.topk_src, self.cand, self.cand_n, self.cand_bs, self.pick,
         ]
     }
 
@@ -141,6 +153,7 @@ impl CompLinks {
         Self {
             src: f[0], slot: f[1], ratio: f[2], kv: f[3], gate: f[4], norm: f[5], ik: f[6], k_norm: f[7], n_rot: f[8], rope_base: f[9],
             freq_scale: f[10], ext_factor: f[11], attn_factor: f[12], beta_fast: f[13], beta_slow: f[14], n_ctx_orig: f[15], eps: f[16], sinks: f[17], sel: f[18], n_top: f[19], row_len: f[20],
+            iq: f[21], iw: f[22], topk_src: f[23], cand: f[24], cand_n: f[25], cand_bs: f[26], pick: f[27],
         }
     }
 
@@ -752,7 +765,7 @@ mod tests {
         let comp = CompLinks {
             src: 2, slot: 0, ratio: 2, kv: 70, gate: 71, norm: 80, ik: 81, k_norm: 82, n_rot: 64, rope_base: 160_000f32.to_bits(), freq_scale: (1.0f32 / 16.0).to_bits(),
             ext_factor: 1f32.to_bits(), attn_factor: 0.78f32.to_bits(), beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(),
-            sinks: 83, sel: 0, n_top: 512, row_len: 640,
+            sinks: 83, sel: 0, n_top: 512, row_len: 640, iq: 90, iw: 91, topk_src: 2, cand: NONE, cand_n: 0, cand_bs: 0, pick: 0,
         };
         let lc = Chain::Layer(LayerLinks { comp: Some(comp), ..inner });
         let lhc = Chain::Layer(LayerLinks { hc: Some(hc), comp: Some(comp), ..inner });
