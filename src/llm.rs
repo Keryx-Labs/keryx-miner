@@ -1165,6 +1165,9 @@ fn open_pieces(
     if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_comp > 0) {
         bodies.push(open_comp(gguf, dev_id, m, trace, seed, response_txid, index)?);
     }
+    if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_engram > 0) {
+        bodies.push(open_engram(gguf, dev_id, m, trace, seed, response_txid, index)?);
+    }
     if let Some(d) = decision {
         bodies.push(open_decision(gguf, dev_id, m, trace, &d, seed, response_txid)?);
     }
@@ -1211,6 +1214,32 @@ fn open_selection(
     let body = op.encode();
     if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
         return Err(format!("selection opening of {} B over the cap", body.len()));
+    }
+    Ok(body)
+}
+
+/// The n-gram residual opening of the draw of `seed`, checked as the node checks it.
+fn open_engram(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    trace: &crate::trace::ResponseTrace,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+    index: &crate::pom::WeightIndex,
+) -> Result<Vec<u8>, String> {
+    use crate::trace_dsv41::{draw_engram, engram_opening};
+    let rec = &trace.record;
+    let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
+    let d = draw_engram(m, rec, seed).ok_or("no n-gram draw")?;
+    let caps = replay_captures_all(gguf, dev_id, m, trace, &d.captures(m.n_products as u64))?;
+    let op = engram_opening(m, rec, seq, index, &d, &caps, response_txid)?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    keryx_verifiable_inference::engram::verify_engram_point(&m.tier_ctx(index), &ctx, &crate::trace_seq::seq_response_ctx(rec, seq), seed, &op)
+        .map_err(|e| format!("n-gram point {e:?} at layer {}, position {}", d.layer, d.t))?;
+    let body = op.encode();
+    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
+        return Err(format!("n-gram opening of {} B over the cap", body.len()));
     }
     Ok(body)
 }

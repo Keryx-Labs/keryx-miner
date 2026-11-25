@@ -12,6 +12,8 @@ pub mod dsv41;
 pub mod dsv41kit;
 pub mod engram;
 #[cfg(any(test, feature = "testkit"))]
+pub mod engramkit;
+#[cfg(any(test, feature = "testkit"))]
 pub mod chainkit;
 #[cfg(any(test, feature = "testkit"))]
 pub mod hckit;

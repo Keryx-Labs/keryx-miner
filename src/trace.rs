@@ -1009,6 +1009,8 @@ pub struct ResidDraw {
     /// Hyper-connection streams of the layer: the drawn chunk is chunk `c` of stream `stream`.
     pub hc: Option<manifest::HcLinks>,
     pub stream: u64,
+    /// Streams after the n-gram lookup of the layer, which its attention half reads.
+    pub engram_out: Option<u32>,
 }
 
 impl ResidDraw {
@@ -1034,6 +1036,7 @@ impl ResidDraw {
 
     pub fn src_leaf(&self, np: u64) -> Option<u32> {
         match self.kind {
+            Resid::Attn if self.engram_out.is_some() => self.engram_out,
             Resid::Attn if self.layer == 0 => None,
             Resid::Attn => Some(chain::resid_leaf(np, self.layer - 1, Resid::Out) as u32),
             Resid::Out => Some(chain::resid_leaf(np, self.layer, Resid::Attn) as u32),
@@ -1057,8 +1060,14 @@ fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32
     let np = m.n_products as u64;
     let Chain::Product(pl) = m.entry(g_rank).chain else { return None };
     let layer = pl.layer as u64;
+    // the attention half of a layer with an n-gram lookup reads the streams after it
+    let engram_out = match (layer < ctx.n_layers as u64).then(|| m.entry(ctx.layer_base as u64 + layer).chain) {
+        Some(Chain::Layer(ll)) => ll.engram.map(|e| e.out_leaf),
+        _ => None,
+    };
     Some(match pl.link {
-        manifest::LINK_NONE => None,
+        manifest::LINK_NONE | manifest::LINK_ENGRAM => None,
+        manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE if engram_out.is_some() => engram_out,
         manifest::LINK_ATTN_IN if layer == 0 => None,
         manifest::LINK_ATTN_IN => Some(chain::resid_leaf(np, layer - 1, Resid::Out) as u32),
         manifest::LINK_FFN_IN => Some(chain::resid_leaf(np, layer, Resid::Attn) as u32),
@@ -1108,7 +1117,7 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
         }
         None => (d[2] % (4 * dim).div_ceil(B3_CHUNK as u64).max(1), 0),
     };
-    Some(ChainDraw { points, prefix_t: draw_prefix(pctx, seed), resid: ResidDraw { t, layer, kind, rank, c, moe, hc: ll.hc, stream }, n_layers, extra })
+    Some(ChainDraw { points, prefix_t: draw_prefix(pctx, seed), resid: ResidDraw { t, layer, kind, rank, c, moe, hc: ll.hc, stream, engram_out: ll.engram.map(|e| e.out_leaf) }, n_layers, extra })
 }
 
 impl ChainDraw {
@@ -1310,6 +1319,7 @@ pub fn chain_opening(
                     LinkOpening::HcPre { layer, src, mixes, base, norm: norm_fragment(m, index, pl.norm as u64, block?)? }
                 }
             }
+            (manifest::LINK_ENGRAM, None) => crate::trace_dsv41::engram_link(m, rec, tokens, pl.layer as u64, p.t, block?)?,
             (_, Some(l)) => LinkOpening::Norm { src: leaf_bytes(rec, p.t, *l, cap(p.t, *l)?), norm: norm_fragment(m, index, pl.norm as u64, block?)? },
             _ => return None,
         };

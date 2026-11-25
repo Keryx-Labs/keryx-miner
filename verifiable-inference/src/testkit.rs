@@ -82,7 +82,7 @@ pub(crate) fn in_layout(leaf: &[u8], layout: u8) -> Vec<u8> {
 }
 
 /// Committed batch size and input layout of a Q8_0 product at position `t`.
-pub(crate) fn layout_at(t: u64, n_prompt: u32) -> (u32, u8) {
+pub fn layout_at(t: u64, n_prompt: u32) -> (u32, u8) {
     let ub = expected_ubatch(t, n_prompt);
     (ub, layout_for(ub, quant::Q8_0))
 }
