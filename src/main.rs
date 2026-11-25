@@ -907,6 +907,8 @@ fn main() -> Result<(), Error> {
     }
     // Attention openings expect unrotated key and value cache rows.
     set_llama_env("LLAMA_ATTN_ROT_DISABLE", "1");
+    // Compressed attention openings expect the selected rows.
+    set_llama_env("LLAMA_DSV41_SPARSE", "1");
     // Hidden child mode of the startup engine check (see llama_engine::probe_device).
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--probe-engine-device") {

@@ -439,7 +439,11 @@ impl TierManifest {
         for (e, _) in &self.entries {
             let Chain::Layer(ll) = e.chain else { continue };
             if let Some(a) = ll.attn {
-                out.push([ll.layer, if a.mla_rank > 0 { 2 } else { 1 }, a.slot, a.n_head_kv, a.head_dim]);
+                // compressed attention caches keys only, and its source layers write the compressed rows
+                out.push([ll.layer, if a.mla_rank > 0 || ll.comp.is_some() { 2 } else { 1 }, a.slot, a.n_head_kv, a.head_dim]);
+                if let Some(c) = ll.comp.filter(|c| c.ratio > 0 && c.src == ll.layer) {
+                    out.push([ll.layer, 5, c.slot, 1, c.row_len]);
+                }
             } else if let Some(r) = ll.recur {
                 out.push([ll.layer, if manifest::per_key_decay(r.kind) { 4 } else { 3 }, r.slot, r.n_v_heads, r.head_dim]);
             }
@@ -1519,6 +1523,23 @@ pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sequence streams of a deepseek41 manifest (`VI_DSV41_MANIFEST`): a key-only window per
+    /// layer and one compressed row stream per source layer, as many as the node lays out.
+    #[test]
+    #[ignore]
+    fn dsv41_sequence_layers() {
+        let bytes: &'static [u8] = Box::leak(std::fs::read(std::env::var("VI_DSV41_MANIFEST").unwrap()).unwrap().into_boxed_slice());
+        let m = TierManifest::parse(bytes).unwrap();
+        let rows = m.seq_layers();
+        let window: Vec<_> = rows.iter().filter(|r| r[1] == 2).collect();
+        let comp: Vec<_> = rows.iter().filter(|r| r[1] == 5).collect();
+        assert_eq!((window.len(), comp.len(), rows.len()), (40, 4, 44));
+        assert!(window.iter().all(|r| r[3] == 1 && r[4] == 512));
+        assert_eq!(comp.iter().map(|r| (r[0], r[2], r[4])).collect::<Vec<_>>(), vec![(2, 0, 640), (8, 1, 640), (14, 2, 640), (20, 3, 640)]);
+        let layout = keryx_verifiable_inference::seq::SeqLayout { n_attn: 40, n_recur: 0, heads: 1, n_comp: 4 };
+        assert_eq!(layout.n_leaves(), 124);
+    }
 
     /// Stage-2 openings of a trace over hyper-connection layers verify as the node checks them.
     #[test]
