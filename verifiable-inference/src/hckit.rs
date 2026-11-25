@@ -78,6 +78,13 @@ pub struct HcTrace {
     pub trace_root: Hash,
 }
 
+impl HcTrace {
+    /// Micro-batch size of each position.
+    pub fn ubatch(&self) -> Vec<u32> {
+        (0..self.positions.len() as u64).map(|t| layout_at(t, self.n_prompt).0).collect()
+    }
+}
+
 /// What a trace computes dishonestly.
 #[derive(Clone, Copy, Default)]
 pub struct Faults {

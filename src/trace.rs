@@ -8,8 +8,8 @@ use keryx_verifiable_inference::manifest::{self, Chain, Entry};
 use borsh::{BorshDeserialize, BorshSerialize};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_root, rt_range_proof, Hash, B3_CHUNK};
 use keryx_verifiable_inference::opening::{
-    self, ChunkRange, EntryOpening, ExpertIds, ExpertRow, FeedRow, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening, Point, PrefixPoint,
-    ResidAdd, ResidOpening, ResidPoint, ResidSrc,
+    self, ChunkRange, EntryOpening, ExpertIds, ExpertRow, FeedRow, HcAdd, HcMoe, HcSource, LeafBytes, LeafChunk, LinkOpening, MoeAdd, Opening,
+    Point, PrefixPoint, ResidAdd, ResidOpening, ResidPoint, ResidSrc,
 };
 use keryx_verifiable_inference::prefix::{self, PrefixCtx};
 use keryx_verifiable_inference::verify::{self, ResponseCtx, TierCtx};
@@ -990,11 +990,30 @@ pub struct ResidDraw {
     pub c: u64,
     /// Routed experts added with it.
     pub moe: Option<manifest::MoeLinks>,
+    /// Hyper-connection streams of the layer: the drawn chunk is chunk `c` of stream `stream`.
+    pub hc: Option<manifest::HcLinks>,
+    pub stream: u64,
 }
 
 impl ResidDraw {
     pub fn dst_leaf(&self, np: u64) -> u32 {
         chain::resid_leaf(np, self.layer, self.kind) as u32
+    }
+
+    /// Chunk of the drawn residual leaf: stream `stream`, chunk `c` of it.
+    pub fn dst_chunk(&self, per: u64) -> u64 {
+        self.stream * per + self.c
+    }
+
+    /// Chunks per stream of a hyper-connection layer of `dim` values.
+    pub fn per_stream(dim: u64) -> u64 {
+        4 * dim / B3_CHUNK as u64
+    }
+
+    /// Mix product output of the half the residual closes.
+    pub fn hc_mixes(&self) -> Option<u32> {
+        let hc = self.hc?;
+        Some(2 * if self.kind == Resid::Attn { hc.attn_fn } else { hc.ffn_fn } + 1)
     }
 
     pub fn src_leaf(&self, np: u64) -> Option<u32> {
@@ -1014,6 +1033,8 @@ pub struct ChainDraw {
     pub prefix_t: u64,
     pub resid: ResidDraw,
     pub n_layers: u64,
+    /// Further captures the links read: the mix outputs of hyper-connection half inputs.
+    pub extra: Vec<(u64, u32)>,
 }
 
 fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32>> {
@@ -1027,6 +1048,9 @@ fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32
         manifest::LINK_FFN_IN => Some(chain::resid_leaf(np, layer, Resid::Attn) as u32),
         manifest::LINK_HEAD => Some(chain::resid_leaf(np, ctx.n_layers.checked_sub(1)? as u64, Resid::Out) as u32),
         manifest::LINK_GLU | manifest::LINK_DIRECT | manifest::LINK_HEAD_SLICE | manifest::LINK_NORMED => Some(2 * pl.src + 1),
+        manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE if layer == 0 => None,
+        manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE => Some(chain::resid_leaf(np, layer - 1, Resid::Out) as u32),
+        manifest::LINK_HC_FFN_IN | manifest::LINK_HC_FFN_PRE => Some(chain::resid_leaf(np, layer, Resid::Attn) as u32),
         _ => return None,
     })
 }
@@ -1035,8 +1059,14 @@ fn link_leaf(m: &TierManifest, ctx: &ChainCtx, g_rank: u64) -> Option<Option<u32
 pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &Hash) -> Option<ChainDraw> {
     let ctx = m.chain?;
     let mut points = Vec::with_capacity(POINTS as usize);
+    let mut extra = Vec::new();
     for i in 0..POINTS {
         let p = draw_point(m, rec.n_prompt, rec.n_pos, seed, i)?;
+        if let Chain::Product(pl) = m.entry(p.g_rank).chain {
+            if matches!(pl.link, manifest::LINK_HC_ATTN_PRE | manifest::LINK_HC_FFN_PRE) {
+                extra.push((p.t, 2 * pl.src + 1));
+            }
+        }
         points.push((p, link_leaf(m, &ctx, p.g_rank)?));
     }
     let n_layers = ctx.n_layers as u64;
@@ -1054,8 +1084,14 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
     let moe = ll.moe.filter(|_| kind == Resid::Out && ll.post_ffn == manifest::NONE);
     let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
     let dim = m.entry(rank).m;
-    let c = d[2] % (4 * dim).div_ceil(B3_CHUNK as u64).max(1);
-    Some(ChainDraw { points, prefix_t: draw_prefix(pctx, seed), resid: ResidDraw { t, layer, kind, rank, c, moe }, n_layers })
+    let (c, stream) = match ll.hc {
+        Some(hc) => {
+            let (s, jc, _) = chain::hc_resid_chunk(d[2], hc.n_hc as u64, dim)?;
+            (jc, s)
+        }
+        None => (d[2] % (4 * dim).div_ceil(B3_CHUNK as u64).max(1), 0),
+    };
+    Some(ChainDraw { points, prefix_t: draw_prefix(pctx, seed), resid: ResidDraw { t, layer, kind, rank, c, moe, hc: ll.hc, stream }, n_layers, extra })
 }
 
 impl ChainDraw {
@@ -1086,6 +1122,15 @@ impl ChainDraw {
             add(r.t, 2 * moe.down_exps);
             add(r.t, 2 * moe.down_exps + 1);
             add(r.t, chain::router_leaf(np, self.n_layers, r.layer) as u32);
+            if r.hc.is_some() {
+                add(r.t, 2 * moe.gate_exps);
+            }
+        }
+        if let Some(l) = r.hc_mixes() {
+            add(r.t, l);
+        }
+        for &(t, l) in &self.extra {
+            add(t, l);
         }
         out
     }
@@ -1221,6 +1266,30 @@ pub fn chain_opening(
                 let c = block? / chain::CHUNK_BLOCKS;
                 LinkOpening::Source { src: m.entry_opening(pl.src as u64), y: leaf_chunk(rec, p.t, *l, y, c)?, ids: None }
             }
+            (manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_FFN_IN | manifest::LINK_HC_ATTN_PRE | manifest::LINK_HC_FFN_PRE, l) => {
+                let layer = m.entry_opening(ctx.layer_base as u64 + pl.layer as u64);
+                let src = match l {
+                    None => HcSource::Token(row_opening(m, index, ctx.embd_entry as u64, tok(p.t)? as u64)?),
+                    Some(l) => HcSource::Streams(leaf_bytes(rec, p.t, *l, cap(p.t, *l)?)),
+                };
+                if matches!(pl.link, manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_FFN_IN) {
+                    LinkOpening::HcIn { layer, src }
+                } else {
+                    let hc = match m.entry(ctx.layer_base as u64 + pl.layer as u64).chain {
+                        Chain::Layer(ll) => ll.hc?,
+                        _ => return None,
+                    };
+                    let base = if pl.link == manifest::LINK_HC_ATTN_PRE { hc.attn_base } else { hc.ffn_base };
+                    let n_mix = (2 + hc.n_hc as u64) * hc.n_hc as u64;
+                    LinkOpening::HcPre {
+                        layer,
+                        src,
+                        mixes: leaf_bytes(rec, p.t, 2 * pl.src + 1, cap(p.t, 2 * pl.src + 1)?),
+                        base: bytes_range(m, index, base as u64, 0, 4 * n_mix)?,
+                        norm: norm_fragment(m, index, pl.norm as u64, block?)?,
+                    }
+                }
+            }
             (_, Some(l)) => LinkOpening::Norm { src: leaf_bytes(rec, p.t, *l, cap(p.t, *l)?), norm: norm_fragment(m, index, pl.norm as u64, block?)? },
             _ => return None,
         };
@@ -1245,7 +1314,7 @@ pub fn chain_opening(
         x: cap(t, 0)?.to_vec(),
         x_path: b3_path(pos_leaves, 0),
         embd: row_opening(m, index, pctx.embd_entry as u64, ptok as u64)?,
-        norm: norm_fragment(m, index, pctx.norm_entry as u64, pblock)?,
+        norm: if pctx.norm_entry == manifest::NONE { Default::default() } else { norm_fragment(m, index, pctx.norm_entry as u64, pblock)? },
     };
 
     let r = &d.resid;
@@ -1255,6 +1324,7 @@ pub fn chain_opening(
     };
     let rtok = tok(r.t)?;
     let dst = cap(r.t, r.dst_leaf(np))?;
+    let per_stream = ResidDraw::per_stream(m.entry(r.rank).m);
     let src = match r.src_leaf(np) {
         None => {
             let (e, range) = row_opening(m, index, ctx.embd_entry as u64, rtok as u64)?;
@@ -1265,7 +1335,47 @@ pub fn chain_opening(
     let y_leaf = 2 * r.rank as u32 + 1;
     let y = cap(r.t, y_leaf)?;
     let post = if r.kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
-    let add = if let Some(moe) = &r.moe {
+    let add = if let Some(hc) = &r.hc {
+        let n = hc.n_hc as u64;
+        let streams = match r.src_leaf(np) {
+            None => Vec::new(),
+            Some(l) => (1..n).map(|s| leaf_chunk(rec, r.t, l, cap(r.t, l)?, s * per_stream + r.c)).collect::<Option<Vec<_>>>()?,
+        };
+        let mixes = r.hc_mixes()?;
+        let base = if r.kind == Resid::Attn { hc.attn_base } else { hc.ffn_base };
+        let moe = match &r.moe {
+            None => None,
+            Some(moe) => {
+                let n_used = ctx.n_used as u64;
+                let dim = m.entry(r.rank).m;
+                let per_slot = dim * 4 / B3_CHUNK as u64;
+                let n_exp = m.entry(moe.router as u64).m;
+                let down_leaf = 2 * moe.down_exps + 1;
+                let down_y = cap(r.t, down_leaf)?;
+                let router_leaf = chain::router_leaf(np, ctx.n_layers as u64, r.layer) as u32;
+                let row = draw::point(seed, chain::RESID_POINT)[3] % n_exp;
+                Some(Box::new(HcMoe {
+                    scores: leaf_bytes(rec, r.t, router_leaf, cap(r.t, router_leaf)?),
+                    bias: match moe.probs_bias {
+                        manifest::NONE => Default::default(),
+                        b => bytes_range(m, index, b as u64, 0, 4 * n_exp)?,
+                    },
+                    ids: expert_ids(down_y, n_used)?,
+                    slots: (0..n_used).map(|sl| leaf_chunk(rec, r.t, down_leaf, down_y, sl * per_slot + r.c)).collect::<Option<Vec<_>>>()?,
+                    router_row: bytes_range(m, index, moe.router as u64, row * 4 * dim, 4 * dim)?,
+                    gate: m.entry_opening(moe.gate_exps as u64),
+                    x: leaf_bytes(rec, r.t, 2 * moe.gate_exps, cap(r.t, 2 * moe.gate_exps)?),
+                }))
+            }
+        };
+        ResidAdd::Hc(Box::new(HcAdd {
+            o: leaf_chunk(rec, r.t, y_leaf, y, r.c)?,
+            streams,
+            mixes: leaf_bytes(rec, r.t, mixes, cap(r.t, mixes)?),
+            base: bytes_range(m, index, base as u64, 0, 4 * (2 + n) * n)?,
+            moe,
+        }))
+    } else if let Some(moe) = &r.moe {
         let n_used = ctx.n_used as u64;
         let dim = m.entry(r.rank).m;
         let per_slot = dim * 4 / B3_CHUNK as u64;
@@ -1309,7 +1419,7 @@ pub fn chain_opening(
         meta_path: b3_path(rpos, rec.n_leaves - 1),
         layer: m.entry_opening(ctx.layer_base as u64 + r.layer),
         product: m.entry_opening(r.rank),
-        dst: leaf_chunk(rec, r.t, r.dst_leaf(np), dst, r.c)?,
+        dst: leaf_chunk(rec, r.t, r.dst_leaf(np), dst, if r.hc.is_some() { r.dst_chunk(per_stream) } else { r.c })?,
         src,
         add,
     };
@@ -1393,6 +1503,82 @@ pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stage-2 openings of a trace over hyper-connection layers verify as the node checks them.
+    #[test]
+    fn hyper_connection_openings_verify() {
+        use keryx_verifiable_inference::hckit::{Faults, HcTier};
+        let tier = HcTier::new();
+        let offset = 2u32;
+        let request: Hash = std::array::from_fn(|i| (i * 29 + 11) as u8);
+        let mut toks: Vec<u32> = vec![5, 42];
+        toks.extend(request.iter().map(|&b| b as u32));
+        toks.extend([7, 9, 13]);
+        let n = toks.len() as u32;
+        let trace = tier.trace(&toks, n, Faults::default());
+        let mut file = b"KXMANIF2".to_vec();
+        file.extend((tier.entries.len() as u32).to_le_bytes());
+        file.extend((tier.tier().n_products as u32).to_le_bytes());
+        for (_, b) in &tier.entries {
+            file.extend_from_slice(b);
+        }
+        let ctx = tier.chain_ctx();
+        let m = TierManifest { chain: Some(ctx), ..TierManifest::parse(&file).expect("kit manifest") };
+        assert_eq!(m.m_t, tier.m_t);
+        let index = crate::pom::index_from_ram(tier.weights.clone());
+        assert_eq!(index.r_t, tier.r_t);
+        let pctx = tier.prefix_ctx(offset);
+        let tokens: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
+        let leaves: Vec<Hash> = trace.positions.iter().flat_map(|p| p.hashes.clone()).collect();
+        let rec = TraceRecord::new_chain(&m, n, trace.ubatch(), leaves, &tokens).expect("kit record");
+        assert_eq!(rec.trace_root, trace.trace_root);
+        let caps: Captures = trace
+            .positions
+            .iter()
+            .enumerate()
+            .flat_map(|(t, p)| p.leaves.iter().enumerate().map(move |(l, b)| ((t as u32, l as u32), b.clone())))
+            .collect();
+        let mut links = std::collections::BTreeMap::<String, u32>::new();
+        for s in 0..64u32 {
+            let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            let d = draw_chain(&m, &pctx, &rec, &seed).expect("draw");
+            let (o, r) = chain_opening(&m, &pctx, &rec, &tokens, &seed, &request, [0; 32], &d, &caps, &index).unwrap_or_else(|| panic!("seed {s}: no opening"));
+            for l in &o.links {
+                let k = match &l.1 {
+                    LinkOpening::HcIn { src: HcSource::Token(_), .. } => "in-token",
+                    LinkOpening::HcIn { .. } => "in",
+                    LinkOpening::HcPre { src: HcSource::Token(_), .. } => "pre-token",
+                    LinkOpening::HcPre { .. } => "pre",
+                    _ => "other",
+                };
+                *links.entry(k.into()).or_default() += 1;
+            }
+            *links.entry(format!("resid-{:?}-{}", d.resid.kind, d.resid.layer)).or_default() += 1;
+            verify_chain_opening(&tier.tier(), &ctx, &pctx, &rec, &seed, &request, &o.encode(), &r.encode()).unwrap_or_else(|e| panic!("seed {s}: {e}"));
+        }
+        assert!(["in-token", "in", "pre-token", "pre"].iter().all(|k| links.contains_key(*k)), "{links:?}");
+        assert!(links.keys().filter(|k| k.starts_with("resid")).count() >= 3, "{links:?}");
+
+        // A transposed stream mix is caught by the residual points the miner opens.
+        let bad = tier.trace(&toks, n, Faults { transposed_comb: true, ..Faults::default() });
+        let leaves: Vec<Hash> = bad.positions.iter().flat_map(|p| p.hashes.clone()).collect();
+        let rec = TraceRecord::new_chain(&m, n, bad.ubatch(), leaves, &tokens).expect("kit record");
+        let caps: Captures = bad
+            .positions
+            .iter()
+            .enumerate()
+            .flat_map(|(t, p)| p.leaves.iter().enumerate().map(move |(l, b)| ((t as u32, l as u32), b.clone())))
+            .collect();
+        let refused = (0..64u32)
+            .filter(|s| {
+                let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+                let d = draw_chain(&m, &pctx, &rec, &seed).unwrap();
+                let (o, r) = chain_opening(&m, &pctx, &rec, &tokens, &seed, &request, [0; 32], &d, &caps, &index).unwrap();
+                verify_chain_opening(&tier.tier(), &ctx, &pctx, &rec, &seed, &request, &o.encode(), &r.encode()).is_err_and(|e| e.starts_with("residual"))
+            })
+            .count();
+        assert!(refused > 16, "{refused}");
+    }
 
     #[test]
     fn deadlines_chain_behind_the_open_audits_of_the_key() {

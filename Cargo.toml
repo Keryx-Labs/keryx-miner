@@ -99,6 +99,7 @@ time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 sha3 = { git = "https://github.com/elichai/hashes", branch = "cSHAKE" }
+keryx-verifiable-inference = { path = "verifiable-inference", features = ["testkit"] }
 
 [workspace]
 members = ["inference", "verifiable-inference", "plugins/*"]
