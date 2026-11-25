@@ -24,6 +24,8 @@ pub const ROLE_LAYER: u8 = 5;
 pub const ROLE_ROUTER: u8 = 6;
 /// One product per head: `n_exp` heads of `m` rows of `k` weights, head `h` reads input slice `h`.
 pub const ROLE_HEADS: u8 = 7;
+/// A matrix a check reads whole (no committed product leaves).
+pub const ROLE_MATRIX: u8 = 10;
 
 pub const LINK_NONE: u8 = 0;
 pub const LINK_ATTN_IN: u8 = 1;
@@ -62,6 +64,9 @@ const TAG_HC: u8 = 14;
 /// An attention layer restricted to the cells an indexer selects, wrapping its links.
 const TAG_DSA: u8 = 15;
 const DSA_FIELDS: usize = 12;
+/// An attention layer reading compressed rows of blocks of tokens, wrapping its links.
+const TAG_COMP: u8 = 16;
+const COMP_FIELDS: usize = 16;
 const HC_FIELDS: usize = 13;
 
 /// Source of a product's input.
@@ -87,6 +92,61 @@ pub struct LayerLinks {
     pub recur: Option<RecurLinks>,
     pub hc: Option<HcLinks>,
     pub dsa: Option<DsaLinks>,
+    pub comp: Option<CompLinks>,
+}
+
+/// Compressed rows a layer attends: block `k` of `ratio` tokens pooled by the compressor products
+/// of layer `src`, normed, and its indexer key appended; the rotary parts use the YaRN fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompLinks {
+    pub src: u32,
+    pub ratio: u32,
+    /// Compressor value and gate products (gate `NONE` at ratio 1).
+    pub kv: u32,
+    pub gate: u32,
+    pub norm: u32,
+    /// Indexer key matrix (`ROLE_MATRIX`, `NONE` without an indexer key) and its norm.
+    pub ik: u32,
+    pub k_norm: u32,
+    pub n_rot: u32,
+    /// f32 bits.
+    pub rope_base: u32,
+    pub freq_scale: u32,
+    pub ext_factor: u32,
+    pub attn_factor: u32,
+    pub beta_fast: u32,
+    pub beta_slow: u32,
+    pub n_ctx_orig: u32,
+    pub eps: u32,
+}
+
+impl CompLinks {
+    fn fields(&self) -> [u32; COMP_FIELDS] {
+        [
+            self.src, self.ratio, self.kv, self.gate, self.norm, self.ik, self.k_norm, self.n_rot, self.rope_base, self.freq_scale,
+            self.ext_factor, self.attn_factor, self.beta_fast, self.beta_slow, self.n_ctx_orig, self.eps,
+        ]
+    }
+
+    fn from_fields(f: [u32; COMP_FIELDS]) -> Self {
+        Self {
+            src: f[0], ratio: f[1], kv: f[2], gate: f[3], norm: f[4], ik: f[5], k_norm: f[6], n_rot: f[7], rope_base: f[8],
+            freq_scale: f[9], ext_factor: f[10], attn_factor: f[11], beta_fast: f[12], beta_slow: f[13], n_ctx_orig: f[14], eps: f[15],
+        }
+    }
+
+    /// The YaRN scaling of the rotary parts.
+    pub fn yarn(&self) -> crate::attn::Yarn {
+        let f = |b: u32| f32::from_bits(b) as f64;
+        crate::attn::Yarn {
+            freq_scale: f(self.freq_scale),
+            ext_factor: f(self.ext_factor),
+            attn_factor: f(self.attn_factor),
+            beta_fast: f(self.beta_fast),
+            beta_slow: f(self.beta_slow),
+            n_ctx_orig: self.n_ctx_orig,
+        }
+    }
 }
 
 /// Sparse attention of a layer: the query attends the cells of `n_top` pools of `kpool`
@@ -330,6 +390,19 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
     match b.first() {
         None => None,
         Some(&TAG_NONE) => Some((Chain::None, 1)),
+        Some(&TAG_COMP) => {
+            let mut f = [0u32; COMP_FIELDS];
+            for (i, v) in f.iter_mut().enumerate() {
+                *v = u32a(1 + 4 * i)?;
+            }
+            let head = 1 + 4 * COMP_FIELDS;
+            match parse_chain(b.get(head..)?)? {
+                (Chain::Layer(l), len) if l.comp.is_none() && l.dsa.is_none() && l.hc.is_none() && l.attn.is_some() => {
+                    Some((Chain::Layer(LayerLinks { comp: Some(CompLinks::from_fields(f)), ..l }), head + len))
+                }
+                _ => None,
+            }
+        }
         Some(&TAG_DSA) => {
             let mut f = [0u32; DSA_FIELDS];
             for (i, v) in f.iter_mut().enumerate() {
@@ -407,7 +480,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                     attn,
                     recur,
                     hc: None,
-                    dsa: None,
+                    dsa: None, comp: None,
                 }),
                 base + if attn.is_some() { 4 * ATTN_FIELDS } else { 0 } + if recur.is_some() { 4 * RECUR_FIELDS } else { 0 },
             ))
@@ -440,7 +513,14 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             for v in l.dsa.unwrap().fields() {
                 b.extend_from_slice(&v.to_le_bytes());
             }
-            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { dsa: None, ..*l })));
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { dsa: None, comp: None, ..*l })));
+        }
+        Chain::Layer(l) if l.comp.is_some() => {
+            b.push(TAG_COMP);
+            for v in l.comp.unwrap().fields() {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { comp: None, ..*l })));
         }
         Chain::Layer(l) => {
             let gated = l.moe.is_some_and(|m| m.shexp_gate != NONE);
@@ -620,15 +700,15 @@ mod tests {
     #[test]
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
-        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, hc: None, dsa: None });
+        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, hc: None, dsa: None, comp: None });
         let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13, shexp_gate: NONE };
-        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None });
+        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None, comp: None });
         let attn = AttnLinks {
             q: 1, k: 2, v: 3, q_norm: NONE, k_norm: NONE, n_head: 32, n_head_kv: 2, head_dim: 128, rope_kind: 0, n_rot: 128,
             rope_base: 10_000f32.to_bits(), kq_scale: (1.0f32 / 128f32.sqrt()).to_bits(), swa_window: 0, softcap: 0, rope_freqs: NONE, v_norm: 0, gated: 0, slot: 0, mla_rank: 0, absorb: NONE, out: NONE,
         };
-        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None });
-        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None, hc: None, dsa: None });
+        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: None });
+        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None, hc: None, dsa: None, comp: None });
         assert_eq!(chain_bytes(&l).len(), 25);
         assert_eq!(chain_bytes(&lm).len(), 49);
         assert_eq!(chain_bytes(&la).len(), 25 + 84);
@@ -637,8 +717,8 @@ mod tests {
             kind: RECUR_KDA, slot: 2, n_v_heads: 32, n_k_heads: 32, head_dim: 128, q: 40, k: 41, v: 42, conv_q: 300, conv_k: 301,
             conv_v: 302, beta: 43, decay: 44, dt: 303, a: 304, norm: 305, gate: 45, interval: 48, conv_len: 4,
         };
-        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur), hc: None, dsa: None });
-        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur), hc: None, dsa: None });
+        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur), hc: None, dsa: None, comp: None });
+        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur), hc: None, dsa: None, comp: None });
         assert_eq!(chain_bytes(&lr).len(), 25 + 76);
         assert_eq!(chain_bytes(&lmr).len(), 49 + 76);
         let gated = MoeLinks { probs_bias: NONE, w_scale: 1f32.to_bits(), shexp_gate: 44, ..moe };
@@ -660,7 +740,15 @@ mod tests {
         no_attn.extend((0..DSA_FIELDS).flat_map(|_| 0u32.to_le_bytes()));
         no_attn.extend_from_slice(&chain_bytes(&l));
         assert!(parse_chain(&no_attn).is_none());
-        for c in [Chain::None, p, l, lm, la, lma, lr, lmr, lg, lga, lgr, ld, lhd] {
+        let comp = CompLinks {
+            src: 2, ratio: 2, kv: 70, gate: 71, norm: 80, ik: 81, k_norm: 82, n_rot: 64, rope_base: 160_000f32.to_bits(), freq_scale: (1.0f32 / 16.0).to_bits(),
+            ext_factor: 1f32.to_bits(), attn_factor: 0.78f32.to_bits(), beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(),
+        };
+        let lc = Chain::Layer(LayerLinks { comp: Some(comp), ..inner });
+        let lhc = Chain::Layer(LayerLinks { hc: Some(hc), comp: Some(comp), ..inner });
+        assert_eq!(chain_bytes(&lhc).len(), 1 + 4 * HC_FIELDS + 1 + 4 * COMP_FIELDS + 53 + 84);
+        assert_eq!(CompLinks::from_fields(comp.fields()).yarn().n_ctx_orig, 65_536);
+        for c in [Chain::None, p, l, lm, la, lma, lr, lmr, lg, lga, lgr, ld, lhd, lc, lhc] {
             let mut b = base_bytes("x", ROLE_PRODUCT);
             b.extend_from_slice(&chain_bytes(&c));
             let (e, len) = Entry::parse(&b).unwrap();

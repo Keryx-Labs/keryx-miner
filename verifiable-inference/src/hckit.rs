@@ -176,7 +176,7 @@ impl HcTier {
                 moe: None,
                 attn: None,
                 recur: None,
-                hc: Some(hc), dsa: None,
+                hc: Some(hc), dsa: None, comp: None,
             };
             entries.push(base(format!("blk.{l}"), manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, Chain::Layer(ll)));
         }
@@ -711,7 +711,7 @@ mod moe_tests {
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, 0, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
             entry("blk.0.hc_ffn_base.weight", manifest::ROLE_NORM, 0, N_MIX, 1, 1, base_off, 4 * N_MIX, 4 * N_MIX, Chain::None),
             entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, 0, Chain::Layer(LayerLinks {
-                layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None, hc: Some(hc), dsa: None,
+                layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None, hc: Some(hc), dsa: None, comp: None,
             })),
         ];
         let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();

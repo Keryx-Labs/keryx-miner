@@ -211,7 +211,7 @@ impl Tier {
                 moe: None,
                 attn: None,
                 recur: None,
-            hc: None, dsa: None, });
+            hc: None, dsa: None, comp: None, });
             entries.push(e);
         }
 
@@ -1662,7 +1662,7 @@ mod moe_tests {
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
             entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                 layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None,
-            hc: None, dsa: None, })),
+            hc: None, dsa: None, comp: None, })),
         ];
         let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
         let tier = TierCtx {
@@ -2319,11 +2319,11 @@ mod attn_tests {
         if c.mixed {
             entries.push(entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                 layer: 0, proj: none, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: None, recur: None,
-            hc: None, dsa: None, })));
+            hc: None, dsa: None, comp: None, })));
         }
         entries.push(entry(&format!("blk.{al}"), manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
             layer: al, proj: 3, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-        hc: None, dsa: None, })));
+        hc: None, dsa: None, comp: None, })));
         if c.qk_norm {
             entries.push(entry("blk.0.attn_q_norm.weight", manifest::ROLE_NORM, HD, 1, offs[0], 4 * HD, Chain::None));
             entries.push(entry("blk.0.attn_k_norm.weight", manifest::ROLE_NORM, HD, 1, offs[1], 4 * HD, Chain::None));
@@ -2855,7 +2855,7 @@ mod attn_tests {
                 entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, NH * VD, 512, 0, 0, Chain::None),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                     layer: 0, proj: 4, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-                hc: None, dsa: None, })),
+                hc: None, dsa: None, comp: None, })),
                 entry("blk.0.attn_kv_a_norm.weight", manifest::ROLE_NORM, R, 1, 0, 4 * R, Chain::None),
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
@@ -3216,7 +3216,7 @@ mod attn_tests {
                 entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, NH * VD, 512, 0, 0, Chain::None),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                     layer: 0, proj: 4, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-                    hc: None, dsa: Some(DSA) })),
+                    hc: None, dsa: Some(DSA), comp: None })),
                 entry("blk.0.attn_kv_a_norm.weight", manifest::ROLE_NORM, R, 1, 0, 4 * R, Chain::None),
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
@@ -3508,7 +3508,7 @@ mod attn_tests {
                 entry("blk.0.indexer.proj.weight", manifest::ROLE_PRODUCT, 64, NHI, 0, 0, Chain::None),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                     layer: 0, proj: 3, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-                    hc: None, dsa: Some(DSA) })),
+                    hc: None, dsa: Some(DSA), comp: None })),
                 entry("blk.0.indexer.k_norm.weight", manifest::ROLE_NORM, DK, 1, 0, 4 * DK, Chain::None),
                 entry("blk.0.indexer.k_norm.bias", manifest::ROLE_NORM, DK, 1, 4 * DK, 4 * DK, Chain::None),
                 entry("blk.0.indexer_compressor_ape.weight", manifest::ROLE_NORM, KP * DK, 1, 8 * DK, 4 * KP * DK, Chain::None),
@@ -3837,7 +3837,7 @@ mod recur_tests {
         let mut layer = Entry::parse(&entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0)).unwrap().0;
         layer.chain = Chain::Layer(LayerLinks {
             layer: 0, proj: out_r, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: None, recur: Some(links),
-        hc: None, dsa: None, });
+        hc: None, dsa: None, comp: None, });
         let mut lb = serialize(&layer);
         lb.extend_from_slice(&manifest::chain_bytes(&layer.chain));
         entries.push(lb);

@@ -34,6 +34,54 @@ pub fn rope_neox(x: &mut [f64], pos: u64, n_rot: usize, base: f64, ff: Option<&[
     }
 }
 
+/// YaRN scaling of a rotary embedding: interpolated angles, blended with the extrapolated ones
+/// over the corrected dimension range, and a magnitude factor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Yarn {
+    pub freq_scale: f64,
+    pub ext_factor: f64,
+    pub attn_factor: f64,
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+    pub n_ctx_orig: u32,
+}
+
+impl Yarn {
+    /// No scaling.
+    pub const NONE: Yarn = Yarn { freq_scale: 1.0, ext_factor: 0.0, attn_factor: 1.0, beta_fast: 0.0, beta_slow: 0.0, n_ctx_orig: 0 };
+
+    /// First and last pair dimension of the blend, truncated to whole dimensions.
+    fn corr_dims(&self, n_rot: usize, base: f64) -> [f64; 2] {
+        let dim = |beta: f64| n_rot as f64 * libm::log(self.n_ctx_orig as f64 / (beta * 2.0 * std::f64::consts::PI)) / (2.0 * libm::log(base));
+        [libm::floor(dim(self.beta_fast)).max(0.0), libm::ceil(dim(self.beta_slow)).min(n_rot as f64 - 1.0)]
+    }
+}
+
+/// Rotary embedding of adjacent pairs of `x[off..off + n_rot]` at position `pos` under YaRN
+/// scaling; `inverse` applies the transpose (sine negated).
+pub fn rope_norm_yarn(x: &mut [f64], off: usize, pos: u64, n_rot: usize, base: f64, y: &Yarn, inverse: bool) {
+    let corr = if y.ext_factor != 0.0 { y.corr_dims(n_rot, base) } else { [0.0; 2] };
+    let mut mscale = y.attn_factor;
+    if y.ext_factor != 0.0 {
+        mscale *= 1.0 + 0.1 * libm::log(1.0 / y.freq_scale);
+    }
+    let sign = if inverse { -1.0 } else { 1.0 };
+    for i in 0..n_rot / 2 {
+        let extrap = pos as f64 * libm::pow(base, -2.0 * i as f64 / n_rot as f64);
+        let interp = y.freq_scale * extrap;
+        let theta = if y.ext_factor != 0.0 {
+            let ramp = (1.0 - ((i as f64 - corr[0]) / (corr[1] - corr[0]).max(0.001)).clamp(0.0, 1.0)) * y.ext_factor;
+            interp * (1.0 - ramp) + extrap * ramp
+        } else {
+            interp
+        };
+        let (s, c) = (sign * libm::sin(theta) * mscale, libm::cos(theta) * mscale);
+        let (a, b) = (x[off + 2 * i], x[off + 2 * i + 1]);
+        x[off + 2 * i] = a * c - b * s;
+        x[off + 2 * i + 1] = a * s + b * c;
+    }
+}
+
 /// RMS normalization of `x`, scaled by `w` when given.
 pub fn rms_norm(x: &mut [f64], w: Option<&[f32]>, eps: f64) {
     let ms = x.iter().map(|a| a * a).sum::<f64>() / x.len() as f64;
@@ -287,6 +335,31 @@ mod tests {
         let keys = (0..=t).map(|p| vecf(10 + p as u64, DIM, 1.0).iter().map(|&x| x as f32).collect()).collect();
         let values = (0..=t).map(|p| vecf(50 + p as u64, DIM, 1.0).iter().map(|&x| x as f32).collect()).collect();
         (keys, values)
+    }
+
+    /// Outputs of ggml's rope and rope back on 2 heads of 512 values at 6 positions, rotating the
+    /// last 64 in pairs: YaRN of the compressed DeepSeek-V4.1 layers, then plain rotation.
+    #[test]
+    fn yarn_rope_matches_ggml() {
+        let data = include_bytes!("../testdata/dsv41-rope.bin");
+        let f: Vec<f32> = data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let fs = 1.0f32 / 16.0;
+        let yarn = Yarn { freq_scale: fs as f64, ext_factor: 1.0, attn_factor: (1.0f32 / (1.0 + 0.1 * (16.0f32).ln())) as f64, beta_fast: 32.0, beta_slow: 1.0, n_ctx_orig: 65_536 };
+        let cases = [(160_000.0, yarn, false), (160_000.0, yarn, true), (10_000.0, Yarn::NONE, false), (10_000.0, Yarn::NONE, true)];
+        let pos = [0u64, 1, 7, 128, 4095, 70_000];
+        let n = 512 * 2 * 6;
+        let mut worst = 0f64;
+        for (k, (base, y, inv)) in cases.iter().enumerate() {
+            let (x, want) = (&f[2 * k * n..(2 * k + 1) * n], &f[(2 * k + 1) * n..(2 * k + 2) * n]);
+            for (r, (xr, wr)) in x.chunks_exact(512).zip(want.chunks_exact(512)).enumerate() {
+                let mut v: Vec<f64> = xr.iter().map(|&a| a as f64).collect();
+                rope_norm_yarn(&mut v, 448, pos[r / 2], 64, *base, y, *inv);
+                let w = v.iter().zip(wr).fold(0f64, |m, (a, &b)| m.max((a - b as f64).abs()));
+                // single-precision angles drift with the position
+                worst = worst.max(w / (1e-6 + 4e-8 * pos[r / 2] as f64));
+            }
+        }
+        assert!(worst < 1.0, "{worst}");
     }
 
     #[test]
