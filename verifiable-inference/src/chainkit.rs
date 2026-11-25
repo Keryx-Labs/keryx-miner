@@ -3020,9 +3020,7 @@ mod attn_tests {
         fn selection(t: usize) -> Vec<u8> {
             let n_pool = (t + 1) / DSA.kpool as usize;
             let mut b = 0f32.to_le_bytes().to_vec();
-            if n_pool > 0 {
-                b.extend((n_pool as u32 - 1).to_le_bytes());
-            }
+            b.extend(if n_pool > 0 { n_pool as u32 - 1 } else { u32::MAX }.to_le_bytes());
             b
         }
 
@@ -3197,14 +3195,15 @@ mod attn_tests {
         #[test]
         fn the_selection_is_the_chosen_pools_and_the_tail() {
             let at = |t: u64, sel: &[u32]| dsa_attended(&DSA, t, &[0u32].iter().chain(sel).flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
-            assert_eq!(at(1, &[]), Some(vec![true; 2]));
+            assert_eq!(at(1, &[u32::MAX]), Some(vec![true; 2]));
+            assert_eq!(at(1, &[0]), None);
             assert_eq!(at(4, &[0]), Some(vec![true; 5]));
             assert_eq!(at(7, &[1]), Some(vec![false, false, false, true, true, true, true, true]));
             assert_eq!(at(5, &[0]), Some(vec![true, true, true, false, false, false]));
-            for bad in [&[][..], &[0, 1], &[2], &[1, 0]] {
+            for bad in [&[][..], &[0, 1], &[2], &[u32::MAX]] {
                 assert_eq!(at(5, bad), None, "{bad:?}");
             }
-            assert_eq!(dsa_attended(&DsaLinks { tail: 0, ..DSA }, 1, &[0; 4]), None);
+            assert_eq!(dsa_attended(&DsaLinks { tail: 0, ..DSA }, 1, &[0, 0, 0, 0, 255, 255, 255, 255]), None);
             assert_eq!(dsa_attended(&DSA, 1, &[]), None);
         }
 
@@ -3324,7 +3323,7 @@ mod attn_tests {
             };
             pools.sort();
             let mut b = (thr as f32).to_le_bytes().to_vec();
-            b.extend(pools.iter().flat_map(|&p| (p as u32).to_le_bytes()));
+            b.extend(pools.iter().map(|&p| p as u32).chain(std::iter::repeat(u32::MAX)).take(NTOP).flat_map(|p| p.to_le_bytes()));
             b
         }
 
@@ -3408,7 +3407,7 @@ mod attn_tests {
                     proof: rt_range_proof(&self.chunk_leaves, (off / 32) as u64, (n / 32) as u64).1,
                 };
                 let ranges = [range(0, 4 * DK), range(4 * DK, 4 * DK), range(8 * DK, 4 * KP * DK)];
-                let pools: Vec<u64> = pos.leaves[SEL][4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect();
+                let pools: Vec<u64> = pos.leaves[SEL][4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).filter(|&p| p != u32::MAX).map(|p| p as u64).collect();
                 let members = drawn_pools(seed, &pools, ((t + 1) / KP) as u64)
                     .into_iter()
                     .flat_map(|p| (0..KP as u64).map(move |j| p * KP as u64 + j))

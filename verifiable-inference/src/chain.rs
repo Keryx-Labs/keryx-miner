@@ -1506,17 +1506,25 @@ impl AttnSite {
     }
 }
 
-/// Threshold and pools of a selection leaf: an f32 score, then the chosen pools (u32, strictly
-/// increasing, below the complete pools of `t`, as many as the indexer keeps).
+/// Length of a selection leaf under `dsa`.
+pub const fn sel_len(dsa: &manifest::DsaLinks) -> usize {
+    4 + 4 * dsa.n_top as usize
+}
+
+/// Threshold and pools of a selection leaf: an f32 score, then `n_top` slots holding the chosen
+/// pools (strictly increasing, below the complete pools of `t`, as many as the indexer keeps),
+/// the slots left over set to `u32::MAX`.
 pub fn dsa_pools(dsa: &manifest::DsaLinks, t: u64, sel: &[u8]) -> Option<(f32, Vec<u64>)> {
     let kpool = dsa.kpool as u64;
-    if kpool < 2 || dsa.n_top == 0 || sel.len() < 4 || !sel.len().is_multiple_of(4) {
+    if kpool < 2 || dsa.n_top == 0 || sel.len() != sel_len(dsa) {
         return None;
     }
     let thr = f32::from_le_bytes(sel[..4].try_into().unwrap());
-    let pools: Vec<u64> = sel[4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect();
+    let slots: Vec<u32> = sel[4..].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     let n_pool = (t + 1) / kpool;
-    if pools.len() as u64 != n_pool.min(dsa.n_top as u64) || pools.windows(2).any(|w| w[0] >= w[1]) || pools.last().is_some_and(|&p| p >= n_pool) {
+    let m = n_pool.min(dsa.n_top as u64) as usize;
+    let pools: Vec<u64> = slots[..m].iter().map(|&p| p as u64).collect();
+    if slots[m..].iter().any(|&p| p != u32::MAX) || pools.windows(2).any(|w| w[0] >= w[1]) || pools.last().is_some_and(|&p| p >= n_pool) {
         return None;
     }
     Some((thr, pools))

@@ -1,0 +1,239 @@
+diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
+index 7139b3c0b..afdb167c2 100644
+--- a/ggml/src/ggml-cuda/q8canon.cu
++++ b/ggml/src/ggml-cuda/q8canon.cu
+@@ -400,6 +400,12 @@ struct q8c_dev {
+     uint32_t n_layers   = 0;
+     uint32_t n_router   = 0;
+     bool     ple        = false;
++    // Selection leaf and slot count of each sparse attention layer, -1 elsewhere.
++    std::vector<int>      sel_of_layer;
++    std::vector<uint32_t> sel_top;
++    uint32_t n_sel      = 0;
++    uint8_t * sel_buf   = nullptr;
++    size_t    sel_cap   = 0;
+     uint32_t nl         = 0;
+     uint32_t max_pos    = 0;
+     uint8_t * stage     = nullptr;
+@@ -455,6 +461,9 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+     uint32_t n_layers = 0;
+     bool moe = false;
+     bool ple = false;
++    std::vector<int> sel_of_layer;
++    std::vector<uint32_t> sel_top;
++    uint32_t n_sel = 0;
+     size_t o = 16;
+     for (uint32_t i = 0; i < n_entries; ++i) {
+         if (o + 2 > len) {
+@@ -478,12 +487,36 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+         }
+         o += 2 + nl + 55;
+         if (chain) {
++            if (o >= len) {
++                return false;
++            }
++            // hyper-connection and sparse attention envelopes precede the layer they wrap
++            if (b[o] == 14) {
++                o += 1 + 4*13;
++            }
++            int sel = -1;
++            uint32_t top = 0;
++            if (o < len && b[o] == 15) {
++                if (o + 1 + 4*12 > len) {
++                    return false;
++                }
++                uint32_t v;
++                memcpy(&v, &b[o + 1], 4);
++                memcpy(&top, &b[o + 1 + 8], 4);
++                sel = (int) v;
++                o += 1 + 4*12;
++            }
+             if (o >= len) {
+                 return false;
+             }
+             const uint8_t tag = b[o];
+             size_t ext = tag == 0 ? 1 : tag == 1 ? 14 : tag == 2 ? 25 : tag == 3 ? 49 : tag == 4 ? 25 + 84 :
+-                         tag == 5 ? 49 + 84 : tag == 6 ? 25 + 76 : tag == 7 ? 49 + 76 : tag == 9 ? 25 : 0;
++                         tag == 5 ? 49 + 84 : tag == 6 ? 25 + 76 : tag == 7 ? 49 + 76 : tag == 9 ? 25 :
++                         tag == 10 ? 53 : tag == 11 ? 53 + 84 : tag == 12 ? 53 + 76 : 0;
++            const bool layer_tag = (tag >= 2 && tag <= 8) || (tag >= 10 && tag <= 12);
++            if (sel >= 0 && tag != 4 && tag != 5 && tag != 11) {
++                return false;
++            }
+             uint8_t flags = 0;
+             if (tag == 8 && o + 2 <= len) {
+                 flags = b[o + 1];
+@@ -495,15 +528,23 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+             if (ext == 0 || o + ext > len) {
+                 return false;
+             }
+-            if (tag >= 2 && tag <= 8) {
++            if (layer_tag) {
+                 uint32_t layer;
+                 memcpy(&layer, &b[o + (tag == 8 ? 2 : 1)], 4);
+                 if (layer != n_layers) {
+                     return false;
+                 }
+                 n_layers++;
+-                moe = moe || tag == 3 || tag == 5 || tag == 7 || (flags & 1);
++                moe = moe || tag == 3 || tag == 5 || tag == 7 || tag >= 10 || (flags & 1);
+                 ple = ple || (flags & 8);
++                sel_of_layer.push_back(sel);
++                sel_top.push_back(top);
++                if (sel >= 0) {
++                    if ((uint32_t) sel != n_sel || top == 0) {
++                        return false;
++                    }
++                    n_sel++;
++                }
+             }
+             o += ext;
+         }
+@@ -512,7 +553,10 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+     s.n_layers   = n_layers;
+     s.n_router   = moe ? n_layers : 0;
+     s.ple        = ple;
+-    s.nl = 2*n_products + (ple ? 3 : 2)*n_layers + s.n_router + (ple ? 2 : 0) + 1;
++    s.sel_of_layer = sel_of_layer;
++    s.sel_top    = sel_top;
++    s.n_sel      = n_sel;
++    s.nl = 2*n_products + (ple ? 3 : 2)*n_layers + s.n_router + (ple ? 2 : 0) + n_sel + 1;
+     return true;
+ }
+ 
+@@ -529,6 +573,11 @@ static void q8c_free_dev(q8c_dev & s) {
+     if (s.cap_buf) {
+         cudaFree(s.cap_buf);
+     }
++    if (s.sel_buf) {
++        cudaFree(s.sel_buf);
++        s.sel_buf = nullptr;
++        s.sel_cap = 0;
++    }
+     if (s.h_leaves) {
+         cudaFreeHost(s.h_leaves);
+     }
+@@ -799,8 +848,110 @@ bool ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream) {
+     return true;
+ }
+ 
++// Selection row of each token: the smallest finite score of its chosen pools, then the pools with
++// a finite score in increasing order, then Q8C_NONE up to `n_slots`.
++static __global__ void q8c_sel_kernel(const int32_t * top, size_t top_nb1, int k, const float * score, size_t score_nb1,
++                                      int n_slots, uint8_t * out) {
++    const int t = blockIdx.x;
++    const int32_t * ti = (const int32_t *) ((const uint8_t *) top + (size_t) t*top_nb1);
++    const float *   sc = (const float *) ((const uint8_t *) score + (size_t) t*score_nb1);
++    uint32_t * row = (uint32_t *) (out + (size_t) t*(4 + 4*(size_t) n_slots));
++    __shared__ float vmin[256];
++    __shared__ int   nfin;
++    if (threadIdx.x == 0) {
++        nfin = 0;
++    }
++    __syncthreads();
++    float m = INFINITY;
++    for (int i = threadIdx.x; i < k; i += blockDim.x) {
++        const float v = sc[ti[i]];
++        if (isfinite(v)) {
++            m = fminf(m, v);
++            atomicAdd(&nfin, 1);
++        }
++    }
++    vmin[threadIdx.x] = m;
++    __syncthreads();
++    for (int w = blockDim.x/2; w > 0; w >>= 1) {
++        if (threadIdx.x < w) {
++            vmin[threadIdx.x] = fminf(vmin[threadIdx.x], vmin[threadIdx.x + w]);
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        const float thr = isfinite(vmin[0]) ? vmin[0] : 0.0f;
++        memcpy(&row[0], &thr, 4);
++    }
++    for (int i = threadIdx.x; i < k; i += blockDim.x) {
++        const int32_t p = ti[i];
++        if (!isfinite(sc[p])) {
++            continue;
++        }
++        int rank = 0;
++        for (int j = 0; j < k; ++j) {
++            rank += isfinite(sc[ti[j]]) && ti[j] < p;
++        }
++        row[1 + rank] = (uint32_t) p;
++    }
++    for (int i = nfin + threadIdx.x; i < n_slots; i += blockDim.x) {
++        row[1 + i] = Q8C_NONE;
++    }
++}
++
++// Selection leaf of an indexer top-k node named `indexer_top_k_raw-<layer>`, or -1.
++static int q8c_sel_leaf(const q8c_dev & s, const char * name, uint32_t * n_slots) {
++    static const char key[] = "indexer_top_k_raw-";
++    if (s.n_sel == 0 || strncmp(name, key, sizeof(key) - 1) != 0) {
++        return -1;
++    }
++    char * end = nullptr;
++    const unsigned long il = strtoul(name + sizeof(key) - 1, &end, 10);
++    if (*end != '\0' || il >= s.sel_of_layer.size() || s.sel_of_layer[il] < 0) {
++        return -1;
++    }
++    *n_slots = s.sel_top[il];
++    return (int) (2*s.n_products + (s.ple ? 3 : 2)*s.n_layers + s.n_router + (s.ple ? 2 : 0)) + s.sel_of_layer[il];
++}
++
++static bool q8c_sel(const ggml_tensor * node, cudaStream_t stream) {
++    q8c_dev * s = q8c_current();
++    if (!s || !s->on || node->op != GGML_OP_TOP_K || node->type != GGML_TYPE_I32) {
++        return false;
++    }
++    uint32_t n_slots = 0;
++    const int leaf = q8c_sel_leaf(*s, node->name, &n_slots);
++    if (leaf < 0) {
++        return false;
++    }
++    const ggml_tensor * score = node->src[0];
++    const int64_t k = node->ne[0], n_tokens = ggml_nrows(node);
++    if (!score || score->type != GGML_TYPE_F32 || ggml_nrows(score) != n_tokens || k > (int64_t) n_slots || k > score->ne[0]
++        || node->nb[0] != sizeof(int32_t) || score->nb[0] != sizeof(float)) {
++        return true;
++    }
++    const size_t row_bytes = 4 + 4*(size_t) n_slots;
++    const size_t need = row_bytes*(size_t) n_tokens;
++    if (need > s->sel_cap) {
++        if (s->sel_buf) {
++            cudaFree(s->sel_buf);
++        }
++        s->sel_cap = 0;
++        if (cudaMalloc(&s->sel_buf, need) != cudaSuccess) {
++            s->sel_buf = nullptr;
++            return true;
++        }
++        s->sel_cap = need;
++    }
++    q8c_sel_kernel<<<(unsigned) n_tokens, 256, 0, stream>>>((const int32_t *) node->data, node->nb[1], (int) k,
++                                                           (const float *) score->data, score->nb[1], (int) n_slots, s->sel_buf);
++    const int shift = s->cur && (int64_t) s->cur->n_tokens > n_tokens ? (int) (s->cur->n_tokens - n_tokens) : 0;
++    ggml_cuda_q8c_out(s->sel_buf, n_tokens, (int64_t) row_bytes, leaf, shift, false, stream);
++    return true;
++}
++
+ void ggml_cuda_q8c_node(const ggml_tensor * node, cudaStream_t stream) {
+-    if (!ggml_cuda_q8c_enabled() || ggml_cuda_q8c_resid(node, stream) || !ggml_is_contiguous(node) || node->type != GGML_TYPE_F32) {
++    if (!ggml_cuda_q8c_enabled() || q8c_sel(node, stream) || ggml_cuda_q8c_resid(node, stream) || !ggml_is_contiguous(node)
++        || node->type != GGML_TYPE_F32) {
+         return;
+     }
+     const ggml_tensor * mm = node->src[0];
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index d7a163cb4..ef420ae37 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -993,6 +993,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
+ 
+         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+         ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], UNORDERED
++        cb(top_k, "indexer_top_k_raw", il);
+ 
+         // keep the cells of the live picked pools and the tail, -inf elsewhere
+         // all retained cells are in the token's sequence, so the kq_mask is not needed
