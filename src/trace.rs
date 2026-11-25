@@ -27,13 +27,13 @@ pub const STAGE_1A: u8 = 1;
 pub const POINTS: u32 = draw::POINTS;
 
 /// Trace slots: the H14 tiers in tier order, then the traced H18 tiers.
-const SLOTS: usize = 6;
+const SLOTS: usize = 7;
 
 /// Slot of each H18 tier; `None` = not traced. MUST follow the node's `TRACE_TIERS_H18`.
-const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [None, Some(5), None, None, None, None, None];
+const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [Some(6), Some(5), None, None, None, None, None];
 
 /// Slot whose prefix and sequence contexts a slot uses.
-const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0];
+const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0, 0];
 
 /// Trace slot of `model_id` serving `tier`; `None` = the tier is not traced.
 pub fn slot(model_id: &[u8; 32], tier: u8) -> Option<u8> {
@@ -51,6 +51,7 @@ const MANIFESTS: [Option<&[u8]>; SLOTS] = [
     Some(include_bytes!("../assets/trace-manifests/tier3.bin")),
     None,
     Some(include_bytes!("../assets/trace-manifests/h18-tier1.bin")),
+    Some(include_bytes!("../assets/trace-manifests/h18-tier0.bin")),
 ];
 
 /// Prefix contexts of the audited tiers, in tier order. MUST equal the node's `TRACE_PREFIXES`.
@@ -170,6 +171,7 @@ const CHAIN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/chain-tier3.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier4.bin"),
     include_bytes!("../assets/trace-manifests/chain-h18-tier1.bin"),
+    include_bytes!("../assets/trace-manifests/chain-h18-tier0.bin"),
 ];
 
 /// Serialized manifests under the attention rule (attention and recurrent descriptors), in tier
@@ -181,6 +183,7 @@ const ATTN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/attn-tier3.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier4.bin"),
     include_bytes!("../assets/trace-manifests/attn-h18-tier1.bin"),
+    include_bytes!("../assets/trace-manifests/attn-h18-tier0.bin"),
 ];
 
 /// Attention layers, recurrent layers and sequence heads of each manifest under the attention
@@ -199,7 +202,90 @@ const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; SLOTS] = [
     Some((ChainCtx { n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 497, 498)),
     Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
     Some((ChainCtx { n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
+    Some((ChainCtx { n_layers: 32, layer_base: 316, embd_entry: 250, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 250, 251)),
 ];
+
+/// Positions whose head output a decision opening reads: every marker, then the pointer.
+pub fn decision_positions(tokens: &[i32], n_prompt: u32, dctx: &keryx_verifiable_inference::decision::DecisionCtx) -> Vec<u32> {
+    let n = (n_prompt as usize).min(tokens.len());
+    let mut p: Vec<u32> = (0..n).filter(|&i| tokens[i] == dctx.marker_tok as i32).map(|i| i as u32).collect();
+    p.push(n_prompt.saturating_sub(1));
+    p
+}
+
+/// The decision opening of `trace` under `seed`, from the head outputs `ys` replayed at
+/// [`decision_positions`]; the answer is rebuilt from them and checked against its commitment.
+pub fn decision_opening(
+    m: &TierManifest,
+    trace: &ResponseTrace,
+    dctx: &keryx_verifiable_inference::decision::DecisionCtx,
+    seed: &Hash,
+    response_txid: [u8; 32],
+    ys: &[Vec<u8>],
+) -> Result<Vec<u8>, String> {
+    use keryx_verifiable_inference::decision::{score, DecisionAnswer, DECISION_POINT};
+    use keryx_verifiable_inference::opening::{DecisionLeaf, DecisionOpening};
+    let rec = &trace.record;
+    let pos = decision_positions(&trace.tokens, rec.n_prompt, dctx);
+    let n = pos.len() - 1;
+    if n == 0 || ys.len() != pos.len() {
+        return Err("decision head outputs missing".into());
+    }
+    let leaf = 2 * dctx.head_rank + 1;
+    if pos.iter().zip(ys).any(|(&t, y)| *blake3::hash(y).as_bytes() != rec.leaf(t as u64, leaf)) {
+        return Err("a replayed head output does not reproduce the trace".into());
+    }
+    let floats = |y: &[u8]| y.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<f32>>();
+    let q = floats(&ys[n]);
+    if q.len() != m.entry(dctx.head_rank as u64).m as usize || q.len() % 2 != 0 {
+        return Err("head output of an unexpected width".into());
+    }
+    let half = q.len() / 2;
+    let scores: Vec<f32> = ys[..n].iter().map(|y| score(&q[..half], &floats(y)[half..]).0 as f32).collect();
+    let answer = DecisionAnswer { positions: pos[..n].to_vec(), scores }.encode();
+    if Some(DecisionAnswer::commitment(&answer)) != rec.tokens_root {
+        return Err("the rebuilt answer does not match its commitment".into());
+    }
+    let i = (draw::point(seed, DECISION_POINT)[0] % n as u64) as usize;
+    let leaf_at = |t: u32, c: u64, y: &[u8]| -> Option<DecisionLeaf> {
+        Some(DecisionLeaf {
+            n_ubatch: *rec.ubatch.get(t as usize)?,
+            pos_path: b3_path(&rec.pos_roots, t as usize),
+            meta_path: b3_path(rec.leaves_at(t as u64), rec.n_leaves - 1),
+            y: leaf_chunk(rec, t as u64, leaf, y, c)?,
+        })
+    };
+    let (Some(marker), Some(pointer)) = (leaf_at(pos[i], 1, &ys[i]), leaf_at(pos[n], 0, &ys[n])) else {
+        return Err("decision leaves unavailable".into());
+    };
+    let op = DecisionOpening {
+        response_txid,
+        roots: trace.seq.as_ref().map(|s| (rec.trace_root, s.root)),
+        head: m.entry_opening(dctx.head_rank as u64),
+        answer,
+        marker,
+        pointer,
+    };
+    Ok(op.encode())
+}
+
+/// Prefix context of the H18 decision tier. MUST equal the node's `KEV_PREFIX`.
+static KEV_PREFIX: PrefixCtx = match PREFIXES {
+    [Some(p), ..] => PrefixCtx { offset: 1, embd_entry: 250, norm_entry: 251, ..p },
+    _ => panic!(),
+};
+
+/// Slot of the decision tier.
+const DECISION_SLOT: u8 = 6;
+
+/// Pointer head of the decision tier. MUST equal the node's `DecisionCtx` of `TRACE_TIERS_H18`.
+pub const DECISION_CTX: keryx_verifiable_inference::decision::DecisionCtx =
+    keryx_verifiable_inference::decision::DecisionCtx { head_rank: 248, marker_tok: 248_050, pointer_tok: 248_062 };
+
+/// Pointer head of `slot`; `None` for a chat slot.
+pub fn decision_ctx(slot: u8) -> Option<keryx_verifiable_inference::decision::DecisionCtx> {
+    (slot == DECISION_SLOT).then_some(DECISION_CTX)
+}
 
 /// Entries of the stage-2 manifest of `slot` and its product count.
 pub fn chain_manifest(slot: u8) -> Option<keryx_verifiable_inference::manifest::Manifest> {
@@ -208,10 +294,9 @@ pub fn chain_manifest(slot: u8) -> Option<keryx_verifiable_inference::manifest::
 
 /// Stage-2 chain context of `slot`, and its prefix context on the stage-2 manifest.
 pub fn chain_ctx(slot: u8) -> Option<(ChainCtx, PrefixCtx)> {
-    let tier = *CTX_SLOT.get(slot as usize)?;
     let (ctx, embd, norm) = (*CHAIN_CTX.get(slot as usize)?)?;
-    let prefix = PREFIXES.get(tier)?.clone().map(|p| PrefixCtx { embd_entry: embd, norm_entry: norm, ..p });
-    let prefix = match (tier, prefix) {
+    let prefix = prefix_ctx(slot).cloned().map(|p| PrefixCtx { embd_entry: embd, norm_entry: norm, ..p });
+    let prefix = match (slot, prefix) {
         (_, Some(p)) => p,
         (4, None) => PrefixCtx { table: PREFIXES[0].clone()?.table, offset: KIMI_PREFIX_OFFSET, embd_entry: embd, norm_entry: norm, eps: ctx.eps, embd_scale: ctx.embd_scale },
         _ => return None,
@@ -225,6 +310,9 @@ pub const KIMI_PREFIX_OFFSET: u32 = 6;
 
 /// The prefix context of `slot`; `None` = no manifest.
 pub fn prefix_ctx(slot: u8) -> Option<&'static PrefixCtx> {
+    if slot == DECISION_SLOT {
+        return Some(&KEV_PREFIX);
+    }
     PREFIXES.get(*CTX_SLOT.get(slot as usize)?).and_then(|p| p.as_ref())
 }
 
@@ -1343,11 +1431,11 @@ mod tests {
     fn h18_slots_match_the_node() {
         use crate::models::{H18_LINEUP, KEV_4B, QWEN3_5_9B_ABLITERATED, QWEN3_5_9B_Q8};
         assert_eq!(slot(&QWEN3_5_9B_Q8.model_id, 1), Some(5));
-        assert_eq!(slot(&KEV_4B.model_id, 0), None);
+        assert_eq!(slot(&KEV_4B.model_id, 0), Some(6));
         assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 0), Some(0));
         assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 5), None);
         for (t, m) in H18_LINEUP.iter().enumerate() {
-            assert_eq!(slot(&m.model_id, t as u8).is_some(), t == 1, "tier {t}");
+            assert_eq!(slot(&m.model_id, t as u8).is_some(), t <= 1, "tier {t}");
         }
         let hex = |m: &TierManifest| hex::encode(m.m_t);
         let p = TierManifest::for_tier(5).unwrap();
@@ -1364,6 +1452,28 @@ mod tests {
         let pre = prefix_ctx(5).unwrap();
         assert_eq!((p.entry(pre.embd_entry as u64).role, p.entry(pre.norm_entry as u64).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
         assert_eq!((pre.offset, pre.eps, pre.table), (6, 9.999999974752427e-07, prefix_ctx(0).unwrap().table));
+        assert!(decision_ctx(5).is_none());
+    }
+
+    #[test]
+    fn the_decision_slot_matches_the_node() {
+        let hex = |m: &TierManifest| hex::encode(m.m_t);
+        let p = TierManifest::for_tier(6).unwrap();
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("030af32e77ff5f9e8d1e37337c27ef89265a50b815de473be7b29ec12d26a3b5", 252, 249));
+        let c = TierManifest::for_chain(6).unwrap();
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("b4b736b109d91eae13005dd9ffaee71d1cfbb65c2d36b913b42f4565cdbb0b32", 348, 249));
+        let a = TierManifest::for_attn(6).unwrap();
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("f440b69dc8a09fdc3245db51578f1da6b19a453de185bf22700c2aa15c09933a", 460, 249));
+        let ac = a.chain.unwrap();
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.trim_last, ac.n_attn, ac.n_recur, ac.seq_heads), (32, 316, 250, false, 8, 24, 32));
+        let pre = prefix_ctx(6).unwrap();
+        assert_eq!((pre.offset, pre.embd_entry, pre.norm_entry, pre.table), (1, 250, 251, prefix_ctx(0).unwrap().table));
+        assert_eq!((p.entry(250).role, p.entry(251).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+        let (_, cp) = chain_ctx(6).unwrap();
+        assert_eq!((cp.offset, cp.embd_entry, cp.norm_entry), (1, 250, 251));
+        let d = decision_ctx(6).unwrap();
+        let head = c.entry(d.head_rank as u64);
+        assert_eq!((head.role, head.m, head.n_exp, head.glu_form), (manifest::ROLE_PRODUCT, 512, 1, manifest::FORM_NONE));
     }
 
     use keryx_verifiable_inference::merkle::{rt_range_proof, rt_verify_range};

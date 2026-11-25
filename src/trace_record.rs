@@ -34,6 +34,7 @@ pub fn patch_set_hash() -> [u8; 32] {
         &include_bytes!("../tools/keryx-llama/patches/0006-sequence-leaves.patch")[..],
         &include_bytes!("../tools/keryx-llama/patches/0007-canonical-attention-rope-angle-and-attention-lse.patch")[..],
         &include_bytes!("../tools/keryx-llama/patches/0008-canonical-weight-layout.patch")[..],
+        &include_bytes!("../tools/keryx-llama/patches/0009-decision-head-without-lm-head.patch")[..],
     ] {
         h.update(&(p.len() as u64).to_le_bytes());
         h.update(p);

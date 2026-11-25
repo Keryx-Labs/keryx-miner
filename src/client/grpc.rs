@@ -1202,7 +1202,12 @@ impl KeryxdHandler {
                         } else if private_era {
                             return None;
                         } else {
-                            (String::from_utf8_lossy(&req.prompt).into_owned(), req.prompt.len() as u32, None)
+                            let prompt = if keryx_miner::models::is_decision_model(&req.model_id) {
+                                keryx_miner::llm::decision_prompt_text(&req.prompt)
+                            } else {
+                                String::from_utf8_lossy(&req.prompt).into_owned()
+                            };
+                            (prompt, req.prompt.len() as u32, None)
                         };
                         Some((raw, req.model_id, prompt, prompt_len, req.max_tokens as usize, req.inference_reward, private))
                     })
@@ -1315,7 +1320,11 @@ impl KeryxdHandler {
         };
         match keryx_inference::open_request(req, secret) {
             Ok(opened) => Some((
-                decode_private_prompt(&opened.prompt),
+                if keryx_miner::models::is_decision_model(&req.model_id) {
+                    keryx_miner::llm::decision_prompt_text(&private_prompt_bytes(&opened.prompt))
+                } else {
+                    decode_private_prompt(&opened.prompt)
+                },
                 opened.prompt.len() as u32,
                 Some(PrivateRequest::Opened(opened.response_key.clone())),
             )),
@@ -1706,7 +1715,7 @@ impl KeryxdHandler {
             };
             if unreadable {
                 // No inference to run: the answer is the fixed error text.
-                let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), trace: None, device: 0 }), 0.0, false));
+                let _ = tx_done.send((Some(keryx_miner::llm::Generated { text: UNREADABLE_PRIVATE_REQUEST_ANSWER.to_string(), decision: None, trace: None, device: 0 }), 0.0, false));
                 self.inference_rx = Some(job);
                 return Ok(());
             }
@@ -1726,7 +1735,7 @@ impl KeryxdHandler {
                 let result = match tier {
                     Some(tier) => keryx_miner::llm::load_and_run_traced_inference(&model_id, &prompt, max_tokens, tier, prompt_len, &request_hash, chain, attention),
                     None => keryx_miner::llm::load_and_run_inference(&model_id, &prompt, max_tokens)
-                        .map(|text| keryx_miner::llm::Generated { text, trace: None, device: 0 }),
+                        .map(|text| keryx_miner::llm::Generated { text, decision: None, trace: None, device: 0 }),
                 };
                 let transient = result.is_none() && keryx_miner::llm::last_failure_transient();
                 if result.is_none() {
@@ -2935,6 +2944,7 @@ impl KeryxdHandler {
         };
         let InferenceJob { request_hash, private, model_id, tier, max_tokens, .. } = job;
         let result = generated.text;
+        let answer: Vec<u8> = generated.decision.unwrap_or_else(|| result.clone().into_bytes());
         let trace = match (generated.trace, tier) {
             (Some(trace), Some(tier)) => {
                 speeds::note_generation(&model_id, trace.record.n_prompt, trace.record.n_pos.saturating_sub(trace.record.n_prompt), gen_secs);
@@ -2949,16 +2959,16 @@ impl KeryxdHandler {
         // the gate on it travels inline and the CID field carries its multihash; before the
         // gate the sealed body is pinned on IPFS like a plaintext answer.
         let publish: Vec<u8> = match private {
-            None => result.clone().into_bytes(),
+            None => answer.clone(),
             Some(p) => {
                 let body = match p {
                     PrivateRequest::Opened(key) => {
                         let plain = match trace.as_ref().filter(|t| t.trace.record.stage == keryx_miner::trace::STAGE_CHAIN) {
                             Some(t) => {
                                 let ids: Vec<u32> = t.trace.tokens[t.trace.record.n_prompt as usize..].iter().map(|&v| v as u32).collect();
-                                keryx_verifiable_inference::answer::encode(result.as_bytes(), &ids)
+                                keryx_verifiable_inference::answer::encode(&answer, &ids)
                             }
-                            None => result.clone().into_bytes(),
+                            None => answer.clone(),
                         };
                         keryx_inference::seal_response(&key, &request_hash, &plain)
                     }
@@ -3781,16 +3791,21 @@ const MAX_DECOMPRESSED_PROMPT_LEN: u64 = 1 << 20;
 /// Plaintext of an opened private prompt: inflated when it carries the compression magic, cut at
 /// the cap. A stream that fails to inflate yields its partial output, else the raw bytes.
 pub(crate) fn decode_private_prompt(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&private_prompt_bytes(bytes)).into_owned()
+}
+
+/// Bytes of an opened private prompt, inflated like [`decode_private_prompt`].
+pub(crate) fn private_prompt_bytes(bytes: &[u8]) -> Vec<u8> {
     use std::io::Read;
     let Some(deflated) = bytes.strip_prefix(&COMPRESSED_PROMPT_MAGIC[..]) else {
-        return String::from_utf8_lossy(bytes).into_owned();
+        return bytes.to_vec();
     };
     let mut inflated = Vec::new();
     let read = flate2::read::DeflateDecoder::new(deflated).take(MAX_DECOMPRESSED_PROMPT_LEN).read_to_end(&mut inflated);
     if read.is_err() && inflated.is_empty() {
-        return String::from_utf8_lossy(deflated).into_owned();
+        return deflated.to_vec();
     }
-    String::from_utf8_lossy(&inflated).into_owned()
+    inflated
 }
 
 /// Generation and replay speeds measured on this rig, by model, for the life of the process.

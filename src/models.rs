@@ -329,6 +329,11 @@ pub const H18_LINEUP: &[&ModelSpec] = &[&KEV_4B, &QWEN3_5_9B_Q8, &MINICPM_V_4_7,
 /// Number of tiers of the H18 lineup. MUST equal the node's `H18_TIER_COUNT`.
 pub const H18_TIER_COUNT: usize = 7;
 
+/// Whether `model_id` is a decision model. MUST equal the node's `DECISION_MODELS_H18`.
+pub fn is_decision_model(model_id: &[u8; 32]) -> bool {
+    *model_id == KEV_4B.model_id
+}
+
 /// Whether `model_id` is one of the Proof-of-Model tier models. DAA-independent — used at startup
 /// to pick a mineable PoM model before any block DAA is known (the tier *index* is then computed
 /// per block via `pom_tier_index`).

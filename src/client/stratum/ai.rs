@@ -61,7 +61,10 @@ impl AiRequest {
             AiRequestParams::Plain(fields) => (fields, Value::Null),
         };
         let trace = parse_trace(&ext)?;
-        if !task_id.eq_ignore_ascii_case(&request_hash) || max_tokens == 0 || max_tokens > i32::MAX as u32 {
+        let mut model_id = [0; 32];
+        hex::decode_to_slice(&model_hex, &mut model_id).map_err(|_| "Invalid AI task identifier")?;
+        let decision = keryx_miner::models::is_decision_model(&model_id);
+        if !task_id.eq_ignore_ascii_case(&request_hash) || (max_tokens == 0) != decision || max_tokens > i32::MAX as u32 {
             return Err("Invalid AI task metadata".into());
         }
         for value in [&task_id, &txid, &request_hash, &model_hex] {
@@ -77,11 +80,13 @@ impl AiRequest {
         if raw.len() > MAX_PAYLOAD_BYTES {
             return Err("Invalid AI prompt".into());
         }
-        let prompt = crate::client::grpc::decode_private_prompt(&raw);
+        let prompt = if decision {
+            keryx_miner::llm::decision_prompt_text(&crate::client::grpc::private_prompt_bytes(&raw))
+        } else {
+            crate::client::grpc::decode_private_prompt(&raw)
+        };
         let sent_len = raw.len().min(keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN) as u32;
         let prompt_len = trace.as_ref().and_then(|(_, l, _)| *l).map_or(sent_len, |l| l.min(keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u32));
-        let mut model_id = [0; 32];
-        hex::decode_to_slice(&model_hex, &mut model_id)?;
         Ok(Self {
             task_id,
             request_hash,

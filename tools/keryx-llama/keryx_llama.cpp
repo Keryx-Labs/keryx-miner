@@ -384,6 +384,11 @@ struct KeryxLlama {
     std::string kv;
     bool fast_kv = true;            // single-GPU engine; false for a pipeline head
     std::string timing;             // timing report of the load and the last generation, one line per step
+    bool decision = false;          // decision model: every position is an output row
+    llama_token decision_marker = -1;
+    std::vector<uint32_t> decision_pos;
+    std::vector<float> decision_rows;
+    bool decision_ok = false;
 };
 
 static std::string keryx_ctx_info(KeryxLlama* h) {
@@ -437,8 +442,27 @@ static bool keryx_needs_glm4_rope_fix(const char* gguf_path) {
 }
 
 // Feeds the prompt in n_batch chunks: the replay must split it the same way.
+// Keeps the head rows of the marker positions and of the last position of a decision prompt.
+static void keryx_keep_decision_rows(KeryxLlama* h, const llama_token* toks, int i, int len, int n) {
+    const int width = llama_model_n_embd_out(h->model);
+    for (int j = 0; j < len && h->decision_ok; j++) {
+        const int p = i + j;
+        if (toks[p] != h->decision_marker && p != n - 1) continue;
+        const float* row = llama_get_embeddings_ith(h->ctx, j);
+        if (!row || width <= 0) {
+            h->decision_ok = false;
+            break;
+        }
+        h->decision_pos.push_back((uint32_t)p);
+        h->decision_rows.insert(h->decision_rows.end(), row, row + width);
+    }
+}
+
 static int keryx_feed_prompt(KeryxLlama* h, const llama_token* toks, int n) {
     const int n_batch = std::max(1, (int)llama_n_batch(h->ctx));
+    h->decision_pos.clear();
+    h->decision_rows.clear();
+    h->decision_ok = h->decision;
     for (int i = 0; i < n; i += n_batch) {
         llama_batch batch = llama_batch_get_one(const_cast<llama_token*>(toks) + i, std::min(n_batch, n - i));
         keryx_trace_batch(h->trace, toks + i, std::min(n_batch, n - i), i);
@@ -447,8 +471,17 @@ static int keryx_feed_prompt(KeryxLlama* h, const llama_token* toks, int n) {
             keryx_set_error("decode", "llama_decode failed while reading the prompt (" + std::to_string(rc) + ")");
             return -3;
         }
+        if (h->decision) keryx_keep_decision_rows(h, toks, i, std::min(n_batch, n - i), n);
     }
     return 0;
+}
+
+// Whether the model carries a decision head (`<arch>.decision.type`).
+static bool keryx_is_decision_model(const llama_model* model) {
+    char arch[64] = {0};
+    char v[64];
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) return false;
+    return llama_model_meta_val_str(model, (std::string(arch) + ".decision.type").c_str(), v, sizeof(v)) >= 0;
 }
 
 // Token fed as padding: a newline, else the end-of-sequence token.
@@ -495,7 +528,7 @@ static llama_sampler* keryx_make_sampler(const llama_model* model) {
     return smpl;
 }
 
-KERYX_EXPORT int keryx_llama_abi() { return 14; }
+KERYX_EXPORT int keryx_llama_abi() { return 15; }
 
 // Reason for the last failed call on this thread; empty when none. Valid until the next call.
 KERYX_EXPORT const char* keryx_llama_last_error() { return keryx_last_error.c_str(); }
@@ -530,6 +563,11 @@ static KeryxLlama* keryx_load_with(const char* gguf_path, int gpu, int n_ctx, ll
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx > 0 ? n_ctx : 4096;
+    const bool decision = keryx_is_decision_model(model);
+    if (decision) {
+        cp.embeddings = true;
+        cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
     const char* kv = "f16";
     if (fast_kv) {
         // The logical batch bounds one decode call; the physical one bounds the compute buffers,
@@ -585,6 +623,13 @@ static KeryxLlama* keryx_load_with(const char* gguf_path, int gpu, int n_ctx, ll
     h->model = model; h->ctx = ctx; h->smpl = smpl; h->trace = trace; h->gpu = gpu;
     h->canon_base = canon_base; h->canon_bytes = canon_bytes;
     h->cparams = cp; h->kv = kv; h->fast_kv = fast_kv;
+    h->decision = decision;
+    if (decision) {
+        llama_token t[4];
+        const int k = llama_tokenize(llama_model_get_vocab(model), "<|box_end|>", 11, t, 4, false, true);
+        h->decision_marker = k == 1 ? t[0] : -1;
+        h->decision = k == 1;
+    }
     h->ctx_info = keryx_ctx_info(h);
     if (trace) keryx_trace_meta(gpu, gguf_path, h->ctx_info, trace);
     for (auto& p : model->tensors_by_name) h->names.push_back(p.first);
@@ -893,6 +938,29 @@ KERYX_EXPORT int keryx_llama_generate_traced(KeryxLlama* h, const char* prompt, 
     *n_prompt_out = n;
     *n_fed_out = fed;
     return written;
+}
+
+// Token ids of `text` (no BOS), special tokens parsed when `parse_special`. Returns the count, or
+// -1 (arguments), -6 (buffer).
+KERYX_EXPORT int keryx_llama_tokenize(KeryxLlama* h, const char* text, int len, int parse_special, int32_t* out, int cap) {
+    if (!h || !text || len < 0 || !out) return -1;
+    const int n = llama_tokenize(llama_model_get_vocab(h->model), text, len, out, cap, false, parse_special != 0);
+    return n < 0 ? -6 : n;
+}
+
+// Decision-head rows of the last prompt fed to a decision model: the marker positions, then the
+// last position. Returns the row width, -1 (arguments or not a decision model), -6 (buffers).
+KERYX_EXPORT int keryx_llama_decision_rows(KeryxLlama* h, uint32_t* positions, int pos_cap, float* rows, size_t rows_cap, int* n_rows) {
+    if (!h || !n_rows) return -1;
+    std::lock_guard<std::mutex> g(h->gen_lock);
+    if (!h->decision || !h->decision_ok) return -1;
+    const int width = llama_model_n_embd_out(h->model);
+    const int n = (int)h->decision_pos.size();
+    *n_rows = n;
+    if (!positions || !rows || n > pos_cap || h->decision_rows.size() > rows_cap) return -6;
+    memcpy(positions, h->decision_pos.data(), (size_t)n * sizeof(uint32_t));
+    memcpy(rows, h->decision_rows.data(), h->decision_rows.size() * sizeof(float));
+    return width;
 }
 
 // Traced evaluation of `tokens` as a prompt with nothing generated; the trace is read with

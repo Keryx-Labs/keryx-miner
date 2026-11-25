@@ -1,0 +1,13 @@
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 5b05fc63f..9f826fa0e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -231,6 +231,8 @@ llama_model_qwen35::graph::graph(const llm_graph_params & params) :
+         cb(embd, "result_embd_proj", -1);
+         res->t_embd = embd;
+         ggml_build_forward_expand(gf, embd);
++        // decision models read the pointer head only
++        return;
+     }
+ 
+     // LM head

@@ -1136,14 +1136,15 @@ impl StratumHandler {
                         return;
                     };
                     let (text, device) = (generated.text, generated.device);
+                    let plain = generated.decision.unwrap_or_else(|| text.clone().into_bytes());
                     match generated.trace {
                         Some(trace) => {
                             let answer = if trace.record.stage == keryx_miner::trace::STAGE_CHAIN {
                                 let ids: Vec<u32> =
                                     trace.tokens[trace.record.n_prompt as usize..].iter().map(|&v| v as u32).collect();
-                                keryx_verifiable_inference::answer::encode(text.as_bytes(), &ids)
+                                keryx_verifiable_inference::answer::encode(&plain, &ids)
                             } else {
-                                text.clone().into_bytes()
+                                plain
                             };
                             let commitment = hex::encode(trace.commitment().to_bytes());
                             let key = request.request_hash.to_ascii_lowercase();

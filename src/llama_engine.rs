@@ -51,6 +51,8 @@ type GenTracedFn = unsafe extern "C" fn(
 type TraceConfigureFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int;
 type TraceLeafCountFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type TraceReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, usize, *mut u32, usize, *mut u32) -> c_int;
+type TokenizeFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_int, *mut i32, c_int) -> c_int;
+type DecisionRowsFn = unsafe extern "C" fn(*mut c_void, *mut u32, c_int, *mut f32, usize, *mut c_int) -> c_int;
 type ReplayFn = unsafe extern "C" fn(
     *mut c_void,
     *const i32,
@@ -101,7 +103,7 @@ type SeqReplayFn = unsafe extern "C" fn(
     *mut u32,
 ) -> c_int;
 
-pub(crate) const ABI: c_int = 14;
+pub(crate) const ABI: c_int = 15;
 /// Context kept for the block task while the context pad is resident.
 const TASK_CONTEXT_TOKENS: c_int = 64;
 /// Largest captured leaf the engine hands back.
@@ -167,6 +169,8 @@ struct Engine {
     seq_configure: SeqConfigureFn,
     seq_roots: SeqRootsFn,
     seq_replay: SeqReplayFn,
+    decision_rows: DecisionRowsFn,
+    tokenize: TokenizeFn,
     ctx_acquire: CtxAcquireFn,
     free: FreeFn,
     tensor_device: Option<TensorDeviceFn>,
@@ -491,7 +495,11 @@ pub fn ensure_loaded_with(gguf: &str, gpu: usize, canonical: bool) -> Result<u64
         ) else {
             return Err(failed("symbols", format!("{} is missing sequence symbols", so.display()), false));
         };
-        let Some(ctx_acquire) = sym::<CtxAcquireFn>(lib, "keryx_llama_context_acquire") else {
+        let (Some(ctx_acquire), Some(decision_rows), Some(tokenize)) = (
+            sym::<CtxAcquireFn>(lib, "keryx_llama_context_acquire"),
+            sym::<DecisionRowsFn>(lib, "keryx_llama_decision_rows"),
+            sym::<TokenizeFn>(lib, "keryx_llama_tokenize"),
+        ) else {
             return Err(failed("symbols", format!("{} is missing context symbols", so.display()), false));
         };
         let last_error = sym::<ErrorFn>(lib, "keryx_llama_last_error");
@@ -566,6 +574,8 @@ pub fn ensure_loaded_with(gguf: &str, gpu: usize, canonical: bool) -> Result<u64
             seq_configure,
             seq_roots,
             seq_replay,
+            decision_rows,
+            tokenize,
             ctx_acquire,
             free,
             tensor_device,
@@ -918,6 +928,72 @@ pub fn generate_traced(
     ubatch.truncate(n_pos as usize);
     let seq = if e.seq_leaves > 0 { Some(read_seq_roots(e).map_err(GenError::Failed)?) } else { None };
     Ok(TracedGeneration { text, tokens, n_prompt: n_prompt.max(0) as u32, n_pos, ubatch, leaves, seq })
+}
+
+/// Token ids of `text` on the engine hosting `gguf` on `gpu`, special tokens parsed when
+/// `special`.
+pub fn tokenize(gguf: &str, gpu: usize, text: &str, special: bool) -> Result<Vec<i32>, String> {
+    let slot = slot(gpu);
+    let g = slot.lock().map_err(|_| "engine slot poisoned".to_string())?;
+    let e = g.as_ref().filter(|e| e.gguf == gguf).ok_or_else(|| "no engine hosts this model".to_string())?;
+    let len = c_int::try_from(text.len()).map_err(|_| "text too long".to_string())?;
+    let mut out = vec![0i32; text.len() + 16];
+    let _native = native();
+    let n = unsafe { (e.tokenize)(e.model, text.as_ptr() as *const c_char, len, special as c_int, out.as_mut_ptr(), out.len() as c_int) };
+    if n < 0 {
+        return Err(engine_error(e, &format!("tokenization failed ({n})")));
+    }
+    out.truncate(n as usize);
+    Ok(out)
+}
+
+/// A traced decision prompt: its trace and the head rows of its marker positions and last position.
+#[derive(Debug, Clone, Default)]
+pub struct TracedDecision {
+    pub ubatch: Vec<u32>,
+    pub leaves: Vec<[u8; 32]>,
+    pub seq: Option<Vec<[u8; 32]>>,
+    /// Marker positions, then the last position.
+    pub positions: Vec<u32>,
+    pub rows: Vec<Vec<f32>>,
+}
+
+/// Traces `tokens` as the prompt of a decision model and reads its head rows.
+pub fn trace_decision(gguf: &str, gpu: usize, tokens: &[i32]) -> Result<TracedDecision, GenError> {
+    let slot = slot(gpu);
+    let mut g = slot.lock().map_err(|_| GenError::Unavailable)?;
+    let e = g.as_mut().filter(|e| e.gguf == gguf && e.trace_leaves > 0).ok_or(GenError::Unavailable)?;
+    ensure_full_context(e, gpu, 0).map_err(GenError::Failed)?;
+    let e = &*e;
+    if tokens.len() + 16 > e.n_ctx.max(0) as usize {
+        return Err(GenError::PromptTooLong(format!("{} prompt tokens do not fit the {}-token context", tokens.len(), e.n_ctx)));
+    }
+    let _native = native();
+    let rc = unsafe { (e.trace_tokens)(e.model, tokens.as_ptr(), tokens.len() as c_int) };
+    if rc != 0 {
+        return Err(GenError::Failed(engine_error(e, &format!("traced evaluation failed ({rc})"))));
+    }
+    let mut n_pos: u32 = 0;
+    let mut leaves = vec![[0u8; 32]; tokens.len() * e.trace_leaves];
+    let mut ubatch = vec![0u32; tokens.len()];
+    let rc = unsafe { (e.trace_read)(e.model, leaves.as_mut_ptr() as *mut u8, leaves.len() * 32, ubatch.as_mut_ptr(), ubatch.len(), &mut n_pos) };
+    if rc != 0 || n_pos as usize != tokens.len() {
+        return Err(GenError::Failed(format!("trace read failed ({rc}), {n_pos} positions traced for {} fed", tokens.len())));
+    }
+    let seq = if e.seq_leaves > 0 { Some(read_seq_roots(e).map_err(GenError::Failed)?) } else { None };
+    let mut n: c_int = 0;
+    let rc = unsafe { (e.decision_rows)(e.model, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, &mut n) };
+    if rc == -1 || n <= 0 {
+        return Err(GenError::Failed(engine_error(e, "no decision rows")));
+    }
+    let mut positions = vec![0u32; n as usize];
+    let mut flat = vec![0f32; n as usize * 1024];
+    let width = unsafe { (e.decision_rows)(e.model, positions.as_mut_ptr(), n, flat.as_mut_ptr(), flat.len(), &mut n) };
+    if width <= 0 || n as usize != positions.len() || n as usize * width as usize > flat.len() {
+        return Err(GenError::Failed(engine_error(e, &format!("decision rows unavailable ({width})"))));
+    }
+    let rows = flat.chunks_exact(width as usize).take(n as usize).map(<[f32]>::to_vec).collect();
+    Ok(TracedDecision { ubatch, leaves, seq, positions, rows })
 }
 
 fn read_seq_roots(e: &Engine) -> Result<Vec<[u8; 32]>, String> {

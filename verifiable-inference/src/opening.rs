@@ -19,6 +19,8 @@ pub const VERSION_RECUR: u8 = 6;
 pub const VERSION_ROOTS: u8 = 7;
 /// Residual opening of a response, sent apart from its trace opening.
 pub const VERSION_RESID: u8 = 8;
+/// Decision opening of a response, sent apart from its trace opening.
+pub const VERSION_DECISION: u8 = 9;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -1163,5 +1165,81 @@ mod attn_opening_tests {
         c[0] = VERSION_CHAIN;
         assert!(AttnOpening::decode(&c).is_none());
         assert!(Opening::decode(&sample().encode()).is_none());
+    }
+}
+
+/// The pointer head output at one position: the meta leaf and one chunk of the head's `Y` leaf.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecisionLeaf {
+    pub n_ubatch: u32,
+    pub pos_path: Vec<Hash>,
+    pub meta_path: Vec<Hash>,
+    pub y: LeafChunk,
+}
+
+/// The answer of a decision response and the head outputs that give its drawn score.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DecisionOpening {
+    pub response_txid: Hash,
+    /// Position and sequence roots of a trace that commits sequence leaves.
+    pub roots: Option<(Hash, Hash)>,
+    pub head: EntryOpening,
+    /// The answer plaintext.
+    pub answer: Vec<u8>,
+    pub marker: DecisionLeaf,
+    pub pointer: DecisionLeaf,
+}
+
+impl W {
+    fn decision_leaf(&mut self, l: &DecisionLeaf) {
+        self.u32(l.n_ubatch);
+        self.hashes(&l.pos_path);
+        self.hashes(&l.meta_path);
+        self.leaf_chunk(&l.y);
+    }
+}
+
+impl R<'_> {
+    fn decision_leaf(&mut self) -> Option<DecisionLeaf> {
+        Some(DecisionLeaf { n_ubatch: self.u32()?, pos_path: self.hashes()?, meta_path: self.hashes()?, y: self.leaf_chunk()? })
+    }
+}
+
+impl DecisionOpening {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_DECISION);
+        w.0.extend_from_slice(&self.response_txid);
+        match &self.roots {
+            Some((p, q)) => {
+                w.u8(1);
+                w.0.extend_from_slice(p);
+                w.0.extend_from_slice(q);
+            }
+            None => w.u8(0),
+        }
+        w.entry(&self.head);
+        w.bytes32(&self.answer);
+        w.decision_leaf(&self.marker);
+        w.decision_leaf(&self.pointer);
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<DecisionOpening> {
+        if b.first() != Some(&VERSION_DECISION) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let roots = match r.u8()? {
+            0 => None,
+            1 => Some((r.take(32)?.try_into().ok()?, r.take(32)?.try_into().ok()?)),
+            _ => return None,
+        };
+        let head = r.entry()?;
+        let answer = r.bytes32()?;
+        let marker = r.decision_leaf()?;
+        let pointer = r.decision_leaf()?;
+        (r.o == b.len()).then_some(DecisionOpening { response_txid, roots, head, answer, marker, pointer })
     }
 }

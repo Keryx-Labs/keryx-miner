@@ -900,6 +900,8 @@ struct Traced {
 /// A generated answer and, when the tier is audited, the trace an opening needs.
 pub struct Generated {
     pub text: String,
+    /// Plaintext answer of a decision request, in place of `text`.
+    pub decision: Option<Vec<u8>>,
     pub trace: Option<crate::trace::ResponseTrace>,
     /// CUDA device the answer was generated on.
     pub device: u32,
@@ -1134,6 +1136,7 @@ fn open_pieces(
     request_hash: &[u8; 32],
     response_txid: [u8; 32],
     index: &crate::pom::WeightIndex,
+    decision: Option<keryx_verifiable_inference::decision::DecisionCtx>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let (body, resid) = open_chain(gguf, dev_id, m, pctx, trace, seed, request_hash, response_txid, index)?;
     let mut bodies = vec![body];
@@ -1143,8 +1146,33 @@ fn open_pieces(
             bodies.push(open_recurrent(gguf, dev_id, m, trace, seed, response_txid, index)?);
         }
     }
+    if let Some(d) = decision {
+        bodies.push(open_decision(gguf, dev_id, m, trace, &d, seed, response_txid)?);
+    }
     bodies.push(resid);
     Ok(bodies)
+}
+
+/// Replays the head outputs of a decision response and builds its decision opening.
+fn open_decision(
+    gguf: &str,
+    dev_id: u32,
+    m: &crate::trace::TierManifest,
+    trace: &crate::trace::ResponseTrace,
+    dctx: &keryx_verifiable_inference::decision::DecisionCtx,
+    seed: &[u8; 32],
+    response_txid: [u8; 32],
+) -> Result<Vec<u8>, String> {
+    let rec = &trace.record;
+    let leaf = 2 * dctx.head_rank + 1;
+    let width = 4 * m.entry(dctx.head_rank as u64).m as usize;
+    let positions = crate::trace::decision_positions(&trace.tokens, rec.n_prompt, dctx);
+    let mut ys = Vec::with_capacity(positions.len());
+    for group in positions.chunks(crate::llama_engine::REPLAY_MAX_CAPTURES) {
+        let caps: Vec<(u32, u32)> = group.iter().map(|&t| (t, leaf)).collect();
+        ys.extend(crate::llama_engine::replay_multi(gguf, dev_id as usize, &trace.tokens, rec.n_prompt, &caps, width)?);
+    }
+    crate::trace::decision_opening(m, trace, dctx, seed, response_txid, &ys)
 }
 
 /// A trace opening body carrying the residual point of its residual piece, as the block task
@@ -1224,11 +1252,62 @@ fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attenti
     let index = weight_index(spec, gguf).ok_or("no possession index")?;
     let tier_ctx = m.tier_ctx(&index);
     for seed in [[0x11u8; 32], [0x77u8; 32]] {
-        let bodies = open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index)?;
+        let bodies = open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index, None)?;
         verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &bodies[0], bodies.last().ok_or("no residual piece")?)?;
     }
     PREFIX_CHECKED.lock().unwrap().insert((gguf.to_string(), dev_id, key));
     log::info!("LlmEngine '{}': stage-2 self-check passed (gpu{})", spec.name, dev_id);
+    Ok(())
+}
+
+/// Answers a fixed decision request, then opens and verifies it under two seeds as the node would.
+fn decision_self_check(
+    spec: &ModelSpec,
+    gguf: &str,
+    dev_id: u32,
+    tier: u8,
+    attention: bool,
+    dctx: keryx_verifiable_inference::decision::DecisionCtx,
+) -> Result<(), String> {
+    use crate::trace::{chain_ctx, verify_chain_opening, TierManifest, STAGE_CHAIN};
+    use keryx_verifiable_inference::decision::{verify_decision_opening, DecisionOption, DecisionRequest, QuestionType};
+    use keryx_verifiable_inference::opening::DecisionOpening;
+    let key = if attention { STAGE_CHAIN | 0xC0 } else { STAGE_CHAIN | 0x40 };
+    if PREFIX_CHECKED.lock().unwrap().contains(&(gguf.to_string(), dev_id, key)) {
+        return Ok(());
+    }
+    let req = DecisionRequest {
+        kind: QuestionType::Choice,
+        state: "The kettle is boiling and the tea bags are on the counter.".into(),
+        instructions: "What should happen next?".into(),
+        options: vec![
+            DecisionOption { key: "pour".into(), description: "pour the water over a tea bag".into() },
+            DecisionOption { key: "wait".into(), description: "wait an hour".into() },
+        ],
+    };
+    let plain = req.encode();
+    let request_hash: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
+    let t = Traced { tier, prompt_len: plain.len() as u32, request_hash, chain: true, attention };
+    let (answer, trace) = run_decision(gguf, dev_id, &decision_prompt_text(&plain), &t).map_err(|e| format!("{e:?}"))?;
+    let m = if attention { TierManifest::for_attn(tier) } else { TierManifest::for_chain(tier) }.ok_or("no stage-2 manifest")?;
+    let (_, pctx) = chain_ctx(tier).ok_or("no stage-2 context")?;
+    let ctx = m.chain.ok_or("no stage-2 context")?;
+    let index = weight_index(spec, gguf).ok_or("no possession index")?;
+    let tier_ctx = m.tier_ctx(&index);
+    let answer_root = trace.record.tokens_root.ok_or("no answer commitment")?;
+    if keryx_verifiable_inference::decision::DecisionAnswer::commitment(&answer) != answer_root {
+        return Err("the answer does not match its commitment".into());
+    }
+    for seed in [[0x11u8; 32], [0x77u8; 32]] {
+        let bodies = open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index, Some(dctx))?;
+        let resid = bodies.last().ok_or("no residual piece")?;
+        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &bodies[0], resid)?;
+        let body = bodies.get(bodies.len().wrapping_sub(2)).and_then(|b| DecisionOpening::decode(b)).ok_or("no decision piece")?;
+        verify_decision_opening(&tier_ctx, &ctx, &dctx, &trace.record.response_ctx(), &seed, &answer_root, &body)
+            .map_err(|e| format!("decision point ({e:?})"))?;
+    }
+    PREFIX_CHECKED.lock().unwrap().insert((gguf.to_string(), dev_id, key));
+    log::info!("LlmEngine '{}': decision self-check passed (gpu{})", spec.name, dev_id);
     Ok(())
 }
 
@@ -1263,7 +1342,11 @@ fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, chain: bool, a
         log::warn!("LlmEngine '{}': sequence leaves unavailable ({}) — answering untraced", spec.name, e);
         return false;
     }
-    let checked = if chain { chain_self_check(spec, gguf, dev_id, tier, attention) } else { prefix_self_check(spec, gguf, dev_id, tier) };
+    let checked = match (chain, crate::trace::decision_ctx(tier)) {
+        (true, Some(d)) => decision_self_check(spec, gguf, dev_id, tier, attention, d),
+        (true, None) => chain_self_check(spec, gguf, dev_id, tier, attention),
+        (false, _) => prefix_self_check(spec, gguf, dev_id, tier),
+    };
     if let Err(e) = checked {
         fatal(&format!("'{}' fails the {} self-check on gpu{}: {}", spec.name, if chain { "stage-2" } else { "prefix" }, dev_id, e));
     }
@@ -1273,6 +1356,101 @@ fn arm_trace(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, chain: bool, a
 /// The prompt without NUL characters, which the engine cannot take.
 fn engine_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
     if prompt.contains('\0') { std::borrow::Cow::Owned(prompt.replace('\0', "")) } else { std::borrow::Cow::Borrowed(prompt) }
+}
+
+/// Text a decision request travels as through the request queue: the hex of its plaintext.
+pub fn decision_prompt_text(plain: &[u8]) -> String {
+    hex::encode(plain)
+}
+
+/// Answers a decision request (`prompt` = [`decision_prompt_text`]) on the engine hosting `spec`.
+fn run_decision_request(spec: &ModelSpec, prompt: &str, traced: Option<Traced>) -> Option<Generated> {
+    let Some(t) = traced else {
+        log::warn!("LlmEngine '{}': a decision is answered traced only — response dropped", spec.name);
+        return None;
+    };
+    let Some((gguf, dev_id)) = resident_engine(spec) else {
+        LAST_FAILURE_TRANSIENT.with(|c| c.set(true));
+        return None;
+    };
+    if !t.chain || !arm_trace(spec, &gguf, dev_id, t.tier, t.chain, t.attention) {
+        log::warn!("LlmEngine '{}': decision trace unavailable — response dropped", spec.name);
+        return None;
+    }
+    match run_decision(&gguf, dev_id, prompt, &t) {
+        Ok((answer, trace)) => {
+            mark_model_available(&spec.model_id, "generation_success");
+            Some(Generated { text: String::new(), decision: Some(answer), trace: Some(trace), device: dev_id })
+        }
+        Err(crate::llama_engine::GenError::Unavailable) => {
+            LAST_FAILURE_TRANSIENT.with(|c| c.set(true));
+            None
+        }
+        Err(e) => {
+            log::warn!("LlmEngine '{}': decision failed ({:?}) — response dropped", spec.name, e);
+            None
+        }
+    }
+}
+
+/// The traced decision of a request: its answer plaintext and the trace committing to it.
+fn run_decision(gguf: &str, dev_id: u32, prompt: &str, t: &Traced) -> Result<(Vec<u8>, crate::trace::ResponseTrace), crate::llama_engine::GenError> {
+    use crate::llama_engine::{tokenize, trace_decision, GenError};
+    use keryx_verifiable_inference::decision::{kev_segments, score, DecisionAnswer, DecisionRequest, Segment};
+    let fail = |s: &str| GenError::Failed(s.to_string());
+    let dev = dev_id as usize;
+    let plain = hex::decode(prompt).map_err(|_| fail("decision prompt is not hex"))?;
+    let req = DecisionRequest::decode(&plain).ok_or_else(|| fail("malformed decision request"))?;
+    let dctx = crate::trace::decision_ctx(t.tier).ok_or_else(|| fail("no decision head"))?;
+    let m = if t.attention { crate::trace::TierManifest::for_attn(t.tier) } else { crate::trace::TierManifest::for_chain(t.tier) }
+        .ok_or_else(|| fail("no stage-2 manifest"))?;
+    let (_, pctx) = crate::trace::chain_ctx(t.tier).ok_or_else(|| fail("no stage-2 context"))?;
+    let prefix = crate::trace::prefix_tokens(&pctx, &t.request_hash);
+    let mut tokens: Vec<i32> = Vec::new();
+    for seg in kev_segments(&req) {
+        match seg {
+            Segment::Special(s) => match tokenize(gguf, dev, s, true).map_err(GenError::Failed)?[..] {
+                [id] => tokens.push(id),
+                _ => return Err(fail("a special token of the template is not one token")),
+            },
+            Segment::Text(x) => tokens.extend(tokenize(gguf, dev, &x, false).map_err(GenError::Failed)?),
+            Segment::Prefix => {
+                if tokens.len() != pctx.offset as usize {
+                    return Err(fail("the prefix is not at its offset"));
+                }
+                tokens.extend_from_slice(&prefix);
+            }
+        }
+    }
+    let n_prompt = tokens.len() as u32;
+    if n_prompt < keryx_verifiable_inference::shape::min_prompt_positions(t.prompt_len) || tokens.last() != Some(&(dctx.pointer_tok as i32)) {
+        return Err(fail("the rendered prompt does not fit the decision shape"));
+    }
+    let d = trace_decision(gguf, dev, &tokens)?;
+    let (Some((&pointer, markers)), Some((q_row, o_rows))) = (d.positions.split_last(), d.rows.split_last()) else {
+        return Err(fail("no decision rows"));
+    };
+    if pointer + 1 != n_prompt
+        || markers.len() != req.options.len()
+        || markers.iter().any(|&p| tokens.get(p as usize) != Some(&(dctx.marker_tok as i32)))
+        || q_row.len() != 512
+    {
+        return Err(fail("decision rows do not match the prompt"));
+    }
+    let half = q_row.len() / 2;
+    let scores: Vec<f32> = o_rows.iter().map(|o| score(&q_row[..half], &o[half..]).0 as f32).collect();
+    if scores.iter().any(|s| !s.is_finite()) {
+        return Err(fail("non-finite decision score"));
+    }
+    let answer = DecisionAnswer { positions: markers.to_vec(), scores }.encode();
+    let mut record = crate::trace::TraceRecord::new_chain(&m, n_prompt, d.ubatch, d.leaves, &tokens).ok_or_else(|| fail("incomplete decision trace"))?;
+    record.tokens_root = Some(DecisionAnswer::commitment(&answer));
+    let seq = match (t.attention, d.seq) {
+        (true, Some(leaves)) => Some(crate::trace::SeqTrace::new(leaves).ok_or_else(|| fail("empty sequence leaves"))?),
+        (true, None) => return Err(fail("no sequence leaves")),
+        (false, _) => None,
+    };
+    Ok((answer, crate::trace::ResponseTrace { record, tokens, seq }))
 }
 
 /// Context tokens the node reserves beyond the prompt and the answer budget.
@@ -1318,6 +1496,9 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
+    if crate::models::is_decision_model(model_id) {
+        return run_decision_request(spec, prompt, traced);
+    }
     let prompt = engine_prompt(prompt);
 
     let Some((gguf, dev_id)) = resident_engine(spec) else {
@@ -1402,7 +1583,7 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
     match outcome {
         Ok((text, trace)) if trace.is_some() || !text.trim().is_empty() => {
             mark_model_available(model_id, "generation_success");
-            Some(Generated { text: truncate_answer(text, max_tokens), trace, device: dev_id })
+            Some(Generated { text: truncate_answer(text, max_tokens), decision: None, trace, device: dev_id })
         }
         Ok(_) => {
             log::warn!("LlmEngine '{}': llama generate returned an empty answer — response dropped", spec.name);
@@ -1542,7 +1723,7 @@ pub fn open_trace(
     if chain {
         let m = if attention { TierManifest::for_attn(tier)? } else { TierManifest::for_chain(tier)? };
         let (_, pctx) = crate::trace::chain_ctx(tier)?;
-        return match open_pieces(&gguf, dev_id, &m, &pctx, trace, seed, request_hash, response_txid, &index) {
+        return match open_pieces(&gguf, dev_id, &m, &pctx, trace, seed, request_hash, response_txid, &index, crate::trace::decision_ctx(tier)) {
             Ok(bodies) => Some(crate::trace_seq::bundle(&bodies)),
             Err(e) => {
                 log::warn!("LlmEngine '{}': stage-2 opening failed ({})", spec.name, e);
@@ -1744,7 +1925,7 @@ mod tests {
             for counter in counters {
                 let seed = *blake3::hash(&counter.to_le_bytes()).as_bytes();
                 let t0 = std::time::Instant::now();
-                let bodies = open_pieces(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                let bodies = open_pieces(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index, None).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let took = t0.elapsed();
                 verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &bodies[0], bodies.last().unwrap()).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let sizes: Vec<usize> = bodies.iter().map(Vec::len).collect();
