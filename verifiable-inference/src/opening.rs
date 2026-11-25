@@ -23,6 +23,8 @@ pub const VERSION_RESID: u8 = 8;
 pub const VERSION_DECISION: u8 = 9;
 /// Selection opening of a response, sent apart from its trace opening.
 pub const VERSION_SEL: u8 = 10;
+/// Compressed row opening of a response, sent apart from its trace opening.
+pub const VERSION_COMP: u8 = 11;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -938,7 +940,7 @@ pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL | VERSION_COMP) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -1491,5 +1493,66 @@ impl SelOpeningPoint {
         let nm = r.u8()? as usize;
         let members = (0..nm).map(|_| Some(SelMember { pos_path: r.hashes()?, k: r.leaf_bytes()?, g: r.leaf_bytes()? })).collect::<Option<Vec<_>>>()?;
         (r.o == b.len()).then_some(SelOpeningPoint { response_txid, pos_root, seq_root, layer, entries, norms, pos_path, sel, iq, w, members })
+    }
+}
+
+/// Compressed row point of a response: the drawn row of the compressed cache of a source layer,
+/// the compressor outputs of the block's members (`k` value, `g` gate, empty without a gate), and
+/// the norm, indexer key matrix and key norm the row is built with, in that order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompOpeningPoint {
+    pub response_txid: Hash,
+    pub pos_root: Hash,
+    pub seq_root: Hash,
+    pub layer: EntryOpening,
+    pub entries: Vec<EntryOpening>,
+    pub weights: Vec<(EntryOpening, ChunkRange)>,
+    pub row: crate::seq::SeqSpan,
+    pub members: Vec<SelMember>,
+}
+
+impl CompOpeningPoint {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_COMP);
+        w.0.extend_from_slice(&self.response_txid);
+        w.0.extend_from_slice(&self.pos_root);
+        w.0.extend_from_slice(&self.seq_root);
+        w.entry(&self.layer);
+        w.u8(self.entries.len() as u8);
+        for e in &self.entries {
+            w.entry(e);
+        }
+        w.u8(self.weights.len() as u8);
+        for n in &self.weights {
+            w.weights(n);
+        }
+        w.seq_span(&self.row);
+        w.u8(self.members.len() as u8);
+        for m in &self.members {
+            w.hashes(&m.pos_path);
+            w.leaf_bytes(&m.k);
+            w.leaf_bytes(&m.g);
+        }
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<CompOpeningPoint> {
+        if b.first() != Some(&VERSION_COMP) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let pos_root: Hash = r.take(32)?.try_into().ok()?;
+        let seq_root: Hash = r.take(32)?.try_into().ok()?;
+        let layer = r.entry()?;
+        let ne = r.u8()? as usize;
+        let entries = (0..ne).map(|_| r.entry()).collect::<Option<Vec<_>>>()?;
+        let nw = r.u8()? as usize;
+        let weights = (0..nw).map(|_| r.weights()).collect::<Option<Vec<_>>>()?;
+        let row = r.seq_span()?;
+        let nm = r.u8()? as usize;
+        let members = (0..nm).map(|_| Some(SelMember { pos_path: r.hashes()?, k: r.leaf_bytes()?, g: r.leaf_bytes()? })).collect::<Option<Vec<_>>>()?;
+        (r.o == b.len()).then_some(CompOpeningPoint { response_txid, pos_root, seq_root, layer, entries, weights, row, members })
     }
 }

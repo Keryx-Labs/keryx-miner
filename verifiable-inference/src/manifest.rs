@@ -66,7 +66,7 @@ const TAG_DSA: u8 = 15;
 const DSA_FIELDS: usize = 12;
 /// An attention layer reading compressed rows of blocks of tokens, wrapping its links.
 const TAG_COMP: u8 = 16;
-const COMP_FIELDS: usize = 16;
+const COMP_FIELDS: usize = 17;
 const HC_FIELDS: usize = 13;
 
 /// Source of a product's input.
@@ -100,6 +100,8 @@ pub struct LayerLinks {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompLinks {
     pub src: u32,
+    /// Compressed row leaf of the source layer.
+    pub slot: u32,
     pub ratio: u32,
     /// Compressor value and gate products (gate `NONE` at ratio 1).
     pub kv: u32,
@@ -123,15 +125,15 @@ pub struct CompLinks {
 impl CompLinks {
     fn fields(&self) -> [u32; COMP_FIELDS] {
         [
-            self.src, self.ratio, self.kv, self.gate, self.norm, self.ik, self.k_norm, self.n_rot, self.rope_base, self.freq_scale,
+            self.src, self.slot, self.ratio, self.kv, self.gate, self.norm, self.ik, self.k_norm, self.n_rot, self.rope_base, self.freq_scale,
             self.ext_factor, self.attn_factor, self.beta_fast, self.beta_slow, self.n_ctx_orig, self.eps,
         ]
     }
 
     fn from_fields(f: [u32; COMP_FIELDS]) -> Self {
         Self {
-            src: f[0], ratio: f[1], kv: f[2], gate: f[3], norm: f[4], ik: f[5], k_norm: f[6], n_rot: f[7], rope_base: f[8],
-            freq_scale: f[9], ext_factor: f[10], attn_factor: f[11], beta_fast: f[12], beta_slow: f[13], n_ctx_orig: f[14], eps: f[15],
+            src: f[0], slot: f[1], ratio: f[2], kv: f[3], gate: f[4], norm: f[5], ik: f[6], k_norm: f[7], n_rot: f[8], rope_base: f[9],
+            freq_scale: f[10], ext_factor: f[11], attn_factor: f[12], beta_fast: f[13], beta_slow: f[14], n_ctx_orig: f[15], eps: f[16],
         }
     }
 
@@ -741,7 +743,7 @@ mod tests {
         no_attn.extend_from_slice(&chain_bytes(&l));
         assert!(parse_chain(&no_attn).is_none());
         let comp = CompLinks {
-            src: 2, ratio: 2, kv: 70, gate: 71, norm: 80, ik: 81, k_norm: 82, n_rot: 64, rope_base: 160_000f32.to_bits(), freq_scale: (1.0f32 / 16.0).to_bits(),
+            src: 2, slot: 0, ratio: 2, kv: 70, gate: 71, norm: 80, ik: 81, k_norm: 82, n_rot: 64, rope_base: 160_000f32.to_bits(), freq_scale: (1.0f32 / 16.0).to_bits(),
             ext_factor: 1f32.to_bits(), attn_factor: 0.78f32.to_bits(), beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(),
         };
         let lc = Chain::Layer(LayerLinks { comp: Some(comp), ..inner });

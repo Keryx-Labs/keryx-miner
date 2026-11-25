@@ -241,7 +241,7 @@ impl Tier {
     }
 
     pub fn chain_ctx(&self) -> ChainCtx {
-        ChainCtx { n_sel: 0,
+        ChainCtx { n_sel: 0, n_comp: 0,
             n_layers: N_LAYERS as u32,
             layer_base: LAYERS as u32,
             embd_entry: EMBD as u32,
@@ -1063,7 +1063,7 @@ mod head_link_tests {
             n_entries: NP,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let x0 = q8_1_row(&(0..D).map(|i| (((i * 7) % 23) as f64 * 0.01 - 0.1) * if i / 32 == 3 { spike } else { 1.0 }).collect::<Vec<_>>());
         let y0 = dot_rows(&weights[0], 0..NH * STRIDE, &x0);
         let off = if shift { 32 } else { 0 };
@@ -1277,7 +1277,7 @@ mod normed_link_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let x0 = q8_1_row(&(0..D).map(|i| ((i * 7) % 23) as f64 * 0.01 - 0.1).collect::<Vec<_>>());
         let y0 = dot_rows(&weights[0], D, &x0);
         let mut h: Vec<f64> = y0.iter().map(|&a| a as f64).collect();
@@ -1471,7 +1471,7 @@ mod hc_head_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 2, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 2, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let streams: Vec<f32> = (0..NHC * D).map(|i| ((i * 13) % 29) as f32 * 0.07 - 1.0 + (i / D) as f32 * 0.3).collect();
         let mut h: Vec<f64> = match fault {
             Fault::FirstStream => streams[..D].iter().map(|&a| a as f64).collect(),
@@ -1672,7 +1672,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: 4,
         };
-        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
@@ -2123,7 +2123,7 @@ mod attn_tests {
 
     impl Seq {
         fn new(heads: usize, kcache: &[Vec<Vec<u8>>], vcache: Option<&[Vec<Vec<u8>>]>, lse: &[Vec<u8>]) -> Seq {
-            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: heads as u64 };
+            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: heads as u64, n_comp: 0 };
             let mut leaves = vec![Vec::new(); layout.n_leaves() as usize];
             for h in 0..kcache[0].len() {
                 leaves[layout.kcache(0, h as u64).unwrap() as usize] = kcache.iter().flat_map(|p| p[h].clone()).collect();
@@ -2339,7 +2339,7 @@ mod attn_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32 };
         let prep = Prep {
             q_norm: c.qk_norm.then_some(&q_norm[..]),
             k_norm: c.qk_norm.then_some(&k_norm[..]),
@@ -2427,7 +2427,7 @@ mod attn_tests {
 
         /// Spans of the key and value caches of head `kv` over positions `[p0, p1)`.
         fn caches(&self, kv: u64, p0: usize, p1: usize) -> (SeqSpan, SeqSpan) {
-            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: NKV as u64 };
+            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: NKV as u64, n_comp: 0 };
             let bb = HD / 32 * 34;
             (self.seq.span(layout.kcache(0, kv).unwrap(), p0 * bb, p1 * bb), self.seq.span(layout.vcache(0, kv).unwrap(), p0 * bb, p1 * bb))
         }
@@ -2866,7 +2866,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let n_leaves = n_pos_leaves(NP, 1, 0) as usize;
             let q: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, NH * QW)).collect();
             let kv_a: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, HD)).collect();
@@ -2930,7 +2930,7 @@ mod attn_tests {
                 let pos = &self.positions[t];
                 let n = self.chunk_leaves.len() as u64;
                 let range = ChunkRange { first_chunk: 0, chunks: self.weights.clone(), proof: rt_range_proof(&self.chunk_leaves, 0, n).1 };
-                let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1 };
+                let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1, n_comp: 0 };
                 let bb = HD / 32 * 34;
                 AttnOpening {
                     response_txid: [1; 32],
@@ -2992,7 +2992,7 @@ mod attn_tests {
                     let (p0, p1) = tree.node(path).unwrap();
                     let ps = (p0 + d[3] % (p1 - p0)) as usize;
                     let bb = HD / 32 * 34;
-                    let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1 };
+                    let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1, n_comp: 0 };
                     return AttnOpening {
                         q_entry: whole.q_entry,
                         pos_path: whole.pos_path,
@@ -3227,7 +3227,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_sel: 1, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 1, n_comp: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let n_leaves = n_pos_leaves(NP, 1, 0) as usize + 1;
             let q: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, NH * QW)).collect();
             let kv_a: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, R)).collect();
@@ -3319,7 +3319,7 @@ mod attn_tests {
                     let (p0, p1) = tree.node(path).unwrap();
                     let ps = (p0 + d[3] % (p1 - p0)) as usize;
                     let bb = R / 32 * 34;
-                    let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1 };
+                    let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1, n_comp: 0 };
                     let range = ChunkRange { first_chunk: 0, chunks: self.weights.clone(), proof: rt_range_proof(&self.chunk_leaves, 0, n).1 };
                     let leaf = AttnOpening {
                         norms: vec![(self.eo(6), range)],
@@ -3521,7 +3521,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_sel: 1, n_layers: 1, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 1, n_comp: 0, n_layers: 1, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let iq: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(400 + t as u64, NHI * DK)).collect();
             let ik: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(500 + t as u64, DK).iter().map(|x| 3.0 * x).collect()).collect();
             let ig: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(600 + t as u64, DK)).collect();
@@ -3675,7 +3675,7 @@ mod attn_tests {
             let mut op = a.open(&s);
             op.members.clear();
             assert_eq!(verify_sel_point(&a.tier, &a.ctx, &resp, &s, &op), Ok(()));
-            assert_eq!(verify_sel_point(&a.tier, &ChainCtx { n_sel: 0, ..a.ctx }, &resp, &s, &op), Err(Fail::Unsupported));
+            assert_eq!(verify_sel_point(&a.tier, &ChainCtx { n_sel: 0, n_comp: 0, ..a.ctx }, &resp, &s, &op), Err(Fail::Unsupported));
         }
     }
 }
@@ -3859,7 +3859,7 @@ mod recur_tests {
             n_entries: entries.len() as u64,
             n_products: np as u64,
         };
-        let ctx = ChainCtx { n_sel: 0,
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0,
             n_layers: 1, layer_base: np as u32, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0,
             n_recur: 1, seq_heads: NV as u32,
         };
@@ -3959,7 +3959,7 @@ mod recur_tests {
         }
         let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
         let pos_root = b3_root(&pos_roots);
-        let layout = SeqLayout { n_attn: 0, n_recur: 1, heads: NV as u64 };
+        let layout = SeqLayout { n_attn: 0, n_recur: 1, heads: NV as u64, n_comp: 0 };
         let mut seq_leaves = vec![Vec::new(); layout.n_leaves() as usize];
         for h in 0..NV {
             seq_leaves[layout.record(0, h as u64).unwrap() as usize] = records[h].clone();
@@ -4012,7 +4012,7 @@ mod recur_tests {
             let (c, e) = (s * IV, ((s + 1) * IV).min(N_POS));
             let r0 = d[3] % (hd as u64 / RECUR_ROWS) * RECUR_ROWS;
             let p = c + ((d[3] >> 32) % (e - c) as u64) as usize;
-            let layout = SeqLayout { n_attn: 0, n_recur: 1, heads: NV as u64 };
+            let layout = SeqLayout { n_attn: 0, n_recur: 1, heads: NV as u64, n_comp: 0 };
             let rl = seq::record_len(l.kind, hd);
             let rows = |m: usize| {
                 let (lo, hi) = seq::checkpoint_rows(hd as u64, m as u64, r0, RECUR_ROWS);

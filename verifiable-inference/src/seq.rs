@@ -17,11 +17,18 @@ pub struct SeqLayout {
     pub n_attn: u64,
     pub n_recur: u64,
     pub heads: u64,
+    /// Compressed row leaves, after the mass leaves.
+    pub n_comp: u64,
 }
 
 impl SeqLayout {
     pub fn n_leaves(&self) -> u64 {
-        2 * self.heads * (self.n_attn + self.n_recur) + self.heads * self.n_attn
+        2 * self.heads * (self.n_attn + self.n_recur) + self.heads * self.n_attn + self.n_comp
+    }
+
+    /// Compressed row leaf `slot`: one row per completed block, block by block.
+    pub fn comp(&self, slot: u64) -> Option<u64> {
+        (slot < self.n_comp).then(|| 2 * self.heads * (self.n_attn + self.n_recur) + self.heads * self.n_attn + slot)
     }
 
     /// Key cache leaf of head `h` of attention layer `slot`.
@@ -150,7 +157,7 @@ mod tests {
 
     #[test]
     fn sequence_leaves_do_not_overlap() {
-        let l = SeqLayout { n_attn: 3, n_recur: 5, heads: 4 };
+        let l = SeqLayout { n_attn: 3, n_recur: 5, heads: 4, n_comp: 0 };
         let mut seen = std::collections::HashSet::new();
         for s in 0..3 {
             for h in 0..4 {
@@ -169,7 +176,7 @@ mod tests {
 
     #[test]
     fn spans_open_against_the_sequence_root() {
-        let layout = SeqLayout { n_attn: 1, n_recur: 1, heads: 2 };
+        let layout = SeqLayout { n_attn: 1, n_recur: 1, heads: 2, n_comp: 0 };
         let leaves: Vec<Vec<u8>> = (0..layout.n_leaves()).map(|i| leaf_bytes(i, 700 + 1500 * i as usize)).collect();
         let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
         let root = b3_root(&hashes);

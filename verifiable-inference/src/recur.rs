@@ -99,7 +99,7 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     let r0 = d[3] % (hd as u64 / RECUR_ROWS) * RECUR_ROWS;
     let p = c + (d[3] >> 32) % (e - c);
 
-    let layout = SeqLayout { n_attn: ctx.n_attn as u64, n_recur, heads: ctx.seq_heads as u64 };
+    let layout = SeqLayout { n_attn: ctx.n_attn as u64, n_recur, heads: ctx.seq_heads as u64, n_comp: ctx.n_comp as u64 };
     let rl = seq::record_len(r.kind, hd) as u64;
     let rec_leaf = layout.record(slot, h).ok_or(Fail::Shape)?;
     let bytes = seq::open_span(&op.seq_root, &layout, rec_leaf, n_pos * rl, c * rl, e * rl, &op.records).ok_or(Fail::Trace)?;

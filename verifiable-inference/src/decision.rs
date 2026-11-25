@@ -358,7 +358,7 @@ mod tests {
         let leaves: Vec<Hash> = entries.iter().map(|b| manifest::Entry::leaf(b)).collect();
         let m_t = rt_range_proof(&leaves, 0, 1).0;
         let tier = TierCtx { r_t: [0; 32], n_chunks: 1, m_t, n_entries: entries.len() as u64, n_products: N_PRODUCTS };
-        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: N_PRODUCTS as u32, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: N_PRODUCTS as u32, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let dctx = DecisionCtx { head_rank: HEAD, marker_tok: MARKER, pointer_tok: POINTER };
         let mut toks: Vec<u32> = (0..n as u32).map(|i| 10 + i).collect();
         for &p in markers {

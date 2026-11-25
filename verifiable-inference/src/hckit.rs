@@ -200,7 +200,7 @@ impl HcTier {
     }
 
     pub fn chain_ctx(&self) -> ChainCtx {
-        ChainCtx { n_sel: 0,
+        ChainCtx { n_sel: 0, n_comp: 0,
             n_layers: N_LAYERS as u32,
             layer_base: LAYERS as u32,
             embd_entry: EMBD as u32,
@@ -723,7 +723,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: np,
         };
-        let ctx = ChainCtx { n_sel: 0, n_layers: 1, layer_base: 9, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 9, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
 
         // FFN half of the layer: streams after attention, their mix, then the routed FFN.
         let r: Vec<f32> = vecf(3, N_HC * D, 2.0);

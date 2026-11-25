@@ -209,17 +209,17 @@ const DEFAULT_INTERVAL: u32 = 48;
 /// Stage-2 chain context of each tier, with the prefix embedding and norm entries of its
 /// manifest. MUST equal the node's `TRACE_CHAINS_H15`.
 const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; SLOTS] = [
-    Some((ChainCtx { n_sel: 0, n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
-    Some((ChainCtx { n_sel: 0, n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 361, 362)),
-    Some((ChainCtx { n_sel: 0, n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 329, 330)),
-    Some((ChainCtx { n_sel: 0, n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 497, 498)),
-    Some((ChainCtx { n_sel: 0, n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
-    Some((ChainCtx { n_sel: 0, n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
-    Some((ChainCtx { n_sel: 0, n_layers: 32, layer_base: 316, embd_entry: 250, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 250, 251)),
-    Some((ChainCtx { n_sel: 0, n_layers: 60, layer_base: 653, embd_entry: 411, eps: 9.999999974752427e-07, embd_scale: 73.32121276855469, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 411, 412)),
-    Some((ChainCtx { n_sel: 0, n_layers: 40, layer_base: 593, embd_entry: 431, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 431, 432)),
-    Some((ChainCtx { n_sel: 0, n_layers: 64, layer_base: 626, embd_entry: 496, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 496, 497)),
-    Some((ChainCtx { n_sel: 0, n_layers: 45, layer_base: 1079, embd_entry: 802, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: false, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 802, manifest::NONE)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 40, layer_base: 523, embd_entry: 361, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 361, 362)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 48, layer_base: 523, embd_entry: 329, eps: 9.999999974752427e-07, embd_scale: 61.967735290527344, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 329, 330)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 64, layer_base: 627, embd_entry: 497, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 497, 498)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 32, layer_base: 315, embd_entry: 249, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 249, 250)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 32, layer_base: 316, embd_entry: 250, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 250, 251)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 60, layer_base: 653, embd_entry: 411, eps: 9.999999974752427e-07, embd_scale: 73.32121276855469, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 411, 412)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 40, layer_base: 593, embd_entry: 431, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 431, 432)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 64, layer_base: 626, embd_entry: 496, eps: 9.999999974752427e-07, embd_scale: 1.0, trim_last: true, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 }, 496, 497)),
+    Some((ChainCtx { n_sel: 0, n_comp: 0, n_layers: 45, layer_base: 1079, embd_entry: 802, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: false, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 802, manifest::NONE)),
 ];
 
 /// Positions whose head output a decision opening reads: every marker, then the pointer.

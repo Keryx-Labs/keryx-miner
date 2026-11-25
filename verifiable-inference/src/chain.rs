@@ -39,6 +39,8 @@ pub struct ChainCtx {
     pub seq_heads: u32,
     /// Selection leaves per position, one per attention layer with a full sparse indexer.
     pub n_sel: u32,
+    /// Compressed row leaves of the sequence tree, one per layer producing compressed rows.
+    pub n_comp: u32,
 }
 /// Relative tolerance of a residual addition, per element.
 pub const EPS_RESID: f64 = 1e-6;
@@ -1972,7 +1974,7 @@ fn committed_lse(ctx: &ChainCtx, op: &AttnOpening, s: &AttnSite, n_pos: u64, kv:
 }
 
 pub fn seq_layout(ctx: &ChainCtx) -> crate::seq::SeqLayout {
-    crate::seq::SeqLayout { n_attn: ctx.n_attn as u64, n_recur: ctx.n_recur as u64, heads: ctx.seq_heads as u64 }
+    crate::seq::SeqLayout { n_attn: ctx.n_attn as u64, n_recur: ctx.n_recur as u64, heads: ctx.seq_heads as u64, n_comp: ctx.n_comp as u64 }
 }
 
 /// Q8_0 head rows of positions `[p0, p1)` of the cache sequence leaf `leaf`, from `span`.
