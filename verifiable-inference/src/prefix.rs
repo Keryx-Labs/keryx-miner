@@ -23,7 +23,8 @@ pub struct PrefixCtx {
     pub offset: u32,
     /// Manifest index of the embedding table entry.
     pub embd_entry: u32,
-    /// Manifest index of the layer-0 input norm entry.
+    /// Manifest index of the layer-0 input norm entry; `NONE` = unit weights, the input being the
+    /// embedding repeated over the product's width (hyper-connection streams).
     pub norm_entry: u32,
     /// RMS norm epsilon.
     pub eps: f64,
@@ -115,12 +116,17 @@ pub(crate) fn verify_prefix_point_at(
         return Err(Fail::Manifest);
     }
     let embd = open_entry(tier, &p.embd.0, ctx.embd_entry as u64)?;
-    let norm = open_entry(tier, &p.norm.0, ctx.norm_entry as u64)?;
-    if embd.role != manifest::ROLE_EMBD || norm.role != manifest::ROLE_NORM || norm.wtype != 0 {
+    if embd.role != manifest::ROLE_EMBD || embd.n_exp != 1 || embd.k == 0 {
         return Err(Fail::Manifest);
     }
-    if embd.k != first.k || norm.k != first.k || embd.n_exp != 1 || norm.n_exp != 1 {
-        return Err(Fail::Manifest);
+    let norm = match ctx.norm_entry {
+        manifest::NONE => None,
+        i => Some(open_entry(tier, &p.norm.0, i as u64)?),
+    };
+    match &norm {
+        Some(n) if n.role != manifest::ROLE_NORM || n.wtype != 0 || n.k != first.k || n.n_exp != 1 || embd.k != first.k => return Err(Fail::Manifest),
+        None if !first.k.is_multiple_of(embd.k) => return Err(Fail::Manifest),
+        _ => {}
     }
 
     let shape = shape_for(tok);
@@ -142,15 +148,18 @@ pub(crate) fn verify_prefix_point_at(
 
     let k = first.k as usize;
     let row = open_row(tier, &embd, &p.embd.1, tok as u64)?;
-    let e = quant::dequant_row(embd.wtype, &row, k).ok_or(Fail::Unsupported)?;
+    let one = quant::dequant_row(embd.wtype, &row, embd.k as usize).ok_or(Fail::Unsupported)?;
+    let e: Vec<f32> = one.iter().copied().cycle().take(k).collect();
     let (b0, nb) = if fragment {
         crate::chain::norm_fragment(crate::chain::link_block(seed, PREFIX_POINT, &p.x, layout, k as u64).ok_or(Fail::Shape)?, k as u64)
     } else {
         (0, (k as u64).div_ceil(32))
     };
     let (lo, len) = (b0 * 32, (nb * 32).min(k as u64 - b0 * 32));
-    let w_bytes = open_bytes(tier, &norm, &p.norm.1, 4 * lo, 4 * len)?;
-    let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let w: Vec<f32> = match &norm {
+        Some(n) => open_bytes(tier, n, &p.norm.1, 4 * lo, 4 * len)?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        None => vec![1.0; len as usize],
+    };
     let dev = if fragment {
         let s = crate::chain::rms_scaled(&e, ctx.eps, ctx.embd_scale);
         let v: Vec<f64> = s[lo as usize..(lo + len) as usize].iter().zip(&w).map(|(a, &b)| a * b as f64).collect();

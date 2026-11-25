@@ -8,6 +8,8 @@ pub mod chain;
 pub mod decision;
 #[cfg(any(test, feature = "testkit"))]
 pub mod chainkit;
+#[cfg(test)]
+pub mod hckit;
 pub mod dot;
 pub mod draw;
 pub mod f16;

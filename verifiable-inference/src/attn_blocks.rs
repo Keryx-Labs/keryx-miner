@@ -158,6 +158,48 @@ impl BlockTree {
     }
 }
 
+/// A block tree whose nodes keep only the children holding an attended position; `keep[p - lo]`
+/// tells whether position `p` is attended. Paths index the kept children.
+#[derive(Clone, Copy, Debug)]
+pub struct PrunedTree<'a> {
+    pub tree: BlockTree,
+    pub keep: &'a [bool],
+}
+
+impl PrunedTree<'_> {
+    fn kept(&self, (p0, p1): (u64, u64)) -> bool {
+        (p0..p1).any(|p| self.keep.get((p - self.tree.lo) as usize).copied().unwrap_or(false))
+    }
+
+    fn raw_path(&self, path: &[u64]) -> Option<Vec<u64>> {
+        let mut raw = Vec::with_capacity(path.len());
+        for &i in path {
+            let (j, _) = self.tree.children(&raw)?.into_iter().enumerate().filter(|(_, r)| self.kept(*r)).nth(i as usize)?;
+            raw.push(j as u64);
+        }
+        Some(raw)
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.tree.depth()
+    }
+
+    /// Positions of the node reached by `path` over kept children.
+    pub fn node(&self, path: &[u64]) -> Option<(u64, u64)> {
+        self.tree.node(&self.raw_path(path)?)
+    }
+
+    /// Positions of each kept child of the node reached by `path`; `None` for a leaf.
+    pub fn children(&self, path: &[u64]) -> Option<Vec<(u64, u64)>> {
+        Some(self.tree.children(&self.raw_path(path)?)?.into_iter().filter(|r| self.kept(*r)).collect())
+    }
+
+    /// Whether position `p` is attended.
+    pub fn attended(&self, p: u64) -> bool {
+        p >= self.tree.lo && self.keep.get((p - self.tree.lo) as usize).copied().unwrap_or(false)
+    }
+}
+
 /// Partial of the union of the runs of `parts`.
 pub fn combine(parts: &[Partial]) -> Option<Partial> {
     let d = parts.first()?.o.len();
@@ -345,6 +387,32 @@ pub fn children_partials(arith: Arith, q: &[f64], scale: f64, keys: &[Vec<f32>],
             partial(arith, q, scale, keys.get(r.clone())?, values.get(r)?)
         })
         .collect()
+}
+
+/// Partials of the kept children of `path` over their attended positions; `keys[p - lo]` is the
+/// key of position `p`.
+#[allow(clippy::too_many_arguments)]
+pub fn pruned_partials(arith: Arith, q: &[f64], scale: f64, keys: &[Vec<f32>], values: &[Vec<f32>], lo: u64, tree: &PrunedTree, path: &[u64]) -> Option<Vec<Partial>> {
+    tree.children(path)?
+        .into_iter()
+        .map(|(p0, p1)| {
+            let at: Vec<usize> = (p0..p1).filter(|&p| tree.attended(p)).map(|p| p.checked_sub(lo).map(|i| i as usize)).collect::<Option<_>>()?;
+            let ks = at.iter().map(|&i| keys.get(i).cloned()).collect::<Option<Vec<_>>>()?;
+            let vs = at.iter().map(|&i| values.get(i).cloned()).collect::<Option<Vec<_>>>()?;
+            partial(arith, q, scale, &ks, &vs)
+        })
+        .collect()
+}
+
+/// Encoded partials of the kept children of `path` under the first rounding whose decoded
+/// partials pass `check`.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_pruned_partials(q: &[f64], scale: f64, keys: &[Vec<f32>], values: &[Vec<f32>], lo: u64, tree: &PrunedTree, path: &[u64], check: impl Fn(&[Partial]) -> bool) -> Option<Vec<u8>> {
+    let d = values.first()?.len();
+    ARITHS.iter().find_map(|&a| {
+        let enc = encode_partials(&pruned_partials(a, q, scale, keys, values, lo, tree, path)?);
+        decode_partials(&enc, d).is_some_and(|p| check(&p)).then_some(enc)
+    })
 }
 
 /// Encoded partials of the children of `path` under the first rounding whose decoded partials

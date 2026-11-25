@@ -122,6 +122,44 @@ pub enum LinkOpening {
     Norm { src: LeafBytes, norm: (EntryOpening, ChunkRange) },
     Token { embd: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
     Source { src: EntryOpening, y: LeafChunk, ids: Option<ExpertIds> },
+    /// The whole residual streams a mix product reads, or the token embedding at layer 0.
+    HcIn { layer: EntryOpening, src: HcSource },
+    /// The streams, the mix output and the mix weights the first product of a half reads.
+    HcPre { layer: EntryOpening, src: HcSource, mixes: LeafBytes, base: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
+}
+
+/// Residual streams of a hyper-connection link: committed, or the token embedding repeated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HcSource {
+    Streams(LeafBytes),
+    Token((EntryOpening, ChunkRange)),
+}
+
+/// One chunk of each source stream and the mix a hyper-connection residual is built from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HcAdd {
+    /// The chunk of the half's output at the same offset as the residual chunk.
+    pub o: LeafChunk,
+    /// The same chunk of every source stream; empty when the source is the token embedding.
+    pub streams: Vec<LeafChunk>,
+    pub mixes: LeafBytes,
+    pub base: (EntryOpening, ChunkRange),
+    /// The routed experts of a MoE half, whose output adds to `o`.
+    pub moe: Option<Box<HcMoe>>,
+}
+
+/// The routed experts of a hyper-connection MoE half, read from the router input as committed by
+/// the gate product of the experts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HcMoe {
+    pub scores: LeafBytes,
+    pub bias: (EntryOpening, ChunkRange),
+    pub ids: ExpertIds,
+    pub slots: Vec<LeafChunk>,
+    pub router_row: (EntryOpening, ChunkRange),
+    /// The gate product of the experts and its whole input leaf.
+    pub gate: EntryOpening,
+    pub x: LeafBytes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +173,7 @@ pub enum ResidAdd {
     Chunk(LeafChunk),
     Normed { y: LeafBytes, norm: (EntryOpening, ChunkRange) },
     Moe(Box<MoeAdd>),
+    Hc(Box<HcAdd>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +285,16 @@ pub struct AttnOpening {
     pub partials: Vec<u8>,
     /// Committed log mass of the drawn query head at the drawn position (output phase).
     pub lse: crate::seq::SeqSpan,
+    /// The selection the drawn position attends, on a sparse attention layer (every phase).
+    pub sel: Option<SelOpening>,
+}
+
+/// A selection leaf of a position: the chosen pools, and its paths to the position root.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SelOpening {
+    pub bytes: Vec<u8>,
+    pub leaf_path: Vec<Hash>,
+    pub pos_path: Vec<Hash>,
 }
 
 /// The projection outputs read by the convolutions at one position of the anchor window.
@@ -366,6 +415,31 @@ impl W {
                     None => self.u8(0),
                 }
             }
+            LinkOpening::HcIn { layer, src } => {
+                self.u8(4);
+                self.entry(layer);
+                self.hc_source(src);
+            }
+            LinkOpening::HcPre { layer, src, mixes, base, norm } => {
+                self.u8(5);
+                self.entry(layer);
+                self.hc_source(src);
+                self.leaf_bytes(mixes);
+                self.weights(base);
+                self.weights(norm);
+            }
+        }
+    }
+    fn hc_source(&mut self, s: &HcSource) {
+        match s {
+            HcSource::Streams(b) => {
+                self.u8(0);
+                self.leaf_bytes(b);
+            }
+            HcSource::Token(w) => {
+                self.u8(1);
+                self.weights(w);
+            }
         }
     }
     fn resid(&mut self, p: &ResidPoint) {
@@ -413,6 +487,33 @@ impl W {
                 self.weights(&m.norm);
                 if let Some(g) = &m.shexp_gate {
                     self.weights(g);
+                }
+            }
+            ResidAdd::Hc(h) => {
+                self.u8(4);
+                self.leaf_chunk(&h.o);
+                self.u8(h.streams.len() as u8);
+                for c in &h.streams {
+                    self.leaf_chunk(c);
+                }
+                self.leaf_bytes(&h.mixes);
+                self.weights(&h.base);
+                match &h.moe {
+                    Some(m) => {
+                        self.u8(1);
+                        self.leaf_bytes(&m.scores);
+                        self.weights(&m.bias);
+                        self.bytes32(&m.ids.chunk);
+                        self.hashes(&m.ids.chunk_path);
+                        self.u8(m.slots.len() as u8);
+                        for c in &m.slots {
+                            self.leaf_chunk(c);
+                        }
+                        self.weights(&m.router_row);
+                        self.entry(&m.gate);
+                        self.leaf_bytes(&m.x);
+                    }
+                    None => self.u8(0),
                 }
             }
         }
@@ -494,6 +595,15 @@ impl R<'_> {
                     _ => return None,
                 },
             },
+            4 => LinkOpening::HcIn { layer: self.entry()?, src: self.hc_source()? },
+            5 => LinkOpening::HcPre { layer: self.entry()?, src: self.hc_source()?, mixes: self.leaf_bytes()?, base: self.weights()?, norm: self.weights()? },
+            _ => return None,
+        })
+    }
+    fn hc_source(&mut self) -> Option<HcSource> {
+        Some(match self.u8()? {
+            0 => HcSource::Streams(self.leaf_bytes()?),
+            1 => HcSource::Token(self.weights()?),
             _ => return None,
         })
     }
@@ -530,6 +640,24 @@ impl R<'_> {
                     norm: self.weights()?,
                     shexp_gate: if tag == 3 { Some(self.weights()?) } else { None },
                 }))
+            }
+            4 => {
+                let o = self.leaf_chunk()?;
+                let n = self.u8()? as usize;
+                let streams = (0..n).map(|_| self.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+                let (mixes, base) = (self.leaf_bytes()?, self.weights()?);
+                let moe = match self.u8()? {
+                    0 => None,
+                    1 => {
+                        let (scores, bias) = (self.leaf_bytes()?, self.weights()?);
+                        let ids = ExpertIds { chunk: self.bytes32()?, chunk_path: self.hashes()? };
+                        let n = self.u8()? as usize;
+                        let slots = (0..n).map(|_| self.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+                        Some(Box::new(HcMoe { scores, bias, ids, slots, router_row: self.weights()?, gate: self.entry()?, x: self.leaf_bytes()? }))
+                    }
+                    _ => return None,
+                };
+                ResidAdd::Hc(Box::new(HcAdd { o, streams, mixes, base, moe }))
             }
             _ => return None,
         };
@@ -857,6 +985,12 @@ impl AttnOpening {
         w.hashes(&self.parent_path);
         w.bytes32(&self.partials);
         w.seq_span(&self.lse);
+        if let Some(s) = &self.sel {
+            w.u8(1);
+            w.bytes32(&s.bytes);
+            w.hashes(&s.leaf_path);
+            w.hashes(&s.pos_path);
+        }
         w.0
     }
 
@@ -892,6 +1026,11 @@ impl AttnOpening {
         let parent_path = r.hashes()?;
         let partials = r.bytes32()?;
         let lse = r.seq_span()?;
+        let sel = match r.o == b.len() {
+            true => None,
+            false if r.u8()? == 1 => Some(SelOpening { bytes: r.bytes32()?, leaf_path: r.hashes()?, pos_path: r.hashes()? }),
+            false => return None,
+        };
         let o = AttnOpening {
             response_txid,
             pos_root,
@@ -914,6 +1053,7 @@ impl AttnOpening {
             parent_path,
             partials,
             lse,
+            sel,
         };
         (r.o == b.len()).then_some(o)
     }
@@ -1168,6 +1308,7 @@ mod attn_opening_tests {
             parent_path: vec![[14; 32]; 8],
             partials: vec![15; 264 * 3],
             lse: span(22, 1024),
+            sel: None,
         }
     }
 
@@ -1177,6 +1318,13 @@ mod attn_opening_tests {
         let b = o.encode();
         assert_eq!(b[0], VERSION_ATTN);
         assert_eq!(AttnOpening::decode(&b), Some(o));
+        let with_sel = AttnOpening { sel: Some(SelOpening { bytes: vec![1, 0, 0, 0, 5, 0, 0, 0], leaf_path: vec![[3; 32]; 4], pos_path: vec![[4; 32]; 3] }), ..sample() };
+        assert_eq!(AttnOpening::decode(&with_sel.encode()), Some(with_sel.clone()));
+        let empty = AttnOpening { sel: Some(SelOpening { bytes: Vec::new(), leaf_path: vec![[3; 32]; 4], pos_path: vec![[4; 32]; 3] }), ..sample() };
+        assert_eq!(AttnOpening::decode(&empty.encode()), Some(empty));
+        let mut w = W(sample().encode());
+        w.u8(0);
+        assert!(AttnOpening::decode(&w.0).is_none());
     }
 
     #[test]

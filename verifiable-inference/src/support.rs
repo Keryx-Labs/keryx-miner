@@ -4,7 +4,7 @@
 use crate::attn::Prep;
 use crate::attn_blocks::{BlockTree, block_params, partial_len};
 use crate::chain::{ChainCtx, gqa_shape, seq_layout};
-use crate::manifest::{self, AttnLinks, Chain, Entry, LayerLinks, RECUR_GDA, RECUR_KDA, RecurLinks};
+use crate::manifest::{self, AttnLinks, Chain, Entry, LayerLinks, RecurLinks};
 use crate::merkle::B3_CHUNK;
 use crate::recur::RECUR_ROWS;
 use crate::seq::SeqLayout;
@@ -120,10 +120,10 @@ fn recur_layer<'a>(entry: &impl Fn(u32) -> Result<&'a Entry, String>, ctx: &Chai
         return Err("context or slot".into());
     }
     let (hd, nv, nk, cl) = (r.head_dim as usize, r.n_v_heads as usize, r.n_k_heads as usize, r.conv_len as u64);
-    if !matches!(r.kind, RECUR_GDA | RECUR_KDA) || !(1..=8).contains(&cl) || r.interval == 0 {
+    if !manifest::recur_kind_known(r.kind) || !(1..=8).contains(&cl) || r.interval == 0 {
         return Err("kind, convolution or interval".into());
     }
-    let kda = r.kind == RECUR_KDA;
+    let kda = manifest::per_key_decay(r.kind);
     if hd == 0 || !hd.is_multiple_of(32) || !(hd as u64).is_multiple_of(RECUR_ROWS) || nk == 0 || !nv.is_multiple_of(nk) || nv > ctx.seq_heads as usize || (kda && nk != nv) {
         return Err("heads".into());
     }

@@ -2,7 +2,7 @@
 //! byte spans.
 
 use crate::f16;
-use crate::manifest::{RECUR_GDA, RECUR_KDA};
+use crate::manifest;
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunks, b3_root};
 
 /// Trace root over the position tree root and the sequence tree root.
@@ -77,7 +77,7 @@ pub fn open_span<'a>(seq_root: &Hash, layout: &SeqLayout, leaf: u64, total_len: 
 
 /// Bytes of the record of one recurrent head at one position.
 pub fn record_len(kind: u32, hd: usize) -> usize {
-    4 * 2 * hd + 4 + if kind == RECUR_KDA { 2 * hd } else { 4 }
+    4 * 2 * hd + 4 + if manifest::per_key_decay(kind) { 2 * hd } else { 4 }
 }
 
 /// Inputs and output of the delta rule of one head at one position.
@@ -101,7 +101,7 @@ impl Record {
             b.extend_from_slice(&f16::from_f32(*x).to_le_bytes());
         }
         b.extend_from_slice(&self.beta.to_le_bytes());
-        if kind == RECUR_KDA {
+        if manifest::per_key_decay(kind) {
             for x in &self.g {
                 b.extend_from_slice(&f16::from_f32(*x).to_le_bytes());
             }
@@ -112,13 +112,13 @@ impl Record {
     }
 
     pub fn decode(kind: u32, hd: usize, b: &[u8]) -> Option<Record> {
-        if !matches!(kind, RECUR_GDA | RECUR_KDA) || b.len() != record_len(kind, hd) {
+        if !manifest::recur_kind_known(kind) || b.len() != record_len(kind, hd) {
             return None;
         }
         let halves = |o: usize, n: usize| (0..n).map(|i| f16::read(b, o + 2 * i)).collect::<Vec<f32>>();
         let f32_at = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         let beta = f32_at(8 * hd);
-        let g = if kind == RECUR_KDA { halves(8 * hd + 4, hd) } else { vec![f32_at(8 * hd + 4)] };
+        let g = if manifest::per_key_decay(kind) { halves(8 * hd + 4, hd) } else { vec![f32_at(8 * hd + 4)] };
         let r = Record { q: halves(0, hd), k: halves(2 * hd, hd), v: halves(4 * hd, hd), o: halves(6 * hd, hd), beta, g };
         let finite = [&r.q, &r.k, &r.v, &r.o, &r.g].into_iter().flatten().all(|x| x.is_finite()) && beta.is_finite();
         finite.then_some(r)
@@ -141,6 +141,7 @@ pub fn checkpoint_rows(hd: u64, m: u64, r0: u64, n: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{RECUR_GDA, RECUR_KDA};
     use crate::merkle::{b3_chunks_proof, b3_path};
 
     fn leaf_bytes(i: u64, n: usize) -> Vec<u8> {

@@ -33,6 +33,14 @@ pub const LINK_HEAD: u8 = 4;
 pub const LINK_DIRECT: u8 = 5;
 /// Per-head input: head `h` reads `[h * stride, h * stride + k)` of the source output, `stride` = source rows / heads.
 pub const LINK_HEAD_SLICE: u8 = 6;
+/// Input of a hyper-connection mix product: the layer's input streams, normed without weight.
+pub const LINK_HC_ATTN_IN: u8 = 16;
+/// Input of the FFN mix product: the streams after the attention half.
+pub const LINK_HC_FFN_IN: u8 = 17;
+/// First input of the attention half: `rms_norm(sum pre_i R_i) * norm`, `src` = the mix product.
+pub const LINK_HC_ATTN_PRE: u8 = 18;
+/// First input of the FFN half, as [`LINK_HC_ATTN_PRE`].
+pub const LINK_HC_FFN_PRE: u8 = 19;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
@@ -45,6 +53,12 @@ const TAG_RECUR_MOE_LAYER: u8 = 7;
 const TAG_MOEG_LAYER: u8 = 10;
 const TAG_ATTN_MOEG_LAYER: u8 = 11;
 const TAG_RECUR_MOEG_LAYER: u8 = 12;
+/// A layer of hyper-connection streams, wrapping its residual links.
+const TAG_HC: u8 = 14;
+/// An attention layer restricted to the cells an indexer selects, wrapping its links.
+const TAG_DSA: u8 = 15;
+const DSA_FIELDS: usize = 4;
+const HC_FIELDS: usize = 13;
 
 /// Source of a product's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +81,68 @@ pub struct LayerLinks {
     pub moe: Option<MoeLinks>,
     pub attn: Option<AttnLinks>,
     pub recur: Option<RecurLinks>,
+    pub hc: Option<HcLinks>,
+    pub dsa: Option<DsaLinks>,
+}
+
+/// Sparse attention of a layer: the query attends the cells of `n_top` pools of `kpool`
+/// consecutive cells, chosen by an indexer, and the incomplete pool before it when `tail`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsaLinks {
+    /// Selection leaf of a position the layer reads (one per layer with a full indexer).
+    pub sel: u32,
+    pub kpool: u32,
+    pub n_top: u32,
+    pub tail: u32,
+}
+
+impl DsaLinks {
+    fn fields(&self) -> [u32; DSA_FIELDS] {
+        [self.sel, self.kpool, self.n_top, self.tail]
+    }
+
+    fn from_fields(f: [u32; DSA_FIELDS]) -> Self {
+        Self { sel: f[0], kpool: f[1], n_top: f[2], tail: f[3] }
+    }
+}
+
+/// Hyper-connection mix of a layer: `n_hc` residual streams combined by `pre`, `post`, `comb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HcLinks {
+    /// Ranks of the mix products of the attention and FFN halves.
+    pub attn_fn: u32,
+    pub ffn_fn: u32,
+    /// The 3 scales of each half, f32 bits (too short to be committed by the weight root).
+    pub attn_scale: [u32; 3],
+    pub ffn_scale: [u32; 3],
+    /// F32 entries of the `(2 + n_hc) * n_hc` biases of each half.
+    pub attn_base: u32,
+    pub ffn_base: u32,
+    pub n_hc: u32,
+    pub sinkhorn_iters: u32,
+    /// f32 bits.
+    pub eps: u32,
+}
+
+impl HcLinks {
+    fn fields(&self) -> [u32; HC_FIELDS] {
+        let (a, f) = (self.attn_scale, self.ffn_scale);
+        [self.attn_fn, self.ffn_fn, a[0], a[1], a[2], f[0], f[1], f[2], self.attn_base, self.ffn_base, self.n_hc, self.sinkhorn_iters, self.eps]
+    }
+
+    fn from_fields(f: [u32; HC_FIELDS]) -> Self {
+        Self {
+            attn_fn: f[0],
+            ffn_fn: f[1],
+            attn_scale: [f[2], f[3], f[4]],
+            ffn_scale: [f[5], f[6], f[7]],
+            attn_base: f[8],
+            ffn_base: f[9],
+            n_hc: f[10],
+            sinkhorn_iters: f[11],
+            eps: f[12],
+        }
+    }
 }
 
 /// Routed experts of a layer.
@@ -143,6 +219,20 @@ impl AttnLinks {
 pub const RECUR_GDA: u32 = 0;
 /// Gated delta rule with one decay per key dimension.
 pub const RECUR_KDA: u32 = 1;
+/// [`RECUR_KDA`] with the decay bounded below: `KDA_GATE_LOWER_BOUND * sigmoid(-a x)` instead of
+/// `a * softplus(x)`.
+pub const RECUR_KDA_BOUNDED: u32 = 2;
+pub const KDA_GATE_LOWER_BOUND: f64 = -5.0;
+
+/// Whether a recurrent kind is known.
+pub fn recur_kind_known(kind: u32) -> bool {
+    matches!(kind, RECUR_GDA | RECUR_KDA | RECUR_KDA_BOUNDED)
+}
+
+/// Whether a recurrent kind decays per key dimension, not per head.
+pub fn per_key_decay(kind: u32) -> bool {
+    matches!(kind, RECUR_KDA | RECUR_KDA_BOUNDED)
+}
 
 /// Recurrent layer: inputs of the per-head delta rule and its gated output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +315,30 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
     match b.first() {
         None => None,
         Some(&TAG_NONE) => Some((Chain::None, 1)),
+        Some(&TAG_DSA) => {
+            let mut f = [0u32; DSA_FIELDS];
+            for (i, v) in f.iter_mut().enumerate() {
+                *v = u32a(1 + 4 * i)?;
+            }
+            let head = 1 + 4 * DSA_FIELDS;
+            match parse_chain(b.get(head..)?)? {
+                (Chain::Layer(l), len) if l.dsa.is_none() && l.hc.is_none() && l.attn.is_some() => {
+                    Some((Chain::Layer(LayerLinks { dsa: Some(DsaLinks::from_fields(f)), ..l }), head + len))
+                }
+                _ => None,
+            }
+        }
+        Some(&TAG_HC) => {
+            let mut f = [0u32; HC_FIELDS];
+            for (i, v) in f.iter_mut().enumerate() {
+                *v = u32a(1 + 4 * i)?;
+            }
+            let head = 1 + 4 * HC_FIELDS;
+            match parse_chain(b.get(head..)?)? {
+                (Chain::Layer(l), len) if l.hc.is_none() => Some((Chain::Layer(LayerLinks { hc: Some(HcLinks::from_fields(f)), ..l }), head + len)),
+                _ => None,
+            }
+        }
         Some(&TAG_PRODUCT) => {
             let link = *b.get(5)?;
             Some((Chain::Product(ProductLink { layer: u32a(1)?, link, norm: u32a(6)?, src: u32a(10)? }), 14))
@@ -277,6 +391,8 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                     moe,
                     attn,
                     recur,
+                    hc: None,
+                    dsa: None,
                 }),
                 base + if attn.is_some() { 4 * ATTN_FIELDS } else { 0 } + if recur.is_some() { 4 * RECUR_FIELDS } else { 0 },
             ))
@@ -296,6 +412,20 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             b.push(p.link);
             b.extend_from_slice(&p.norm.to_le_bytes());
             b.extend_from_slice(&p.src.to_le_bytes());
+        }
+        Chain::Layer(l) if l.hc.is_some() => {
+            b.push(TAG_HC);
+            for v in l.hc.unwrap().fields() {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { hc: None, ..*l })));
+        }
+        Chain::Layer(l) if l.dsa.is_some() => {
+            b.push(TAG_DSA);
+            for v in l.dsa.unwrap().fields() {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { dsa: None, ..*l })));
         }
         Chain::Layer(l) => {
             let gated = l.moe.is_some_and(|m| m.shexp_gate != NONE);
@@ -475,15 +605,15 @@ mod tests {
     #[test]
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
-        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None });
+        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, hc: None, dsa: None });
         let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13, shexp_gate: NONE };
-        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None });
+        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None });
         let attn = AttnLinks {
             q: 1, k: 2, v: 3, q_norm: NONE, k_norm: NONE, n_head: 32, n_head_kv: 2, head_dim: 128, rope_kind: 0, n_rot: 128,
             rope_base: 10_000f32.to_bits(), kq_scale: (1.0f32 / 128f32.sqrt()).to_bits(), swa_window: 0, softcap: 0, rope_freqs: NONE, v_norm: 0, gated: 0, slot: 0, mla_rank: 0, absorb: NONE, out: NONE,
         };
-        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None });
-        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None });
+        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None });
+        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None, hc: None, dsa: None });
         assert_eq!(chain_bytes(&l).len(), 25);
         assert_eq!(chain_bytes(&lm).len(), 49);
         assert_eq!(chain_bytes(&la).len(), 25 + 84);
@@ -492,8 +622,8 @@ mod tests {
             kind: RECUR_KDA, slot: 2, n_v_heads: 32, n_k_heads: 32, head_dim: 128, q: 40, k: 41, v: 42, conv_q: 300, conv_k: 301,
             conv_v: 302, beta: 43, decay: 44, dt: 303, a: 304, norm: 305, gate: 45, interval: 48, conv_len: 4,
         };
-        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur) });
-        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur) });
+        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur), hc: None, dsa: None });
+        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur), hc: None, dsa: None });
         assert_eq!(chain_bytes(&lr).len(), 25 + 76);
         assert_eq!(chain_bytes(&lmr).len(), 49 + 76);
         let gated = MoeLinks { probs_bias: NONE, w_scale: 1f32.to_bits(), shexp_gate: 44, ..moe };

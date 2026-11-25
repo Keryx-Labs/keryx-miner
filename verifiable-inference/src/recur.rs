@@ -2,7 +2,7 @@
 
 use crate::chain::{ChainCtx, block_outliers, chunk_leaf, f32_weights, f32s, shape_any};
 use crate::draw;
-use crate::manifest::{self, Chain, RECUR_GDA, RECUR_KDA};
+use crate::manifest::{self, Chain, RECUR_KDA_BOUNDED};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_verify};
 use crate::opening::{LeafChunk, RecurOpening};
 use crate::prefix::THRESHOLD;
@@ -85,13 +85,13 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     if r.slot as u64 != slot {
         return Err(Fail::Manifest);
     }
-    if !matches!(r.kind, RECUR_GDA | RECUR_KDA) || !(1..=8).contains(&cl) || iv == 0 {
+    if !manifest::recur_kind_known(r.kind) || !(1..=8).contains(&cl) || iv == 0 {
         return Err(Fail::Unsupported);
     }
-    if hd == 0 || !hd.is_multiple_of(32) || !(hd as u64).is_multiple_of(RECUR_ROWS) || nk == 0 || !nv.is_multiple_of(nk) || nv > ctx.seq_heads as u64 || (r.kind == RECUR_KDA && nk != nv) {
+    if hd == 0 || !hd.is_multiple_of(32) || !(hd as u64).is_multiple_of(RECUR_ROWS) || nk == 0 || !nv.is_multiple_of(nk) || nv > ctx.seq_heads as u64 || (manifest::per_key_decay(r.kind) && nk != nv) {
         return Err(Fail::Manifest);
     }
-    let kda = r.kind == RECUR_KDA;
+    let kda = manifest::per_key_decay(r.kind);
     let h = d[2] % nv;
     let hk = h % nk;
     let s = d[0] % n_pos.div_ceil(iv);
@@ -235,7 +235,11 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     same_root(rt)?;
     let dt = f32_weights(tier, &op.weights[3], r.dt, nv64 * gw as u64, h * gw as u64, gw as u64)?;
     let a = f32_weights(tier, &op.weights[4], r.a, nv64, h, 1)?;
-    let g: Vec<f64> = (0..gw).map(|i| a[0] as f64 * softplus(dy[i] as f64 + if dt_in { dt[i] as f64 } else { 0.0 })).collect();
+    let x = |i: usize| dy[i] as f64 + if dt_in { dt[i] as f64 } else { 0.0 };
+    let g: Vec<f64> = match r.kind {
+        RECUR_KDA_BOUNDED => (0..gw).map(|i| manifest::KDA_GATE_LOWER_BOUND * sigmoid(-(x(i) * a[0] as f64))).collect(),
+        _ => (0..gw).map(|i| a[0] as f64 * softplus(x(i))).collect(),
+    };
     if !all_close(&g, &rec.g) {
         return Err(Fail::Mismatch);
     }

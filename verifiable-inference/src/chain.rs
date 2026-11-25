@@ -3,9 +3,9 @@
 use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
-use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, HcMoe, HcSource, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::attn::Partial;
-use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
+use crate::attn_blocks::{BlockTree, PrunedTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
 use crate::opening::{AttnOpening, PrefixPoint};
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
@@ -37,6 +37,8 @@ pub struct ChainCtx {
     pub n_recur: u32,
     /// Heads per layer in the sequence tree (the largest key/value or recurrent head count).
     pub seq_heads: u32,
+    /// Selection leaves per position, one per attention layer with a full sparse indexer.
+    pub n_sel: u32,
 }
 /// Relative tolerance of a residual addition, per element.
 pub const EPS_RESID: f64 = 1e-6;
@@ -274,12 +276,18 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
     Ok(())
 }
 
+/// Leaf index of selection `i` of a position, after the router leaves.
+pub const fn sel_leaf(n_products: u64, n_layers: u64, n_router: u64, i: u64) -> u64 {
+    2 * n_products + 2 * n_layers + n_router + i
+}
+
 /// Leaf layout of a stage-2 position consuming `tok`.
 pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
     let n_layers = ctx.n_layers as u64;
+    let n_sel = ctx.n_sel as u64;
     PosShape {
-        n_leaves: n_pos_leaves(tier.n_products, n_layers, n_router(ctx)),
-        meta_index: meta_leaf(tier.n_products, n_layers, n_router(ctx)),
+        n_leaves: n_pos_leaves(tier.n_products, n_layers, n_router(ctx)) + n_sel,
+        meta_index: meta_leaf(tier.n_products, n_layers, n_router(ctx)) + n_sel,
         tok: Some(tok),
         n_used: ctx.n_used,
     }
@@ -343,6 +351,110 @@ pub(crate) fn leaf_chunk(pos_root: &Hash, shape: &PosShape, leaf: u64, c: &LeafC
 
 fn n_chunks(total_len: u64) -> u64 {
     total_len.div_ceil(B3_CHUNK as u64).max(1)
+}
+
+/// Relative tolerance of a residual built from a hyper-connection mix.
+pub const EPS_HC: f64 = 1e-5;
+
+/// Weights of a hyper-connection mix: `pre[i]`, `post[i]`, `comb[dst + n * src]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HcMix {
+    pub pre: Vec<f64>,
+    pub post: Vec<f64>,
+    pub comb: Vec<f64>,
+}
+
+/// The mix of `n` streams from the mix product output `mixes`, its 3 scales and its biases:
+/// `pre = sigmoid + eps`, `post = 2 sigmoid`, `comb` = row softmax then Sinkhorn, as the graph.
+pub fn hc_mix(mixes: &[f32], scale: &[f32], base: &[f32], n: usize, iters: u32, eps: f64) -> Option<HcMix> {
+    if n == 0 || mixes.len() != (2 + n) * n || base.len() != mixes.len() || scale.len() != 3 || iters == 0 {
+        return None;
+    }
+    let sig = |x: f64| 1.0 / (1.0 + libm::exp(-x));
+    let at = |i: usize, s: f32| mixes[i] as f64 * s as f64 + base[i] as f64;
+    let pre: Vec<f64> = (0..n).map(|i| sig(at(i, scale[0])) + eps).collect();
+    let post: Vec<f64> = (0..n).map(|i| 2.0 * sig(at(n + i, scale[1]))).collect();
+    let mut c: Vec<f64> = (0..n * n).map(|k| at(2 * n + k, scale[2])).collect();
+    for src in 0..n {
+        let col = &mut c[n * src..n * (src + 1)];
+        let top = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let z: f64 = col.iter().map(|v| libm::exp(v - top)).sum();
+        for v in col.iter_mut() {
+            *v = libm::exp(*v - top) / z + eps;
+        }
+    }
+    let by_dst = |c: &mut Vec<f64>| {
+        for dst in 0..n {
+            let sum: f64 = (0..n).map(|src| c[dst + n * src]).sum::<f64>() + eps;
+            for src in 0..n {
+                c[dst + n * src] /= sum;
+            }
+        }
+    };
+    let by_src = |c: &mut Vec<f64>| {
+        for src in 0..n {
+            let sum: f64 = (0..n).map(|dst| c[dst + n * src]).sum::<f64>() + eps;
+            for dst in 0..n {
+                c[dst + n * src] /= sum;
+            }
+        }
+    };
+    by_dst(&mut c);
+    for _ in 1..iters {
+        by_src(&mut c);
+        by_dst(&mut c);
+    }
+    let all = pre.iter().chain(&post).chain(&c);
+    if all.clone().any(|v| !v.is_finite()) {
+        return None;
+    }
+    Some(HcMix { pre, post, comb: c })
+}
+
+/// The hyper-connection links of `layer` and the mix weights of its half `kind`.
+fn hc_half(tier: &TierCtx, ctx: &ChainCtx, layer: u64, kind: Resid, le: &EntryOpening) -> Result<(manifest::HcLinks, u32, [u32; 3], u32), Fail> {
+    let e = open_entry(tier, le, ctx.layer_base as u64 + layer)?;
+    let hc = match e.chain {
+        Chain::Layer(ll) if e.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => ll.hc.ok_or(Fail::Manifest)?,
+        _ => return Err(Fail::Manifest),
+    };
+    Ok(match kind {
+        Resid::Attn => (hc, hc.attn_fn, hc.attn_scale, hc.attn_base),
+        Resid::Out => (hc, hc.ffn_fn, hc.ffn_scale, hc.ffn_base),
+    })
+}
+
+/// The mix of the half whose mix product is `fn_rank`, from its committed output at the position.
+#[allow(clippy::too_many_arguments)]
+fn hc_mix_at(
+    tier: &TierCtx,
+    pos_root: &Hash,
+    shape: &PosShape,
+    hc: &manifest::HcLinks,
+    fn_rank: u32,
+    mixes: &LeafBytes,
+    scale: [u32; 3],
+    base: (&(EntryOpening, ChunkRange), u32),
+) -> Result<HcMix, Fail> {
+    let n = hc.n_hc as u64;
+    let m = (2 + n) * n;
+    let y = whole_leaf(pos_root, shape, 2 * fn_rank as u64 + 1, mixes, 4 * m)?;
+    let s = scale.map(f32::from_bits);
+    let b = f32_weights(tier, base.0, base.1, m, 0, m)?;
+    hc_mix(&y, &s, &b, n as usize, hc.sinkhorn_iters, f32::from_bits(hc.eps) as f64).ok_or(Fail::Mismatch)
+}
+
+/// The `n` streams of a hyper-connection source as one flat vector: committed, or the token
+/// embedding repeated.
+fn hc_streams(tier: &TierCtx, ctx: &ChainCtx, pos_root: &Hash, shape: &PosShape, src: &HcSource, leaf: Option<u64>, n: u64, dim: u64, tok: u32) -> Result<Vec<f32>, Fail> {
+    match (src, leaf) {
+        (HcSource::Streams(b), Some(l)) => whole_leaf(pos_root, shape, l, b, 4 * n * dim),
+        (HcSource::Token(w), None) => {
+            let row: Vec<f32> = embedding(tier, ctx, w, tok, dim)?.iter().map(|&v| (v as f64 * ctx.embd_scale) as f32).collect();
+            Ok((0..n).flat_map(|_| row.iter().copied()).collect())
+        }
+        _ => Err(Fail::Shape),
+    }
 }
 
 /// Verify point `i` of a stage-2 opening and the link of its input.
@@ -461,6 +573,46 @@ pub fn verify_chain_point(
             let (lo, hi) = ((c * per_chunk).max(start), ((c + 1) * per_chunk).min(start + k));
             let vals = h.get((lo - c * per_chunk) as usize..(hi - c * per_chunk) as usize).ok_or(Fail::Shape)?;
             glu_link(xs, o.layout, k as usize, ((lo - start) / 32) as usize, vals)?;
+        }
+        (manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_FFN_IN, LinkOpening::HcIn { layer: le, src })
+        | (manifest::LINK_HC_ATTN_PRE | manifest::LINK_HC_FFN_PRE, LinkOpening::HcPre { layer: le, src, .. }) => {
+            let attn = matches!(pl.link, manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE);
+            let half = if attn { Resid::Attn } else { Resid::Out };
+            let (hc, fn_rank, si, bi) = hc_half(tier, ctx, layer, half, le)?;
+            let leaf = match (attn, layer) {
+                (true, 0) => None,
+                (true, l) => Some(resid_leaf(np, l - 1, Resid::Out)),
+                (false, l) => Some(resid_leaf(np, l, Resid::Attn)),
+            };
+            let nh = hc.n_hc as u64;
+            let (b0, n) = norm_fragment(link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?, k);
+            let len = (n * 32).min(k - b0 * 32);
+            let x: Vec<f32> = match link {
+                LinkOpening::HcIn { .. } => {
+                    if pl.norm != manifest::NONE || pl.src != manifest::NONE || nh == 0 || !k.is_multiple_of(nh) || report.rank != fn_rank as u64 {
+                        return Err(Fail::Manifest);
+                    }
+                    hc_streams(tier, ctx, &o.pos_root, &shape, src, leaf, nh, k / nh, tok)?
+                }
+                LinkOpening::HcPre { mixes, base, .. } => {
+                    if pl.src != fn_rank {
+                        return Err(Fail::Manifest);
+                    }
+                    let mix = hc_mix_at(tier, &o.pos_root, &shape, &hc, fn_rank, mixes, si, (base, bi))?;
+                    let r = hc_streams(tier, ctx, &o.pos_root, &shape, src, leaf, nh, k, tok)?;
+                    let k = k as usize;
+                    (0..k).map(|j| (0..nh as usize).map(|s| mix.pre[s] * r[s * k + j] as f64).sum::<f64>() as f32).collect()
+                }
+                _ => unreachable!(),
+            };
+            if leaf.is_some() && !(RESID_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&x)) {
+                return Err(Fail::Mismatch);
+            }
+            let w = match link {
+                LinkOpening::HcPre { norm, .. } => f32_weights(tier, norm, pl.norm, k, b0 * 32, len)?,
+                _ => vec![1f32; len as usize],
+            };
+            fragment_link(&p.x, o.layout, k as usize, &rms_scaled(&x, ctx.eps, 1.0), &w, b0, n)?;
         }
         _ => return Err(Fail::Shape),
     }
@@ -685,6 +837,9 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     if !layer_role(pe.role, trimmed) || pe.glu_form != manifest::FORM_NONE || pe.n_exp != 1 {
         return Err(Fail::Manifest);
     }
+    if let Some(hc) = ll.hc {
+        return verify_hc_resid(tier, ctx, resp, seed, p, (layer, kind, t, d[2]), &ll, &hc, rank, pe.m);
+    }
     let dim = pe.m;
     let total = 4 * dim;
     let c = d[2] % n_chunks(total);
@@ -743,6 +898,183 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     residual_link(&dst, &add, &src, scale)
 }
 
+/// Largest `|v - q d|` of a Q8_1 value, in units of its block scale: half a step, plus the f16
+/// rounding of the scale over 127 steps.
+const Q8_ROUND: f64 = 0.6;
+
+/// The output of a hyper-connection MoE half on chunk `c` of its streams: `sum_e w_e down_e +
+/// shexp`, the routed experts and their weights checked against the router input committed by the
+/// gate product of the experts. Returns the values and their magnitudes.
+#[allow(clippy::too_many_arguments)]
+fn hc_moe_out(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    pos_root: &Hash,
+    shape: &PosShape,
+    seed: &Hash,
+    (layer, dim, c, n_ubatch): (u64, u64, u64, u32),
+    moe: &manifest::MoeLinks,
+    m: &HcMoe,
+    shexp: &[f32],
+) -> Result<(Vec<f64>, Vec<f64>), Fail> {
+    let np = tier.n_products;
+    let n_used = ctx.n_used as u64;
+    if n_used == 0 || m.slots.len() as u64 != n_used || moe.shexp_gate != manifest::NONE {
+        return Err(Fail::Shape);
+    }
+    let re = open_entry(tier, &m.router_row.0, moe.router as u64)?;
+    if re.role != manifest::ROLE_ROUTER || re.wtype != 0 || re.k != dim {
+        return Err(Fail::Manifest);
+    }
+    let n_exp = re.m;
+    let scores = whole_leaf(pos_root, shape, router_leaf(np, ctx.n_layers as u64, layer), &m.scores, 4 * n_exp)?;
+    let bias = match moe.probs_bias {
+        manifest::NONE => None,
+        b => Some(f32_weights(tier, &m.bias, b, n_exp, 0, n_exp)?),
+    };
+    let per_slot = dim * 4 / B3_CHUNK as u64;
+    if per_slot == 0 || !(dim * 4).is_multiple_of(B3_CHUNK as u64) {
+        return Err(Fail::Shape);
+    }
+    let body = n_used * dim * 4;
+    let total = body + 4 * n_used;
+    let y_leaf = 2 * moe.down_exps as u64 + 1;
+    let ids_leaf = chunk_leaf_raw(&m.ids, total, body / B3_CHUNK as u64)?;
+    if !b3_verify(pos_root, shape.n_leaves, y_leaf, &ids_leaf, &m.slots[0].leaf_path) {
+        return Err(Fail::Trace);
+    }
+    let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let w = route_weights(&scores, bias.as_deref(), &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
+
+    let ge = open_entry(tier, &m.gate, moe.gate_exps as u64)?;
+    if ge.k != dim || ge.n_exp < 2 {
+        return Err(Fail::Manifest);
+    }
+    let layout = crate::verify::input_layout(ge.role, n_ubatch, ge.wtype);
+    let x_one = crate::verify::x_len(dim, layout) as usize;
+    if !b3_verify(pos_root, shape.n_leaves, 2 * moe.gate_exps as u64, blake3::hash(&m.x.bytes).as_bytes(), &m.x.leaf_path) {
+        return Err(Fail::Trace);
+    }
+    let blocks = q8::blocks(m.x.bytes.get(..x_one).ok_or(Fail::Shape)?, layout, dim as usize).ok_or(Fail::Shape)?;
+    let row = draw::point(seed, RESID_POINT)[3] % n_exp;
+    let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * dim, 4 * dim)?);
+    let (mut dot, mut mag, mut round) = (0f64, 0f64, 0f64);
+    for (j, &wj) in wr.iter().enumerate() {
+        let (d, q) = &blocks[j / 32];
+        let v = q[j % 32] as f64 * *d as f64;
+        dot += wj as f64 * v;
+        mag += (wj as f64 * v).abs();
+        round += (wj as f64).abs() * (*d as f64).abs() * Q8_ROUND;
+    }
+    let tol = EPS_ROUTER * mag + round + f32::MIN_POSITIVE as f64;
+    if !(scores[row as usize] as f64 - dot).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+        return Err(Fail::Mismatch);
+    }
+    let ys = (0..n_used)
+        .map(|s| leaf_chunk(pos_root, shape, y_leaf, &m.slots[s as usize], total, s * per_slot + c))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ys.iter().any(|y| y.len() != shexp.len()) {
+        return Err(Fail::Shape);
+    }
+    let out = (0..shexp.len()).map(|j| shexp[j] as f64 + w.iter().zip(&ys).map(|(a, y)| a * y[j] as f64).sum::<f64>()).collect();
+    let mags = (0..shexp.len()).map(|j| (shexp[j] as f64).abs() + w.iter().zip(&ys).map(|(a, y)| (a * y[j] as f64).abs()).sum::<f64>()).collect();
+    Ok((out, mags))
+}
+
+/// Chunk of a hyper-connection residual drawn from `d2`: the stream, the chunk within the stream,
+/// and the chunks per stream, for streams of `dim` values.
+pub fn hc_resid_chunk(d2: u64, n_hc: u64, dim: u64) -> Option<(u64, u64, u64)> {
+    let per = (4 * dim).checked_div(B3_CHUNK as u64).filter(|&p| p > 0 && (4 * dim).is_multiple_of(B3_CHUNK as u64))?;
+    let c = d2 % (n_hc * per);
+    Some((c / per, c % per, per))
+}
+
+/// A hyper-connection residual, element by element on the drawn chunk:
+/// `R'[s] = post[s] * o + sum_src comb[s][src] * R[src]`.
+#[allow(clippy::too_many_arguments)]
+fn verify_hc_resid(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    p: &ResidPoint,
+    site: (u64, Resid, u64, u64),
+    ll: &manifest::LayerLinks,
+    hc: &manifest::HcLinks,
+    rank: u64,
+    dim: u64,
+) -> Result<(), Fail> {
+    let (layer, kind, t, d2) = site;
+    let np = tier.n_products;
+    let shape = shape(tier, ctx, p.tok);
+    let n = hc.n_hc as u64;
+    let (s, jc, per) = hc_resid_chunk(d2, n, dim).ok_or(Fail::Shape)?;
+    let total = 4 * n * dim;
+    let c = s * per + jc;
+    let ResidAdd::Hc(h) = &p.add else { return Err(Fail::Shape) };
+    let dst_leaf = chunk_leaf(&p.dst, total, c)?;
+    let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    if p.n_ubatch != crate::verify::expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
+    if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path)
+        || !b3_verify(&pos_root, shape.n_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path)
+    {
+        return Err(Fail::Trace);
+    }
+    let dst = finite_f32s(&p.dst.chunk)?;
+    if !(RESID_CHUNK_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&dst)) {
+        return Err(Fail::Mismatch);
+    }
+    let len = dst.len();
+    let off = (jc * B3_CHUNK as u64 / 4) as usize;
+    let o = leaf_chunk(&pos_root, &shape, 2 * rank + 1, &h.o, 4 * dim, jc)?;
+    let (o, o_mag): (Vec<f64>, Vec<f64>) = match (kind, ll.moe, &h.moe) {
+        (Resid::Out, Some(moe), Some(hm)) => hc_moe_out(tier, ctx, &pos_root, &shape, seed, (layer, dim, jc, p.n_ubatch), &moe, hm, &o)?,
+        (Resid::Out, Some(_), None) | (_, _, Some(_)) => return Err(Fail::Shape),
+        _ => (o.iter().map(|&v| v as f64).collect(), o.iter().map(|&v| (v as f64).abs()).collect()),
+    };
+    let srcs: Vec<Vec<f32>> = match (kind, layer, &p.src) {
+        (Resid::Attn, 0, ResidSrc::Token(e, r)) if h.streams.is_empty() => {
+            let row = embedding(tier, ctx, &(e.clone(), r.clone()), p.tok, dim)?;
+            let v: Vec<f32> = row.get(off..off + len).ok_or(Fail::Shape)?.iter().map(|&x| (x as f64 * ctx.embd_scale) as f32).collect();
+            vec![v; n as usize]
+        }
+        (_, _, ResidSrc::Chunk(first)) if h.streams.len() as u64 + 1 == n && !(kind == Resid::Attn && layer == 0) => {
+            let leaf = if kind == Resid::Attn { resid_leaf(np, layer - 1, Resid::Out) } else { resid_leaf(np, layer, Resid::Attn) };
+            std::iter::once(first)
+                .chain(&h.streams)
+                .enumerate()
+                .map(|(src, sc)| leaf_chunk(&pos_root, &shape, leaf, sc, total, src as u64 * per + jc))
+                .collect::<Result<_, _>>()?
+        }
+        _ => return Err(Fail::Shape),
+    };
+    let (fn_rank, si, bi) = match kind {
+        Resid::Attn => (hc.attn_fn, hc.attn_scale, hc.attn_base),
+        Resid::Out => (hc.ffn_fn, hc.ffn_scale, hc.ffn_base),
+    };
+    let mix = hc_mix_at(tier, &pos_root, &shape, hc, fn_rank, &h.mixes, si, (&h.base, bi))?;
+    if o.len() != len || srcs.iter().any(|v| v.len() != len) {
+        return Err(Fail::Shape);
+    }
+    let su = s as usize;
+    for j in 0..len {
+        let mut want = mix.post[su] * o[j];
+        let mut mag = mix.post[su].abs() * o_mag[j];
+        for (src, v) in srcs.iter().enumerate() {
+            let term = mix.comb[su + n as usize * src] * v[j] as f64;
+            want += term;
+            mag += term.abs();
+        }
+        let tol = EPS_HC * mag + f32::MIN_POSITIVE as f64;
+        if !tol.is_finite() || !(dst[j] as f64 - want).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+            return Err(Fail::Mismatch);
+        }
+    }
+    Ok(())
+}
+
 /// Verify a residual opening: its residual point, then one row of the product whose output the
 /// residual adds and, on a routed layer, one row of a routed expert.
 pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &ResidOpening) -> Result<(), Fail> {
@@ -760,8 +1092,17 @@ pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, 
     let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
     let pe = open_entry(tier, &p.product, rank)?;
     let (dim, per) = (pe.m, (B3_CHUNK / 4) as u64);
-    let c = d[2] % n_chunks(4 * dim);
-    let dst_leaf = chunk_leaf(&p.dst, 4 * dim, c)?;
+    let (c, dst_c, dst_total) = match ll.hc {
+        Some(hc) => {
+            let (s, jc, cps) = hc_resid_chunk(d[2], hc.n_hc as u64, dim).ok_or(Fail::Shape)?;
+            (jc, s * cps + jc, 4 * hc.n_hc as u64 * dim)
+        }
+        None => {
+            let c = d[2] % n_chunks(4 * dim);
+            (c, c, 4 * dim)
+        }
+    };
+    let dst_leaf = chunk_leaf(&p.dst, dst_total, dst_c)?;
     let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
     let lo = c * per;
     let row = lo + (d[3] >> 32) % per.min(dim.checked_sub(lo).filter(|&n| n > 0).ok_or(Fail::Shape)?);
@@ -773,6 +1114,7 @@ pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, 
         ResidAdd::Chunk(ac) => y_at(&ac.chunk, row - lo)?,
         ResidAdd::Normed { y, .. } => y_at(&y.bytes, row)?,
         ResidAdd::Moe(m) => y_at(&m.shexp.chunk, row - lo)?,
+        ResidAdd::Hc(h) => y_at(&h.o.chunk, row - lo)?,
     };
     let f = &op.feed;
     feed_row(tier, &shape, &pos_root, p.n_ubatch, (&pe, rank), (0, 0, 1), row, y, (&f.x, &f.x_path), &f.row, f.bias.as_ref())?;
@@ -789,6 +1131,19 @@ pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, 
             let s = 4 * slot as usize;
             let id = u32::from_le_bytes(m.ids.chunk.get(s..s + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as u64;
             let y = y_at(&m.slots.get(slot as usize).ok_or(Fail::Shape)?.chunk, row - lo)?;
+            feed_row(tier, &shape, &pos_root, p.n_ubatch, (&de, moe.down_exps as u64), (id, slot, n_used), row, y, (&er.x, &er.x_path), &er.row, None)
+        }
+        (ResidAdd::Hc(h), Some(er)) if h.moe.is_some() => {
+            let (moe, hm) = (ll.moe.ok_or(Fail::Shape)?, h.moe.as_ref().unwrap());
+            let de = open_entry(tier, &er.entry, moe.down_exps as u64)?;
+            if de.role != manifest::ROLE_PRODUCT || de.glu_form != manifest::FORM_NONE || de.n_exp < 2 || de.m != dim {
+                return Err(Fail::Manifest);
+            }
+            let n_used = ctx.n_used as u64;
+            let slot = (d[3] >> 48) % n_used.max(1);
+            let s = 4 * slot as usize;
+            let id = u32::from_le_bytes(hm.ids.chunk.get(s..s + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as u64;
+            let y = y_at(&hm.slots.get(slot as usize).ok_or(Fail::Shape)?.chunk, row - lo)?;
             feed_row(tier, &shape, &pos_root, p.n_ubatch, (&de, moe.down_exps as u64), (id, slot, n_used), row, y, (&er.x, &er.x_path), &er.row, None)
         }
         (ResidAdd::Moe(_), None) | (_, Some(_)) => Err(Fail::Shape),
@@ -1032,6 +1387,28 @@ mod tests {
         assert!((w2.iter().sum::<f64>() - 2.0).abs() < 1e-12);
     }
 
+    /// `hc_mix` against llama.cpp's fused mix kernels on GLM-5.3-Flash, layer 0, first token of a
+    /// probe: mixes recomputed from the GGUF, expected values as the probe printed them.
+    #[test]
+    fn hc_mix_matches_the_fused_kernels_on_glm() {
+        let mixes: [f32; 24] = [2.715549469e+01, -8.747535706e+00, 8.463341713e+00, 7.669409180e+01, -5.148453712e+00, -3.682340240e+01, -1.652810669e+01, -1.402769089e+01, 8.885743713e+01, -2.163059235e+01, -3.372954559e+01, -3.353501129e+01, 1.280406647e+02, -1.879361343e+01, -4.886148071e+01, -6.059747314e+01, -2.376058960e+01, -9.349130630e+00, -1.406003284e+01, 4.707107925e+01, -2.038398552e+01, 5.488075638e+01, -9.178322792e+00, -2.542195702e+01];
+        let scale: [f32; 3] = [6.140246615e-02, 4.462148994e-02, 8.887463808e-02];
+        let base: [f32; 24] = [-7.583102226e+00, 5.753003359e-01, -7.202132225e+00, -7.759641647e+00, 2.692349434e+00, 1.496213675e+00, -1.532154322e+00, -1.147554278e+00, 8.127574256e-05, -8.000000000e+00, -8.000000000e+00, -8.000000000e+00, -8.000000000e+00, -3.258989891e-04, -8.000000000e+00, -8.000000000e+00, -8.000000000e+00, -8.000000000e+00, -3.044366604e-04, -8.000000000e+00, -8.000000000e+00, -8.000000000e+00, -8.000000000e+00, -2.892836346e-04];
+        let m = hc_mix(&mixes, &scale, &base, 4, 20, 1e-6).unwrap();
+        let near = |a: &[f64], b: &[f64], tol: f64| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol);
+        assert!(near(&m.pre, &[0.0027, 0.5099, 0.0013, 0.0451], 2e-3), "{:?}", m.pre);
+        assert!(near(&m.post, &[1.8431, 0.9270, 0.1870, 0.2901], 5e-3), "{:?}", m.post);
+        let printed = [[0.9129, 0.0015, 0.0041, 0.0048], [0.0871, 0.8810, 0.0005, 0.0005], [0.0, 0.0002, 0.9943, 0.0888], [0.0, 0.1173, 0.0011, 0.9059]];
+        for (src, row) in printed.iter().enumerate() {
+            let got: Vec<f64> = (0..4).map(|dst| m.comb[dst + 4 * src]).collect();
+            assert!(near(&got, row, 5e-3), "src {src}: {got:?} vs {row:?}");
+        }
+        for dst in 0..4 {
+            assert!(((0..4).map(|src| m.comb[dst + 4 * src]).sum::<f64>() - 1.0).abs() < 1e-5);
+        }
+        assert!(hc_mix(&mixes[..23], &scale, &base, 4, 20, 1e-6).is_none());
+    }
+
     #[test]
     fn softmax_routing_takes_the_top_scores() {
         let scores = [0.5f32, 3.0, -1.0, 2.0, 2.5, 0.0];
@@ -1099,6 +1476,50 @@ struct AttnSite {
     tree: BlockTree,
     /// Values per partial.
     dv: usize,
+    /// Attended positions of a sparse attention layer, from the tree's first position.
+    keep: Option<Vec<bool>>,
+}
+
+impl AttnSite {
+    fn node(&self, path: &[u64]) -> Option<(u64, u64)> {
+        match &self.keep {
+            Some(k) => PrunedTree { tree: self.tree, keep: k }.node(path),
+            None => self.tree.node(path),
+        }
+    }
+
+    fn children(&self, path: &[u64]) -> Option<Vec<(u64, u64)>> {
+        match &self.keep {
+            Some(k) => PrunedTree { tree: self.tree, keep: k }.children(path),
+            None => self.tree.children(path),
+        }
+    }
+
+    fn attended(&self, p: u64) -> bool {
+        self.keep.as_ref().is_none_or(|k| PrunedTree { tree: self.tree, keep: k }.attended(p))
+    }
+}
+
+/// Positions of `[0, t]` a query at `t` attends under `dsa`, given the selected pools `sel` (u32,
+/// strictly increasing, below the complete pools, as many as the indexer keeps).
+pub fn dsa_attended(dsa: &manifest::DsaLinks, t: u64, sel: &[u8]) -> Option<Vec<bool>> {
+    let kpool = dsa.kpool as u64;
+    if kpool < 2 || dsa.n_top == 0 || !sel.len().is_multiple_of(4) {
+        return None;
+    }
+    let pools: Vec<u64> = sel.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64).collect();
+    let n_pool = (t + 1) / kpool;
+    if pools.len() as u64 != n_pool.min(dsa.n_top as u64) || pools.windows(2).any(|w| w[0] >= w[1]) || pools.last().is_some_and(|&p| p >= n_pool) {
+        return None;
+    }
+    let mut keep = vec![false; t as usize + 1];
+    for p in pools {
+        keep[(p * kpool) as usize..((p + 1) * kpool) as usize].iter_mut().for_each(|k| *k = true);
+    }
+    if dsa.tail != 0 {
+        keep[(n_pool * kpool) as usize..].iter_mut().for_each(|k| *k = true);
+    }
+    keep.iter().any(|&k| k).then_some(keep)
 }
 
 fn attn_site(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &AttnOpening) -> Result<AttnSite, Fail> {
@@ -1136,7 +1557,23 @@ fn attn_site(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op
     };
     let (c, b) = block_params(row, partial_len(dv)).ok_or(Fail::Manifest)?;
     let tree = BlockTree::new(start, t + 1, c, b).ok_or(Fail::Manifest)?;
-    Ok(AttnSite { ll, a, slot, t, d, tree, dv })
+    let keep = match (&ll.dsa, &op.sel) {
+        (None, None) => None,
+        (Some(dsa), Some(sel)) => {
+            if dsa.sel >= ctx.n_sel || start != 0 || a.mla_rank == 0 {
+                return Err(Fail::Manifest);
+            }
+            let pshape = shape_any(tier, ctx);
+            let leaf = sel_leaf(tier.n_products, nl, n_router(ctx), dsa.sel as u64);
+            let root_t = b3_fold(pshape.n_leaves, leaf, blake3::hash(&sel.bytes).as_bytes(), &sel.leaf_path).ok_or(Fail::Trace)?;
+            if !b3_verify(&op.pos_root, n_pos, t, &root_t, &sel.pos_path) {
+                return Err(Fail::Trace);
+            }
+            Some(dsa_attended(dsa, t, &sel.bytes).ok_or(Fail::Mismatch)?)
+        }
+        _ => return Err(Fail::Shape),
+    };
+    Ok(AttnSite { ll, a, slot, t, d, tree, dv, keep })
 }
 
 /// Verify phase `path.len()` of the attention point of a response; `path` holds the child drawn
@@ -1158,7 +1595,7 @@ pub fn verify_attn_phase(
     let parent = match (path.split_last(), parent_root) {
         (None, None) if op.parent.is_empty() && op.parent_path.is_empty() => None,
         (Some((&i, up)), Some(root)) => {
-            let n = s.tree.children(up).ok_or(Fail::Shape)?.len() as u64;
+            let n = s.children(up).ok_or(Fail::Shape)?.len() as u64;
             Some(open_partial(root, n, i, &op.parent, &op.parent_path, s.dv).ok_or(Fail::Trace)?)
         }
         _ => return Err(Fail::Shape),
@@ -1172,6 +1609,7 @@ pub fn verify_attn_phase(
         path: op.path.clone(),
         parent: op.parent.clone(),
         parent_path: op.parent_path.clone(),
+        sel: op.sel.clone(),
         ..Default::default()
     };
     if path.is_empty() || last {
@@ -1201,7 +1639,7 @@ pub fn verify_attn_phase(
     let children = if last {
         None
     } else {
-        let n = s.tree.children(path).ok_or(Fail::Shape)?.len();
+        let n = s.children(path).ok_or(Fail::Shape)?.len();
         Some(decode_partials(&op.partials, s.dv).filter(|p| p.len() == n).ok_or(Fail::Shape)?)
     };
     match (&parent, &children) {
@@ -1292,7 +1730,9 @@ fn mla_query(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, op: &AttnOpenin
         .iter()
         .map(|&x| x as f64)
         .collect();
-    q.extend(head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * qh_w + nope, rope)?.iter().map(|&x| x as f64));
+    if rope > 0 {
+        q.extend(head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * qh_w + nope, rope)?.iter().map(|&x| x as f64));
+    }
     Ok(q)
 }
 
@@ -1355,7 +1795,7 @@ fn gqa_phase(
     if !prep.fits(&shape) {
         return Err(Fail::Manifest);
     }
-    let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
+    let (p0, p1) = s.node(path).ok_or(Fail::Shape)?;
     let sl = seq_layout(ctx);
     let krows = cache_rows(ctx, &op.seq_root, sl.kcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.kcache)?;
     let vrows = cache_rows(ctx, &op.seq_root, sl.vcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.vcache)?;
@@ -1451,9 +1891,10 @@ fn mla_phase(
     let [w] = <[(EntryOpening, ChunkRange); 1]>::try_from(op.norms.clone()).map_err(|_| Fail::Shape)?;
     let k_norm = f32_weights(tier, &w, a.k_norm, r as u64, 0, r as u64)?;
     let q = mla_query(tier, ctx, resp, op, s)?;
-    let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
+    let (p0, p1) = s.node(path).ok_or(Fail::Shape)?;
     let rows = cache_rows(ctx, &op.seq_root, seq_layout(ctx).kcache(s.slot, 0), n_pos, hd, p0, p1, &op.kcache)?;
-    let keys = rows.iter().map(|row| dequant_head(row, hd)).collect::<Result<Vec<_>, _>>()?;
+    let all = rows.iter().map(|row| dequant_head(row, hd)).collect::<Result<Vec<_>, _>>()?;
+    let keys: Vec<Vec<f32>> = all.into_iter().zip(p0..p1).filter(|(_, p)| s.attended(*p)).map(|(k, _)| k).collect();
     let values: Vec<Vec<f32>> = keys.iter().map(|k| k[..r].to_vec()).collect();
     let scale = f32::from_bits(a.kq_scale) as f64;
     let ok = match (parent, out) {

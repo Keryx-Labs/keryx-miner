@@ -6,7 +6,7 @@ use crate::trace::{bytes_range, leaf_bytes, leaf_chunk, Captures, SeqTrace, Tier
 use keryx_verifiable_inference::attn_blocks::{block_params, partial_len, partial_opening, BlockTree};
 use keryx_verifiable_inference::chain::{self, ATTN_POINT};
 use keryx_verifiable_inference::draw;
-use keryx_verifiable_inference::manifest::{self, AttnLinks, Chain, LayerLinks, RecurLinks, RECUR_KDA};
+use keryx_verifiable_inference::manifest::{self, AttnLinks, Chain, LayerLinks, RecurLinks};
 use keryx_verifiable_inference::merkle::{b3_chunk_cv, b3_path, b3_range_proof, b3_root, Hash, B3_CHUNK};
 use keryx_verifiable_inference::opening::{AttnOpening, LeafChunk, RecurOpening, RecurTap};
 use keryx_verifiable_inference::quant::{dequant_row, Q8_0};
@@ -350,6 +350,7 @@ pub fn attn_opening(
         parent_path,
         partials: Vec::new(),
         lse,
+        sel: None,
     })
 }
 
@@ -389,7 +390,7 @@ pub fn draw_recur(m: &TierManifest, rec: &TraceRecord, seed: &Hash) -> Option<Re
 
 impl RecurDraw {
     fn kda(&self) -> bool {
-        self.links.kind == RECUR_KDA
+        manifest::per_key_decay(self.links.kind)
     }
 
     /// Value offsets of the query, key and value channels of the drawn head in their projections.
