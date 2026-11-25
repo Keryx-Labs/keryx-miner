@@ -47,6 +47,8 @@ pub const LINK_HC_FFN_PRE: u8 = 19;
 pub const LINK_NORMED: u8 = 20;
 /// Head input `rms_norm(mean_s R_s) * norm` over the streams of the last layer; `src` = stream count.
 pub const LINK_HC_HEAD: u8 = 21;
+/// Input of the n-gram lookup product: the table rows the position's n-gram hashes to.
+pub const LINK_ENGRAM: u8 = 22;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
@@ -66,6 +68,12 @@ const TAG_DSA: u8 = 15;
 const DSA_FIELDS: usize = 12;
 /// An attention layer reading compressed rows of blocks of tokens, wrapping its links.
 const TAG_COMP: u8 = 16;
+/// A layer whose input streams receive an n-gram table lookup first, wrapping its links.
+const TAG_ENGRAM: u8 = 17;
+const ENGRAM_HEAD: usize = 27;
+/// Largest n-gram length and head count of an n-gram lookup.
+pub const ENGRAM_MAX_GRAM: usize = 8;
+pub const ENGRAM_MAX_COLS: usize = 64;
 const COMP_FIELDS: usize = 28;
 const HC_FIELDS: usize = 13;
 
@@ -93,6 +101,90 @@ pub struct LayerLinks {
     pub hc: Option<HcLinks>,
     pub dsa: Option<DsaLinks>,
     pub comp: Option<CompLinks>,
+    pub engram: Option<EngramLinks>,
+}
+
+/// N-gram table lookup added to a layer's input streams: each token hashes itself and its
+/// `n_gram - 1` predecessors (through the committed token map) into one table row per head, the
+/// rows feed product `kv` (a key per stream and a value), and the value is added to each stream
+/// gated by its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngramLinks {
+    /// Module index (n-gram layers in order).
+    pub module: u32,
+    pub kv: u32,
+    /// F32 entry of the per-stream gate weights.
+    pub gate: u32,
+    pub n_gram: u32,
+    /// Heads per n-gram length: `(n_gram - 1) * n_head` rows per token.
+    pub n_head: u32,
+    pub head_dim: u32,
+    /// Type and weight root of the table file, its chunk count.
+    pub table_type: u32,
+    pub table_root: [u8; 32],
+    pub table_chunks: u64,
+    /// Root of the token map (u32 per token, 32 B chunks) and its token count.
+    pub map_root: [u8; 32],
+    pub map_len: u32,
+    /// Mapped id standing for a blocked token.
+    pub pad: u32,
+    /// Residual leaf of the streams after the lookup.
+    pub out_leaf: u32,
+    pub mult: [u64; ENGRAM_MAX_GRAM],
+    pub primes: [u32; ENGRAM_MAX_COLS],
+    pub offsets: [u32; ENGRAM_MAX_COLS],
+}
+
+impl EngramLinks {
+    /// Heads (table rows) per token.
+    pub fn n_cols(&self) -> usize {
+        (self.n_gram as usize).saturating_sub(1) * self.n_head as usize
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        for v in [self.module, self.kv, self.gate, self.n_gram, self.n_head, self.head_dim, self.table_type] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&self.table_root);
+        b.extend_from_slice(&self.table_chunks.to_le_bytes());
+        b.extend_from_slice(&self.map_root);
+        for v in [self.map_len, self.pad, self.out_leaf] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for m in &self.mult[..self.n_gram as usize] {
+            b.extend_from_slice(&m.to_le_bytes());
+        }
+        for v in self.primes[..self.n_cols()].iter().chain(&self.offsets[..self.n_cols()]) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    /// Parsed from `b`, and the bytes it takes.
+    fn parse(b: &[u8]) -> Option<(Self, usize)> {
+        let u = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+        let h = |o: usize| b.get(o..o + 32).map(|s| <[u8; 32]>::try_from(s).unwrap());
+        let mut e = EngramLinks {
+            module: u(0)?, kv: u(4)?, gate: u(8)?, n_gram: u(12)?, n_head: u(16)?, head_dim: u(20)?, table_type: u(24)?, table_root: h(28)?,
+            table_chunks: u64::from_le_bytes(b.get(60..68)?.try_into().ok()?), map_root: h(68)?, map_len: u(100)?, pad: u(104)?, out_leaf: u(108)?,
+            mult: [0; ENGRAM_MAX_GRAM], primes: [0; ENGRAM_MAX_COLS], offsets: [0; ENGRAM_MAX_COLS],
+        };
+        let (g, c) = (e.n_gram as usize, e.n_cols());
+        if !(2..=ENGRAM_MAX_GRAM).contains(&g) || c == 0 || c > ENGRAM_MAX_COLS {
+            return None;
+        }
+        let mut o = 4 * ENGRAM_HEAD + 4;
+        for m in e.mult.iter_mut().take(g) {
+            *m = u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?);
+            o += 8;
+        }
+        for i in 0..c {
+            e.primes[i] = u(o + 4 * i)?;
+            e.offsets[i] = u(o + 4 * (c + i))?;
+        }
+        Some((e, o + 8 * c))
+    }
 }
 
 /// Compressed rows a layer attends: block `k` of `ratio` tokens pooled by the compressor products
@@ -412,6 +504,13 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
     match b.first() {
         None => None,
         Some(&TAG_NONE) => Some((Chain::None, 1)),
+        Some(&TAG_ENGRAM) => {
+            let (e, n) = EngramLinks::parse(b.get(1..)?)?;
+            match parse_chain(b.get(1 + n..)?)? {
+                (Chain::Layer(l), len) if l.engram.is_none() => Some((Chain::Layer(LayerLinks { engram: Some(e), ..l }), 1 + n + len)),
+                _ => None,
+            }
+        }
         Some(&TAG_COMP) => {
             let mut f = [0u32; COMP_FIELDS];
             for (i, v) in f.iter_mut().enumerate() {
@@ -502,7 +601,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                     attn,
                     recur,
                     hc: None,
-                    dsa: None, comp: None,
+                    dsa: None, comp: None, engram: None,
                 }),
                 base + if attn.is_some() { 4 * ATTN_FIELDS } else { 0 } + if recur.is_some() { 4 * RECUR_FIELDS } else { 0 },
             ))
@@ -523,6 +622,11 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             b.extend_from_slice(&p.norm.to_le_bytes());
             b.extend_from_slice(&p.src.to_le_bytes());
         }
+        Chain::Layer(l) if l.engram.is_some() => {
+            b.push(TAG_ENGRAM);
+            b.extend_from_slice(&l.engram.unwrap().bytes());
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { engram: None, ..*l })));
+        }
         Chain::Layer(l) if l.hc.is_some() => {
             b.push(TAG_HC);
             for v in l.hc.unwrap().fields() {
@@ -535,14 +639,14 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             for v in l.dsa.unwrap().fields() {
                 b.extend_from_slice(&v.to_le_bytes());
             }
-            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { dsa: None, comp: None, ..*l })));
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { dsa: None, comp: None, engram: None, ..*l })));
         }
         Chain::Layer(l) if l.comp.is_some() => {
             b.push(TAG_COMP);
             for v in l.comp.unwrap().fields() {
                 b.extend_from_slice(&v.to_le_bytes());
             }
-            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { comp: None, ..*l })));
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { comp: None, engram: None, ..*l })));
         }
         Chain::Layer(l) => {
             let gated = l.moe.is_some_and(|m| m.shexp_gate != NONE);
@@ -722,15 +826,15 @@ mod tests {
     #[test]
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
-        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, hc: None, dsa: None, comp: None });
+        let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None, attn: None, recur: None, hc: None, dsa: None, comp: None, engram: None });
         let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13, shexp_gate: NONE };
-        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None, comp: None });
+        let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: None, hc: None, dsa: None, comp: None, engram: None });
         let attn = AttnLinks {
             q: 1, k: 2, v: 3, q_norm: NONE, k_norm: NONE, n_head: 32, n_head_kv: 2, head_dim: 128, rope_kind: 0, n_rot: 128,
             rope_base: 10_000f32.to_bits(), kq_scale: (1.0f32 / 128f32.sqrt()).to_bits(), swa_window: 0, softcap: 0, rope_freqs: NONE, v_norm: 0, gated: 0, slot: 0, mla_rank: 0, absorb: NONE, out: NONE,
         };
-        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: None });
-        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None, hc: None, dsa: None, comp: None });
+        let la = Chain::Layer(LayerLinks { layer: 5, proj: 6, down: 12, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: None, engram: None });
+        let lma = Chain::Layer(LayerLinks { layer: 6, proj: 7, down: 13, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: Some(attn), recur: None, hc: None, dsa: None, comp: None, engram: None });
         assert_eq!(chain_bytes(&l).len(), 25);
         assert_eq!(chain_bytes(&lm).len(), 49);
         assert_eq!(chain_bytes(&la).len(), 25 + 84);
@@ -739,8 +843,8 @@ mod tests {
             kind: RECUR_KDA, slot: 2, n_v_heads: 32, n_k_heads: 32, head_dim: 128, q: 40, k: 41, v: 42, conv_q: 300, conv_k: 301,
             conv_v: 302, beta: 43, decay: 44, dt: 303, a: 304, norm: 305, gate: 45, interval: 48, conv_len: 4,
         };
-        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur), hc: None, dsa: None, comp: None });
-        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur), hc: None, dsa: None, comp: None });
+        let lr = Chain::Layer(LayerLinks { layer: 7, proj: 8, down: 14, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: Some(recur), hc: None, dsa: None, comp: None, engram: None });
+        let lmr = Chain::Layer(LayerLinks { layer: 8, proj: 9, down: 15, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe), attn: None, recur: Some(recur), hc: None, dsa: None, comp: None, engram: None });
         assert_eq!(chain_bytes(&lr).len(), 25 + 76);
         assert_eq!(chain_bytes(&lmr).len(), 49 + 76);
         let gated = MoeLinks { probs_bias: NONE, w_scale: 1f32.to_bits(), shexp_gate: 44, ..moe };

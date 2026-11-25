@@ -41,6 +41,8 @@ pub struct ChainCtx {
     pub n_sel: u32,
     /// Compressed row leaves of the sequence tree, one per layer producing compressed rows.
     pub n_comp: u32,
+    /// Leaves per position of the streams after each n-gram lookup, after the selection leaves.
+    pub n_engram: u32,
 }
 /// Relative tolerance of a residual addition, per element.
 pub const EPS_RESID: f64 = 1e-6;
@@ -287,7 +289,7 @@ pub const fn sel_leaf(n_products: u64, n_layers: u64, n_router: u64, i: u64) -> 
 /// Leaf layout of a stage-2 position consuming `tok`.
 pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
     let n_layers = ctx.n_layers as u64;
-    let n_sel = ctx.n_sel as u64;
+    let n_sel = ctx.n_sel as u64 + ctx.n_engram as u64;
     PosShape {
         n_leaves: n_pos_leaves(tier.n_products, n_layers, n_router(ctx)) + n_sel,
         meta_index: meta_leaf(tier.n_products, n_layers, n_router(ctx)) + n_sel,
@@ -415,16 +417,36 @@ pub fn hc_mix(mixes: &[f32], scale: &[f32], base: &[f32], n: usize, iters: u32, 
 }
 
 /// The hyper-connection links of `layer` and the mix weights of its half `kind`.
-fn hc_half(tier: &TierCtx, ctx: &ChainCtx, layer: u64, kind: Resid, le: &EntryOpening) -> Result<(manifest::HcLinks, u32, [u32; 3], u32), Fail> {
+fn hc_half(tier: &TierCtx, ctx: &ChainCtx, layer: u64, kind: Resid, le: &EntryOpening) -> Result<(manifest::HcLinks, u32, [u32; 3], u32, Option<u64>), Fail> {
     let e = open_entry(tier, le, ctx.layer_base as u64 + layer)?;
-    let hc = match e.chain {
-        Chain::Layer(ll) if e.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => ll.hc.ok_or(Fail::Manifest)?,
+    let (hc, ll) = match e.chain {
+        Chain::Layer(ll) if e.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => (ll.hc.ok_or(Fail::Manifest)?, ll),
         _ => return Err(Fail::Manifest),
     };
+    let src = attn_source(tier, ctx, &ll)?;
     Ok(match kind {
-        Resid::Attn => (hc, hc.attn_fn, hc.attn_scale, hc.attn_base),
-        Resid::Out => (hc, hc.ffn_fn, hc.ffn_scale, hc.ffn_base),
+        Resid::Attn => (hc, hc.attn_fn, hc.attn_scale, hc.attn_base, src),
+        Resid::Out => (hc, hc.ffn_fn, hc.ffn_scale, hc.ffn_base, src),
     })
+}
+
+/// Leaf of the streams after the n-gram lookup `e` of a position.
+pub const fn engram_leaf(n_products: u64, n_layers: u64, n_router: u64, n_sel: u64, e: u64) -> u64 {
+    sel_leaf(n_products, n_layers, n_router, n_sel + e)
+}
+
+/// Leaf of the streams the attention half of layer `ll` reads: after its n-gram lookup, else the
+/// output of the layer before (`None` at layer 0: the repeated embedding).
+pub(crate) fn attn_source(tier: &TierCtx, ctx: &ChainCtx, ll: &manifest::LayerLinks) -> Result<Option<u64>, Fail> {
+    let (np, nl) = (tier.n_products, ctx.n_layers as u64);
+    match ll.engram {
+        Some(e) => {
+            let leaf = engram_leaf(np, nl, n_router(ctx), ctx.n_sel as u64, e.module as u64);
+            (e.module < ctx.n_engram && e.out_leaf as u64 == leaf).then_some(Some(leaf)).ok_or(Fail::Manifest)
+        }
+        None if ll.layer == 0 => Ok(None),
+        None => Ok(Some(resid_leaf(np, ll.layer as u64 - 1, Resid::Out))),
+    }
 }
 
 /// The mix of the half whose mix product is `fn_rank`, from its committed output at the position.
@@ -511,6 +533,40 @@ pub fn verify_chain_point(
             let (b0, n) = norm_fragment(link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)?, k);
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
+        }
+        (manifest::LINK_ENGRAM, LinkOpening::Engram { layer: le, prev, map, row }) if o.input.n_exp == 1 => {
+            let e = match open_entry(tier, le, ctx.layer_base as u64 + layer)?.chain {
+                Chain::Layer(ll) if ll.layer as u64 == layer => ll.engram.ok_or(Fail::Manifest)?,
+                _ => return Err(Fail::Manifest),
+            };
+            let (n_gram, d) = (e.n_gram as u64, e.head_dim as u64);
+            if report.rank != e.kv as u64 || k != e.n_cols() as u64 * d || !d.is_multiple_of(32) {
+                return Err(Fail::Manifest);
+            }
+            let t = report.t;
+            let shifts = t.min(n_gram - 1);
+            if prev.len() as u64 != shifts || map.len() as u64 != 1 + shifts {
+                return Err(Fail::Shape);
+            }
+            // the tokens back from t, each bound to its position by the meta leaf
+            let mut toks = vec![tok];
+            for (s, pt) in prev.iter().enumerate() {
+                let q = t - 1 - s as u64;
+                let meta = shape_any(tier, ctx);
+                let h = PosShape { tok: Some(pt.tok), ..meta }.meta_hash(q, crate::verify::expected_ubatch(q, resp.n_prompt));
+                let root = b3_fold(meta.n_leaves, meta.meta_index, &h, &pt.meta_path).ok_or(Fail::Trace)?;
+                if !b3_verify(&resp.trace_root, resp.n_pos as u64, q, &root, &pt.pos_path) {
+                    return Err(Fail::Trace);
+                }
+                toks.push(pt.tok);
+            }
+            let mut ids = toks.iter().zip(map).map(|(&tk, m)| crate::engram::mapped_id(&e, tk, m).ok_or(Fail::Trace)).collect::<Result<Vec<_>, _>>()?;
+            ids.resize(n_gram as usize, None);
+            let rows = crate::engram::engram_rows(&e, &ids).ok_or(Fail::Manifest)?;
+            let block = link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?;
+            let col = (block * 32 / d) as usize;
+            let vals = crate::engram::table_row(&e, rows[col], row).ok_or(Fail::Weights)?;
+            glu_link(&p.x, o.layout, k as usize, col * (d as usize / 32), &vals)?;
         }
         (manifest::LINK_HC_HEAD, LinkOpening::Norm { src, norm }) if n_layers > 0 && o.input.n_exp == 1 => {
             let n_hc = pl.src as u64;
@@ -602,12 +658,8 @@ pub fn verify_chain_point(
         | (manifest::LINK_HC_ATTN_PRE | manifest::LINK_HC_FFN_PRE, LinkOpening::HcPre { layer: le, src, .. }) => {
             let attn = matches!(pl.link, manifest::LINK_HC_ATTN_IN | manifest::LINK_HC_ATTN_PRE);
             let half = if attn { Resid::Attn } else { Resid::Out };
-            let (hc, fn_rank, si, bi) = hc_half(tier, ctx, layer, half, le)?;
-            let leaf = match (attn, layer) {
-                (true, 0) => None,
-                (true, l) => Some(resid_leaf(np, l - 1, Resid::Out)),
-                (false, l) => Some(resid_leaf(np, l, Resid::Attn)),
-            };
+            let (hc, fn_rank, si, bi, attn_src) = hc_half(tier, ctx, layer, half, le)?;
+            let leaf = if attn { attn_src } else { Some(resid_leaf(np, layer, Resid::Attn)) };
             let nh = hc.n_hc as u64;
             let (b0, n) = norm_fragment(link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?, k);
             let len = (n * 32).min(k - b0 * 32);
@@ -1065,7 +1117,7 @@ fn verify_hc_resid(
             vec![v; n as usize]
         }
         (_, _, ResidSrc::Chunk(first)) if h.streams.len() as u64 + 1 == n && !(kind == Resid::Attn && layer == 0) => {
-            let leaf = if kind == Resid::Attn { resid_leaf(np, layer - 1, Resid::Out) } else { resid_leaf(np, layer, Resid::Attn) };
+            let leaf = if kind == Resid::Attn { attn_source(tier, ctx, ll)?.ok_or(Fail::Shape)? } else { resid_leaf(np, layer, Resid::Attn) };
             std::iter::once(first)
                 .chain(&h.streams)
                 .enumerate()

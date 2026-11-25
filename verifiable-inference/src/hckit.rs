@@ -176,7 +176,7 @@ impl HcTier {
                 moe: None,
                 attn: None,
                 recur: None,
-                hc: Some(hc), dsa: None, comp: None,
+                hc: Some(hc), dsa: None, comp: None, engram: None,
             };
             entries.push(base(format!("blk.{l}"), manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, Chain::Layer(ll)));
         }
@@ -200,7 +200,7 @@ impl HcTier {
     }
 
     pub fn chain_ctx(&self) -> ChainCtx {
-        ChainCtx { n_sel: 0, n_comp: 0,
+        ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0,
             n_layers: N_LAYERS as u32,
             layer_base: LAYERS as u32,
             embd_entry: EMBD as u32,
@@ -711,7 +711,7 @@ mod moe_tests {
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, 0, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
             entry("blk.0.hc_ffn_base.weight", manifest::ROLE_NORM, 0, N_MIX, 1, 1, base_off, 4 * N_MIX, 4 * N_MIX, Chain::None),
             entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, 0, Chain::Layer(LayerLinks {
-                layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None, hc: Some(hc), dsa: None, comp: None,
+                layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None, hc: Some(hc), dsa: None, comp: None, engram: None,
             })),
         ];
         let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
@@ -723,7 +723,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: np,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 9, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 9, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
 
         // FFN half of the layer: streams after attention, their mix, then the routed FFN.
         let r: Vec<f32> = vecf(3, N_HC * D, 2.0);

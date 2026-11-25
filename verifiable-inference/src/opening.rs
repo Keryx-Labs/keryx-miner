@@ -29,6 +29,8 @@ pub const VERSION_COMP: u8 = 11;
 pub const VERSION_ATTN_COMP: u8 = 12;
 /// Selection opening of a compressed attention tier, sent as the selection piece.
 pub const VERSION_COMP_SEL: u8 = 13;
+/// N-gram lookup residual opening of a response, sent apart from its trace opening.
+pub const VERSION_ENGRAM: u8 = 14;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -134,6 +136,17 @@ pub enum LinkOpening {
     HcIn { layer: EntryOpening, src: HcSource },
     /// The streams, the mix output and the mix weights the first product of a half reads.
     HcPre { layer: EntryOpening, src: HcSource, mixes: LeafBytes, base: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
+    /// The layer of an n-gram lookup, the tokens before the position (their meta leaves), the
+    /// token map entries of the n-gram (the position's own first), and the table row read.
+    Engram { layer: EntryOpening, prev: Vec<PrevToken>, map: Vec<ChunkRange>, row: ChunkRange },
+}
+
+/// A committed token of an earlier position: its meta leaf's path and the position's path.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrevToken {
+    pub tok: u32,
+    pub meta_path: Vec<Hash>,
+    pub pos_path: Vec<Hash>,
 }
 
 /// Residual streams of a hyper-connection link: committed, or the token embedding repeated.
@@ -436,6 +449,21 @@ impl W {
                 self.weights(base);
                 self.weights(norm);
             }
+            LinkOpening::Engram { layer, prev, map, row } => {
+                self.u8(6);
+                self.entry(layer);
+                self.u8(prev.len() as u8);
+                for p in prev {
+                    self.u32(p.tok);
+                    self.hashes(&p.meta_path);
+                    self.hashes(&p.pos_path);
+                }
+                self.u8(map.len() as u8);
+                for m in map {
+                    self.range(m);
+                }
+                self.range(row);
+            }
         }
     }
     fn hc_source(&mut self, s: &HcSource) {
@@ -605,6 +633,14 @@ impl R<'_> {
             },
             4 => LinkOpening::HcIn { layer: self.entry()?, src: self.hc_source()? },
             5 => LinkOpening::HcPre { layer: self.entry()?, src: self.hc_source()?, mixes: self.leaf_bytes()?, base: self.weights()?, norm: self.weights()? },
+            6 => {
+                let layer = self.entry()?;
+                let np = self.u8()? as usize;
+                let prev = (0..np).map(|_| Some(PrevToken { tok: self.u32()?, meta_path: self.hashes()?, pos_path: self.hashes()? })).collect::<Option<Vec<_>>>()?;
+                let nm = self.u8()? as usize;
+                let map = (0..nm).map(|_| self.range()).collect::<Option<Vec<_>>>()?;
+                LinkOpening::Engram { layer, prev, map, row: self.range()? }
+            }
             _ => return None,
         })
     }
@@ -945,7 +981,7 @@ pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP | VERSION_COMP_SEL) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP | VERSION_COMP_SEL | VERSION_ENGRAM) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -1740,5 +1776,62 @@ impl CompSelOpening {
         let nr = r.u8()? as usize;
         let rows = (0..nr).map(|_| r.seq_span()).collect::<Option<Vec<_>>>()?;
         (r.o == b.len()).then_some(CompSelOpening { response_txid, pos_root, seq_root, layer, entries, pos_path, sel, iq, iw, cand, rows })
+    }
+}
+
+/// N-gram lookup point of a response: one chunk of one stream after the lookup, the whole stream
+/// before it, the stream's key and gate weights, and the value chunk, at the drawn position.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EngramOpening {
+    pub response_txid: Hash,
+    pub pos_root: Hash,
+    pub seq_root: Hash,
+    pub layer: EntryOpening,
+    pub kv: EntryOpening,
+    pub gate: (EntryOpening, ChunkRange),
+    pub pos_path: Vec<Hash>,
+    pub dst: LeafChunk,
+    pub x: Vec<LeafChunk>,
+    pub key: Vec<LeafChunk>,
+    pub value: LeafChunk,
+}
+
+impl EngramOpening {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_ENGRAM);
+        w.0.extend_from_slice(&self.response_txid);
+        w.0.extend_from_slice(&self.pos_root);
+        w.0.extend_from_slice(&self.seq_root);
+        w.entry(&self.layer);
+        w.entry(&self.kv);
+        w.weights(&self.gate);
+        w.hashes(&self.pos_path);
+        w.leaf_chunk(&self.dst);
+        for list in [&self.x, &self.key] {
+            w.u8(list.len() as u8);
+            for c in list {
+                w.leaf_chunk(c);
+            }
+        }
+        w.leaf_chunk(&self.value);
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<EngramOpening> {
+        if b.first() != Some(&VERSION_ENGRAM) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let pos_root: Hash = r.take(32)?.try_into().ok()?;
+        let seq_root: Hash = r.take(32)?.try_into().ok()?;
+        let (layer, kv, gate, pos_path, dst) = (r.entry()?, r.entry()?, r.weights()?, r.hashes()?, r.leaf_chunk()?);
+        let nx = r.u8()? as usize;
+        let x = (0..nx).map(|_| r.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+        let nk = r.u8()? as usize;
+        let key = (0..nk).map(|_| r.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+        let value = r.leaf_chunk()?;
+        (r.o == b.len()).then_some(EngramOpening { response_txid, pos_root, seq_root, layer, kv, gate, pos_path, dst, x, key, value })
     }
 }

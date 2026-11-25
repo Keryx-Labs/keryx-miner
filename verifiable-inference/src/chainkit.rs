@@ -211,7 +211,7 @@ impl Tier {
                 moe: None,
                 attn: None,
                 recur: None,
-            hc: None, dsa: None, comp: None, });
+            hc: None, dsa: None, comp: None, engram: None, });
             entries.push(e);
         }
 
@@ -241,7 +241,7 @@ impl Tier {
     }
 
     pub fn chain_ctx(&self) -> ChainCtx {
-        ChainCtx { n_sel: 0, n_comp: 0,
+        ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0,
             n_layers: N_LAYERS as u32,
             layer_base: LAYERS as u32,
             embd_entry: EMBD as u32,
@@ -661,7 +661,7 @@ mod tests {
                     LinkOpening::Token { .. } => 1,
                     LinkOpening::Norm { .. } => 2,
                     LinkOpening::Source { .. } => 3,
-                    LinkOpening::HcIn { .. } | LinkOpening::HcPre { .. } => 4,
+                    LinkOpening::HcIn { .. } | LinkOpening::HcPre { .. } | LinkOpening::Engram { .. } => 4,
                 };
                 links[kind] += 1;
                 verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).unwrap_or_else(|e| panic!("seed {s} point {i}: {e:?}"));
@@ -1063,7 +1063,7 @@ mod head_link_tests {
             n_entries: NP,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let x0 = q8_1_row(&(0..D).map(|i| (((i * 7) % 23) as f64 * 0.01 - 0.1) * if i / 32 == 3 { spike } else { 1.0 }).collect::<Vec<_>>());
         let y0 = dot_rows(&weights[0], 0..NH * STRIDE, &x0);
         let off = if shift { 32 } else { 0 };
@@ -1277,7 +1277,7 @@ mod normed_link_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let x0 = q8_1_row(&(0..D).map(|i| ((i * 7) % 23) as f64 * 0.01 - 0.1).collect::<Vec<_>>());
         let y0 = dot_rows(&weights[0], D, &x0);
         let mut h: Vec<f64> = y0.iter().map(|&a| a as f64).collect();
@@ -1471,7 +1471,7 @@ mod hc_head_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 2, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 2, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
         let streams: Vec<f32> = (0..NHC * D).map(|i| ((i * 13) % 29) as f32 * 0.07 - 1.0 + (i / D) as f32 * 0.3).collect();
         let mut h: Vec<f64> = match fault {
             Fault::FirstStream => streams[..D].iter().map(|&a| a as f64).collect(),
@@ -1662,7 +1662,7 @@ mod moe_tests {
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
             entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                 layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None,
-            hc: None, dsa: None, comp: None, })),
+            hc: None, dsa: None, comp: None, engram: None, })),
         ];
         let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
         let tier = TierCtx {
@@ -1672,7 +1672,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: 4,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
@@ -2319,11 +2319,11 @@ mod attn_tests {
         if c.mixed {
             entries.push(entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                 layer: 0, proj: none, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: None, recur: None,
-            hc: None, dsa: None, comp: None, })));
+            hc: None, dsa: None, comp: None, engram: None, })));
         }
         entries.push(entry(&format!("blk.{al}"), manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
             layer: al, proj: 3, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-        hc: None, dsa: None, comp: None, })));
+        hc: None, dsa: None, comp: None, engram: None, })));
         if c.qk_norm {
             entries.push(entry("blk.0.attn_q_norm.weight", manifest::ROLE_NORM, HD, 1, offs[0], 4 * HD, Chain::None));
             entries.push(entry("blk.0.attn_k_norm.weight", manifest::ROLE_NORM, HD, 1, offs[1], 4 * HD, Chain::None));
@@ -2339,7 +2339,7 @@ mod attn_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32 };
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32 };
         let prep = Prep {
             q_norm: c.qk_norm.then_some(&q_norm[..]),
             k_norm: c.qk_norm.then_some(&k_norm[..]),
@@ -2855,7 +2855,7 @@ mod attn_tests {
                 entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, NH * VD, 512, 0, 0, Chain::None),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                     layer: 0, proj: 4, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-                hc: None, dsa: None, comp: None, })),
+                hc: None, dsa: None, comp: None, engram: None, })),
                 entry("blk.0.attn_kv_a_norm.weight", manifest::ROLE_NORM, R, 1, 0, 4 * R, Chain::None),
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
@@ -2866,7 +2866,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let n_leaves = n_pos_leaves(NP, 1, 0) as usize;
             let q: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, NH * QW)).collect();
             let kv_a: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, HD)).collect();
@@ -3216,7 +3216,7 @@ mod attn_tests {
                 entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, NH * VD, 512, 0, 0, Chain::None),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                     layer: 0, proj: 4, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-                    hc: None, dsa: Some(DSA), comp: None })),
+                    hc: None, dsa: Some(DSA), comp: None, engram: None })),
                 entry("blk.0.attn_kv_a_norm.weight", manifest::ROLE_NORM, R, 1, 0, 4 * R, Chain::None),
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
@@ -3227,7 +3227,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_sel: 1, n_comp: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 1, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let n_leaves = n_pos_leaves(NP, 1, 0) as usize + 1;
             let q: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, NH * QW)).collect();
             let kv_a: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, R)).collect();
@@ -3508,7 +3508,7 @@ mod attn_tests {
                 entry("blk.0.indexer.proj.weight", manifest::ROLE_PRODUCT, 64, NHI, 0, 0, Chain::None),
                 entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
                     layer: 0, proj: 3, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
-                    hc: None, dsa: Some(DSA), comp: None })),
+                    hc: None, dsa: Some(DSA), comp: None, engram: None })),
                 entry("blk.0.indexer.k_norm.weight", manifest::ROLE_NORM, DK, 1, 0, 4 * DK, Chain::None),
                 entry("blk.0.indexer.k_norm.bias", manifest::ROLE_NORM, DK, 1, 4 * DK, 4 * DK, Chain::None),
                 entry("blk.0.indexer_compressor_ape.weight", manifest::ROLE_NORM, KP * DK, 1, 8 * DK, 4 * KP * DK, Chain::None),
@@ -3521,7 +3521,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_sel: 1, n_comp: 0, n_layers: 1, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 1, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let iq: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(400 + t as u64, NHI * DK)).collect();
             let ik: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(500 + t as u64, DK).iter().map(|x| 3.0 * x).collect()).collect();
             let ig: Vec<Vec<f32>> = (0..NPOS).map(|t| vals(600 + t as u64, DK)).collect();
@@ -3675,7 +3675,7 @@ mod attn_tests {
             let mut op = a.open(&s);
             op.members.clear();
             assert_eq!(verify_sel_point(&a.tier, &a.ctx, &resp, &s, &op), Ok(()));
-            assert_eq!(verify_sel_point(&a.tier, &ChainCtx { n_sel: 0, n_comp: 0, ..a.ctx }, &resp, &s, &op), Err(Fail::Unsupported));
+            assert_eq!(verify_sel_point(&a.tier, &ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, ..a.ctx }, &resp, &s, &op), Err(Fail::Unsupported));
         }
     }
 }
@@ -3837,7 +3837,7 @@ mod recur_tests {
         let mut layer = Entry::parse(&entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0)).unwrap().0;
         layer.chain = Chain::Layer(LayerLinks {
             layer: 0, proj: out_r, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: None, recur: Some(links),
-        hc: None, dsa: None, comp: None, });
+        hc: None, dsa: None, comp: None, engram: None, });
         let mut lb = serialize(&layer);
         lb.extend_from_slice(&manifest::chain_bytes(&layer.chain));
         entries.push(lb);
@@ -3859,7 +3859,7 @@ mod recur_tests {
             n_entries: entries.len() as u64,
             n_products: np as u64,
         };
-        let ctx = ChainCtx { n_sel: 0, n_comp: 0,
+        let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0,
             n_layers: 1, layer_base: np as u32, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0,
             n_recur: 1, seq_heads: NV as u32,
         };

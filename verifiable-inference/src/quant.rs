@@ -16,6 +16,7 @@ pub const IQ3_XXS: u32 = 18;
 pub const IQ3_S: u32 = 21;
 pub const IQ2_S: u32 = 22;
 pub const IQ4_XS: u32 = 23;
+pub const IQ4_NL: u32 = 20;
 pub const BF16: u32 = 30;
 
 /// (bytes per block, values per block).
@@ -32,6 +33,7 @@ pub fn block_size(wtype: u32) -> Option<(usize, usize)> {
         IQ3_S => Some((110, 256)),
         IQ2_S => Some((82, 256)),
         IQ4_XS => Some((136, 256)),
+        IQ4_NL => Some((18, 32)),
         Q4_K => Some((144, 256)),
         Q5_K => Some((176, 256)),
         Q6_K => Some((210, 256)),
@@ -184,6 +186,13 @@ pub fn dequant_row(wtype: u32, row: &[u8], k: usize) -> Option<Vec<f32>> {
                             out[32 * ib + 8 * l + j] = if sg & (1 << j) != 0 { -v } else { v };
                         }
                     }
+                }
+            }
+            IQ4_NL => {
+                let d = f16::read(blk, 0);
+                for (j, &q) in blk[2..18].iter().enumerate() {
+                    out[j] = d * crate::iq3::KVALUES_IQ4NL[(q & 0xf) as usize] as f32;
+                    out[j + 16] = d * crate::iq3::KVALUES_IQ4NL[(q >> 4) as usize] as f32;
                 }
             }
             IQ4_XS => {
@@ -358,6 +367,21 @@ pub fn offset_block_scales(wtype: u32, row: &[u8], k: usize) -> Option<(Vec<f32>
 
 #[cfg(test)]
 mod tests {
+
+    /// Four rows of the DeepSeek-V4.1 Engram table (first, second, middle, last) and gguf-py's
+    /// dequantization of them.
+    #[test]
+    fn iq4_nl_matches_gguf_py() {
+        let b = include_bytes!("../testdata/dsv41-iq4nl.bin");
+        let (rows, want) = b.split_at(4 * 144);
+        for (r, w) in rows.chunks_exact(144).zip(want.chunks_exact(256 * 4)) {
+            let got = dequant_row(IQ4_NL, r, 256).unwrap();
+            for (g, e) in got.iter().zip(w.chunks_exact(4)) {
+                assert_eq!(g.to_bits(), f32::from_le_bytes(e.try_into().unwrap()).to_bits());
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
