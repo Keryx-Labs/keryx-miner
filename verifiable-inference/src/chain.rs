@@ -671,13 +671,24 @@ pub fn verify_chain_point(
                     hc_streams(tier, ctx, &o.pos_root, &shape, src, leaf, nh, k / nh, tok)?
                 }
                 LinkOpening::HcPre { mixes, base, .. } => {
-                    if pl.src != fn_rank {
-                        return Err(Fail::Manifest);
-                    }
-                    let mix = hc_mix_at(tier, &o.pos_root, &shape, &hc, fn_rank, mixes, si, (base, bi))?;
                     let r = hc_streams(tier, ctx, &o.pos_root, &shape, src, leaf, nh, k, tok)?;
                     let k = k as usize;
-                    (0..k).map(|j| (0..nh as usize).map(|s| mix.pre[s] * r[s * k + j] as f64).sum::<f64>() as f32).collect()
+                    match hc.pre_source(attn) {
+                        // the first single-pass attention input is stream 0
+                        None => {
+                            if pl.src != manifest::NONE || !mixes.bytes.is_empty() || *base != Default::default() {
+                                return Err(Fail::Shape);
+                            }
+                            r[..k].to_vec()
+                        }
+                        Some((src_fn, src_scale, src_base)) => {
+                            if pl.src != src_fn || (hc.lag == 0 && (src_fn != fn_rank || src_scale != si || src_base != bi)) {
+                                return Err(Fail::Manifest);
+                            }
+                            let mix = hc_mix_at(tier, &o.pos_root, &shape, &hc, src_fn, mixes, src_scale, (base, src_base))?;
+                            (0..k).map(|j| (0..nh as usize).map(|s| mix.pre[s] * r[s * k + j] as f64).sum::<f64>() as f32).collect()
+                        }
+                    }
                 }
                 _ => unreachable!(),
             };

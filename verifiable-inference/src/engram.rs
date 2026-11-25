@@ -524,7 +524,7 @@ mod tests {
             let gates: Vec<f32> = vals(5, NHC * D, 1.5);
             let weights: Vec<u8> = gates.iter().flat_map(|a| a.to_le_bytes()).collect();
             let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
-            let hc = HcLinks { attn_fn: 0, ffn_fn: 0, attn_scale: [0; 3], ffn_scale: [0; 3], attn_base: NONE, ffn_base: NONE, n_hc: NHC as u32, sinkhorn_iters: 20, eps: 0 };
+            let hc = HcLinks { attn_fn: 0, ffn_fn: 0, attn_scale: [0; 3], ffn_scale: [0; 3], attn_base: NONE, ffn_base: NONE, n_hc: NHC as u32, sinkhorn_iters: 20, eps: 0 , lag: 0, prev_fn: NONE, prev_scale: [0; 3], prev_base: NONE};
             let mut e = links(&[0], &[0; 32]);
             e.module = 0;
             e.kv = 0;

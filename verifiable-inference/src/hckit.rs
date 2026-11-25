@@ -63,6 +63,8 @@ pub struct HcTier {
     pub entry_leaves: Vec<Hash>,
     pub r_t: Hash,
     pub m_t: Hash,
+    /// Single-pass mixes: each half reads the `pre` of the mix before it.
+    pub lag: bool,
 }
 
 pub struct Position {
@@ -92,6 +94,8 @@ pub struct Faults {
     pub transposed_comb: bool,
     /// The first input of a half reads the streams with `post` instead of `pre`.
     pub post_as_pre: bool,
+    /// Under single-pass mixes, each half reads the `pre` of its own mix.
+    pub own_pre: bool,
 }
 
 impl Default for HcTier {
@@ -102,6 +106,11 @@ impl Default for HcTier {
 
 impl HcTier {
     pub fn new() -> Self {
+        Self::with_lag(false)
+    }
+
+    /// A tier of single-pass mixes when `lag`.
+    pub fn with_lag(lag: bool) -> Self {
         let mut weights: Vec<u8> = Vec::new();
         let mut entries: Vec<Entry> = Vec::new();
         let push = |weights: &mut Vec<u8>, bytes: Vec<u8>| {
@@ -132,8 +141,15 @@ impl HcTier {
         for l in 0..N_LAYERS {
             for p in 0..PER_LAYER {
                 let (name, k, m, chain) = match p {
-                    ATTN_X => ("attn_x", D, D, link(l, manifest::LINK_HC_ATTN_PRE, norm(l, 0) as u32, rank(l, HC_ATTN_FN) as u32)),
-                    FFN_X => ("ffn_x", D, D, link(l, manifest::LINK_HC_FFN_PRE, norm(l, 1) as u32, rank(l, HC_FFN_FN) as u32)),
+                    ATTN_X => {
+                        let src = match (lag, l) {
+                            (false, _) => rank(l, HC_ATTN_FN) as u32,
+                            (true, 0) => manifest::NONE,
+                            (true, l) => rank(l - 1, HC_FFN_FN) as u32,
+                        };
+                        ("attn_x", D, D, link(l, manifest::LINK_HC_ATTN_PRE, norm(l, 0) as u32, src))
+                    }
+                    FFN_X => ("ffn_x", D, D, link(l, manifest::LINK_HC_FFN_PRE, norm(l, 1) as u32, rank(l, if lag { HC_ATTN_FN } else { HC_FFN_FN }) as u32)),
                     HC_ATTN_FN => ("hc_attn_fn", K_HC, N_MIX, link(l, manifest::LINK_HC_ATTN_IN, manifest::NONE, manifest::NONE)),
                     _ => ("hc_ffn_fn", K_HC, N_MIX, link(l, manifest::LINK_HC_FFN_IN, manifest::NONE, manifest::NONE)),
                 };
@@ -165,6 +181,10 @@ impl HcTier {
                 n_hc: N_HC as u32,
                 sinkhorn_iters: ITERS,
                 eps: HC_EPS.to_bits(),
+                lag: lag as u32,
+                prev_fn: if lag && l > 0 { rank(l - 1, HC_FFN_FN) as u32 } else { manifest::NONE },
+                prev_scale: if lag && l > 0 { SCALE.map(f32::to_bits) } else { [0; 3] },
+                prev_base: if lag && l > 0 { norm(l - 1, 3) as u32 } else { manifest::NONE },
             };
             let ll = LayerLinks {
                 layer: l as u32,
@@ -192,7 +212,7 @@ impl HcTier {
             .collect();
         let entry_leaves: Vec<Hash> = entries.iter().map(|(_, b)| Entry::leaf(b)).collect();
         let m_t = rt_range_proof(&entry_leaves, 0, 1).0;
-        Self { weights, chunk_leaves, entries, entry_leaves, r_t, m_t }
+        Self { weights, chunk_leaves, entries, entry_leaves, r_t, m_t, lag }
     }
 
     pub fn tier(&self) -> TierCtx {
@@ -254,12 +274,17 @@ impl HcTier {
             let mut leaves = vec![Vec::new(); n_leaves];
             let e = quant::dequant_row(quant::Q8_0, self.row(EMBD, tok as usize), D).unwrap();
             let mut r: Vec<f32> = (0..N_HC).flat_map(|_| e.iter().copied()).collect();
+            // the pre of the previous mix (single pass): stream 0 before the first
+            let mut prev_pre: Vec<f64> = (0..N_HC).map(|s| (s == 0) as u8 as f64).collect();
             for l in 0..N_LAYERS {
                 for (half, fn_p, x_p, nrm) in [(Resid::Attn, HC_ATTN_FN, ATTN_X, norm(l, 0)), (Resid::Out, HC_FFN_FN, FFN_X, norm(l, 1))] {
                     let x_hc = q8_1_row(&chain::rms_scaled(&r, EPS, 1.0));
                     let mixes = self.matvec(rank(l, fn_p), &x_hc);
                     let m = self.mix(l, half, &mixes);
-                    let w_in = if faults.post_as_pre { &m.post } else { &m.pre };
+                    let lagged = self.lag && !faults.own_pre;
+                    let w_in = if faults.post_as_pre { m.post.clone() } else if lagged { prev_pre.clone() } else { m.pre.clone() };
+                    // the FFN half reads the attention mix's pre, the next attention half this FFN mix's pre
+                    prev_pre = m.pre.clone();
                     let x: Vec<f32> = (0..D).map(|j| (0..N_HC).map(|s| w_in[s] * r[s * D + j] as f64).sum::<f64>() as f32).collect();
                     let x_q = q8_1_row(&chain::rms_norm(&x, &self.f32_tensor(nrm), EPS));
                     let o = self.matvec(rank(l, x_p), &x_q);
@@ -365,13 +390,18 @@ impl HcTier {
             manifest::LINK_HC_FFN_IN => LinkOpening::HcIn { layer, src: self.source(pos, l, Resid::Out) },
             link => {
                 let (half, fn_p, b) = if link == manifest::LINK_HC_ATTN_PRE { (Resid::Attn, HC_ATTN_FN, 2) } else { (Resid::Out, HC_FFN_FN, 3) };
-                LinkOpening::HcPre {
-                    layer,
-                    src: self.source(pos, l, half),
-                    mixes: leaf_bytes(pos, 2 * rank(l, fn_p) as u64 + 1),
-                    base: self.whole(norm(l, b)),
-                    norm: self.norm_fragment_of(pl.norm as usize, block),
-                }
+                // the mix whose pre the input reads: its own, or the one before it under single-pass mixes
+                let source = match (self.lag, half, l) {
+                    (false, _, _) => Some((l, fn_p, b)),
+                    (true, Resid::Attn, 0) => None,
+                    (true, Resid::Attn, l) => Some((l - 1, HC_FFN_FN, 3)),
+                    (true, Resid::Out, l) => Some((l, HC_ATTN_FN, 2)),
+                };
+                let (mixes, base) = match source {
+                    Some((sl, sp, sb)) => (leaf_bytes(pos, 2 * rank(sl, sp) as u64 + 1), self.whole(norm(sl, sb))),
+                    None => (Default::default(), Default::default()),
+                };
+                LinkOpening::HcPre { layer, src: self.source(pos, l, half), mixes, base, norm: self.norm_fragment_of(pl.norm as usize, block) }
             }
         };
         (point, pos.tok, link)
@@ -588,6 +618,56 @@ mod tests {
     }
 
     #[test]
+    fn honest_single_pass_mixes_pass_every_draw() {
+        let tier = HcTier::with_lag(true);
+        let trace = tier.trace(&tokens(), 12, Faults::default());
+        let (tc, cc, rc) = (tier.tier(), tier.chain_ctx(), response(&trace));
+        let mut pre = [0usize; 3];
+        for seed in seeds() {
+            for i in 0..draw::POINTS {
+                let (p, tok, link) = tier.open_point(&trace, &seed, i);
+                if let LinkOpening::HcPre { mixes, .. } = &link {
+                    pre[if mixes.bytes.is_empty() { 0 } else if p.entry.index as usize % PER_LAYER == ATTN_X { 1 } else { 2 }] += 1;
+                }
+                verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).unwrap_or_else(|e| panic!("point {i}: {e:?}"));
+            }
+            verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(&trace, &seed)).unwrap();
+        }
+        assert!(pre.iter().all(|&n| n > 0), "{pre:?}");
+    }
+
+    #[test]
+    fn a_half_reading_its_own_pre_under_single_pass_mixes_is_refused() {
+        let tier = HcTier::with_lag(true);
+        let trace = tier.trace(&tokens(), 12, Faults { own_pre: true, ..Faults::default() });
+        let (tc, cc, rc) = (tier.tier(), tier.chain_ctx(), response(&trace));
+        let mut refused = 0;
+        for seed in seeds() {
+            for i in 0..draw::POINTS {
+                let (p, tok, link) = tier.open_point(&trace, &seed, i);
+                // at layer 0 every stream is the embedding: any pre mixes it to the same normed input
+                if matches!(link, LinkOpening::HcPre { .. }) && p.entry.index as usize != rank(0, ATTN_X) {
+                    let r = verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None);
+                    assert_eq!(r.err(), Some(Fail::Mismatch));
+                    refused += 1;
+                }
+            }
+        }
+        assert!(refused > 0);
+    }
+
+    #[test]
+    fn a_single_pass_layer_round_trips_and_keeps_plain_layers_unchanged() {
+        let plain = HcTier::new();
+        let lagged = HcTier::with_lag(true);
+        let layer = |t: &HcTier, l: usize| t.entries[LAYERS + l].1.clone();
+        assert_ne!(layer(&plain, 1), layer(&lagged, 1));
+        let parsed = Entry::parse(&layer(&lagged, 1)).unwrap().0;
+        assert!(matches!(parsed.chain, Chain::Layer(ll) if ll.hc.is_some_and(|h| h.lag == 1 && h.prev_fn == rank(0, HC_FFN_FN) as u32)));
+        assert!(matches!(Entry::parse(&layer(&plain, 1)).unwrap().0.chain, Chain::Layer(ll) if ll.hc.is_some_and(|h| h.lag == 0)));
+    }
+
+    #[test]
     fn a_layer_wrapped_in_hyper_connections_round_trips() {
         let tier = HcTier::new();
         let (e, b) = &tier.entries[LAYERS + 1];
@@ -698,6 +778,10 @@ mod moe_tests {
             n_hc: N_HC as u32,
             sinkhorn_iters: ITERS,
             eps: HC_EPS.to_bits(),
+            lag: 0,
+            prev_fn: manifest::NONE,
+            prev_scale: [0; 3],
+            prev_base: manifest::NONE,
         };
         let q = quant::Q8_0;
         let entries = vec![

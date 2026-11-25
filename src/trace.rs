@@ -1076,7 +1076,7 @@ pub fn draw_chain(m: &TierManifest, pctx: &PrefixCtx, rec: &TraceRecord, seed: &
     for i in 0..POINTS {
         let p = draw_point(m, rec.n_prompt, rec.n_pos, seed, i)?;
         if let Chain::Product(pl) = m.entry(p.g_rank).chain {
-            if matches!(pl.link, manifest::LINK_HC_ATTN_PRE | manifest::LINK_HC_FFN_PRE) {
+            if matches!(pl.link, manifest::LINK_HC_ATTN_PRE | manifest::LINK_HC_FFN_PRE) && pl.src != manifest::NONE {
                 extra.push((p.t, 2 * pl.src + 1));
             }
         }
@@ -1292,15 +1292,13 @@ pub fn chain_opening(
                         Chain::Layer(ll) => ll.hc?,
                         _ => return None,
                     };
-                    let base = if pl.link == manifest::LINK_HC_ATTN_PRE { hc.attn_base } else { hc.ffn_base };
                     let n_mix = (2 + hc.n_hc as u64) * hc.n_hc as u64;
-                    LinkOpening::HcPre {
-                        layer,
-                        src,
-                        mixes: leaf_bytes(rec, p.t, 2 * pl.src + 1, cap(p.t, 2 * pl.src + 1)?),
-                        base: bytes_range(m, index, base as u64, 0, 4 * n_mix)?,
-                        norm: norm_fragment(m, index, pl.norm as u64, block?)?,
-                    }
+                    // the mix whose pre the input reads (none for the first single-pass attention half)
+                    let (mixes, base) = match hc.pre_source(pl.link == manifest::LINK_HC_ATTN_PRE) {
+                        Some((_, _, base)) => (leaf_bytes(rec, p.t, 2 * pl.src + 1, cap(p.t, 2 * pl.src + 1)?), bytes_range(m, index, base as u64, 0, 4 * n_mix)?),
+                        None => (Default::default(), Default::default()),
+                    };
+                    LinkOpening::HcPre { layer, src, mixes, base, norm: norm_fragment(m, index, pl.norm as u64, block?)? }
                 }
             }
             (_, Some(l)) => LinkOpening::Norm { src: leaf_bytes(rec, p.t, *l, cap(p.t, *l)?), norm: norm_fragment(m, index, pl.norm as u64, block?)? },
@@ -1520,8 +1518,18 @@ mod tests {
     /// Stage-2 openings of a trace over hyper-connection layers verify as the node checks them.
     #[test]
     fn hyper_connection_openings_verify() {
+        hyper_connection_openings(false);
+    }
+
+    /// The same over single-pass mixes, each half reading the pre of the mix before it.
+    #[test]
+    fn single_pass_hyper_connection_openings_verify() {
+        hyper_connection_openings(true);
+    }
+
+    fn hyper_connection_openings(lag: bool) {
         use keryx_verifiable_inference::hckit::{Faults, HcTier};
-        let tier = HcTier::new();
+        let tier = HcTier::with_lag(lag);
         let offset = 2u32;
         let request: Hash = std::array::from_fn(|i| (i * 29 + 11) as u8);
         let mut toks: Vec<u32> = vec![5, 42];

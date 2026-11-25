@@ -76,6 +76,11 @@ pub const ENGRAM_MAX_GRAM: usize = 8;
 pub const ENGRAM_MAX_COLS: usize = 64;
 const COMP_FIELDS: usize = 28;
 const HC_FIELDS: usize = 13;
+/// A layer of single-pass hyper-connection streams: each half's input is mixed with the `pre` of
+/// the mix before it (the FFN mix of the layer before for the attention half, the attention mix
+/// of the layer for the FFN half).
+const TAG_HC1: u8 = 18;
+const HC1_FIELDS: usize = HC_FIELDS + 6;
 
 /// Source of a product's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,9 +316,39 @@ pub struct HcLinks {
     pub sinkhorn_iters: u32,
     /// f32 bits.
     pub eps: u32,
+    /// Single pass (1): the mix whose `pre` the attention half reads is the FFN mix of the layer
+    /// before, product `prev_fn` with its scales and bias entry (`NONE` at layer 0: stream 0).
+    pub lag: u32,
+    pub prev_fn: u32,
+    pub prev_scale: [u32; 3],
+    pub prev_base: u32,
 }
 
 impl HcLinks {
+    /// The mix whose `pre` the input of half `attn` reads: product, scales and bias entry;
+    /// `None` for the attention half of the first single-pass layer.
+    pub fn pre_source(&self, attn: bool) -> Option<(u32, [u32; 3], u32)> {
+        match (self.lag, attn) {
+            (0, true) => Some((self.attn_fn, self.attn_scale, self.attn_base)),
+            (0, false) => Some((self.ffn_fn, self.ffn_scale, self.ffn_base)),
+            (_, true) => (self.prev_fn != NONE).then_some((self.prev_fn, self.prev_scale, self.prev_base)),
+            (_, false) => Some((self.attn_fn, self.attn_scale, self.attn_base)),
+        }
+    }
+
+    fn fields1(&self) -> [u32; HC1_FIELDS] {
+        let mut f = [0u32; HC1_FIELDS];
+        f[..HC_FIELDS].copy_from_slice(&self.fields());
+        let p = self.prev_scale;
+        f[HC_FIELDS..].copy_from_slice(&[self.prev_fn, p[0], p[1], p[2], self.prev_base, 0]);
+        f
+    }
+
+    fn from_fields1(f: [u32; HC1_FIELDS]) -> Option<Self> {
+        let base = Self::from_fields(f[..HC_FIELDS].try_into().unwrap());
+        let x = &f[HC_FIELDS..];
+        (x[5] == 0).then_some(Self { lag: 1, prev_fn: x[0], prev_scale: [x[1], x[2], x[3]], prev_base: x[4], ..base })
+    }
     fn fields(&self) -> [u32; HC_FIELDS] {
         let (a, f) = (self.attn_scale, self.ffn_scale);
         [self.attn_fn, self.ffn_fn, a[0], a[1], a[2], f[0], f[1], f[2], self.attn_base, self.ffn_base, self.n_hc, self.sinkhorn_iters, self.eps]
@@ -330,6 +365,10 @@ impl HcLinks {
             n_hc: f[10],
             sinkhorn_iters: f[11],
             eps: f[12],
+            lag: 0,
+            prev_fn: NONE,
+            prev_scale: [0; 3],
+            prev_base: NONE,
         }
     }
 }
@@ -537,6 +576,18 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                 _ => None,
             }
         }
+        Some(&TAG_HC1) => {
+            let mut f = [0u32; HC1_FIELDS];
+            for (i, v) in f.iter_mut().enumerate() {
+                *v = u32a(1 + 4 * i)?;
+            }
+            let head = 1 + 4 * HC1_FIELDS;
+            let hc = HcLinks::from_fields1(f)?;
+            match parse_chain(b.get(head..)?)? {
+                (Chain::Layer(l), len) if l.hc.is_none() => Some((Chain::Layer(LayerLinks { hc: Some(hc), ..l }), head + len)),
+                _ => None,
+            }
+        }
         Some(&TAG_HC) => {
             let mut f = [0u32; HC_FIELDS];
             for (i, v) in f.iter_mut().enumerate() {
@@ -626,6 +677,13 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
             b.push(TAG_ENGRAM);
             b.extend_from_slice(&l.engram.unwrap().bytes());
             b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { engram: None, ..*l })));
+        }
+        Chain::Layer(l) if l.hc.is_some_and(|h| h.lag != 0) => {
+            b.push(TAG_HC1);
+            for v in l.hc.unwrap().fields1() {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(&chain_bytes(&Chain::Layer(LayerLinks { hc: None, ..*l })));
         }
         Chain::Layer(l) if l.hc.is_some() => {
             b.push(TAG_HC);
@@ -855,7 +913,7 @@ mod tests {
         assert_eq!(chain_bytes(&lga).len(), 53 + 84);
         assert_eq!(chain_bytes(&lgr).len(), 53 + 76);
         assert_eq!(chain_bytes(&lm).len(), 49);
-        let hc = HcLinks { attn_fn: 1, ffn_fn: 2, attn_scale: [3, 4, 5], ffn_scale: [6, 7, 8], attn_base: 9, ffn_base: 10, n_hc: 4, sinkhorn_iters: 20, eps: 1e-6f32.to_bits() };
+        let hc = HcLinks { attn_fn: 1, ffn_fn: 2, attn_scale: [3, 4, 5], ffn_scale: [6, 7, 8], attn_base: 9, ffn_base: 10, n_hc: 4, sinkhorn_iters: 20, eps: 1e-6f32.to_bits() , lag: 0, prev_fn: NONE, prev_scale: [0; 3], prev_base: NONE};
         let dsa = DsaLinks { sel: 3, kpool: 4, n_top: 512, tail: 0, iq: 50, ik: 51, ig: 52, w: 53, k_norm: 60, k_bias: 61, ape: 62, k_eps: 1e-6f32.to_bits() };
         let inner = match lga { Chain::Layer(x) => x, _ => unreachable!() };
         let ld = Chain::Layer(LayerLinks { dsa: Some(dsa), ..inner });
