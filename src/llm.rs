@@ -919,6 +919,7 @@ pub fn load_and_run_traced_inference(
     chain: bool,
     attention: bool,
 ) -> Option<Generated> {
+    let Some(tier) = crate::trace::slot(model_id, tier) else { return run_inference(model_id, prompt, max_tokens, None) };
     run_inference(model_id, prompt, max_tokens, Some(Traced { tier, prompt_len, request_hash: *request_hash, chain, attention: chain && attention }))
 }
 
@@ -1426,6 +1427,7 @@ fn run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usize, traced: O
 /// `model_id`. Blocking.
 pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> Option<crate::trace::ResponseTrace> {
     use keryx_verifiable_inference::block_task::{task_tokens, TASK_LEN};
+    let tier = crate::trace::slot(model_id, tier)?;
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
@@ -1454,6 +1456,7 @@ pub fn run_block_task(model_id: &[u8; 32], tier: u8, window_seed: &[u8; 32]) -> 
 /// node will check it. Blocking.
 pub fn open_block_task(model_id: &[u8; 32], tier: u8, trace: &crate::trace::ResponseTrace, window_seed: &[u8; 32], block_hash: &[u8; 32]) -> Option<Vec<u8>> {
     use keryx_verifiable_inference::block_task::{draw_seed, task_bytes, task_prefix, verify_block_task};
+    let tier = crate::trace::slot(model_id, tier)?;
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
@@ -1496,6 +1499,7 @@ pub fn open_attention_phase(
     path: &[u64],
     prev: &[u8],
 ) -> Option<Vec<u8>> {
+    let tier = crate::trace::slot(model_id, tier)?;
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;
@@ -1524,6 +1528,7 @@ pub fn open_trace(
     accepted_daa: u64,
 ) -> Option<Vec<u8>> {
     use crate::trace::{build_point, build_prefix_point, draw_point, draw_prefix, opening_body, prefix_active, prefix_ctx, TierManifest, POINTS};
+    let tier = crate::trace::slot(model_id, tier)?;
     let _serving = ServingGuard::new();
     let specs = *SUPPORTED_SPECS.read().unwrap();
     let spec = specs.iter().find(|s| &s.model_id == model_id)?;

@@ -26,13 +26,31 @@ pub const STAGE_1A: u8 = 1;
 /// Points opened per audited response.
 pub const POINTS: u32 = draw::POINTS;
 
-/// Serialized manifests of the tiers, in tier order; `None` = no manifest.
-const MANIFESTS: [Option<&[u8]>; 5] = [
+/// Trace slots: the H14 tiers in tier order, then the traced H18 tiers.
+const SLOTS: usize = 6;
+
+/// Slot of each H18 tier; `None` = not traced. MUST follow the node's `TRACE_TIERS_H18`.
+const H18_SLOTS: [Option<u8>; crate::models::H18_TIER_COUNT] = [None, Some(5), None, None, None, None, None];
+
+/// Slot whose prefix, chain and sequence contexts a slot uses.
+const CTX_SLOT: [usize; SLOTS] = [0, 1, 2, 3, 4, 0];
+
+/// Trace slot of `model_id` serving `tier`; `None` = the tier is not traced.
+pub fn slot(model_id: &[u8; 32], tier: u8) -> Option<u8> {
+    if crate::models::H18_LINEUP.iter().any(|m| m.model_id == *model_id) {
+        return H18_SLOTS.get(tier as usize).copied().flatten();
+    }
+    ((tier as usize) < 5).then_some(tier)
+}
+
+/// Serialized manifests of the slots; `None` = no manifest.
+const MANIFESTS: [Option<&[u8]>; SLOTS] = [
     Some(include_bytes!("../assets/trace-manifests/tier0.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier1.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier2.bin")),
     Some(include_bytes!("../assets/trace-manifests/tier3.bin")),
     None,
+    Some(include_bytes!("../assets/trace-manifests/h18-tier1.bin")),
 ];
 
 /// Prefix contexts of the audited tiers, in tier order. MUST equal the node's `TRACE_PREFIXES`.
@@ -145,22 +163,24 @@ pub const STAGE_CHAIN: u8 = keryx_verifiable_inference::chain::STAGE_CHAIN;
 
 /// Serialized stage-2 manifests (`KXMANIF2`), in tier order. MUST equal the node's
 /// `TRACE_CHAINS_H15` manifests.
-const CHAIN_MANIFESTS: [&[u8]; 5] = [
+const CHAIN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/chain-tier0.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier1.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier2.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier3.bin"),
     include_bytes!("../assets/trace-manifests/chain-tier4.bin"),
+    include_bytes!("../assets/trace-manifests/chain-h18-tier1.bin"),
 ];
 
 /// Serialized manifests under the attention rule (attention and recurrent descriptors), in tier
 /// order. MUST equal the node's `TRACE_ATTN_H_NEXT` manifests.
-const ATTN_MANIFESTS: [&[u8]; 5] = [
+const ATTN_MANIFESTS: [&[u8]; SLOTS] = [
     include_bytes!("../assets/trace-manifests/attn-tier0.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier1.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier2.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier3.bin"),
     include_bytes!("../assets/trace-manifests/attn-tier4.bin"),
+    include_bytes!("../assets/trace-manifests/attn-h18-tier1.bin"),
 ];
 
 /// Attention layers, recurrent layers and sequence heads of each manifest under the attention
@@ -180,15 +200,16 @@ const CHAIN_CTX: [Option<(ChainCtx, u32, u32)>; 5] = [
     Some((ChainCtx { n_layers: 27, layer_base: 503, embd_entry: 395, eps: 9.999999747378752e-06, embd_scale: 1.0, trim_last: true, n_used: 8, n_attn: 0, n_recur: 0, seq_heads: 0 }, 395, 396)),
 ];
 
-/// Entries of the stage-2 manifest of `tier` and its product count.
-pub fn chain_manifest(tier: u8) -> Option<keryx_verifiable_inference::manifest::Manifest> {
-    keryx_verifiable_inference::manifest::read_file(CHAIN_MANIFESTS.get(tier as usize)?)
+/// Entries of the stage-2 manifest of `slot` and its product count.
+pub fn chain_manifest(slot: u8) -> Option<keryx_verifiable_inference::manifest::Manifest> {
+    keryx_verifiable_inference::manifest::read_file(CHAIN_MANIFESTS.get(slot as usize)?)
 }
 
-/// Stage-2 chain context of `tier`, and its prefix context on the stage-2 manifest.
-pub fn chain_ctx(tier: u8) -> Option<(ChainCtx, PrefixCtx)> {
-    let (ctx, embd, norm) = (*CHAIN_CTX.get(tier as usize)?)?;
-    let prefix = PREFIXES.get(tier as usize)?.clone().map(|p| PrefixCtx { embd_entry: embd, norm_entry: norm, ..p });
+/// Stage-2 chain context of `slot`, and its prefix context on the stage-2 manifest.
+pub fn chain_ctx(slot: u8) -> Option<(ChainCtx, PrefixCtx)> {
+    let tier = *CTX_SLOT.get(slot as usize)?;
+    let (ctx, embd, norm) = (*CHAIN_CTX.get(tier)?)?;
+    let prefix = PREFIXES.get(tier)?.clone().map(|p| PrefixCtx { embd_entry: embd, norm_entry: norm, ..p });
     let prefix = match (tier, prefix) {
         (_, Some(p)) => p,
         (4, None) => PrefixCtx { table: PREFIXES[0].clone()?.table, offset: KIMI_PREFIX_OFFSET, embd_entry: embd, norm_entry: norm, eps: ctx.eps, embd_scale: ctx.embd_scale },
@@ -201,9 +222,9 @@ pub fn chain_ctx(tier: u8) -> Option<(ChainCtx, PrefixCtx)> {
 pub const KIMI_PREFIX_OFFSET: u32 = 6;
 
 
-/// The prefix context of `tier`; `None` = no manifest.
-pub fn prefix_ctx(tier: u8) -> Option<&'static PrefixCtx> {
-    PREFIXES.get(tier as usize).and_then(|p| p.as_ref())
+/// The prefix context of `slot`; `None` = no manifest.
+pub fn prefix_ctx(slot: u8) -> Option<&'static PrefixCtx> {
+    PREFIXES.get(*CTX_SLOT.get(slot as usize)?).and_then(|p| p.as_ref())
 }
 
 /// Whether a response accepted at `accepted_daa` is opened under the prefix rule.
@@ -253,27 +274,27 @@ impl TierManifest {
         Some(Self { entries, n_products, leaves, m_t, chain: None })
     }
 
-    /// The stage-2 manifest of `tier` with its chain context.
-    pub fn for_chain(tier: u8) -> Option<Self> {
-        let (ctx, _) = chain_ctx(tier)?;
-        let m = Self::parse(Self::raw_chain(tier)?)?;
+    /// The stage-2 manifest of `slot` with its chain context.
+    pub fn for_chain(slot: u8) -> Option<Self> {
+        let (ctx, _) = chain_ctx(slot)?;
+        let m = Self::parse(Self::raw_chain(slot)?)?;
         Some(Self { chain: Some(ctx), ..m })
     }
 
-    pub fn raw_chain(tier: u8) -> Option<&'static [u8]> {
-        CHAIN_MANIFESTS.get(tier as usize).copied()
+    pub fn raw_chain(slot: u8) -> Option<&'static [u8]> {
+        CHAIN_MANIFESTS.get(slot as usize).copied()
     }
 
-    /// The manifest of `tier` under the attention rule, with its chain context.
-    pub fn for_attn(tier: u8) -> Option<Self> {
-        let (mut ctx, _) = chain_ctx(tier)?;
-        (ctx.n_attn, ctx.n_recur, ctx.seq_heads) = *ATTN_SEQ.get(tier as usize)?;
-        let m = Self::parse(Self::raw_attn(tier)?)?;
+    /// The manifest of `slot` under the attention rule, with its chain context.
+    pub fn for_attn(slot: u8) -> Option<Self> {
+        let (mut ctx, _) = chain_ctx(slot)?;
+        (ctx.n_attn, ctx.n_recur, ctx.seq_heads) = *ATTN_SEQ.get(*CTX_SLOT.get(slot as usize)?)?;
+        let m = Self::parse(Self::raw_attn(slot)?)?;
         Some(Self { chain: Some(ctx), ..m })
     }
 
-    pub fn raw_attn(tier: u8) -> Option<&'static [u8]> {
-        ATTN_MANIFESTS.get(tier as usize).copied()
+    pub fn raw_attn(slot: u8) -> Option<&'static [u8]> {
+        ATTN_MANIFESTS.get(slot as usize).copied()
     }
 
     /// Sequence layout for the engine: one `(layer, kind, slot, heads, head_dim)` row per
@@ -302,9 +323,9 @@ impl TierManifest {
             .unwrap_or(DEFAULT_INTERVAL)
     }
 
-    /// The embedded manifest of `tier`; `None` = no manifest.
-    pub fn for_tier(tier: u8) -> Option<Self> {
-        MANIFESTS.get(tier as usize).copied().flatten().and_then(Self::parse)
+    /// The embedded manifest of `slot`; `None` = no manifest.
+    pub fn for_tier(slot: u8) -> Option<Self> {
+        MANIFESTS.get(slot as usize).copied().flatten().and_then(Self::parse)
     }
 
     /// The manifest the node holds for a response accepted at `accepted_daa`: the embedded one
@@ -1282,7 +1303,7 @@ mod tests {
     fn every_drawable_site_of_the_attention_manifests_is_supported() {
         use keryx_verifiable_inference::support::check_manifest;
         let entries = |m: &TierManifest| m.entries.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>();
-        for tier in 0..5u8 {
+        for tier in 0..SLOTS as u8 {
             let m = TierManifest::for_attn(tier).unwrap();
             check_manifest(&entries(&m), &m.chain.unwrap(), 131_072).unwrap_or_else(|e| panic!("tier {tier}: {e}"));
         }
@@ -1317,6 +1338,33 @@ mod tests {
             assert_eq!(m.seq_interval(), if c.n_recur > 0 { 32 } else { DEFAULT_INTERVAL });
         }
     }
+    #[test]
+    fn h18_slots_match_the_node() {
+        use crate::models::{H18_LINEUP, KEV_4B, QWEN3_5_9B_ABLITERATED, QWEN3_5_9B_Q8};
+        assert_eq!(slot(&QWEN3_5_9B_Q8.model_id, 1), Some(5));
+        assert_eq!(slot(&KEV_4B.model_id, 0), None);
+        assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 0), Some(0));
+        assert_eq!(slot(&QWEN3_5_9B_ABLITERATED.model_id, 5), None);
+        for (t, m) in H18_LINEUP.iter().enumerate() {
+            assert_eq!(slot(&m.model_id, t as u8).is_some(), t == 1, "tier {t}");
+        }
+        let hex = |m: &TierManifest| hex::encode(m.m_t);
+        let p = TierManifest::for_tier(5).unwrap();
+        assert_eq!((hex(&p).as_str(), p.entries.len(), p.n_products), ("8047cc475c0273252a4c07b1fa438487ee20aad3c13a5e99f4b385becb2cf52d", 251, 249));
+        let c = TierManifest::for_chain(5).unwrap();
+        assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("07b6944852d310a631d574a3adb39e915b47de8d01896627690be62a9af92137", 347, 249));
+        let a = TierManifest::for_attn(5).unwrap();
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("fb02fbaca5d528f6d320430937a960ec752c0723c45e7c273d9800f0876c05e2", 459, 249));
+        let ac = a.chain.unwrap();
+        assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.n_attn, ac.n_recur, ac.seq_heads), (32, 315, 249, 8, 24, 32));
+        let (_, pctx) = chain_ctx(5).unwrap();
+        assert_eq!((c.entries[pctx.embd_entry as usize].0.role, c.entries[pctx.norm_entry as usize].0.role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+        assert_eq!(c.entries[c.chain.unwrap().layer_base as usize].0.role, manifest::ROLE_LAYER);
+        let pre = prefix_ctx(5).unwrap();
+        assert_eq!((p.entry(pre.embd_entry as u64).role, p.entry(pre.norm_entry as u64).role), (manifest::ROLE_EMBD, manifest::ROLE_NORM));
+        assert_eq!((pre.offset, pre.eps, pre.table), (6, 9.999999974752427e-07, prefix_ctx(0).unwrap().table));
+    }
+
     use keryx_verifiable_inference::merkle::{rt_range_proof, rt_verify_range};
     use keryx_verifiable_inference::verify::{verify_point, ResponseCtx, TierCtx};
 

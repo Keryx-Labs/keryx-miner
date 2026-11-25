@@ -2472,7 +2472,7 @@ impl KeryxdHandler {
             let (Some(txid_bytes), Some(seed_block)) = (hash32(txid), hash32(seed_hash)) else { continue };
             let seed = keryx_miner::trace::trace_seed(&seed_block, &txid_bytes);
             let audited = keryx_miner::trace::audit_all_active(accepted_daa) || keryx_miner::trace::audited(&seed);
-            let attention = keryx_miner::trace::attention_active(accepted_daa) && keryx_miner::trace::TierManifest::for_attn(p.tier).is_some();
+            let attention = keryx_miner::trace::attention_active(accepted_daa) && keryx_miner::trace::slot(&p.model_id, p.tier).and_then(keryx_miner::trace::TierManifest::for_attn).is_some();
             let prompt = if attention { keryx_miner::trace::attn_first_prompt_daa(p.trace.record.n_prompt) } else { 0 };
             let deadline_daa = daa + keryx_miner::trace::opening_window_daa(p.tier, p.max_tokens) + prompt;
             drawn.push((
@@ -2527,8 +2527,9 @@ impl KeryxdHandler {
             let Some((block, _, accepted_daa)) = seed_block_after(&self.chain_log, accepted) else { continue };
             let (Some(txid_bytes), Some(block_bytes)) = (hash32(txid), hash32(block)) else { continue };
             let phase = a.path.len();
-            let Some(n) = keryx_miner::trace_seq::attn_children(p.tier, &p.trace.record, &d.seed, &a.path) else { continue };
-            let Some(weights) = a.bodies.last().and_then(|b| keryx_miner::trace_seq::attn_child_weights(p.tier, &p.trace.record, &d.seed, b)).filter(|w| w.len() as u64 == n) else {
+            let Some(slot) = keryx_miner::trace::slot(&p.model_id, p.tier) else { continue };
+            let Some(n) = keryx_miner::trace_seq::attn_children(slot, &p.trace.record, &d.seed, &a.path) else { continue };
+            let Some(weights) = a.bodies.last().and_then(|b| keryx_miner::trace_seq::attn_child_weights(slot, &p.trace.record, &d.seed, b)).filter(|w| w.len() as u64 == n) else {
                 warn!("Trace: response {} — no draw weights for attention phase {}", txid, phase + 1);
                 continue;
             };
