@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
-index 7139b3c0b..afdb167c2 100644
+index 7139b3c0b..44ef3df93 100644
 --- a/ggml/src/ggml-cuda/q8canon.cu
 +++ b/ggml/src/ggml-cuda/q8canon.cu
-@@ -400,6 +400,12 @@ struct q8c_dev {
+@@ -400,6 +400,14 @@ struct q8c_dev {
      uint32_t n_layers   = 0;
      uint32_t n_router   = 0;
      bool     ple        = false;
@@ -10,22 +10,25 @@ index 7139b3c0b..afdb167c2 100644
 +    std::vector<int>      sel_of_layer;
 +    std::vector<uint32_t> sel_top;
 +    uint32_t n_sel      = 0;
++    // Layers carry hyper-connection streams: residual rows hold every stream of a token.
++    bool      hc        = false;
 +    uint8_t * sel_buf   = nullptr;
 +    size_t    sel_cap   = 0;
      uint32_t nl         = 0;
      uint32_t max_pos    = 0;
      uint8_t * stage     = nullptr;
-@@ -455,6 +461,9 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+@@ -455,6 +463,10 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
      uint32_t n_layers = 0;
      bool moe = false;
      bool ple = false;
 +    std::vector<int> sel_of_layer;
 +    std::vector<uint32_t> sel_top;
 +    uint32_t n_sel = 0;
++    bool hc = false;
      size_t o = 16;
      for (uint32_t i = 0; i < n_entries; ++i) {
          if (o + 2 > len) {
-@@ -478,12 +487,36 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+@@ -478,12 +490,37 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
          }
          o += 2 + nl + 55;
          if (chain) {
@@ -35,6 +38,7 @@ index 7139b3c0b..afdb167c2 100644
 +            // hyper-connection and sparse attention envelopes precede the layer they wrap
 +            if (b[o] == 14) {
 +                o += 1 + 4*13;
++                hc = true;
 +            }
 +            int sel = -1;
 +            uint32_t top = 0;
@@ -63,7 +67,7 @@ index 7139b3c0b..afdb167c2 100644
              uint8_t flags = 0;
              if (tag == 8 && o + 2 <= len) {
                  flags = b[o + 1];
-@@ -495,15 +528,23 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+@@ -495,15 +532,23 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
              if (ext == 0 || o + ext > len) {
                  return false;
              }
@@ -89,7 +93,7 @@ index 7139b3c0b..afdb167c2 100644
              }
              o += ext;
          }
-@@ -512,7 +553,10 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
+@@ -512,7 +557,11 @@ static bool q8c_load_manifest(q8c_dev & s, const uint8_t * b, size_t len) {
      s.n_layers   = n_layers;
      s.n_router   = moe ? n_layers : 0;
      s.ple        = ple;
@@ -97,11 +101,12 @@ index 7139b3c0b..afdb167c2 100644
 +    s.sel_of_layer = sel_of_layer;
 +    s.sel_top    = sel_top;
 +    s.n_sel      = n_sel;
++    s.hc         = hc;
 +    s.nl = 2*n_products + (ple ? 3 : 2)*n_layers + s.n_router + (ple ? 2 : 0) + n_sel + 1;
      return true;
  }
  
-@@ -529,6 +573,11 @@ static void q8c_free_dev(q8c_dev & s) {
+@@ -529,6 +578,11 @@ static void q8c_free_dev(q8c_dev & s) {
      if (s.cap_buf) {
          cudaFree(s.cap_buf);
      }
@@ -113,7 +118,31 @@ index 7139b3c0b..afdb167c2 100644
      if (s.h_leaves) {
          cudaFreeHost(s.h_leaves);
      }
-@@ -799,8 +848,110 @@ bool ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream) {
+@@ -758,6 +812,12 @@ static int q8c_resid_leaf(const q8c_dev & s, const char * name) {
+     if (is("l_out")) {
+         return base + (int) per - 1;
+     }
++    if (s.hc) {
++        if (is("hc_attn_post")) {
++            return base;
++        }
++        return s.n_router > 0 && is("ffn_moe_logits") ? after + (int) il : -1;
++    }
+     if (s.ple && is("pe_in")) {
+         return base + 1;
+     }
+@@ -789,6 +849,10 @@ bool ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream) {
+     }
+     int64_t nrows = ggml_nrows(node);
+     int64_t row_bytes = node->ne[0]*sizeof(float);
++    if (s->hc && leaf < (int) (2*s->n_products + 2*s->n_layers)) {
++        nrows = node->ne[2]*node->ne[3];
++        row_bytes = node->ne[0]*node->ne[1]*(int64_t) sizeof(float);
++    }
+     const int ple_leaf = (int) (2*s->n_products + 3*s->n_layers + s->n_router);
+     if (s->ple && leaf >= ple_leaf) {
+         nrows = leaf == ple_leaf ? node->ne[1] : node->ne[2];
+@@ -799,8 +863,110 @@ bool ggml_cuda_q8c_resid(const ggml_tensor * node, cudaStream_t stream) {
      return true;
  }
  
