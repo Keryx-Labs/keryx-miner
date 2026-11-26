@@ -302,18 +302,19 @@ pub const GLM_5_3_FLASH: ModelSpec = ModelSpec {
 };
 
 /// H18 tier-6 model — DeepSeek-V4.1-Flash-1017 Uncensored IQ2_XXS (ISTA-DASLab GSQ-RCO, Abiray
-/// abliteration), body only. `model_id` MUST equal the node's `DEEPSEEK_V4_1_FLASH_MODEL_ID`.
+/// abliteration), mixes, compressor and indexer in Q8_0; Engram tables in `companion`. `model_id` MUST equal
+/// the node's `DEEPSEEK_V4_1_FLASH_MODEL_ID`.
 pub const DEEPSEEK_V4_1_FLASH: ModelSpec = ModelSpec {
     name: "deepseek-v4.1-flash",
     model_id: [
-        0x54, 0xa0, 0xf4, 0x78, 0xc0, 0x18, 0x6b, 0x83,
-        0x59, 0xe1, 0xcb, 0xc8, 0x59, 0xb4, 0x20, 0xd3,
-        0x2e, 0x54, 0xea, 0x34, 0xd6, 0x5d, 0x13, 0x32,
-        0x92, 0x9d, 0x60, 0x06, 0x3d, 0xf6, 0x38, 0xf9,
+        0x5b, 0x58, 0x14, 0x5d, 0xac, 0xfc, 0x85, 0x65,
+        0x25, 0x4f, 0x25, 0x6b, 0xa0, 0x0e, 0x9e, 0xe9,
+        0x91, 0xd9, 0x99, 0x58, 0xae, 0xb1, 0x33, 0x87,
+        0x67, 0x68, 0xb1, 0x37, 0x76, 0xcc, 0xbd, 0x75,
     ],
     format: ModelFormat::GgufDeepseek41,
     tokenizer_cid: "",
-    weight_cids: &["QmU31Jg5y7nemq3wtmxcSBY2fez6Pof2eyR9uwRNR7Dc3S"],
+    weight_cids: &["QmUVDi26TQFWwTdsiyXkRT5spb2poP7LYTmNEKeQDaLuBS"],
     dir_name: "DeepSeek-V4.1-Flash",
     min_vram_mb: 135_000,
     ctx_floor: 32_768,

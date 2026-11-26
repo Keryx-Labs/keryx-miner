@@ -61,6 +61,9 @@ fn attn_layer<'a>(
     if a.softcap != 0 || a.v_norm > 1 || a.gated > 1 {
         return Err("softcap, value norm or gate".into());
     }
+    if let Some(c) = ll.comp {
+        return comp_attn_layer(entry, ctx, sl, a, &c);
+    }
     let hd = a.head_dim as usize;
     if hd == 0 || !hd.is_multiple_of(32) {
         return Err("head dim".into());
@@ -110,6 +113,35 @@ fn attn_layer<'a>(
         }
         for kv in 0..a.n_head_kv as u64 {
             sl.kcache(a.slot as u64, kv).zip(sl.lse(a.slot as u64, kv)).ok_or("cache or mass leaf")?;
+        }
+    }
+    Ok(())
+}
+
+/// A compressed attention layer: one latent key head that is also the value, a window, the
+/// selected compressed rows of its source, sinks, and grouped output heads.
+fn comp_attn_layer<'a>(entry: &impl Fn(u32) -> Result<&'a Entry, String>, ctx: &ChainCtx, sl: &SeqLayout, a: &AttnLinks, c: &manifest::CompLinks) -> Result<(), String> {
+    let none = manifest::NONE;
+    let hd = a.head_dim as usize;
+    if a.n_head == 0 || a.n_head_kv != 1 || a.v != none || a.mla_rank != 0 || hd == 0 || !hd.is_multiple_of(32) || a.swa_window == 0 || a.n_rot as usize > hd {
+        return Err("compressed attention shape".into());
+    }
+    let (cl, b) = block_params(crate::dsv41::COMP_ROW_COST, partial_len(hd)).ok_or("block parameters")?;
+    BlockTree::new(0, a.swa_window as u64 + c.n_top as u64, cl, b).ok_or("block tree")?;
+    if entry(a.q)?.m != a.n_head as u64 * hd as u64 {
+        return Err("query width".into());
+    }
+    let oe = entry(a.out)?;
+    if oe.role != manifest::ROLE_HEADS || oe.k as usize % hd != 0 || oe.k * oe.n_exp as u64 != a.n_head as u64 * hd as u64 {
+        return Err("output heads".into());
+    }
+    norm_entry(entry, a.k_norm, hd as u64)?.ok_or("key norm")?;
+    norm_entry(entry, c.sinks, a.n_head as u64)?.ok_or("sinks")?;
+    sl.kcache(a.slot as u64, 0).zip(sl.lse(a.slot as u64, 0)).ok_or("key cache or mass leaf")?;
+    if c.ratio > 0 {
+        sl.comp(c.slot as u64).ok_or("compressed row leaf")?;
+        if c.sel >= ctx.n_sel || c.n_top == 0 || (c.row_len as usize) < hd {
+            return Err("selection".into());
         }
     }
     Ok(())

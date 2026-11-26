@@ -439,6 +439,10 @@ pub(crate) fn format_prompt_parts(name: &str, prompt: &str) -> Option<(String, S
                 SYSTEM_PROMPT_NEXT, prompt
             ),
         ),
+        "deepseek-v4.1-flash" => (
+            "<｜begin▁of▁sentence｜><｜System｜>Request id:".to_string(),
+            format!("\n{}<｜User｜>{}<｜Assistant｜></think>", SYSTEM_PROMPT_NEXT, prompt),
+        ),
         "kimi-linear-48b" => (
             "<|im_system|>system<|im_middle|>Request id:".to_string(),
             format!(
