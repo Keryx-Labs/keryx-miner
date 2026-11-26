@@ -1594,11 +1594,13 @@ pub fn is_testnet() -> bool {
 /// Mainnet H15 gate. MUST equal the node's `H15_ACTIVATION_DAA`.
 pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 /// Testnet H15 gate. MUST equal the node's `TESTNET_H15_ACTIVATION_DAA`.
-const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+const TESTNET_H15_ACTIVATION_DAA: u64 = 1;
 /// Mainnet H16 gate. MUST equal the node's `H16_ACTIVATION_DAA`.
 pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
 /// Testnet H16 gate. MUST equal the node's `TESTNET_H16_ACTIVATION_DAA`.
-const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
+const TESTNET_H16_ACTIVATION_DAA: u64 = 1;
+/// Testnet H18 gate. MUST equal the node's `TESTNET_H18_ACTIVATION_DAA`.
+const TESTNET_H18_ACTIVATION_DAA: u64 = 3_000;
 
 /// Picks the gate value for the selected network (`--testnet`).
 #[inline(always)]
@@ -1737,7 +1739,7 @@ pub fn private_inference_activation_daa() -> u64 {
 /// H18 lineup gate: the tier models of `models::pom_model_for_tier` and their per-tier rules.
 /// MUST equal the node's `h18_activation`; `u64::MAX` until it is scheduled.
 pub fn h18_activation_daa() -> u64 {
-    gate(u64::MAX, u64::MAX)
+    gate(u64::MAX, TESTNET_H18_ACTIVATION_DAA)
 }
 
 /// Verifiable-inference gate. At/after this score an AiResponse carries its trace commitment
@@ -2446,8 +2448,8 @@ mod h16_gate_tests {
         assert_eq!(pad_margin_activation_daa(), H16_ACTIVATION_DAA);
         assert_eq!(H16_ACTIVATION_DAA, 147_000_000);
         assert!(H16_ACTIVATION_DAA > H15_ACTIVATION_DAA);
-        assert_eq!(TESTNET_H16_ACTIVATION_DAA, 180_000);
-        assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
+        assert_eq!(TESTNET_H16_ACTIVATION_DAA, 1);
+        assert!(TESTNET_H16_ACTIVATION_DAA >= TESTNET_H15_ACTIVATION_DAA);
     }
 }
 
