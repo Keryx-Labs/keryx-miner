@@ -12,7 +12,7 @@ pub struct Opt {
         long = "very-light",
         help = "Model tier: Qwen3.5-9B-abliterated (Q5_K_M) — 8GB+ GPU, smallest tier",
         help_heading = "Inference",
-        conflicts_with_all = &["light", "high", "very-high", "ultra", "max"]
+        conflicts_with_all = &["light", "high", "very-high", "ultra", "very-ultra"]
     )]
     pub very_light: bool,
 
@@ -20,7 +20,7 @@ pub struct Opt {
         long = "light",
         help = "Model tier: GLM-4-9B (Q6_K) — 12GB+ VRAM",
         help_heading = "Inference",
-        conflicts_with_all = &["very-light", "high", "very-high", "ultra", "max"]
+        conflicts_with_all = &["very-light", "high", "very-high", "ultra", "very-ultra"]
     )]
     pub light: bool,
 
@@ -28,7 +28,7 @@ pub struct Opt {
         long = "high",
         help = "Model tier: Qwen3.8-27B (Q4_K) — 24GB+ VRAM (Qwen3.6-27B before H14)",
         help_heading = "Inference",
-        conflicts_with_all = &["very-light", "light", "very-high", "ultra", "max"]
+        conflicts_with_all = &["very-light", "light", "very-high", "ultra", "very-ultra"]
     )]
     pub high: bool,
 
@@ -36,7 +36,7 @@ pub struct Opt {
         long = "very-high",
         help = "Model tier: Kimi-Linear-48B (Q4_K_M) — 32GB+ VRAM",
         help_heading = "Inference",
-        conflicts_with_all = &["very-light", "light", "high", "ultra", "max"]
+        conflicts_with_all = &["very-light", "light", "high", "ultra", "very-ultra"]
     )]
     pub very_high: bool,
 
@@ -44,23 +44,23 @@ pub struct Opt {
         long = "ultra",
         help = "Model tier: GLM-5.3-Flash (IQ2_XXS) — 96GB+ VRAM, from H18",
         help_heading = "Inference",
-        conflicts_with_all = &["very-light", "light", "high", "very-high", "max"]
+        conflicts_with_all = &["very-light", "light", "high", "very-high", "very-ultra"]
     )]
     pub ultra: bool,
 
     #[clap(
-        long = "max",
+        long = "very-ultra",
         help = "Model tier: DeepSeek-V4.1-Flash (IQ2_XXS) — 141GB+ VRAM, from H18",
         help_heading = "Inference",
         conflicts_with_all = &["very-light", "light", "high", "very-high", "ultra"]
     )]
-    pub max: bool,
+    pub very_ultra: bool,
 
     #[clap(
         long = "force-model",
         value_name = "TIER[,TIER...]",
         help = "Force the model tier per GPU (CUDA-driver order, CSV): e.g. --force-model light,very-high \
-                → GPU0=light, GPU1=very-high. Names: very-light|light|default|high|very-high|ultra|max. Bypasses the \
+                → GPU0=light, GPU1=very-high. Names: very-light|light|default|high|very-high|ultra|very-ultra. Bypasses the \
                 per-card VRAM check (an undersized card will OOM); unlisted/extra cards keep auto best-fit.",
         help_heading = "Inference"
     )]
@@ -282,6 +282,14 @@ mod tests {
     fn model_tier_conflicts_reference_valid_arguments() {
         Opt::command().debug_assert();
         assert!(Opt::try_parse_from(["keryx-miner", "--very-light", "--very-high"]).is_err());
+    }
+
+    #[test]
+    fn datacenter_tier_flags() {
+        assert!(Opt::try_parse_from(["keryx-miner", "--ultra"]).unwrap().ultra);
+        assert!(Opt::try_parse_from(["keryx-miner", "--very-ultra"]).unwrap().very_ultra);
+        assert!(Opt::try_parse_from(["keryx-miner", "--ultra", "--very-ultra"]).is_err());
+        assert!(Opt::try_parse_from(["keryx-miner", "--max"]).is_err());
     }
 
     #[cfg(feature = "block-celebration")]
