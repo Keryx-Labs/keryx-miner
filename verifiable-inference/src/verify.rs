@@ -191,6 +191,37 @@ pub(crate) fn verify_point_at(
     shape: &PosShape,
     ids: Option<&ExpertIds>,
 ) -> Result<(Report, Opened), Fail> {
+    verify_point_rows(tier, resp, seed, i, p, shape, ids, true)
+}
+
+/// Verify the input of point `i` (its draw, input leaf, output leaf and expert id) without its
+/// weight rows; the report carries the committed output as its recomputation.
+pub(crate) fn verify_point_input(
+    tier: &TierCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    i: u32,
+    p: &Point,
+    shape: &PosShape,
+    ids: Option<&ExpertIds>,
+) -> Result<(Report, Opened), Fail> {
+    if !p.rows.is_empty() || p.bias.is_some() {
+        return Err(Fail::Shape);
+    }
+    verify_point_rows(tier, resp, seed, i, p, shape, ids, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_point_rows(
+    tier: &TierCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    i: u32,
+    p: &Point,
+    shape: &PosShape,
+    ids: Option<&ExpertIds>,
+    rows: bool,
+) -> Result<(Report, Opened), Fail> {
     let n_traced = resp.n_pos as u64;
     if n_traced == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos {
         return Err(Fail::Shape);
@@ -310,6 +341,10 @@ pub(crate) fn verify_point_at(
     if !q8::sums_consistent(x, layout, k) {
         return Err(Fail::Mismatch);
     }
+    let opened = Opened { pos_root, input: g_entry.clone(), layout, slot, expert: exp };
+    if !rows {
+        return Ok((Report { t, rank, row, y, y_hat: y, tol: 0.0 }, opened));
+    }
     let dot_row = |entry: &Entry, r: &ChunkRange, rr: u64| -> Result<Recomputed, Fail> {
         let bytes = open_expert_row(tier, entry, r, exp, rr)?;
         dot::canonical_dot(entry.wtype, &bytes, k, x, layout).ok_or(Fail::Unsupported)
@@ -358,5 +393,5 @@ pub(crate) fn verify_point_at(
     if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
         return Err(Fail::Mismatch);
     }
-    Ok((Report { t, rank, row, y, y_hat, tol }, Opened { pos_root, input: g_entry, layout, slot, expert: exp }))
+    Ok((Report { t, rank, row, y, y_hat, tol }, opened))
 }

@@ -1085,10 +1085,18 @@ impl RecurOpening {
     }
 }
 
-/// One drawn point of a stage-2 trace opening with its draw index.
+/// A whole drawn point: its weight rows and the link of its input.
+pub const HALF_WHOLE: u8 = 0;
+/// The weight rows of a drawn point alone, its link empty.
+pub const HALF_PRODUCT: u8 = 1;
+/// The link of a drawn point's input alone, the point without its weight rows.
+pub const HALF_LINK: u8 = 2;
+
+/// One drawn point of a stage-2 trace opening with its draw index, or one half of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartPoint {
     pub index: u8,
+    pub half: u8,
     pub point: Point,
     pub tok: u32,
     pub link: LinkOpening,
@@ -1120,6 +1128,7 @@ impl ChainPart {
         w.u8(self.points.len() as u8);
         for p in &self.points {
             w.u8(p.index);
+            w.u8(p.half);
             w.point(&p.point);
             w.u32(p.tok);
             w.link(&p.link);
@@ -1149,7 +1158,12 @@ impl ChainPart {
         let n = r.u8()? as usize;
         let mut points = Vec::with_capacity(n);
         for _ in 0..n {
-            points.push(PartPoint { index: r.u8()?, point: r.point()?, tok: r.u32()?, link: r.link()?, experts: r.expert_ids()? });
+            let index = r.u8()?;
+            let half = r.u8()?;
+            if half > HALF_LINK {
+                return None;
+            }
+            points.push(PartPoint { index, half, point: r.point()?, tok: r.u32()?, link: r.link()?, experts: r.expert_ids()? });
         }
         let prefix = match r.u8()? {
             0 => None,
@@ -1168,10 +1182,19 @@ impl ChainPart {
         let empty = ChainPart { response_txid: o.response_txid, roots: o.roots, points: Vec::new(), prefix: None };
         let base = empty.encode().len();
         let mut items: Vec<(usize, Option<PartPoint>)> = Vec::with_capacity(o.points.len() + 1);
+        let size = |pp: &PartPoint| ChainPart { points: vec![pp.clone()], ..empty.clone() }.encode().len() - base;
         for (i, (p, (tok, link))) in o.points.iter().zip(&o.links).enumerate() {
-            let pp = PartPoint { index: i as u8, point: p.clone(), tok: *tok, link: link.clone(), experts: o.experts[i].clone() };
-            let one = ChainPart { points: vec![pp.clone()], ..empty.clone() }.encode().len() - base;
-            items.push((one, Some(pp)));
+            let whole = PartPoint { index: i as u8, half: HALF_WHOLE, point: p.clone(), tok: *tok, link: link.clone(), experts: o.experts[i].clone() };
+            let one = size(&whole);
+            if base + one <= max_len {
+                items.push((one, Some(whole)));
+                continue;
+            }
+            let product = PartPoint { half: HALF_PRODUCT, link: LinkOpening::None, ..whole.clone() };
+            let input = Point { rows: Vec::new(), bias: None, ..p.clone() };
+            let linked = PartPoint { half: HALF_LINK, point: input, ..whole };
+            items.push((size(&product), Some(product)));
+            items.push((size(&linked), Some(linked)));
         }
         let prefix = o.prefix.as_ref()?;
         let size = ChainPart { prefix: Some(prefix.clone()), ..empty.clone() }.encode().len() - base;
@@ -1197,7 +1220,7 @@ impl ChainPart {
             }
         }
         let mut out: Vec<ChainPart> = parts.into_iter().map(|(_, mut p)| {
-            p.points.sort_by_key(|q| q.index);
+            p.points.sort_by_key(|q| (q.index, q.half));
             p
         }).collect();
         out.sort_by_key(|p| p.points.first().map_or(u8::MAX, |q| q.index));
@@ -1363,6 +1386,26 @@ mod chain_part_tests {
                 let i = q.index as usize;
                 assert_eq!((&q.point, q.tok, &q.link, &q.experts), (&o.points[i], o.links[i].0, &o.links[i].1, &o.experts[i]));
             }
+        }
+    }
+
+    #[test]
+    fn a_point_over_the_cap_is_split_into_its_rows_and_its_link() {
+        let mut o = opening(&[20_000, 1000]);
+        o.points[0].rows = vec![ChunkRange { first_chunk: 0, chunks: vec![4; 20_000], proof: vec![[3; 32]; 30] }];
+        o.links[0].1 = LinkOpening::HcIn { layer: EntryOpening::default(), src: HcSource::Streams(LeafBytes { bytes: vec![1; 30_000], leaf_path: vec![] }) };
+        let parts = ChainPart::split(&o, 60_000).unwrap();
+        assert!(parts.iter().all(|p| p.encode().len() <= 60_000));
+        let halves: Vec<&PartPoint> = parts.iter().flat_map(|p| p.points.iter()).filter(|q| q.index == 0).collect();
+        assert_eq!(halves.len(), 2);
+        let product = halves.iter().find(|q| q.half == HALF_PRODUCT).unwrap();
+        let link = halves.iter().find(|q| q.half == HALF_LINK).unwrap();
+        assert_eq!((&product.point, &product.link), (&o.points[0], &LinkOpening::None));
+        assert_eq!(&link.link, &o.links[0].1);
+        assert!(link.point.rows.is_empty() && link.point.x == o.points[0].x);
+        assert!(parts.iter().flat_map(|p| p.points.iter()).any(|q| q.index == 1 && q.half == HALF_WHOLE));
+        for p in &parts {
+            assert_eq!(ChainPart::decode(&p.encode()).as_ref(), Some(p));
         }
     }
 

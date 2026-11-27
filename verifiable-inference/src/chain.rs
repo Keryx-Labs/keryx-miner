@@ -495,8 +495,31 @@ pub fn verify_chain_point(
     link: &LinkOpening,
     ids: Option<&ExpertIds>,
 ) -> Result<Report, Fail> {
+    verify_chain_point_half(tier, ctx, resp, seed, i, p, tok, link, ids, crate::opening::HALF_WHOLE)
+}
+
+/// Verify `half` of point `i` of a stage-2 opening: the whole point, its weight rows alone
+/// (`link` empty), or the link of its input alone (`p` without weight rows).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_chain_point_half(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    i: u32,
+    p: &Point,
+    tok: u32,
+    link: &LinkOpening,
+    ids: Option<&ExpertIds>,
+    half: u8,
+) -> Result<Report, Fail> {
+    use crate::opening::{HALF_LINK, HALF_PRODUCT, HALF_WHOLE};
     let shape = shape(tier, ctx, tok);
-    let (report, o) = verify_point_at(tier, resp, seed, i, p, &shape, ids)?;
+    let (report, o) = match half {
+        HALF_WHOLE | HALF_PRODUCT => verify_point_at(tier, resp, seed, i, p, &shape, ids)?,
+        HALF_LINK => crate::verify::verify_point_input(tier, resp, seed, i, p, &shape, ids)?,
+        _ => return Err(Fail::Shape),
+    };
     let Chain::Product(pl) = o.input.chain else {
         return Err(Fail::Manifest);
     };
@@ -504,6 +527,9 @@ pub fn verify_chain_point(
     let layer = pl.layer as u64;
     if pl.link != manifest::LINK_HEAD && pl.link != manifest::LINK_HC_HEAD && layer >= n_layers {
         return Err(Fail::Manifest);
+    }
+    if half == HALF_PRODUCT {
+        return if matches!(link, LinkOpening::None) { Ok(report) } else { Err(Fail::Shape) };
     }
     match (pl.link, link) {
         (manifest::LINK_NONE, LinkOpening::None) => {

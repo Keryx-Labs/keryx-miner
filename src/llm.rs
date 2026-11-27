@@ -1467,8 +1467,9 @@ fn verify_chain_parts(body: &[u8], sent: &[Vec<u8>]) -> Result<(), String> {
     if sent == [body.to_vec()] {
         return Ok(());
     }
+    use keryx_verifiable_inference::opening::{LinkOpening, Point, HALF_LINK, HALF_PRODUCT, HALF_WHOLE};
     let o = Opening::decode(body).ok_or("undecodable stage-2 opening")?;
-    let mut seen = vec![false; o.points.len()];
+    let mut seen = vec![0u8; o.points.len()];
     let mut prefix = 0;
     for b in sent {
         let part = ChainPart::decode(b).ok_or("undecodable stage-2 part")?;
@@ -1477,10 +1478,17 @@ fn verify_chain_parts(body: &[u8], sent: &[Vec<u8>]) -> Result<(), String> {
         }
         for p in &part.points {
             let i = p.index as usize;
-            if i >= seen.len() || seen[i] || p.point != o.points[i] || (p.tok, &p.link) != (o.links[i].0, &o.links[i].1) || p.experts != o.experts[i] {
-                return Err(format!("stage-2 part point {i} does not match its opening"));
+            let mismatch = || format!("stage-2 part point {i} does not match its opening");
+            let (bits, point, link) = match p.half {
+                HALF_WHOLE => (0b11, o.points.get(i).cloned(), o.links.get(i).map(|l| l.1.clone())),
+                HALF_PRODUCT => (0b01, o.points.get(i).cloned(), Some(LinkOpening::None)),
+                HALF_LINK => (0b10, o.points.get(i).map(|q| Point { rows: Vec::new(), bias: None, ..q.clone() }), o.links.get(i).map(|l| l.1.clone())),
+                _ => return Err(mismatch()),
+            };
+            if i >= seen.len() || seen[i] & bits != 0 || Some(&p.point) != point.as_ref() || Some(&p.link) != link.as_ref() || p.tok != o.links[i].0 || p.experts != o.experts[i] {
+                return Err(mismatch());
             }
-            seen[i] = true;
+            seen[i] |= bits;
         }
         if let Some(pp) = &part.prefix {
             if Some(pp) != o.prefix.as_ref() {
@@ -1489,7 +1497,7 @@ fn verify_chain_parts(body: &[u8], sent: &[Vec<u8>]) -> Result<(), String> {
             prefix += 1;
         }
     }
-    if seen.iter().all(|&s| s) && prefix == 1 { Ok(()) } else { Err("stage-2 parts miss a point".to_string()) }
+    if seen.iter().all(|&s| s == 0b11) && prefix == 1 { Ok(()) } else { Err("stage-2 parts miss a point".to_string()) }
 }
 
 /// Traces a fixed prompt under the stage-2 manifest, then opens and verifies it under two seeds
@@ -2051,6 +2059,21 @@ mod tests {
             resid: None,
             roots: Some(([6; 32], [7; 32])),
         }
+    }
+
+    #[test]
+    fn a_point_over_the_cap_alone_is_sent_in_two_halves() {
+        use keryx_verifiable_inference::opening::{ChainPart, ChunkRange, MAX_BODY_LEN, HALF_LINK, HALF_PRODUCT};
+        let mut o = stage2_opening(&[23_040, 4_608], 81_920);
+        o.points[0].rows = vec![ChunkRange { first_chunk: 0, chunks: vec![7; 21_760], proof: vec![[1; 32]; 33] }];
+        let big = o.encode();
+        let parts = chain_parts(big.clone()).unwrap();
+        assert!(parts.iter().all(|b| b.len() + SEEDED_OVERHEAD <= MAX_BODY_LEN));
+        let halves: Vec<u8> = parts.iter().flat_map(|b| ChainPart::decode(b).unwrap().points).filter(|q| q.index == 0).map(|q| q.half).collect();
+        assert!(halves.contains(&HALF_PRODUCT) && halves.contains(&HALF_LINK));
+        verify_chain_parts(&big, &parts).unwrap();
+        let without_link: Vec<Vec<u8>> = parts.iter().filter(|b| !ChainPart::decode(b).unwrap().points.iter().any(|q| q.half == HALF_LINK)).cloned().collect();
+        assert!(verify_chain_parts(&big, &without_link).is_err());
     }
 
     #[test]
