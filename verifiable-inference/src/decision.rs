@@ -451,6 +451,15 @@ mod tests {
     }
 
     #[test]
+    fn a_seeded_decision_opening_unwraps_to_itself() {
+        let f = fixture(24, &MARKERS, M);
+        let (op, _) = f.opening(&f.answer(&MARKERS), &[3; 32]);
+        let body = crate::opening::seeded(&op.encode(), &[7; 32]).unwrap();
+        assert_eq!(crate::opening::seed_block(&body), Some([7; 32]));
+        assert_eq!(crate::opening::inner_body(&body).as_deref().and_then(DecisionOpening::decode), Some(op));
+    }
+
+    #[test]
     fn a_wrong_score_is_rejected() {
         let f = fixture(24, &MARKERS, M);
         for s in 0..16u8 {
