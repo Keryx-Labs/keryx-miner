@@ -31,6 +31,9 @@ pub const VERSION_ATTN_COMP: u8 = 12;
 pub const VERSION_COMP_SEL: u8 = 13;
 /// N-gram lookup residual opening of a response, sent apart from its trace opening.
 pub const VERSION_ENGRAM: u8 = 14;
+/// Part of a stage-2 trace opening: some drawn points with their draw index, and the prefix point
+/// in one of the parts.
+pub const VERSION_CHAIN_PART: u8 = 15;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -729,62 +732,17 @@ impl Opening {
         }
         w.u8(self.points.len() as u8);
         for p in &self.points {
-            w.u32(p.n_ubatch);
-            w.hashes(&p.pos_path);
-            w.hashes(&p.meta_path);
-            w.entry(&p.entry);
-            match &p.partner {
-                Some(e) => {
-                    w.u8(1);
-                    w.entry(e);
-                }
-                None => w.u8(0),
-            }
-            match &p.bias {
-                Some((e, r)) => {
-                    w.u8(1);
-                    w.entry(e);
-                    w.range(r);
-                }
-                None => w.u8(0),
-            }
-            w.u8(p.rows.len() as u8);
-            for r in &p.rows {
-                w.range(r);
-            }
-            w.bytes32(&p.x);
-            w.hashes(&p.x_path);
-            w.u32(p.y_total_len);
-            w.u32(p.y_chunk_index);
-            w.bytes32(&p.y_chunk);
-            w.hashes(&p.y_chunk_path);
-            w.hashes(&p.y_path);
+            w.point(p);
         }
         if chain {
             for (i, (tok, link)) in self.links.iter().enumerate() {
                 w.u32(*tok);
                 w.link(link);
-                match self.experts.get(i).cloned().flatten() {
-                    Some(e) => {
-                        w.u8(1);
-                        w.bytes32(&e.chunk);
-                        w.hashes(&e.chunk_path);
-                    }
-                    None => w.u8(0),
-                }
+                w.expert_ids(self.experts.get(i).and_then(Option::as_ref));
             }
         }
         if let Some(p) = &self.prefix {
-            w.u32(p.n_ubatch);
-            w.hashes(&p.pos_path);
-            w.hashes(&p.meta_path);
-            w.entry(&p.entry);
-            w.bytes32(&p.x);
-            w.hashes(&p.x_path);
-            w.entry(&p.embd.0);
-            w.range(&p.embd.1);
-            w.entry(&p.norm.0);
-            w.range(&p.norm.1);
+            w.prefix_point(p);
         }
         if let Some(p) = &self.resid {
             w.resid(p);
@@ -815,60 +773,20 @@ impl Opening {
         let n = r.u8()? as usize;
         let mut points = Vec::with_capacity(n);
         for _ in 0..n {
-            let n_ubatch = r.u32()?;
-            let pos_path = r.hashes()?;
-            let meta_path = r.hashes()?;
-            let entry = r.entry()?;
-            let partner = if r.u8()? == 1 { Some(r.entry()?) } else { None };
-            let bias = if r.u8()? == 1 { Some((r.entry()?, r.range()?)) } else { None };
-            let nr = r.u8()? as usize;
-            let rows = (0..nr).map(|_| r.range()).collect::<Option<Vec<_>>>()?;
-            points.push(Point {
-                n_ubatch,
-                pos_path,
-                meta_path,
-                entry,
-                partner,
-                bias,
-                rows,
-                x: r.bytes32()?,
-                x_path: r.hashes()?,
-                y_total_len: r.u32()?,
-                y_chunk_index: r.u32()?,
-                y_chunk: r.bytes32()?,
-                y_chunk_path: r.hashes()?,
-                y_path: r.hashes()?,
-            });
+            points.push(r.point()?);
         }
         let mut experts = Vec::new();
         let links = if chain {
             let mut links = Vec::with_capacity(n);
             for _ in 0..n {
                 links.push((r.u32()?, r.link()?));
-                experts.push(match r.u8()? {
-                    0 => None,
-                    1 => Some(ExpertIds { chunk: r.bytes32()?, chunk_path: r.hashes()? }),
-                    _ => return None,
-                });
+                experts.push(r.expert_ids()?);
             }
             links
         } else {
             Vec::new()
         };
-        let prefix = if version >= VERSION_PREFIX {
-            Some(PrefixPoint {
-                n_ubatch: r.u32()?,
-                pos_path: r.hashes()?,
-                meta_path: r.hashes()?,
-                entry: r.entry()?,
-                x: r.bytes32()?,
-                x_path: r.hashes()?,
-                embd: (r.entry()?, r.range()?),
-                norm: (r.entry()?, r.range()?),
-            })
-        } else {
-            None
-        };
+        let prefix = if version >= VERSION_PREFIX { Some(r.prefix_point()?) } else { None };
         let resid = if chain && r.o < b.len() { Some(r.resid()?) } else { None };
         (r.o == b.len()).then_some(Opening { response_txid, points, prefix, links, experts, resid, roots })
     }
@@ -950,10 +868,15 @@ pub fn seed_block(body: &[u8]) -> Option<Hash> {
     body.get(33..65)?.try_into().ok()
 }
 
-/// Whether `body` decodes as a trace, attention, recurrent or residual opening.
+/// Whether `body` decodes as a trace, trace part, attention, recurrent or residual opening.
 pub fn is_audit_body(body: &[u8]) -> bool {
     Opening::decode(body).is_some()
-        || inner_body(body).is_some_and(|b| AttnOpening::decode(&b).is_some() || RecurOpening::decode(&b).is_some() || ResidOpening::decode(&b).is_some())
+        || inner_body(body).is_some_and(|b| {
+            AttnOpening::decode(&b).is_some()
+                || RecurOpening::decode(&b).is_some()
+                || ResidOpening::decode(&b).is_some()
+                || ChainPart::decode(&b).is_some()
+        })
 }
 
 /// The body inside a seeded envelope, or `body` itself when unseeded.
@@ -981,7 +904,7 @@ pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_DECISION | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP | VERSION_COMP_SEL | VERSION_ENGRAM) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_DECISION | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP | VERSION_COMP_SEL | VERSION_ENGRAM | VERSION_CHAIN_PART) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -1159,6 +1082,302 @@ impl RecurOpening {
         let out = r.leaf_bytes()?;
         let o = RecurOpening { response_txid, pos_root, seq_root, layer, out_entry, decay_entry, weights, records, start_rows, end_rows, taps, beta, decay, gate, out };
         (r.o == b.len()).then_some(o)
+    }
+}
+
+/// One drawn point of a stage-2 trace opening with its draw index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartPoint {
+    pub index: u8,
+    pub point: Point,
+    pub tok: u32,
+    pub link: LinkOpening,
+    pub experts: Option<ExpertIds>,
+}
+
+/// Part of a stage-2 trace opening.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChainPart {
+    pub response_txid: Hash,
+    pub roots: Option<(Hash, Hash)>,
+    pub points: Vec<PartPoint>,
+    pub prefix: Option<PrefixPoint>,
+}
+
+impl ChainPart {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_CHAIN_PART);
+        w.0.extend_from_slice(&self.response_txid);
+        match &self.roots {
+            Some((p, q)) => {
+                w.u8(1);
+                w.0.extend_from_slice(p);
+                w.0.extend_from_slice(q);
+            }
+            None => w.u8(0),
+        }
+        w.u8(self.points.len() as u8);
+        for p in &self.points {
+            w.u8(p.index);
+            w.point(&p.point);
+            w.u32(p.tok);
+            w.link(&p.link);
+            w.expert_ids(p.experts.as_ref());
+        }
+        match &self.prefix {
+            Some(p) => {
+                w.u8(1);
+                w.prefix_point(p);
+            }
+            None => w.u8(0),
+        }
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<ChainPart> {
+        if b.first() != Some(&VERSION_CHAIN_PART) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let roots = match r.u8()? {
+            0 => None,
+            1 => Some((r.take(32)?.try_into().ok()?, r.take(32)?.try_into().ok()?)),
+            _ => return None,
+        };
+        let n = r.u8()? as usize;
+        let mut points = Vec::with_capacity(n);
+        for _ in 0..n {
+            points.push(PartPoint { index: r.u8()?, point: r.point()?, tok: r.u32()?, link: r.link()?, experts: r.expert_ids()? });
+        }
+        let prefix = match r.u8()? {
+            0 => None,
+            1 => Some(r.prefix_point()?),
+            _ => return None,
+        };
+        (r.o == b.len()).then_some(ChainPart { response_txid, roots, points, prefix })
+    }
+
+    /// Splits a stage-2 trace opening into parts of at most `max_len` encoded bytes; `None` when
+    /// `o` is not a stage-2 trace opening or one of its points does not fit alone.
+    pub fn split(o: &Opening, max_len: usize) -> Option<Vec<ChainPart>> {
+        if o.resid.is_some() || o.links.len() != o.points.len() || o.experts.len() != o.points.len() || o.points.len() > u8::MAX as usize {
+            return None;
+        }
+        let empty = ChainPart { response_txid: o.response_txid, roots: o.roots, points: Vec::new(), prefix: None };
+        let base = empty.encode().len();
+        let mut items: Vec<(usize, Option<PartPoint>)> = Vec::with_capacity(o.points.len() + 1);
+        for (i, (p, (tok, link))) in o.points.iter().zip(&o.links).enumerate() {
+            let pp = PartPoint { index: i as u8, point: p.clone(), tok: *tok, link: link.clone(), experts: o.experts[i].clone() };
+            let one = ChainPart { points: vec![pp.clone()], ..empty.clone() }.encode().len() - base;
+            items.push((one, Some(pp)));
+        }
+        let prefix = o.prefix.as_ref()?;
+        let size = ChainPart { prefix: Some(prefix.clone()), ..empty.clone() }.encode().len() - base;
+        items.push((size, None));
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut parts: Vec<(usize, ChainPart)> = Vec::new();
+        for (size, item) in items {
+            if base + size > max_len {
+                return None;
+            }
+            let slot = match parts.iter().position(|(len, _)| len + size <= max_len) {
+                Some(k) => k,
+                None => {
+                    parts.push((base, empty.clone()));
+                    parts.len() - 1
+                }
+            };
+            let (len, part) = &mut parts[slot];
+            *len += size;
+            match item {
+                Some(pp) => part.points.push(pp),
+                None => part.prefix = Some(prefix.clone()),
+            }
+        }
+        let mut out: Vec<ChainPart> = parts.into_iter().map(|(_, mut p)| {
+            p.points.sort_by_key(|q| q.index);
+            p
+        }).collect();
+        out.sort_by_key(|p| p.points.first().map_or(u8::MAX, |q| q.index));
+        Some(out)
+    }
+}
+
+impl W {
+    fn point(&mut self, p: &Point) {
+        self.u32(p.n_ubatch);
+        self.hashes(&p.pos_path);
+        self.hashes(&p.meta_path);
+        self.entry(&p.entry);
+        match &p.partner {
+            Some(e) => {
+                self.u8(1);
+                self.entry(e);
+            }
+            None => self.u8(0),
+        }
+        match &p.bias {
+            Some((e, r)) => {
+                self.u8(1);
+                self.entry(e);
+                self.range(r);
+            }
+            None => self.u8(0),
+        }
+        self.u8(p.rows.len() as u8);
+        for r in &p.rows {
+            self.range(r);
+        }
+        self.bytes32(&p.x);
+        self.hashes(&p.x_path);
+        self.u32(p.y_total_len);
+        self.u32(p.y_chunk_index);
+        self.bytes32(&p.y_chunk);
+        self.hashes(&p.y_chunk_path);
+        self.hashes(&p.y_path);
+    }
+
+    fn prefix_point(&mut self, p: &PrefixPoint) {
+        self.u32(p.n_ubatch);
+        self.hashes(&p.pos_path);
+        self.hashes(&p.meta_path);
+        self.entry(&p.entry);
+        self.bytes32(&p.x);
+        self.hashes(&p.x_path);
+        self.entry(&p.embd.0);
+        self.range(&p.embd.1);
+        self.entry(&p.norm.0);
+        self.range(&p.norm.1);
+    }
+
+    fn expert_ids(&mut self, e: Option<&ExpertIds>) {
+        match e {
+            Some(e) => {
+                self.u8(1);
+                self.bytes32(&e.chunk);
+                self.hashes(&e.chunk_path);
+            }
+            None => self.u8(0),
+        }
+    }
+}
+
+impl R<'_> {
+    fn point(&mut self) -> Option<Point> {
+        let n_ubatch = self.u32()?;
+        let pos_path = self.hashes()?;
+        let meta_path = self.hashes()?;
+        let entry = self.entry()?;
+        let partner = if self.u8()? == 1 { Some(self.entry()?) } else { None };
+        let bias = if self.u8()? == 1 { Some((self.entry()?, self.range()?)) } else { None };
+        let nr = self.u8()? as usize;
+        let rows = (0..nr).map(|_| self.range()).collect::<Option<Vec<_>>>()?;
+        Some(Point {
+            n_ubatch,
+            pos_path,
+            meta_path,
+            entry,
+            partner,
+            bias,
+            rows,
+            x: self.bytes32()?,
+            x_path: self.hashes()?,
+            y_total_len: self.u32()?,
+            y_chunk_index: self.u32()?,
+            y_chunk: self.bytes32()?,
+            y_chunk_path: self.hashes()?,
+            y_path: self.hashes()?,
+        })
+    }
+
+    fn prefix_point(&mut self) -> Option<PrefixPoint> {
+        Some(PrefixPoint {
+            n_ubatch: self.u32()?,
+            pos_path: self.hashes()?,
+            meta_path: self.hashes()?,
+            entry: self.entry()?,
+            x: self.bytes32()?,
+            x_path: self.hashes()?,
+            embd: (self.entry()?, self.range()?),
+            norm: (self.entry()?, self.range()?),
+        })
+    }
+
+    /// `None` on a malformed field, `Some(None)` when the point carries no expert ids.
+    fn expert_ids(&mut self) -> Option<Option<ExpertIds>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(ExpertIds { chunk: self.bytes32()?, chunk_path: self.hashes()? })),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod chain_part_tests {
+    use super::*;
+
+    fn point(seed: u8, x: usize) -> Point {
+        Point { n_ubatch: 512, pos_path: vec![[seed; 32]; 3], x: vec![seed; x], y_chunk: vec![seed; 64], ..Default::default() }
+    }
+
+    fn opening(xs: &[usize]) -> Opening {
+        let points: Vec<Point> = xs.iter().enumerate().map(|(i, &x)| point(i as u8 + 1, x)).collect();
+        let links = (0..xs.len())
+            .map(|i| (i as u32 + 7, LinkOpening::HcIn { layer: EntryOpening::default(), src: HcSource::Streams(LeafBytes { bytes: vec![i as u8; 4096], leaf_path: vec![[1; 32]; 2] }) }))
+            .collect();
+        let experts = (0..xs.len()).map(|i| (i == 1).then(|| ExpertIds { chunk: vec![3; 32], chunk_path: vec![[2; 32]] })).collect();
+        let prefix = Some(PrefixPoint { n_ubatch: 512, x: vec![9; 4608], ..Default::default() });
+        Opening { response_txid: [5; 32], points, prefix, links, experts, resid: None, roots: Some(([6; 32], [7; 32])) }
+    }
+
+    #[test]
+    fn a_part_round_trips_and_is_an_audit_body() {
+        let parts = ChainPart::split(&opening(&[1000, 2000]), MAX_BODY_LEN).unwrap();
+        assert_eq!(parts.len(), 1);
+        let b = parts[0].encode();
+        assert_eq!(ChainPart::decode(&b).as_ref(), Some(&parts[0]));
+        assert!(is_audit_body(&b));
+        let s = seeded(&b, &[8; 32]).unwrap();
+        assert!(is_audit_body(&s));
+        assert_eq!(inner_body(&s).as_deref(), Some(&b[..]));
+        assert!(ChainPart::decode(&b[..b.len() - 1]).is_none());
+        assert!(Opening::decode(&b).is_none());
+    }
+
+    #[test]
+    fn a_split_covers_every_point_and_the_prefix_under_the_cap() {
+        let o = opening(&[60_000, 50_000]);
+        assert!(o.encode().len() > 100_000);
+        let parts = ChainPart::split(&o, 70_000).unwrap();
+        assert!(parts.len() >= 2);
+        assert!(parts.iter().all(|p| p.encode().len() <= 70_000));
+        let mut idx: Vec<u8> = parts.iter().flat_map(|p| p.points.iter().map(|q| q.index)).collect();
+        idx.sort();
+        assert_eq!(idx, vec![0, 1]);
+        assert_eq!(parts.iter().filter(|p| p.prefix.is_some()).count(), 1);
+        for p in &parts {
+            for q in &p.points {
+                let i = q.index as usize;
+                assert_eq!((&q.point, q.tok, &q.link, &q.experts), (&o.points[i], o.links[i].0, &o.links[i].1, &o.experts[i]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_over_the_cap_cannot_be_split() {
+        assert!(ChainPart::split(&opening(&[80_000, 1000]), 70_000).is_none());
+        let mut o = opening(&[1000, 1000]);
+        o.prefix = None;
+        assert!(ChainPart::split(&o, MAX_BODY_LEN).is_none());
+    }
+
+    #[test]
+    fn the_whole_opening_encoding_is_unchanged() {
+        let o = opening(&[3000, 4000]);
+        assert_eq!(Opening::decode(&o.encode()), Some(o));
     }
 }
 

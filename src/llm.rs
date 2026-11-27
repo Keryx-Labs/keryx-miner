@@ -1207,6 +1207,19 @@ fn open_recurrent(
     Ok(body)
 }
 
+/// A stage-2 trace opening as sent: whole when it fits the cap, in parts otherwise.
+fn chain_parts(body: Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
+    use keryx_verifiable_inference::opening::{ChainPart, Opening, MAX_BODY_LEN};
+    if body.len() + SEEDED_OVERHEAD <= MAX_BODY_LEN {
+        return Ok(vec![body]);
+    }
+    let o = Opening::decode(&body).ok_or("undecodable stage-2 opening")?;
+    let parts = ChainPart::split(&o, MAX_BODY_LEN - SEEDED_OVERHEAD).ok_or_else(|| format!("stage-2 opening of {} B cannot be split under the cap", body.len()))?;
+    let sent: Vec<Vec<u8>> = parts.iter().map(ChainPart::encode).collect();
+    verify_chain_parts(&body, &sent)?;
+    Ok(sent)
+}
+
 /// Every opening of a stage-2 response: the trace opening, the attention and recurrent ones under
 /// the attention rule when the tier has such layers, then the residual one.
 #[allow(clippy::too_many_arguments)]
@@ -1223,7 +1236,7 @@ fn open_pieces(
     decision: Option<keryx_verifiable_inference::decision::DecisionCtx>,
 ) -> Result<Vec<Vec<u8>>, String> {
     let (body, resid) = open_chain(gguf, dev_id, m, pctx, trace, seed, request_hash, response_txid, index)?;
-    let mut bodies = vec![body];
+    let mut bodies = chain_parts(body)?;
     if trace.seq.is_some() {
         bodies.push(open_attention(gguf, dev_id, m, trace, seed, response_txid, index, &[], None)?);
         if m.chain.is_some_and(|c| c.n_recur > 0) {
@@ -1436,27 +1449,60 @@ fn open_chain(
     r.roots = o.roots;
     let resid = r.encode();
     let body = o.encode();
-    for (name, b) in [("stage-2", &body), ("residual", &resid)] {
-        if b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
-            return Err(format!("{name} opening of {} B over the cap", b.len()));
-        }
+    if resid.len() + SEEDED_OVERHEAD > MAX_BODY_LEN {
+        return Err(format!("residual opening of {} B over the cap", resid.len()));
     }
     let ctx = m.chain.ok_or("no stage-2 context")?;
     crate::trace::verify_chain_opening(&m.tier_ctx(index), &ctx, pctx, rec, seed, request_hash, &body, &resid).map_err(|e| format!("stage-2 opening fails its own check: {e}"))?;
     Ok((body, resid))
 }
 
+/// Checks that the bodies sent for a stage-2 trace opening fit the cap and carry exactly its
+/// points and prefix point.
+fn verify_chain_parts(body: &[u8], sent: &[Vec<u8>]) -> Result<(), String> {
+    use keryx_verifiable_inference::opening::{ChainPart, Opening, MAX_BODY_LEN};
+    if let Some(b) = sent.iter().find(|b| b.len() + SEEDED_OVERHEAD > MAX_BODY_LEN) {
+        return Err(format!("stage-2 piece of {} B over the cap", b.len()));
+    }
+    if sent == [body.to_vec()] {
+        return Ok(());
+    }
+    let o = Opening::decode(body).ok_or("undecodable stage-2 opening")?;
+    let mut seen = vec![false; o.points.len()];
+    let mut prefix = 0;
+    for b in sent {
+        let part = ChainPart::decode(b).ok_or("undecodable stage-2 part")?;
+        if part.response_txid != o.response_txid || part.roots != o.roots {
+            return Err("stage-2 part of another opening".to_string());
+        }
+        for p in &part.points {
+            let i = p.index as usize;
+            if i >= seen.len() || seen[i] || p.point != o.points[i] || (p.tok, &p.link) != (o.links[i].0, &o.links[i].1) || p.experts != o.experts[i] {
+                return Err(format!("stage-2 part point {i} does not match its opening"));
+            }
+            seen[i] = true;
+        }
+        if let Some(pp) = &part.prefix {
+            if Some(pp) != o.prefix.as_ref() {
+                return Err("stage-2 part prefix does not match its opening".to_string());
+            }
+            prefix += 1;
+        }
+    }
+    if seen.iter().all(|&s| s) && prefix == 1 { Ok(()) } else { Err("stage-2 parts miss a point".to_string()) }
+}
+
 /// Traces a fixed prompt under the stage-2 manifest, then opens and verifies it under two seeds
 /// as the node would.
 fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attention: bool) -> Result<(), String> {
-    use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, SeqTrace, TierManifest, TraceRecord, STAGE_CHAIN};
+    use crate::trace::{chain_ctx, prefix_tokens, ResponseTrace, SeqTrace, TierManifest, TraceRecord, STAGE_CHAIN};
     let key = if attention { STAGE_CHAIN | 0x80 } else { STAGE_CHAIN };
     if PREFIX_CHECKED.lock().unwrap().contains(&(gguf.to_string(), dev_id, key)) {
         return Ok(());
     }
     let m = if attention { TierManifest::for_attn(tier) } else { TierManifest::for_chain(tier) }.ok_or("no stage-2 manifest")?;
     let (_, pctx) = chain_ctx(tier).ok_or("no stage-2 context")?;
-    let ctx = m.chain.ok_or("no stage-2 context")?;
+    m.chain.ok_or("no stage-2 context")?;
     let (head, rest) = format_prompt_parts(spec.name, "Reply with one word.").ok_or("no prefix template")?;
     let request_hash: [u8; 32] = std::array::from_fn(|i| (i * 8 + 3) as u8);
     let tokens = prefix_tokens(&pctx, &request_hash);
@@ -1474,10 +1520,8 @@ fn chain_self_check(spec: &ModelSpec, gguf: &str, dev_id: u32, tier: u8, attenti
     };
     let trace = ResponseTrace { record, tokens: g.tokens, seq };
     let index = weight_index(spec, gguf).ok_or("no possession index")?;
-    let tier_ctx = m.tier_ctx(&index);
     for seed in [[0x11u8; 32], [0x77u8; 32]] {
-        let bodies = open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index, None)?;
-        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &bodies[0], bodies.last().ok_or("no residual piece")?)?;
+        open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index, None)?;
     }
     PREFIX_CHECKED.lock().unwrap().insert((gguf.to_string(), dev_id, key));
     log::info!("LlmEngine '{}': stage-2 self-check passed (gpu{})", spec.name, dev_id);
@@ -1493,7 +1537,7 @@ fn decision_self_check(
     attention: bool,
     dctx: keryx_verifiable_inference::decision::DecisionCtx,
 ) -> Result<(), String> {
-    use crate::trace::{chain_ctx, verify_chain_opening, TierManifest, STAGE_CHAIN};
+    use crate::trace::{chain_ctx, TierManifest, STAGE_CHAIN};
     use keryx_verifiable_inference::decision::{verify_decision_opening, DecisionOption, DecisionRequest, QuestionType};
     use keryx_verifiable_inference::opening::DecisionOpening;
     let key = if attention { STAGE_CHAIN | 0xC0 } else { STAGE_CHAIN | 0x40 };
@@ -1524,8 +1568,6 @@ fn decision_self_check(
     }
     for seed in [[0x11u8; 32], [0x77u8; 32]] {
         let bodies = open_pieces(gguf, dev_id, &m, &pctx, &trace, &seed, &request_hash, [0u8; 32], &index, Some(dctx))?;
-        let resid = bodies.last().ok_or("no residual piece")?;
-        verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &request_hash, &bodies[0], resid)?;
         let body = bodies.get(bodies.len().wrapping_sub(2)).and_then(|b| DecisionOpening::decode(b)).ok_or("no decision piece")?;
         verify_decision_opening(&tier_ctx, &ctx, &dctx, &trace.record.response_ctx(), &seed, &answer_root, &body)
             .map_err(|e| format!("decision point ({e:?})"))?;
@@ -1996,6 +2038,40 @@ pub fn open_trace(
 mod tests {
     use super::*;
 
+    fn stage2_opening(x: &[usize], streams: usize) -> keryx_verifiable_inference::opening::Opening {
+        use keryx_verifiable_inference::opening::{EntryOpening, HcSource, LeafBytes, LinkOpening, Opening, Point, PrefixPoint};
+        Opening {
+            response_txid: [5; 32],
+            points: x.iter().enumerate().map(|(i, &n)| Point { x: vec![i as u8; n], ..Default::default() }).collect(),
+            prefix: Some(PrefixPoint { x: vec![9; 4608], ..Default::default() }),
+            links: (0..x.len())
+                .map(|i| (i as u32, LinkOpening::HcIn { layer: EntryOpening::default(), src: HcSource::Streams(LeafBytes { bytes: vec![1; streams], leaf_path: vec![] }) }))
+                .collect(),
+            experts: vec![None; x.len()],
+            resid: None,
+            roots: Some(([6; 32], [7; 32])),
+        }
+    }
+
+    #[test]
+    fn a_stage2_opening_over_the_cap_is_sent_in_parts() {
+        use keryx_verifiable_inference::opening::MAX_BODY_LEN;
+        let small = stage2_opening(&[2_000, 2_000], 16_384).encode();
+        assert_eq!(chain_parts(small.clone()).unwrap(), vec![small]);
+
+        let big = stage2_opening(&[18_432, 4_608], 65_536).encode();
+        assert!(big.len() + SEEDED_OVERHEAD > MAX_BODY_LEN);
+        let parts = chain_parts(big.clone()).unwrap();
+        assert!(parts.len() >= 2);
+        assert!(parts.iter().all(|b| b.len() + SEEDED_OVERHEAD <= MAX_BODY_LEN));
+        verify_chain_parts(&big, &parts).unwrap();
+        assert!(verify_chain_parts(&big, &parts[..1]).is_err());
+        let mut forged = parts.clone();
+        let last = forged[1].len() - 1;
+        forged[1][last] ^= 1;
+        assert!(verify_chain_parts(&big, &forged).is_err());
+    }
+
     #[test]
     fn engine_prompt_drops_nul_characters() {
         assert!(matches!(engine_prompt("Say hello."), std::borrow::Cow::Borrowed("Say hello.")));
@@ -2101,7 +2177,7 @@ mod tests {
         use crate::llama_engine;
         std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
         std::env::set_var("LLAMA_ATTN_ROT_DISABLE", "1");
-        use crate::trace::{chain_ctx, prefix_tokens, verify_chain_opening, ResponseTrace, SeqTrace, TierManifest, TraceRecord};
+        use crate::trace::{chain_ctx, prefix_tokens, ResponseTrace, SeqTrace, TierManifest, TraceRecord};
         let gguf = std::env::var("KERYX_TEST_MODEL_GPU0").expect("set KERYX_TEST_MODEL_GPU0");
         let spec = crate::models::spec_for_gguf(&gguf).expect("registry model");
         let tier = crate::models::pom_tier_index(&spec.model_id, u64::MAX).expect("tiered model");
@@ -2109,7 +2185,6 @@ mod tests {
         let ctx = m.chain.unwrap();
         let (_, pctx) = chain_ctx(tier).expect("stage-2 context");
         let index = crate::pom::WeightIndex::build_from_gguf(&gguf, spec.model_id).unwrap();
-        let tier_ctx = m.tier_ctx(&index);
         llama_engine::ensure_loaded(&gguf, 0).unwrap();
         let nl = llama_engine::trace_configure(&gguf, 0, TierManifest::raw_attn(tier).unwrap()).unwrap();
         assert_eq!(nl, m.n_leaves());
@@ -2151,10 +2226,10 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 let bodies = open_pieces(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index, None).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let took = t0.elapsed();
-                verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &bodies[0], bodies.last().unwrap()).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let sizes: Vec<usize> = bodies.iter().map(Vec::len).collect();
+                let attn = bodies.iter().find(|b| keryx_verifiable_inference::opening::AttnOpening::decode(b).is_some()).expect("attention piece");
                 let t1 = std::time::Instant::now();
-                let phases = attention_phases(&gguf, &m, &trace, &seed, &index, &bodies[1]).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                let phases = attention_phases(&gguf, &m, &trace, &seed, &index, attn).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let phase_sizes: Vec<usize> = phases.iter().map(Vec::len).collect();
                 eprintln!("{label} seed {counter}: {} pieces verified, sizes {:?} B, replays+build {:.2?}; later attention phases {:?} B in {:.2?}", bodies.len(), sizes, took, phase_sizes, t1.elapsed());
             }
@@ -2201,7 +2276,8 @@ mod tests {
                 let (body, resid) = open_chain(&gguf, 0, &m, &pctx, &trace, &seed, &rh, [3u8; 32], &index).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
                 let took = t0.elapsed();
                 verify_chain_opening(&tier_ctx, &ctx, &pctx, &trace.record, &seed, &rh, &body, &resid).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
-                eprintln!("{label} seed {counter}: verified, body {} B, residual {} B, replay+build {:.2?}", body.len(), resid.len(), took);
+                let parts = chain_parts(body.clone()).unwrap_or_else(|e| panic!("{label} seed {counter}: {e}"));
+                eprintln!("{label} seed {counter}: verified, body {} B in {} piece(s), residual {} B, replay+build {:.2?}", body.len(), parts.len(), resid.len(), took);
                 sizes.push(body.len().max(resid.len()));
             }
             eprintln!("{label}: max body {} B, coverage {:?}", sizes.iter().max().unwrap(), kinds);
