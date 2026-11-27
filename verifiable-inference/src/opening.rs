@@ -34,6 +34,12 @@ pub const VERSION_ENGRAM: u8 = 14;
 /// Part of a stage-2 trace opening: some drawn points with their draw index, and the prefix point
 /// in one of the parts.
 pub const VERSION_CHAIN_PART: u8 = 15;
+/// Half of a selection opening: the drawn pools of one side only, after the response id a part byte.
+pub const VERSION_SEL_PART: u8 = 16;
+/// Selection part carrying the pools drawn among the selected ones.
+pub const SEL_PART_SELECTED: u8 = 1;
+/// Selection part carrying the pools drawn among the others.
+pub const SEL_PART_OUTSIDE: u8 = 2;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -868,7 +874,7 @@ pub fn seed_block(body: &[u8]) -> Option<Hash> {
     body.get(33..65)?.try_into().ok()
 }
 
-/// Whether `body` decodes as a trace, trace part, attention, recurrent or residual opening.
+/// Whether `body`, seeded or not, decodes as an audit opening of any piece.
 pub fn is_audit_body(body: &[u8]) -> bool {
     Opening::decode(body).is_some()
         || inner_body(body).is_some_and(|b| {
@@ -876,6 +882,12 @@ pub fn is_audit_body(body: &[u8]) -> bool {
                 || RecurOpening::decode(&b).is_some()
                 || ResidOpening::decode(&b).is_some()
                 || ChainPart::decode(&b).is_some()
+                || DecisionOpening::decode(&b).is_some()
+                || SelOpeningPoint::decode(&b).is_some()
+                || CompOpeningPoint::decode(&b).is_some()
+                || CompAttnOpening::decode(&b).is_some()
+                || CompSelOpening::decode(&b).is_some()
+                || EngramOpening::decode(&b).is_some()
         })
 }
 
@@ -904,7 +916,7 @@ pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_DECISION | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP | VERSION_COMP_SEL | VERSION_ENGRAM | VERSION_CHAIN_PART) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID | VERSION_DECISION | VERSION_SEL | VERSION_COMP | VERSION_ATTN_COMP | VERSION_COMP_SEL | VERSION_ENGRAM | VERSION_CHAIN_PART | VERSION_SEL_PART) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -1747,13 +1759,18 @@ pub struct SelOpeningPoint {
     pub iq: LeafBytes,
     pub w: LeafBytes,
     pub members: Vec<SelMember>,
+    /// 0 for every drawn pool, else [`SEL_PART_SELECTED`] or [`SEL_PART_OUTSIDE`].
+    pub part: u8,
 }
 
 impl SelOpeningPoint {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(VERSION_SEL);
+        w.u8(if self.part == 0 { VERSION_SEL } else { VERSION_SEL_PART });
         w.0.extend_from_slice(&self.response_txid);
+        if self.part != 0 {
+            w.u8(self.part);
+        }
         w.0.extend_from_slice(&self.pos_root);
         w.0.extend_from_slice(&self.seq_root);
         w.entry(&self.layer);
@@ -1779,11 +1796,17 @@ impl SelOpeningPoint {
     }
 
     pub fn decode(b: &[u8]) -> Option<SelOpeningPoint> {
-        if b.first() != Some(&VERSION_SEL) {
-            return None;
-        }
+        let split = match b.first() {
+            Some(&VERSION_SEL) => false,
+            Some(&VERSION_SEL_PART) => true,
+            _ => return None,
+        };
         let mut r = R { b, o: 1 };
         let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let part = if split { r.u8()? } else { 0 };
+        if split && part != SEL_PART_SELECTED && part != SEL_PART_OUTSIDE {
+            return None;
+        }
         let pos_root: Hash = r.take(32)?.try_into().ok()?;
         let seq_root: Hash = r.take(32)?.try_into().ok()?;
         let layer = r.entry()?;
@@ -1795,7 +1818,25 @@ impl SelOpeningPoint {
         let (sel, iq, w) = (r.leaf_bytes()?, r.leaf_bytes()?, r.leaf_bytes()?);
         let nm = r.u8()? as usize;
         let members = (0..nm).map(|_| Some(SelMember { pos_path: r.hashes()?, k: r.leaf_bytes()?, g: r.leaf_bytes()? })).collect::<Option<Vec<_>>>()?;
-        (r.o == b.len()).then_some(SelOpeningPoint { response_txid, pos_root, seq_root, layer, entries, norms, pos_path, sel, iq, w, members })
+        (r.o == b.len()).then_some(SelOpeningPoint { response_txid, pos_root, seq_root, layer, entries, norms, pos_path, sel, iq, w, members, part })
+    }
+
+    /// The opening as sent: whole when it fits `max_len` encoded bytes, else its selected and
+    /// outside halves; `None` when a half does not fit or the members do not split evenly.
+    pub fn split(&self, max_len: usize) -> Option<Vec<SelOpeningPoint>> {
+        if self.part != 0 {
+            return None;
+        }
+        if self.encode().len() <= max_len {
+            return Some(vec![self.clone()]);
+        }
+        if self.members.is_empty() || self.members.len() % 2 != 0 {
+            return None;
+        }
+        let half = self.members.len() / 2;
+        let parts = [(SEL_PART_SELECTED, &self.members[..half]), (SEL_PART_OUTSIDE, &self.members[half..])]
+            .map(|(part, members)| SelOpeningPoint { part, members: members.to_vec(), ..self.clone() });
+        parts.iter().all(|p| p.encode().len() <= max_len).then(|| parts.to_vec())
     }
 }
 

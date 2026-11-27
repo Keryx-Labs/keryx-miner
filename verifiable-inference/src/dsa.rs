@@ -211,11 +211,17 @@ pub fn verify_sel_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed
     let scale = 1.0 / ((dk * nh) as f64).sqrt();
     let w: Vec<f64> = f32_leaf(&op.w.bytes, nh)?.iter().map(|&x| x as f64 * scale).collect();
     let drawn = drawn_pools(seed, &pools, (t + 1) / kp);
-    if op.members.len() as u64 != drawn.len() as u64 * kp {
+    let range = match op.part {
+        0 => 0..drawn.len(),
+        crate::opening::SEL_PART_SELECTED => 0..SEL_DRAWS,
+        crate::opening::SEL_PART_OUTSIDE => SEL_DRAWS..drawn.len(),
+        _ => return Err(Fail::Shape),
+    };
+    if op.members.len() as u64 != range.len() as u64 * kp {
         return Err(Fail::Shape);
     }
     let eps = f32::from_bits(dsa.k_eps) as f64;
-    for (i, (&p, ms)) in drawn.iter().zip(op.members.chunks_exact(kp as usize)).enumerate() {
+    for (i, (&p, ms)) in drawn[range.clone()].iter().zip(op.members.chunks_exact(kp as usize)).enumerate().map(|(j, x)| (j + range.start, x)) {
         let mut keys = Vec::with_capacity(kp as usize);
         let mut gates = Vec::with_capacity(kp as usize);
         for (j, m) in ms.iter().enumerate() {

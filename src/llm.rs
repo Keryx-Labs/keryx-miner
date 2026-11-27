@@ -1244,7 +1244,7 @@ fn open_pieces(
         }
     }
     if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_sel > 0) {
-        bodies.push(open_selection(gguf, dev_id, m, trace, seed, response_txid, index)?);
+        bodies.extend(open_selection(gguf, dev_id, m, trace, seed, response_txid, index)?);
     }
     if trace.seq.is_some() && m.chain.is_some_and(|c| c.n_comp > 0) {
         bodies.push(open_comp(gguf, dev_id, m, trace, seed, response_txid, index)?);
@@ -1277,12 +1277,12 @@ fn open_selection(
     seed: &[u8; 32],
     response_txid: [u8; 32],
     index: &crate::pom::WeightIndex,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<Vec<u8>>, String> {
     use crate::trace_seq::{draw_sel, sel_opening, seq_response_ctx};
     let rec = &trace.record;
     let seq = trace.seq.as_ref().ok_or("no sequence leaves")?;
     if m.chain.is_some_and(|c| c.n_comp > 0) {
-        return open_comp_sel(gguf, dev_id, m, trace, seed, response_txid, index);
+        return open_comp_sel(gguf, dev_id, m, trace, seed, response_txid, index).map(|b| vec![b]);
     }
     let d = draw_sel(m, rec, seed).ok_or("no selection draw")?;
     let mut caps = crate::trace::Captures::new();
@@ -1293,13 +1293,16 @@ fn open_selection(
     }
     let op = sel_opening(m, rec, seq, index, &d, seed, &caps, response_txid)?;
     let ctx = m.chain.ok_or("no stage-2 context")?;
-    keryx_verifiable_inference::dsa::verify_sel_point(&m.tier_ctx(index), &ctx, &seq_response_ctx(rec, seq), seed, &op)
+    let (tier, resp) = (m.tier_ctx(index), seq_response_ctx(rec, seq));
+    keryx_verifiable_inference::dsa::verify_sel_point(&tier, &ctx, &resp, seed, &op)
         .map_err(|e| format!("selection point {e:?} at layer {}, position {:?}", d.layer, d.t))?;
-    let body = op.encode();
-    if body.len() + SEEDED_OVERHEAD > keryx_verifiable_inference::opening::MAX_BODY_LEN {
-        return Err(format!("selection opening of {} B over the cap", body.len()));
+    let parts = op
+        .split(keryx_verifiable_inference::opening::MAX_BODY_LEN - SEEDED_OVERHEAD)
+        .ok_or_else(|| format!("selection opening of {} B cannot be split under the cap", op.encode().len()))?;
+    for p in &parts {
+        keryx_verifiable_inference::dsa::verify_sel_point(&tier, &ctx, &resp, seed, p).map_err(|e| format!("selection half {e:?} at layer {}", d.layer))?;
     }
-    Ok(body)
+    Ok(parts.iter().map(|p| p.encode()).collect())
 }
 
 /// The n-gram residual opening of the draw of `seed`, checked as the node checks it.

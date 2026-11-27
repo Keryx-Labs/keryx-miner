@@ -3590,6 +3590,7 @@ mod attn_tests {
                     iq: leaf_bytes(pos, 1),
                     w: leaf_bytes(pos, 7),
                     members,
+                    part: 0,
                 }
             }
 
@@ -3607,6 +3608,28 @@ mod attn_tests {
                 assert!(op.encode().len() < crate::opening::MAX_BODY_LEN);
                 a.verify(&s, &op).unwrap_or_else(|e| panic!("{e:?}"));
             }
+        }
+
+        #[test]
+        fn selection_halves_verify_alone_and_round_trip() {
+            use crate::opening::{SEL_PART_OUTSIDE, SEL_PART_SELECTED};
+            let a = build(Fault::None);
+            for s in seeds() {
+                let op = a.open(&s);
+                assert_eq!(op.split(usize::MAX).unwrap(), vec![op.clone()]);
+                let halves = op.split(op.encode().len() - 1).unwrap();
+                assert_eq!(halves.iter().map(|h| h.part).collect::<Vec<_>>(), vec![SEL_PART_SELECTED, SEL_PART_OUTSIDE]);
+                for h in &halves {
+                    assert_eq!(SelOpeningPoint::decode(&h.encode()).as_ref(), Some(h));
+                    a.verify(&s, h).unwrap_or_else(|e| panic!("{e:?}"));
+                }
+                let mut swapped = halves[0].clone();
+                swapped.part = SEL_PART_OUTSIDE;
+                assert!(a.verify(&s, &swapped).is_err());
+            }
+            let a = build(Fault::Lowest);
+            let caught = seeds().filter(|s| a.open(s).split(1 << 20).unwrap().iter().any(|h| a.verify(s, h).is_err())).count();
+            assert_eq!(caught, seeds().filter(|s| a.verify(s, &a.open(s)).is_err()).count());
         }
 
         #[test]
