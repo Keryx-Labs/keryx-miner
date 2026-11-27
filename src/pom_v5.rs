@@ -21,7 +21,7 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
 /// Context pad tiles of each H18 tier. Mirror of the node's `POM_V5_PAD_TILES_H18`.
-pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688, 846_848, 4_439_040, 8_225_792, 3_375_104, 10_001_408];
+pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_345_984, 1_618_944, 2_000_896, 3_490_816, 8_039_424, 2_621_440, 2_621_440];
 
 /// Context pad tiles of `tier` at `daa`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, daa: u64) -> u64 {
