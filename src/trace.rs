@@ -1838,7 +1838,9 @@ mod tests {
         let c = TierManifest::for_chain(10).unwrap();
         assert_eq!((hex(&c).as_str(), c.entries.len(), c.n_products), ("e28698361ce88e4c42734df8aba442bd1c26ca1dfe26091701cf16697c7417f7", 1124, 768));
         let a = TierManifest::for_attn(10).unwrap();
-        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("01499c420b14d3ea976030258c42d0e3354a8937b47c27853a8f555d7eab480d", 1372, 768));
+        assert_eq!((hex(&a).as_str(), a.entries.len(), a.n_products), ("f6b1d9b21fa5994a3152e651972402f735209b7be9bd0e3d9ac971c86af7a273", 1372, 768));
+        let dsa: Vec<_> = a.entries.iter().filter_map(|(e, _)| match e.chain { manifest::Chain::Layer(l) => l.dsa, _ => None }).collect();
+        assert!(dsa.len() == 11 && dsa.iter().all(|d| d.tail == 1));
         let ac = a.chain.unwrap();
         assert_eq!((ac.n_layers, ac.layer_base, ac.embd_entry, ac.n_attn, ac.n_recur, ac.seq_heads, ac.n_sel), (45, 1079, 802, 11, 34, 64, 11));
         assert_eq!(c.chain.unwrap().n_sel, 0);
