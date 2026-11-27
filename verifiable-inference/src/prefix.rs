@@ -64,7 +64,7 @@ pub fn deviation(x: &[u8], layout: u8, v: &[f64]) -> Option<f64> {
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
-        if !d.is_finite() || !q8::canonical(*d, q) || vals.iter().any(|a| !a.is_finite()) {
+        if !d.is_finite() || !q8::canonical_at(&blocks, layout, b) || vals.iter().any(|a| !a.is_finite()) {
             return None;
         }
         if *d == 0.0 {

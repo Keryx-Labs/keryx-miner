@@ -196,7 +196,7 @@ pub fn block_deviation(x: &[u8], layout: u8, k: usize, first_block: usize, v: &[
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.get(first_block..first_block.checked_add(n)?)?.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
-        if !d.is_finite() || !q8::canonical(*d, q) || vals.iter().any(|a| !a.is_finite()) {
+        if !d.is_finite() || !q8::canonical_at(&blocks, layout, first_block + b) || vals.iter().any(|a| !a.is_finite()) {
             return None;
         }
         if *d == 0.0 {
@@ -221,7 +221,7 @@ pub fn block_outliers(x: &[u8], layout: u8, k: usize, first_block: usize, v: &[f
     let (mut worst, mut spare) = (0f64, 0usize);
     for (b, (d, q)) in blocks.get(first_block..first_block.checked_add(n)?)?.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
-        if !d.is_finite() || !q8::canonical(*d, q) || vals.iter().any(|a| !a.is_finite()) {
+        if !d.is_finite() || !q8::canonical_at(&blocks, layout, first_block + b) || vals.iter().any(|a| !a.is_finite()) {
             return None;
         }
         if *d == 0.0 {

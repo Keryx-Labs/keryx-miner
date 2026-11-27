@@ -23,6 +23,30 @@ pub fn canonical_dot(wtype: u32, row: &[u8], k: usize, x_leaf: &[u8], layout: u8
         return Some(Recomputed { y_hat: main - min, scale });
     }
 
+    if layout == q8::MMQ_D2S6 && wtype == quant::Q2_K {
+        let sums = q8::d2s6_sums(x_leaf, k)?;
+        let (mut main, mut min) = (0f64, 0f64);
+        for (b, blk) in row.chunks_exact(84).take(k / 256).enumerate() {
+            let (d, dmin) = (crate::f16::read(blk, 80), crate::f16::read(blk, 82));
+            for g in 0..16 {
+                let sc = blk[g];
+                let (ds, ms) = (crate::f16::round(d * (sc & 0xf) as f32) as f64, crate::f16::round(dmin * (sc >> 4) as f32) as f64);
+                let mut dot = 0f64;
+                let mut sx = 0f64;
+                for v in 16 * g..16 * g + 16 {
+                    let q = (blk[16 + 32 * (v / 128) + v % 32] >> (2 * ((v / 32) % 4))) & 3;
+                    let xv = x[256 * b + v] as f64;
+                    dot += q as f64 * xv;
+                    sx += xv;
+                }
+                main += ds * dot;
+                let (blk128, g8) = ((256 * b + 16 * g) / 128, g % 8);
+                min += ms * if g8 < 6 { sums[6 * blk128 + g8] as f64 } else { sx };
+            }
+        }
+        return Some(Recomputed { y_hat: main - min, scale });
+    }
+
     let mut y_hat: f64 = w.iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum();
     if layout == q8::MMVQ
         && let Some((dw, off)) = quant::offset_block_scales(wtype, row, k)

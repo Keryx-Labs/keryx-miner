@@ -150,8 +150,10 @@ pub fn input_layout(role: u8, n_ubatch: u32, wtype: u32) -> u8 {
 pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     if n_ubatch <= MMVQ_MAX_BATCH {
         q8::MMVQ
-    } else if matches!(wtype, 2 | 3 | 7 | quant::Q4_K | quant::Q5_K) {
+    } else if matches!(wtype, 2 | 3 | 7 | 19 | quant::Q4_K | quant::Q5_K) {
         q8::MMQ_DS4
+    } else if wtype == quant::Q2_K {
+        q8::MMQ_D2S6
     } else {
         q8::MMQ_D4
     }
@@ -394,4 +396,20 @@ fn verify_point_rows(
         return Err(Fail::Mismatch);
     }
     Ok((Report { t, rank, row, y, y_hat, tol }, opened))
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn batched_inputs_take_the_q8_1_layout_of_their_weight_type() {
+        let b = MMVQ_MAX_BATCH + 1;
+        assert_eq!(layout_for(1, quant::Q2_K), q8::MMVQ);
+        assert_eq!(layout_for(b, quant::Q2_K), q8::MMQ_D2S6);
+        assert_eq!(layout_for(b, 19), q8::MMQ_DS4);
+        assert_eq!(layout_for(b, quant::Q4_K), q8::MMQ_DS4);
+        assert_eq!(layout_for(b, quant::Q8_0), q8::MMQ_D4);
+        assert_eq!(layout_for(b, quant::IQ2_XXS), q8::MMQ_D4);
+    }
 }

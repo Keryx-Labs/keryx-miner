@@ -35,6 +35,20 @@ pub fn blocks(leaf: &[u8], layout: u8, k: usize) -> Option<Vec<(f32, [i8; 32])>>
     Some(out)
 }
 
+/// Whether block `i` of `blocks` is one the quantizer writes, over the values its scale covers:
+/// 64 for [`MMQ_D2S6`], else 32.
+pub fn canonical_at(blocks: &[(f32, [i8; 32])], layout: u8, i: usize) -> bool {
+    let Some(&(d, q)) = blocks.get(i) else { return false };
+    if layout != MMQ_D2S6 {
+        return canonical(d, &q);
+    }
+    let group = &blocks[i & !1..((i | 1) + 1).min(blocks.len())];
+    if d == 0.0 {
+        return group.iter().all(|(_, q)| q.iter().all(|&v| v == 0));
+    }
+    d > 0.0 && group.iter().any(|(_, q)| q.iter().any(|&v| v.unsigned_abs() == 127))
+}
+
 /// Whether a block is one the quantizer writes: a zero scale with zero values, or a positive
 /// scale with a value at full magnitude.
 pub fn canonical(d: f32, q: &[i8; 32]) -> bool {
@@ -108,6 +122,12 @@ pub fn decode(leaf: &[u8], layout: u8, k: usize) -> Option<(Vec<f32>, Option<Vec
     Some((x, has_s.then_some(s)))
 }
 
+/// Partial sums of a [`MMQ_D2S6`] row: six per 128 values, over its first 96 values by 16.
+pub fn d2s6_sums(leaf: &[u8], k: usize) -> Option<Vec<f32>> {
+    let n = k.div_ceil(128);
+    (leaf.len() >= n * 144).then(|| leaf.chunks_exact(144).take(n).flat_map(|b| (0..6).map(move |i| f16::read(b, 4 + 2 * i))).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +149,11 @@ mod tests {
         assert!(!canonical(0.0, &q));
         q[3] = 127;
         assert!(canonical(0.5, &q));
+        let full: [i8; 32] = std::array::from_fn(|j| if j == 0 { 127 } else { 3 });
+        let low = [3i8; 32];
+        let pair = [(0.5f32, low), (0.5, full), (0.5, low), (0.5, low)];
+        assert!(canonical_at(&pair, MMQ_D2S6, 0) && canonical_at(&pair, MMQ_D2S6, 1));
+        assert!(!canonical_at(&pair, MMQ_D2S6, 2) && !canonical_at(&pair, MMQ_DS4, 0));
     }
 
     #[test]
