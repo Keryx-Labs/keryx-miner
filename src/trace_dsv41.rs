@@ -581,7 +581,7 @@ pub fn comp_attn_opening(
     if root {
         op.o_entry = m.entry_opening(a.out as u64);
         op.out = leaf_bytes(rec, t, 2 * a.out, cap(t, 2 * a.out)?);
-        op.sinks = bytes_range(m, index, c.sinks as u64, 0, 4 * a.n_head as u64).ok_or("no sink weights")?;
+        op.sinks = bytes_range(m, index, c.sinks as u64, 4 * d.qh, 4).ok_or("no sink weights")?;
         op.lse = lse;
     }
     if last {
