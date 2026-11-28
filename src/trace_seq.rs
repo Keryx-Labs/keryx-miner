@@ -40,6 +40,42 @@ impl SpanPlan {
     }
 }
 
+/// Largest single capture the engine accepts.
+const MAX_CAPTURE: u64 = 1 << 27;
+
+/// The `(leaf, lo, hi)` captures covering `plans`, one per contiguous leaf range, and the capture
+/// each plan reads from.
+pub fn merge_spans(plans: &[SpanPlan]) -> (Vec<(u32, u64, u64)>, Vec<usize>) {
+    let mut order: Vec<usize> = (0..plans.len()).collect();
+    order.sort_by_key(|&i| (plans[i].leaf, plans[i].lo));
+    let (mut groups, mut at) = (Vec::<(u32, u64, u64)>::new(), vec![0usize; plans.len()]);
+    for i in order {
+        let p = &plans[i];
+        match groups.last_mut() {
+            Some(g) if g.0 == p.leaf && g.2.max(p.hi) - g.1 <= MAX_CAPTURE => g.2 = g.2.max(p.hi),
+            _ => groups.push(p.capture()),
+        }
+        at[i] = groups.len() - 1;
+    }
+    (groups, at)
+}
+
+/// The capture of each plan, cut from the merged captures of `merge_spans`.
+pub fn split_captures(plans: &[SpanPlan], groups: &[(u32, u64, u64)], at: &[usize], caps: Vec<SeqCapture>) -> Option<Vec<SeqCapture>> {
+    if caps.len() != groups.len() || at.len() != plans.len() {
+        return None;
+    }
+    plans
+        .iter()
+        .zip(at)
+        .map(|(p, &g)| {
+            let (c, lo) = (caps.get(g)?, groups.get(g)?.1);
+            let bytes = c.bytes.get(p.lo.checked_sub(lo)? as usize..p.hi.checked_sub(lo)? as usize)?.to_vec();
+            Some(SeqCapture { bytes, cvs: c.cvs.clone() })
+        })
+        .collect()
+}
+
 /// Largest chunk count among `plans`, the capacity each capture's chaining values need.
 pub fn max_chunks(plans: &[SpanPlan]) -> u32 {
     plans.iter().map(|p| p.n_chunks()).max().unwrap_or(1) as u32
@@ -747,5 +783,29 @@ mod tests {
         let q = SpanPlan::new(3, 5000, 4500, 5000).unwrap();
         assert_eq!((q.lo, q.hi), (4096, 5000));
         assert!(SpanPlan::new(3, 5000, 10, 10).is_none() && SpanPlan::new(3, 5000, 10, 5001).is_none());
+    }
+
+    #[test]
+    fn merged_captures_split_back_to_each_plan() {
+        let leaf = |l: u32, n: u64| (0..n).map(|i| (i as u32 * 31 + l * 7) as u8).collect::<Vec<u8>>();
+        let total = 600 * C;
+        let mut plans: Vec<SpanPlan> = (0..228u64).map(|j| SpanPlan::new(5, total, (j * 2 + 1) * C + 17, (j * 2 + 1) * C + 300).unwrap()).collect();
+        plans.insert(0, SpanPlan::new(2, 40 * C, 3 * C, 9 * C).unwrap());
+        plans.push(SpanPlan::new(9, 8 * C, 4 * C + 4, 4 * C + 8).unwrap());
+        plans.push(plans[7]);
+        let (groups, at) = merge_spans(&plans);
+        assert_eq!(groups.len(), 3);
+        let caps = groups
+            .iter()
+            .map(|&(l, lo, hi)| SeqCapture { bytes: leaf(l, hi)[lo as usize..].to_vec(), cvs: vec![[l as u8; 32]] })
+            .collect();
+        let out = split_captures(&plans, &groups, &at, caps).unwrap();
+        for (p, c) in plans.iter().zip(&out) {
+            assert_eq!(c.bytes, leaf(p.leaf, p.hi)[p.lo as usize..]);
+            assert_eq!(c.cvs, vec![[p.leaf as u8; 32]]);
+        }
+        let far = [SpanPlan::new(1, 3 * MAX_CAPTURE, 0, C).unwrap(), SpanPlan::new(1, 3 * MAX_CAPTURE, 2 * MAX_CAPTURE, 2 * MAX_CAPTURE + C).unwrap()];
+        assert_eq!(merge_spans(&far).0.len(), 2);
+        assert!(split_captures(&plans, &groups, &at, Vec::new()).is_none());
     }
 }

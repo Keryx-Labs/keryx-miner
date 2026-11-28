@@ -1074,10 +1074,11 @@ fn replay_captures(gguf: &str, dev_id: u32, m: &crate::trace::TierManifest, trac
     Ok(caps)
 }
 
-/// Replays a response for the sequence spans of `plans`.
+/// Replays a response for the sequence spans of `plans`, one capture per leaf range.
 fn replay_spans(gguf: &str, dev_id: u32, trace: &crate::trace::ResponseTrace, plans: &[crate::trace_seq::SpanPlan]) -> Result<Vec<crate::llama_engine::SeqCapture>, String> {
-    let spans: Vec<(u32, u64, u64)> = plans.iter().map(|p| p.capture()).collect();
-    crate::llama_engine::seq_replay(gguf, dev_id as usize, &trace.tokens, trace.record.n_prompt, &spans, crate::trace_seq::max_chunks(plans))
+    let (groups, at) = crate::trace_seq::merge_spans(plans);
+    let caps = crate::llama_engine::seq_replay(gguf, dev_id as usize, &trace.tokens, trace.record.n_prompt, &groups, crate::trace_seq::max_chunks(plans))?;
+    crate::trace_seq::split_captures(plans, &groups, &at, caps).ok_or_else(|| "sequence capture out of range".to_string())
 }
 
 /// The attention opening of the draw of `seed` at the phase of `path`, `prev` the partials of the
