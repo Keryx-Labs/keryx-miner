@@ -390,12 +390,7 @@ fn nvidia_driver_major(version: &str) -> Option<u32> {
 
 /// Query GPU stats via nvidia-smi and warn on power/VRAM issues for the selected model tier.
 ///
-/// VRAM requirements (GGUF weights only, not counting CUDA workspace):
-///   Qwen3.5-9B-abliterated  →  ~6.5 GB  (requires ≥8 GB card)
-///   GLM-4-9B                →  ~8.3 GB  (requires ≥12 GB card)
-///   Gemma-4-12B-abliterated →  ~9.8 GB  (requires ≥16 GB card)
-///   Qwen3.6/3.8-27B         → ~16.5 GB  (requires ≥24 GB card)
-///   Kimi-Linear-48B         → ~29.7 GB  (requires ≥32 GB card)
+/// The VRAM floor of a tier is its model's `min_vram_mb`.
 ///
 /// Power thresholds empirically derived: Xid 32 observed at ≤300W on RTX 3090 with 32B GGUF.
 fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
@@ -429,19 +424,22 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     // Insufficient VRAM means GPU inference for this tier will OOM. This is non-fatal — a
     // host/CPU path can still serve it — so warn rather than error, and do NOT then claim the
     // model is "ready" on the same GPU (the contradictory ERROR-then-ready pair).
-    let (model_label, min_vram_mb): (&str, u64) = if needs_very_high {
-        ("Kimi-Linear-48B (--very-high)", 30_000)
+    use keryx_miner::models::{spec_for_tier, Tier};
+    let (spec, flag) = if needs_very_high {
+        (spec_for_tier(Tier::VeryHigh), "--very-high")
     } else if needs_high {
-        ("Qwen3-27B (--high)", 20_000)
+        (spec_for_tier(Tier::High), "--high")
     } else {
-        ("Gemma-4-12B-abliterated (default)", 15_000)
+        (spec_for_tier(Tier::Default), "default")
     };
+    let model_label = format!("{} ({})", spec.dir_name, flag);
+    let min_vram_mb = spec.min_vram_mb;
 
     if vram_mb < min_vram_mb {
         log::warn!(
             "⚠  {} needs ≥{} GB VRAM but only {} GB on this GPU — GPU inference for this tier \
-             will OOM. Use a smaller tier (--high Qwen3-27B / --light GLM-4-9B / --very-light \
-             Qwen3.5-9B) or let the per-GPU assignment downgrade it.",
+             will OOM. Use a smaller tier (--high / --light / --very-light) or let the per-GPU \
+             assignment downgrade it.",
             model_label,
             min_vram_mb / 1024,
             vram_mb / 1024,
@@ -1261,11 +1259,8 @@ async fn run() -> Result<(), Error> {
     // PoM: load inference models before mining starts. Under PoM each tier
     // mines AND serves exactly ONE model (1 GPU = 1 tier); multi-tier coverage is a network
     // property, not a per-GPU one.
-    //   --very-light → Qwen3.5-9B-abliterated
-    //   --light      → GLM-4-9B
-    //   (no flag)    → Gemma-4-12B-abliterated   [default]
-    //   --high       → Qwen3.6-27B, Qwen3.8-27B from H14
-    //   --very-high  → Kimi-Linear-48B
+    //   --very-light → tier 0, --light → 1, (no flag) → 2, --high → 3, --very-high → 4,
+    //   --ultra → 5, --very-ultra → 6 (models per era in `models.rs`).
 
     // Per-card tier overrides (--force-model, CUDA-driver order). Parsed once here — the power
     // warning below and the per-GPU assignment both need them.
@@ -1287,25 +1282,25 @@ async fn run() -> Result<(), Error> {
     );
 
     let tier = if opt.very_ultra {
-        info!("--very-ultra mode: 141 GB tier — mines DeepSeek-V4.1-Flash under PoM from H18.");
+        info!("--very-ultra mode: tier 6 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::Max).dir_name);
         keryx_miner::models::Tier::Max
     } else if opt.ultra {
-        info!("--ultra mode: 96 GB tier — mines GLM-5.3-Flash under PoM from H18.");
+        info!("--ultra mode: tier 5 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::Ultra).dir_name);
         keryx_miner::models::Tier::Ultra
     } else if opt.very_high {
-        info!("--very-high mode: top tier — mines Kimi-Linear-48B under PoM.");
+        info!("--very-high mode: tier 4 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::VeryHigh).dir_name);
         keryx_miner::models::Tier::VeryHigh
     } else if opt.high {
-        info!("--high mode: high tier — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::High).dir_name);
+        info!("--high mode: tier 3 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::High).dir_name);
         keryx_miner::models::Tier::High
     } else if opt.light {
-        info!("--light mode: light tier — mines GLM-4-9B under PoM.");
+        info!("--light mode: tier 1 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::Light).dir_name);
         keryx_miner::models::Tier::Light
     } else if opt.very_light {
-        info!("--very-light mode: smallest tier — mines Qwen3.5-9B-abliterated under PoM.");
+        info!("--very-light mode: tier 0 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::VeryLight).dir_name);
         keryx_miner::models::Tier::VeryLight
     } else {
-        info!("default mode: mines Gemma-4-12B-abliterated under PoM.");
+        info!("default mode: tier 2 — mines {} under PoM.", keryx_miner::models::spec_for_tier(keryx_miner::models::Tier::Default).dir_name);
         keryx_miner::models::Tier::Default
     };
     // Per-GPU PoM assignment: each CUDA device mines the highest tier ≤ the flag ceiling that its
