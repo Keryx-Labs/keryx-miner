@@ -176,19 +176,84 @@ diff --git a/ggml/src/ggml-cuda/q8canon.cu b/ggml/src/ggml-cuda/q8canon.cu
  
  static bool q8c_sel(const ggml_tensor * node, cudaStream_t stream) {
 diff --git a/ggml/src/ggml-cuda/q8seq.cu b/ggml/src/ggml-cuda/q8seq.cu
-index ca4ae29bd..1fd8d5a12 100644
 --- a/ggml/src/ggml-cuda/q8seq.cu
 +++ b/ggml/src/ggml-cuda/q8seq.cu
-@@ -341,6 +341,8 @@ struct qs_dev {
+@@ -162,10 +162,14 @@ static __device__ void qs_push(qs_stream & st, uint32_t cv[8], qs_cap * caps, ui
+     st.chunks++;
+ }
+ 
+-// One block per stream `stream0 + blockIdx.x*step`: appends `len` bytes at `src + blockIdx.x*pitch`.
++// One block per stream `stream0 + blockIdx.x*step`: appends `len` bytes at `src + blockIdx.x*pitch`,
++// or `*len_dev` bytes when `len_dev` is set.
+ static __global__ void qs_append(qs_stream * streams, uint32_t stream0, uint32_t step, const uint8_t * src, uint64_t pitch,
+-                                 uint32_t len, qs_cap * caps, uint32_t n_caps) {
++                                 uint32_t len, qs_cap * caps, uint32_t n_caps, const uint32_t * len_dev) {
+     __shared__ uint32_t cvs[QS_BATCH][8];
++    if (len_dev) {
++        len = *len_dev;
++    }
+     const uint32_t sid = stream0 + blockIdx.x*step;
+     qs_stream & st = streams[sid];
+     const uint32_t * p = (const uint32_t *) (src + blockIdx.x*pitch);
+@@ -277,6 +281,38 @@ static __global__ void qs_gather_rows(const uint8_t * cache, uint64_t row_bytes,
+     }
+ }
+ 
++// Cache rows written at `idx`, in order, without the writes to the last slot of a stream; their byte count goes to `len`.
++static __global__ void qs_gather_comp(const uint8_t * cache, uint64_t row_bytes, const int64_t * idx, uint32_t n_rows,
++                                      int64_t kv_size, uint8_t * out, uint32_t * len) {
++    __shared__ uint32_t at;
++    for (uint32_t t = blockIdx.x; t < n_rows; t += gridDim.x) {
++        if (idx[t] % kv_size == kv_size - 1) {
++            continue;
++        }
++        if (threadIdx.x == 0) {
++            uint32_t k = 0;
++            for (uint32_t j = 0; j < t; ++j) {
++                k += idx[j] % kv_size != kv_size - 1;
++            }
++            at = k;
++        }
++        __syncthreads();
++        const uint8_t * row = cache + (uint64_t) idx[t]*row_bytes;
++        uint8_t * dst = out + (uint64_t) at*row_bytes;
++        for (uint32_t i = threadIdx.x; i < row_bytes; i += blockDim.x) {
++            dst[i] = row[i];
++        }
++        __syncthreads();
++    }
++    if (blockIdx.x == 0 && threadIdx.x == 0) {
++        uint32_t k = 0;
++        for (uint32_t j = 0; j < n_rows; ++j) {
++            k += idx[j] % kv_size != kv_size - 1;
++        }
++        *len = k*(uint32_t) row_bytes;
++    }
++}
++
+ // Records of head `blockIdx.x` at every token: q, k, v, o as f16, beta as f32, then g as f32 (one
+ // value) or f16 (one per key dimension).
+ static __global__ void qs_records(const float * q, const float * k, const float * v, const float * g, const float * beta,
+@@ -341,6 +377,9 @@ struct qs_dev {
      int         lse_layer = -1;
      uint32_t    lse_heads = 0, lse_tokens = 0;
      std::vector<uint64_t> lse_pos;  // by layer index
 +    std::vector<int> comp_slot;     // compressed row stream of each source layer, -1 elsewhere
 +    uint32_t    n_comp = 0, comp_row = 0;
++    uint32_t *  comp_len = nullptr;
  };
  
  static qs_dev     qs_devs[QS_MAX_DEVICES];
-@@ -462,6 +464,32 @@ static void qs_kv_rows(qs_dev & s, const ggml_tensor * node, bool value, cudaStr
+@@ -389,7 +428,7 @@ static void qs_append_heads(qs_dev & s, uint32_t stream0, uint32_t heads, const
+     if (len == 0 || heads == 0) {
+         return;
+     }
+-    qs_append<<<heads, 128, 0, stream>>>(s.streams, stream0, 2, src, pitch, len, s.d_caps, s.n_caps);
++    qs_append<<<heads, 128, 0, stream>>>(s.streams, stream0, 2, src, pitch, len, s.d_caps, s.n_caps, nullptr);
+ }
+ 
+ static uint32_t qs_record_bytes(uint32_t kind, uint32_t hd) {
+@@ -462,6 +501,38 @@ static void qs_kv_rows(qs_dev & s, const ggml_tensor * node, bool value, cudaStr
      qs_append_heads(s, stream0, L.heads, s.scratch, (uint64_t) n_tokens*head_bytes, n_tokens*head_bytes, stream);
  }
  
@@ -212,16 +277,31 @@ index ca4ae29bd..1fd8d5a12 100644
 +    if (n_rows == 0) {
 +        return;
 +    }
-+    dim3 grid(1, std::min<uint32_t>(n_rows, 64));
-+    qs_gather_rows<<<grid, 128, 0, stream>>>((const uint8_t *) node->data, s.comp_row, (const int64_t *) idx->data, n_rows, s.comp_row, s.scratch);
++    // padding blocks of the compressed cache are written to the last slot of the stream
++    const ggml_tensor * cache = node->view_src ? node->view_src : node;
++    const int64_t kv_size = cache->ne[1];
++    if (kv_size < 2) {
++        s.overflow = true;
++        return;
++    }
++    qs_gather_comp<<<std::min<uint32_t>(n_rows, 64), 128, 0, stream>>>((const uint8_t *) node->data, s.comp_row, (const int64_t *) idx->data, n_rows, kv_size, s.scratch, s.comp_len);
 +    const uint32_t stream_id = 2*s.seq_heads*(s.n_attn + s.n_recur) + s.seq_heads*s.n_attn + (uint32_t) s.comp_slot[il];
-+    qs_append<<<1, 128, 0, stream>>>(s.streams, stream_id, 1, s.scratch, 0, n_rows*s.comp_row, s.d_caps, s.n_caps);
++    qs_append<<<1, 128, 0, stream>>>(s.streams, stream_id, 1, s.scratch, 0, n_rows*s.comp_row, s.d_caps, s.n_caps, s.comp_len);
 +}
 +
  static void qs_recurrent(qs_dev & s, const ggml_tensor * dst, cudaStream_t stream) {
      const int il = qs_layer_of(dst->src[5], "cache_s_l");
      if (il < 0 || il >= (int) s.layer.size()) {
-@@ -578,6 +606,8 @@ void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
+@@ -559,7 +630,7 @@ static void qs_lse(qs_dev & s, const ggml_tensor * node, cudaStream_t stream) {
+     const uint32_t g = s.lse_heads / L.heads, n = s.lse_heads*s.lse_tokens;
+     qs_lse_gather<<<(n + 255)/256, 256, 0, stream>>>(s.lse, s.lse_heads, s.lse_tokens, g, (float *) s.scratch);
+     const uint32_t len = s.lse_tokens*g*sizeof(float);
+-    qs_append<<<L.heads, 128, 0, stream>>>(s.streams, 2*s.seq_heads*(s.n_attn + s.n_recur) + L.slot*s.seq_heads, 1, s.scratch, len, len, s.d_caps, s.n_caps);
++    qs_append<<<L.heads, 128, 0, stream>>>(s.streams, 2*s.seq_heads*(s.n_attn + s.n_recur) + L.slot*s.seq_heads, 1, s.scratch, len, len, s.d_caps, s.n_caps, nullptr);
+     s.lse_pos[il] += s.lse_tokens;
+     s.lse_layer = -1;
+ }
+@@ -578,6 +649,8 @@ void ggml_cuda_q8s_node(const ggml_tensor * node, cudaStream_t stream) {
              qs_kv_rows(*s, node, false, stream);
          } else if (qs_layer_of(node, "cache_v_l") >= 0) {
              qs_kv_rows(*s, node, true, stream);
@@ -230,7 +310,15 @@ index ca4ae29bd..1fd8d5a12 100644
          }
      } else if (node->op == GGML_OP_GATED_DELTA_NET) {
          qs_recurrent(*s, node, stream);
-@@ -608,9 +638,38 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
+@@ -591,6 +664,7 @@ static void qs_free(qs_dev & s) {
+     cudaFree(s.ckpt);
+     cudaFree(s.roots);
+     cudaFree(s.d_caps);
++    cudaFree(s.comp_len);
+     for (auto & c : s.caps) {
+         cudaFree(c.bytes);
+         cudaFree(c.cvs);
+@@ -608,9 +682,38 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
      qs_dev & s = qs_devs[device];
      qs_free(s);
      size_t scratch = 0, ckpt = 0;
@@ -269,7 +357,7 @@ index ca4ae29bd..1fd8d5a12 100644
          const bool recur = kind == Q8S_GDA || kind == Q8S_KDA;
          if (kind < Q8S_ATTN || kind > Q8S_KDA || heads == 0 || heads > seq_heads || slot >= (recur ? n_recur : n_attn)) {
              return -2;
-@@ -630,7 +689,10 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
+@@ -630,7 +733,10 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
      s.seq_heads = seq_heads;
      s.interval = interval;
      s.max_tokens = max_tokens;
@@ -281,6 +369,16 @@ index ca4ae29bd..1fd8d5a12 100644
      const size_t lse_cap = (size_t) QS_LSE_HEADS*max_tokens;
      scratch = std::max(scratch, lse_cap*sizeof(float));
      if (cudaMalloc(&s.lse, lse_cap*sizeof(float)) != cudaSuccess
+@@ -638,7 +744,8 @@ extern "C" int ggml_cuda_q8s_configure(int device, const uint32_t * layers, uint
+         || cudaMalloc(&s.scratch, std::max<size_t>(scratch, 4)) != cudaSuccess
+         || cudaMalloc(&s.ckpt, std::max<size_t>(ckpt, 4)) != cudaSuccess
+         || cudaMalloc(&s.roots, (size_t) s.n_leaves*32) != cudaSuccess
+-        || cudaMalloc(&s.d_caps, QS_MAX_CAPS*sizeof(qs_cap)) != cudaSuccess) {
++        || cudaMalloc(&s.d_caps, QS_MAX_CAPS*sizeof(qs_cap)) != cudaSuccess
++        || cudaMalloc(&s.comp_len, sizeof(uint32_t)) != cudaSuccess) {
+         qs_free(s);
+         return -3;
+     }
 diff --git a/ggml/src/ggml-cuda/q8seq.cuh b/ggml/src/ggml-cuda/q8seq.cuh
 index 1154a5e49..bfde98ea9 100644
 --- a/ggml/src/ggml-cuda/q8seq.cuh
