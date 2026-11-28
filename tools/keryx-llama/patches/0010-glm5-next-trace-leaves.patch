@@ -163,7 +163,7 @@ index 7139b3c0b..44ef3df93 100644
 +    float m = INFINITY;
 +    for (int i = threadIdx.x; i < k; i += blockDim.x) {
 +        const float v = sc[ti[i]];
-+        if (isfinite(v)) {
++        if (isfinite(v) && v > -__FLT_MAX__) {
 +            m = fminf(m, v);
 +            atomicAdd(&nfin, 1);
 +        }
@@ -182,12 +182,12 @@ index 7139b3c0b..44ef3df93 100644
 +    }
 +    for (int i = threadIdx.x; i < k; i += blockDim.x) {
 +        const int32_t p = ti[i];
-+        if (!isfinite(sc[p])) {
++        if (!(isfinite(sc[p]) && sc[p] > -__FLT_MAX__)) {
 +            continue;
 +        }
 +        int rank = 0;
 +        for (int j = 0; j < k; ++j) {
-+            rank += isfinite(sc[ti[j]]) && ti[j] < p;
++            rank += isfinite(sc[ti[j]]) && sc[ti[j]] > -__FLT_MAX__ && ti[j] < p;
 +        }
 +        row[1 + rank] = (uint32_t) p;
 +    }
